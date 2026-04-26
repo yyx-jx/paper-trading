@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.npm-cache/
+.electron-cache/
+*.log
+*.pid
+coverage/
+data/
+data/logs/*.tmp
+tmp-*
+.tmp-*
