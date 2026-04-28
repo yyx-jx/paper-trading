@@ -1,5 +1,7 @@
 import "dotenv/config";
 
+export type PersistenceMode = "external" | "memory";
+
 export const DEFAULT_CHAINLINK_RPC_URL = "https://eth.llamarpc.com";
 export const DEFAULT_CHAINLINK_FALLBACK_RPC_URLS = [
   "https://ethereum-rpc.publicnode.com",
@@ -24,6 +26,10 @@ function csvEnv(value: string | undefined, fallback: string[] = []) {
   return parsed.length > 0 ? parsed : fallback;
 }
 
+function persistenceModeEnv(value: string | undefined): PersistenceMode {
+  return value === "memory" ? "memory" : "external";
+}
+
 export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
   return {
     port: Number(env.PORT ?? 8787),
@@ -43,6 +49,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     gammaMaxPolls: Number(env.GAMMA_MAX_POLLS ?? 60),
     logRetentionMs: Number(env.LOG_RETENTION_MS ?? 300000),
     snapshotRetentionSeconds: Number(env.REDIS_SNAPSHOT_TTL_SECONDS ?? 300),
+    persistenceMode: persistenceModeEnv(env.PERSISTENCE_MODE),
     databaseUrl: textEnv(env.DATABASE_URL, "postgresql://postgres:postgres@127.0.0.1:5432/paper_trading"),
     redisUrl: textEnv(env.REDIS_URL, "redis://127.0.0.1:6379"),
     binanceRestUrl: textEnv(env.BINANCE_REST_URL, "https://api.binance.com"),

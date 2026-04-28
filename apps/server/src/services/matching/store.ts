@@ -93,6 +93,7 @@ export class MatchingStore {
     private readonly config: {
       databaseUrl: string;
       redisUrl: string;
+      persistenceMode: "external" | "memory";
       redisSnapshotSeconds: number;
     }
   ) {
@@ -394,6 +395,11 @@ export class MatchingStore {
   }
 
   private async connectPostgres() {
+    if (this.config.persistenceMode === "memory") {
+      console.warn("[matching] PERSISTENCE_MODE=memory; skipping PostgreSQL connection.");
+      return;
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {
@@ -426,6 +432,11 @@ export class MatchingStore {
   }
 
   private async connectRedis() {
+    if (this.config.persistenceMode === "memory") {
+      console.warn("[matching] PERSISTENCE_MODE=memory; skipping Redis connection.");
+      return;
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {

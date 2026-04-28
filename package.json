@@ -2,6 +2,7 @@
   "name": "btc-paper-trading-cs",
   "version": "0.1.0",
   "private": true,
+  "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
   "scripts": {
     "dev": "concurrently -k -n renderer,electron \"npm run dev:renderer\" \"npm run dev:electron\"",
@@ -22,9 +23,10 @@
     "test:trading": "tsx scripts/trading-engine-check.ts && tsx scripts/limit-order-lifecycle-check.ts && tsx scripts/latency-optimization-check.ts && tsx scripts/frontend-display-check.ts",
     "test:regression": "tsx scripts/flow-regression-check.ts",
     "build": "npm run build:server && npm run build:matching && npm run build:renderer",
-    "build:server": "tsup apps/server/src/index.ts --format cjs --target node20 --out-dir dist/server --clean",
-    "build:matching": "tsup apps/server/src/matching-index.ts --format cjs --target node20 --out-dir dist/matching",
+    "build:server": "tsup --config tsup.server.config.ts",
+    "build:matching": "tsup --config tsup.matching.config.ts",
     "build:renderer": "vite build --config apps/client/vite.config.ts",
+    "package:win:test": "node scripts/package-win-test.cjs",
     "typecheck": "tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/client/tsconfig.json",
     "start:server": "node dist/server/index.js",
     "start:matching": "node dist/matching/matching-index.js"
@@ -60,10 +62,48 @@
     "@vitejs/plugin-react": "^5.0.4",
     "concurrently": "^9.2.1",
     "electron": "^37.4.0",
+    "electron-builder": "^26.8.1",
     "tsup": "^8.5.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "wait-on": "^8.0.5"
+  },
+  "build": {
+    "appId": "com.local.btcpapertrading.test",
+    "productName": "BTC Paper Trading Test",
+    "asar": true,
+    "asarUnpack": [
+      "dist/server/**/*"
+    ],
+    "npmRebuild": false,
+    "directories": {
+      "output": "部署/windows-test"
+    },
+    "files": [
+      "package.json",
+      "apps/client/electron/**/*",
+      "dist/renderer/**/*",
+      "dist/server/**/*"
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "BTC Paper Trading Test Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BTC Paper Trading Test"
+    }
   }
 }

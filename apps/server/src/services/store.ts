@@ -642,6 +642,7 @@ export class AppStore {
     symbol: string;
     databaseUrl: string;
     redisUrl: string;
+    persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
   };
 
@@ -652,6 +653,7 @@ export class AppStore {
     symbol: string;
     databaseUrl: string;
     redisUrl: string;
+    persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
   }) {
     this.config = config;
@@ -2381,6 +2383,11 @@ export class AppStore {
   }
 
   private async connectPostgres() {
+    if (this.config.persistenceMode === "memory") {
+      console.warn("[store] PERSISTENCE_MODE=memory; skipping PostgreSQL connection.");
+      return;
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {
@@ -2413,6 +2420,11 @@ export class AppStore {
   }
 
   private async connectRedis() {
+    if (this.config.persistenceMode === "memory") {
+      console.warn("[store] PERSISTENCE_MODE=memory; skipping Redis connection.");
+      return;
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {

@@ -79,6 +79,7 @@ const eventSearchSchema = z.object({
 export async function createMatchingServiceApp(config: {
   databaseUrl: string;
   redisUrl: string;
+  persistenceMode: "external" | "memory";
   redisSnapshotSeconds: number;
 }) {
   const app = Fastify({ logger: false });

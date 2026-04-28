@@ -51,6 +51,7 @@ const store = new AppStore({
   symbol: serverConfig.symbol,
   databaseUrl: serverConfig.databaseUrl,
   redisUrl: serverConfig.redisUrl,
+  persistenceMode: serverConfig.persistenceMode,
   chainlinkEnabled: serverConfig.chainlinkEnabled
 });
 
@@ -1125,6 +1126,7 @@ async function bootstrap() {
     matchingRuntime = await createMatchingServiceApp({
       databaseUrl: serverConfig.databaseUrl,
       redisUrl: serverConfig.redisUrl,
+      persistenceMode: serverConfig.persistenceMode,
       redisSnapshotSeconds: serverConfig.snapshotRetentionSeconds
     });
     await matchingRuntime.app.listen({
