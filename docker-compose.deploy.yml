@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: paper_trading
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d paper_trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  matching-service:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+      target: matching-service
+    env_file:
+      - ${APP_ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/paper_trading
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8788:8788"
+    volumes:
+      - app_logs:/app/data/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8788/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  app-server:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+      target: app-server
+    env_file:
+      - ${APP_ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/paper_trading
+      REDIS_URL: redis://redis:6379
+      MATCHING_SERVICE_URL: http://matching-service:8788
+      EMBEDDED_MATCHING_SERVICE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      matching-service:
+        condition: service_healthy
+    ports:
+      - "8787:8787"
+    volumes:
+      - app_logs:/app/data/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_logs:

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.npm-cache/
+.electron-cache/
+*.log
+*.pid
+coverage/
+部署/
+data/postgres/
+data/redis/
+data/logs/*.jsonl
+data/logs/*.tmp
+.tmp-*
+tmp-*
