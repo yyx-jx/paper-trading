@@ -1233,13 +1233,49 @@ function CandlestickChart(props: {
   round?: RoundRecord;
 }) {
   const bars = filterBarsToRecentWindow(props.bars);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [chartSize, setChartSize] = useState({ width: 900, height: 460 });
   const [hoveredBar, setHoveredBar] = useState<{ index: number; mouseX: number; mouseY: number } | undefined>();
+
+  useEffect(() => {
+    const svg = svgRef.current;
+    const container = svg?.parentElement;
+    if (!container) {
+      return;
+    }
+
+    const applySize = (rect: Pick<DOMRectReadOnly, "width" | "height">) => {
+      const nextSize = {
+        width: Math.max(Math.round(rect.width), 320),
+        height: Math.max(Math.round(rect.height), 280)
+      };
+      setChartSize((currentSize) =>
+        currentSize.width === nextSize.width && currentSize.height === nextSize.height ? currentSize : nextSize
+      );
+    };
+
+    applySize(container.getBoundingClientRect());
+
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) {
+        applySize(entry.contentRect);
+      }
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
   if (bars.length === 0) {
     return <div className="chart-empty">{props.emptyText}</div>;
   }
 
-  const width = 900;
-  const height = 330;
+  const width = chartSize.width;
+  const height = chartSize.height;
   const padding = { top: 20, right: 92, bottom: 36, left: 14 };
   const highs = bars.map((bar) => bar.high);
   const lows = bars.map((bar) => bar.low);
@@ -1330,6 +1366,7 @@ function CandlestickChart(props: {
 
   return (
     <svg
+      ref={svgRef}
       viewBox={`0 0 ${width} ${height}`}
       className="candle-chart"
       role="img"
