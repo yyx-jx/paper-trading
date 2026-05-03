@@ -66,7 +66,6 @@ const engine = new SimulationEngine(store, matchingClient, {
   freezeWindowMs: serverConfig.freezeWindowMs,
   pollDelayMs: serverConfig.pollDelayMs,
   gammaPollIntervalMs: serverConfig.gammaPollIntervalMs,
-  gammaMaxPolls: serverConfig.gammaMaxPolls,
   binanceRestUrl: serverConfig.binanceRestUrl,
   binanceWsUrl: serverConfig.binanceWsUrl,
   binanceRequestTimeoutMs: serverConfig.binanceRequestTimeoutMs,
@@ -79,6 +78,9 @@ const engine = new SimulationEngine(store, matchingClient, {
   chainlinkRequestTimeoutMs: serverConfig.chainlinkRequestTimeoutMs,
   chainlinkBtcUsdProxyAddress: serverConfig.chainlinkBtcUsdProxyAddress as `0x${string}`,
   chainlinkPollMs: serverConfig.chainlinkPollMs,
+  chainlinkRtdsWsUrl: serverConfig.chainlinkRtdsWsUrl,
+  chainlinkRtdsSymbol: serverConfig.chainlinkRtdsSymbol,
+  chainlinkRtdsPingMs: serverConfig.chainlinkRtdsPingMs,
   gammaBaseUrl: serverConfig.gammaBaseUrl,
   clobBaseUrl: serverConfig.clobBaseUrl,
   dataApiBaseUrl: serverConfig.dataApiBaseUrl,
@@ -156,6 +158,12 @@ const userBalanceSchema = z.object({
 const quickSideSchema = z.object({
   side: z.enum(["UP", "DOWN"]),
   clientSendTs: z.number().optional()
+});
+
+const manualSettlementSchema = z.object({
+  side: z.enum(["UP", "DOWN"]),
+  price: z.number().nonnegative().optional(),
+  reason: z.string().trim().max(300).optional()
 });
 
 const trainingLogQuerySchema = z.object({
@@ -296,15 +304,11 @@ function requirePermission(user: UserRecord, code: string) {
 }
 
 function canViewAllLogs(user: UserRecord) {
-  return (
-    user.role === "Admin" ||
-    user.role === "Test Engineer" ||
-    user.permissionCodes.includes("logs:view:all" as never)
-  );
+  return user.role === "Admin";
 }
 
 function canViewTeamLogs(user: UserRecord) {
-  return user.role === "Senior Tester" || user.permissionCodes.includes("logs:view:team" as never);
+  return user.role === "Senior Tester" || user.role === "Test Engineer" || user.permissionCodes.includes("logs:view:team" as never);
 }
 
 function teamVisibleUserIds(user: UserRecord) {
@@ -688,10 +692,10 @@ function canListUsers(user: UserRecord) {
 }
 
 function listUsersForActor(actor: UserRecord) {
-  if (actor.role === "Admin" || actor.role === "Test Engineer") {
+  if (actor.role === "Admin") {
     return store.listUsers();
   }
-  if (actor.role === "Senior Tester") {
+  if (actor.role === "Senior Tester" || actor.role === "Test Engineer") {
     const visibleIds = new Set(teamVisibleUserIds(actor));
     return store.listUsers().filter((user) => visibleIds.has(user.id));
   }
@@ -1073,21 +1077,8 @@ function warnForLocalMisconfiguration() {
   }
 
   const warnings: string[] = [];
-  if (
-    !serverConfig.chainlinkRpcUrl ||
-    serverConfig.chainlinkRpcUrl.includes("YOUR_PRIMARY_KEY") ||
-    serverConfig.chainlinkRpcUrl.includes("YOUR_API_KEY") ||
-    serverConfig.chainlinkRpcUrl.includes("YOUR_ALCHEMY_KEY")
-  ) {
-    warnings.push("CHAINLINK_RPC_URL is still a placeholder.");
-  }
-  if (
-    serverConfig.chainlinkFallbackRpcUrls.length === 0 ||
-    serverConfig.chainlinkFallbackRpcUrls.some(
-      (url) => url.includes("YOUR_FALLBACK_KEY") || url.includes("YOUR_API_KEY") || url.includes("YOUR_INFURA_KEY")
-    )
-  ) {
-    warnings.push("CHAINLINK_FALLBACK_RPC_URLS is missing or still contains placeholders.");
+  if (!serverConfig.chainlinkRtdsWsUrl || !serverConfig.chainlinkRtdsWsUrl.startsWith("wss://")) {
+    warnings.push("CHAINLINK_RTDS_WS_URL must point to the Polymarket RTDS WebSocket.");
   }
   if (warnings.length === 0) {
     return;
@@ -1188,7 +1179,7 @@ async function bootstrap() {
     const candidate = store.findUserByUsername(parsed.data.username);
     const user = store.findUserByCredentials(parsed.data.username, parsed.data.password);
     if (!user) {
-      const disabledMatch = candidate && candidate.password === parsed.data.password && !candidate.isActive;
+      const disabledMatch = candidate && store.verifyUserPassword(candidate, parsed.data.password) && !candidate.isActive;
       await recordLoginAudit({
         username: parsed.data.username,
         user: disabledMatch ? candidate : undefined,
@@ -1327,7 +1318,7 @@ async function bootstrap() {
         usernameExists: (username) => Boolean(store.findUserByUsername(username)),
         seniorTesterExists: (userId) => {
           const senior = store.getUserById(userId);
-          return Boolean(senior && senior.role === "Senior Tester");
+          return Boolean(senior && (senior.role === "Senior Tester" || senior.role === "Test Engineer"));
         }
       });
       if (validation.failed.length > 0) {
@@ -1508,6 +1499,25 @@ async function bootstrap() {
       requirePermission(user, "trade:view");
       const limit = Number((request.query as { limit?: string }).limit ?? 10);
       return getHistoryWithSettlementPreview(limit, user.id);
+    })
+  );
+
+  app.post("/api/rounds/:id/manual-settlement", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      if (user.role === "Tester") {
+        throw new Error("Tester accounts cannot enter manual settlement.");
+      }
+      const params = request.params as { id: string };
+      const parsed = manualSettlementSchema.parse(request.body);
+      return decorateRoundWithSettlementPreview(
+        await engine.manualSettleRound(user, {
+          roundId: params.id,
+          side: parsed.side,
+          price: parsed.price,
+          reason: parsed.reason
+        })
+      );
     })
   );
 

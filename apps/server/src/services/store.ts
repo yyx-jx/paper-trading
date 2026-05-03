@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
 import { Pool } from "pg";
 import { createClient } from "redis";
@@ -39,12 +40,28 @@ const STARTUP_CONNECT_RETRY_DELAY_MS = 2000;
 const FIVE_MINUTE_ROUND_MS = 5 * 60_000;
 const QTY_EPSILON = 0.0000001;
 const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
+const BCRYPT_COST = 10;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const roundNumber = (value: number, digits = 8) => Number(value.toFixed(digits));
+
+function isBcryptHash(value: string) {
+  return /^\$2[aby]\$\d{2}\$/.test(value);
+}
+
+function hashPassword(password: string) {
+  return bcrypt.hashSync(password, BCRYPT_COST);
+}
+
+function verifyPassword(password: string, stored: string) {
+  if (isBcryptHash(stored)) {
+    return bcrypt.compareSync(password, stored);
+  }
+  return password === stored;
+}
 
 function isFiveMinuteRound(round: RoundRecord) {
   return round.endAt > round.startAt && round.endAt - round.startAt === FIVE_MINUTE_ROUND_MS;
@@ -111,7 +128,7 @@ const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
     "profile:view",
     "system:status:view",
     "users:list",
-    "logs:view:all"
+    "logs:view:team"
   ],
   Admin: [
     "trade:view",
@@ -542,12 +559,22 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       candlesByInterval: {
         "1m": [createEmptyCandleBar("1m", now)],
         "5m": [createEmptyCandleBar("5m", now)],
+        "15m": [createEmptyCandleBar("15m", now)],
+        "1h": [createEmptyCandleBar("1h", now)],
         "1d": [createEmptyCandleBar("1d", now)]
       }
     },
     chainlink: {
       referencePrice: 0,
-      settlementReference: 0
+      settlementReference: 0,
+      candles5s: [],
+      candlesByInterval: {
+        "1m": [createEmptyCandleBar("1m", now)],
+        "5m": [createEmptyCandleBar("5m", now)],
+        "15m": [createEmptyCandleBar("15m", now)],
+        "1h": [createEmptyCandleBar("1h", now)],
+        "1d": [createEmptyCandleBar("1d", now)]
+      }
     },
     clob: {
       delta: 0,
@@ -699,7 +726,12 @@ export class AppStore {
 
   findUserByCredentials(username: string, password: string) {
     for (const user of this.users.values()) {
-      if (user.username === username && user.password === password && user.isActive) {
+      if (user.username === username && verifyPassword(password, user.password) && user.isActive) {
+        if (!isBcryptHash(user.password)) {
+          user.password = hashPassword(password);
+          user.updatedAt = Date.now();
+          void this.persistUser(user);
+        }
         return user;
       }
     }
@@ -708,6 +740,10 @@ export class AppStore {
 
   findUserByUsername(username: string) {
     return [...this.users.values()].find((user) => user.username === username);
+  }
+
+  verifyUserPassword(user: UserRecord, password: string) {
+    return verifyPassword(password, user.password);
   }
 
   getUserById(userId: string) {
@@ -817,7 +853,7 @@ export class AppStore {
     const user: UserRecord = {
       id: this.newId("u"),
       username: input.username,
-      password: input.password,
+      password: hashPassword(input.password),
       displayName: input.displayName,
       role: input.role,
       language: input.language,
@@ -866,7 +902,7 @@ export class AppStore {
     if (!user) {
       throw new Error("User was not found.");
     }
-    user.password = password;
+    user.password = hashPassword(password);
     user.updatedAt = Date.now();
     await this.persistUser(user);
     return user;
@@ -2478,7 +2514,7 @@ export class AppStore {
           this.users.set(id, {
             id,
             username,
-            password,
+            password: hashPassword(password),
             displayName,
             role,
             language,
@@ -2507,7 +2543,7 @@ export class AppStore {
           [
             id,
             username,
-            password,
+            hashPassword(password),
             displayName,
             role,
             language,

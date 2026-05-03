@@ -38,9 +38,18 @@ interface DetailedMarketPayload {
   winningOutcome?: string;
   winningTokenId?: string;
   resolutionOutcome?: string;
+  automaticallyResolved?: boolean;
   outcomes: string;
   outcomePrices: string;
   clobTokenIds: string;
+  tokens?: Array<{
+    token_id?: string;
+    tokenId?: string;
+    id?: string;
+    outcome?: string;
+    title?: string;
+    price?: number | string;
+  }>;
   events?: Array<{
     id: string;
     slug: string;
@@ -98,6 +107,72 @@ function toFloat(value: number | string | undefined) {
     return Number(value);
   }
   return 0;
+}
+
+function normalizeOutcomeText(value?: string) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function outcomeSide(value?: string): TradeSide | undefined {
+  const normalized = normalizeOutcomeText(value);
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "up" || normalized.includes(" up") || normalized.includes("above")) {
+    return "UP";
+  }
+  if (normalized === "down" || normalized.includes("down") || normalized.includes("below")) {
+    return "DOWN";
+  }
+  return undefined;
+}
+
+function normalizeMarketOutcomes(payload: DetailedMarketPayload) {
+  const outcomes = parseJsonArray<string>(payload.outcomes);
+  const outcomePrices = parseJsonArray<string>(payload.outcomePrices).map((value) => Number(value));
+  const clobTokenIds = parseJsonArray<string>(payload.clobTokenIds);
+  const rows = outcomes.map((outcome, index) => ({
+    side: outcomeSide(outcome),
+    outcome,
+    tokenId: clobTokenIds[index] ?? "",
+    price: toFloat(outcomePrices[index])
+  }));
+
+  for (const token of payload.tokens ?? []) {
+    const side = outcomeSide(token.outcome ?? token.title);
+    if (!side) {
+      continue;
+    }
+    const existing = rows.find((row) => row.side === side);
+    if (existing) {
+      existing.tokenId = String(token.token_id ?? token.tokenId ?? token.id ?? existing.tokenId);
+      existing.outcome = String(token.outcome ?? token.title ?? existing.outcome);
+      existing.price = toFloat(token.price ?? existing.price);
+    } else {
+      rows.push({
+        side,
+        outcome: String(token.outcome ?? token.title ?? side),
+        tokenId: String(token.token_id ?? token.tokenId ?? token.id ?? ""),
+        price: toFloat(token.price)
+      });
+    }
+  }
+
+  const fallbackUpIndex = rows.findIndex((row) => row.side === "UP");
+  const fallbackDownIndex = rows.findIndex((row) => row.side === "DOWN");
+  const up = rows[fallbackUpIndex >= 0 ? fallbackUpIndex : 0] ?? { outcome: "Up", tokenId: clobTokenIds[0] ?? "", price: toFloat(outcomePrices[0]) };
+  const down =
+    rows[fallbackDownIndex >= 0 ? fallbackDownIndex : 1] ??
+    { outcome: "Down", tokenId: clobTokenIds[1] ?? "", price: toFloat(outcomePrices[1]) };
+
+  return {
+    upOutcome: up.outcome || "Up",
+    downOutcome: down.outcome || "Down",
+    upTokenId: up.tokenId || "",
+    downTokenId: down.tokenId || "",
+    upPrice: toFloat(up.price),
+    downPrice: toFloat(down.price)
+  };
 }
 
 function isBtcPrice(value: number) {
@@ -1035,9 +1110,7 @@ export class PolymarketConnector {
   }
 
   private toMarketDetail(payload: DetailedMarketPayload): PolymarketMarketDetail {
-    const outcomes = parseJsonArray<string>(payload.outcomes);
-    const outcomePrices = parseJsonArray<string>(payload.outcomePrices).map((value) => Number(value));
-    const clobTokenIds = parseJsonArray<string>(payload.clobTokenIds);
+    const normalizedOutcomes = normalizeMarketOutcomes(payload);
     const event = payload.events?.[0];
     const slugStartAt = parseBtcFiveMinuteSlugStart(payload.slug) ?? parseBtcFiveMinuteSlugStart(event?.slug);
     const parsedStartAt = Date.parse(event?.startTime ?? event?.startDate ?? payload.endDate);
@@ -1053,6 +1126,7 @@ export class PolymarketConnector {
       payload.winningOutcome ?? payload.winner ?? payload.resolutionOutcome ?? raw.resolvedOutcome ?? ""
     );
     const winningTokenId = String(payload.winningTokenId ?? raw.winningAssetId ?? raw.winning_asset_id ?? "");
+    const automaticallyResolved = Boolean(raw.automaticallyResolved);
     const settlementStatus = payload.closed
       ? ("resolved" as const)
       : ("pending" as const);
@@ -1066,11 +1140,11 @@ export class PolymarketConnector {
       eventId: event?.id ?? payload.id,
       eventSlug: event?.slug ?? payload.slug,
       seriesSlug: event?.seriesSlug,
-      upTokenId: clobTokenIds[0] ?? "",
-      downTokenId: clobTokenIds[1] ?? "",
-      upOutcome: outcomes[0] ?? "Up",
-      downOutcome: outcomes[1] ?? "Down",
-      outcomePrices: [toFloat(outcomePrices[0]), toFloat(outcomePrices[1])],
+      upTokenId: normalizedOutcomes.upTokenId,
+      downTokenId: normalizedOutcomes.downTokenId,
+      upOutcome: normalizedOutcomes.upOutcome,
+      downOutcome: normalizedOutcomes.downOutcome,
+      outcomePrices: [normalizedOutcomes.upPrice, normalizedOutcomes.downPrice],
       referencePrice: referencePrice?.price,
       referencePriceSource: referencePrice?.source,
       referenceOpenPrice: referenceOpenPrice?.price,
@@ -1079,8 +1153,9 @@ export class PolymarketConnector {
       referenceClosePriceSource: referenceClosePrice?.source,
       winningTokenId: winningTokenId || undefined,
       winningOutcome: winningOutcome || undefined,
-      settlementPrice: payload.closed ? Math.max(toFloat(outcomePrices[0]), toFloat(outcomePrices[1])) : undefined,
+      settlementPrice: payload.closed ? Math.max(normalizedOutcomes.upPrice, normalizedOutcomes.downPrice) : undefined,
       settlementStatus,
+      automaticallyResolved: automaticallyResolved || undefined,
       bestBid: toFloat(payload.bestBid),
       bestAsk: toFloat(payload.bestAsk),
       lastTradePrice: toFloat(payload.lastTradePrice),

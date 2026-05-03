@@ -9,6 +9,70 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function evaluateTradeLayout(window, width, height) {
+  window.setContentSize(width, height);
+  await wait(1200);
+  return window.webContents.executeJavaScript(`
+    (() => {
+      const root = document.documentElement;
+      const body = document.body;
+      const intervalButtons = Array.from(document.querySelectorAll(".chart-toolbar.compact button"))
+        .map((button) => (button.textContent || "").trim())
+        .filter((text) => ["1m", "5m", "15m", "1h"].includes(text));
+      const hasTradePage = Boolean(document.querySelector(".terminal-page"));
+      const overflowFree =
+        root.scrollWidth === root.clientWidth &&
+        root.scrollHeight === root.clientHeight &&
+        body.scrollWidth === body.clientWidth &&
+        body.scrollHeight === body.clientHeight;
+      const allModulesPresent = [
+        ".terminal-left",
+        ".terminal-center",
+        ".terminal-right",
+        ".terminal-chart-block",
+        ".terminal-depth",
+        ".terminal-order",
+        ".health-grid",
+        ".strategy-list"
+      ].every((selector) => Boolean(document.querySelector(selector)));
+      const monitorCells = Array.from(document.querySelectorAll(".terminal-monitor .monitor-cell, .terminal-monitor .monitor-timer"));
+      const monitorCellsFit = monitorCells.every((node) => {
+        const element = node;
+        return element.scrollWidth <= element.clientWidth + 1 && element.scrollHeight <= element.clientHeight + 1;
+      });
+      const monitorCellMetrics = monitorCells.map((node) => {
+        const element = node;
+        return {
+          className: element.className,
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          clientHeight: element.clientHeight,
+          scrollHeight: element.scrollHeight,
+          text: (element.textContent || "").replace(/\\s+/g, " ").trim()
+        };
+      });
+      return {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        rootClientWidth: root.clientWidth,
+        rootClientHeight: root.clientHeight,
+        rootScrollWidth: root.scrollWidth,
+        rootScrollHeight: root.scrollHeight,
+        bodyClientWidth: body.clientWidth,
+        bodyClientHeight: body.clientHeight,
+        bodyScrollWidth: body.scrollWidth,
+        bodyScrollHeight: body.scrollHeight,
+        hasTradePage,
+        overflowFree,
+        allModulesPresent,
+        monitorCellsFit,
+        monitorCellMetrics,
+        intervalButtons
+      };
+    })();
+  `);
+}
+
 async function main() {
   app.commandLine.appendSwitch("disable-gpu");
   app.setPath("userData", path.join(os.tmpdir(), `paper-trading-ui-check-${process.pid}`));
@@ -42,6 +106,17 @@ async function main() {
   `);
   await window.loadURL(APP_URL);
   await wait(3000);
+  const trade1440 = await evaluateTradeLayout(window, 1440, 900);
+  if (!trade1440.hasTradePage || !trade1440.overflowFree || !trade1440.allModulesPresent || !trade1440.monitorCellsFit) {
+    throw new Error(`Trade page 1440x900 check failed: ${JSON.stringify(trade1440)}`);
+  }
+  if (["1m", "5m", "15m", "1h"].some((label) => !trade1440.intervalButtons.includes(label))) {
+    throw new Error(`Missing trade interval buttons at 1440x900: ${JSON.stringify(trade1440.intervalButtons)}`);
+  }
+  const trade1920 = await evaluateTradeLayout(window, 1920, 1080);
+  if (!trade1920.hasTradePage || !trade1920.overflowFree || !trade1920.allModulesPresent || !trade1920.monitorCellsFit) {
+    throw new Error(`Trade page 1920x1080 check failed: ${JSON.stringify(trade1920)}`);
+  }
   const result = await window.webContents.executeJavaScript(`
     (async () => {
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -111,6 +186,8 @@ async function main() {
       }
       return {
         title: document.title,
+        trade1440: ${JSON.stringify({ width: 1440, height: 900 })},
+        trade1920: ${JSON.stringify({ width: 1920, height: 1080 })},
         hasExportWizard: true,
         hasBulkDialog: true,
         hasLogFacets: true,

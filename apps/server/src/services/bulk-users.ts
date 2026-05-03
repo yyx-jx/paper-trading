@@ -59,7 +59,7 @@ export function validateBulkCreateUsers(rows: BulkCreateUserInput[], context: Bu
       failed.push({ rowNumber, username, error: "Username already exists." });
     }
     if (role === "Tester" && seniorTesterId && !context.seniorTesterExists(seniorTesterId)) {
-      failed.push({ rowNumber, username, error: "seniorTesterId must point to a Senior Tester." });
+      failed.push({ rowNumber, username, error: "seniorTesterId must point to a Senior Tester or Test Engineer." });
     }
     if (role !== "Tester" && seniorTesterId) {
       failed.push({ rowNumber, username, error: "seniorTesterId is only valid for Tester accounts." });

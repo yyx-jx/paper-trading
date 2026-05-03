@@ -2,6 +2,7 @@ import type {
   AuditEvent,
   BehaviorActionLog,
   BinanceConnectorState,
+  CandleBar,
   ChainlinkConnectorState,
   Language,
   MatchingBookState,
@@ -37,12 +38,82 @@ const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.97;
 const QTY_EPSILON = 0.0001;
 const FIVE_MINUTE_MS = 5 * 60_000;
 const EXECUTION_BOOK_FRESHNESS_FLOOR_MS = 5000;
+const GAMMA_PREFETCH_START_MS = 180_000;
+const GAMMA_PREFETCH_END_MS = 60_000;
+const GAMMA_PREFETCH_INTERVAL_MS = 5000;
+const TRADE_CHART_INTERVALS = ["1m", "5m", "15m", "1h"] as const;
+const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+  "1m": 60,
+  "5m": 30,
+  "15m": 24,
+  "1h": 24
+};
+const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+  "1m": 60_000,
+  "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "1h": 60 * 60_000
+};
+
+function isMarketResolved(detail: PolymarketMarketDetail): boolean {
+  if (detail.automaticallyResolved) return true;
+  if (detail.winningTokenId) return true;
+  if (detail.winningOutcome) return true;
+  if (detail.closed) {
+    const [up, down] = detail.outcomePrices;
+    if (up === 1 && down === 0) return true;
+    if (up === 0 && down === 1) return true;
+  }
+  return false;
+}
 
 function isBtcReferencePrice(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 1000;
 }
 
 const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
+
+function createEmptyChainlinkIntervalBars() {
+  return {
+    "1m": [] as CandleBar[],
+    "5m": [] as CandleBar[],
+    "15m": [] as CandleBar[],
+    "1h": [] as CandleBar[]
+  };
+}
+
+function upsertSampleBar(
+  bars: CandleBar[],
+  interval: (typeof TRADE_CHART_INTERVALS)[number],
+  price: number,
+  ts: number
+) {
+  const bucketSize = CHAINLINK_INTERVAL_MS[interval];
+  const startTs = Math.floor(ts / bucketSize) * bucketSize;
+  const endTs = startTs + bucketSize - 1;
+  const lastBar = bars.at(-1);
+  if (lastBar && lastBar.startTs === startTs) {
+    lastBar.high = roundNumber(Math.max(lastBar.high, price), 2);
+    lastBar.low = roundNumber(Math.min(lastBar.low, price), 2);
+    lastBar.close = roundNumber(price, 2);
+    lastBar.volume += 1;
+    return bars.slice(-CHAINLINK_BAR_LIMITS[interval]);
+  }
+
+  return [
+    ...bars,
+    {
+      interval,
+      startTs,
+      endTs,
+      open: roundNumber(price, 2),
+      high: roundNumber(price, 2),
+      low: roundNumber(price, 2),
+      close: roundNumber(price, 2),
+      volume: 1
+    }
+  ].slice(-CHAINLINK_BAR_LIMITS[interval]);
+}
 
 function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
   return {
@@ -106,6 +177,8 @@ export class SimulationEngine {
   private readonly polymarketReferenceResolver: PolymarketReferenceResolver;
   private binanceState: BinanceConnectorState;
   private chainlinkState: ChainlinkConnectorState;
+  private chainlinkCandles5s: CandleBar[] = [];
+  private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars();
   private polymarketState: PolymarketConnectorState;
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
@@ -130,7 +203,6 @@ export class SimulationEngine {
       freezeWindowMs: number;
       pollDelayMs: number;
       gammaPollIntervalMs: number;
-      gammaMaxPolls: number;
       binanceRestUrl: string;
       binanceWsUrl: string;
       binanceRequestTimeoutMs: number;
@@ -143,6 +215,9 @@ export class SimulationEngine {
       chainlinkRequestTimeoutMs: number;
       chainlinkBtcUsdProxyAddress: `0x${string}`;
       chainlinkPollMs: number;
+      chainlinkRtdsWsUrl: string;
+      chainlinkRtdsSymbol: string;
+      chainlinkRtdsPingMs: number;
       gammaBaseUrl: string;
       clobBaseUrl: string;
       dataApiBaseUrl: string;
@@ -168,11 +243,10 @@ export class SimulationEngine {
     });
     this.chainlinkConnector = new ChainlinkConnector({
       symbol: config.symbol,
-      rpcUrl: config.chainlinkRpcUrl,
-      fallbackRpcUrls: config.chainlinkFallbackRpcUrls,
-      proxyAddress: config.chainlinkBtcUsdProxyAddress,
-      pollMs: config.chainlinkPollMs,
-      requestTimeoutMs: config.chainlinkRequestTimeoutMs
+      rtdsWsUrl: config.chainlinkRtdsWsUrl,
+      rtdsSymbol: config.chainlinkRtdsSymbol,
+      rtdsPingMs: config.chainlinkRtdsPingMs,
+      upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.polymarketConnector = new PolymarketConnector({
       symbol: config.symbol,
@@ -191,7 +265,7 @@ export class SimulationEngine {
       upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.polymarketReferenceResolver = new PolymarketReferenceResolver({
-      requestTimeoutMs: config.chainlinkRequestTimeoutMs,
+      requestTimeoutMs: config.polymarketDiscoveryTimeoutMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.binanceState = this.binanceConnector.getState();
@@ -216,6 +290,7 @@ export class SimulationEngine {
       this.unsubscribers.push(
         this.chainlinkConnector.subscribe((state) => {
           this.chainlinkState = state;
+          this.recordChainlinkSample(state.price, state.updatedAt || Date.now());
           this.scheduleReconcile();
         })
       );
@@ -277,6 +352,62 @@ export class SimulationEngine {
       .map((round) => this.getSettlementPreview(round))
       .filter((preview): preview is SettlementPreview => Boolean(preview))
       .sort((left, right) => (right.detectedAt ?? 0) - (left.detectedAt ?? 0))[0];
+  }
+
+  async manualSettleRound(actor: UserRecord, input: { roundId: string; side: TradeSide; price?: number; reason?: string }) {
+    const round = this.store.getRoundById(input.roundId);
+    if (!round) {
+      throw new Error("Round was not found.");
+    }
+    if (round.status === "Closed" || round.redeemFinishTs) {
+      throw new Error("Round is already closed.");
+    }
+    const now = Date.now();
+    round.settledSide = input.side;
+    round.polymarketSettlementPrice = typeof input.price === "number" ? input.price : input.side === "UP" ? 1 : 0;
+    round.polymarketSettlementStatus = "manual";
+    round.settlementPrice = round.polymarketSettlementPrice;
+    round.settlementTs = now;
+    round.settlementReceivedAt = now;
+    round.settlementSource = "Gamma";
+    round.status = "Settled";
+    round.acceptingOrders = false;
+    round.manualReason = input.reason || `Manual settlement entered by ${actor.username}.`;
+    round.redeemStartTs = now;
+    round.redeemScheduledAt = now + REDEEM_DELAY_MS;
+    this.getPreliminarySettlements().delete(round.id);
+    await this.store.upsertRound(round);
+    await this.writeAuditLog({
+      eventId: this.store.newId("evt"),
+      traceId: this.store.newTraceId(),
+      category: "settlement",
+      actionType: "manual_settlement",
+      actionStatus: "success",
+      userId: actor.id,
+      role: actor.role,
+      pageName: "trade.main",
+      moduleName: "settlement.manual",
+      symbol: round.symbol,
+      roundId: round.id,
+      serverRecvTs: now,
+      serverPublishTs: now,
+      backendLatencyMs: 0,
+      resultCode: "MANUAL_SETTLEMENT_CONFIRMED",
+      resultMessage: `Manual settlement confirmed ${input.side}.`,
+      details: {
+        roundId: round.id,
+        marketId: round.marketId,
+        marketSlug: round.marketSlug,
+        settlementSide: input.side,
+        settlementPrice: round.settlementPrice,
+        reason: input.reason
+      }
+    });
+    for (const userId of this.collectRoundPositionUsers(round.id)) {
+      this.store.emitUserPayload(userId);
+    }
+    this.scheduleReconcile();
+    return round;
   }
 
   private getPreliminarySettlements() {
@@ -1852,19 +1983,14 @@ export class SimulationEngine {
         continue;
       }
 
-      const estimate = estimateClobExecution({
-        action: order.action,
-        book,
-        orderId: order.id,
-        notional: order.action === "buy" ? order.frozenUsdc || order.requestedAmountUsdc : undefined,
-        qty: order.action === "sell" ? order.frozenQty || order.requestedQty : undefined,
-        limitPrice: order.limitPrice,
-        executedAt: Date.now()
-      });
-
-      if (!estimate.fullyMatched) {
+      const currentOdds = order.action === "buy" ? book.bestAsk : book.bestBid;
+      const limitPrice = order.limitPrice ?? 0;
+      const triggerReached =
+        currentOdds > 0 && (order.action === "buy" ? currentOdds <= limitPrice : currentOdds >= limitPrice);
+      if (!triggerReached) {
         continue;
       }
+      const estimate = this.createTriggeredLimitEstimate(order, currentOdds, Date.now());
 
       order.bookHash = book.snapshotId;
       order.bestBid = book.bestBid;
@@ -1894,7 +2020,7 @@ export class SimulationEngine {
         serverPublishTs: Date.now(),
         backendLatencyMs: order.matchLatencyMs,
         resultCode: "LIMIT_ORDER_FILLED",
-        resultMessage: "Pending paper limit order fully matched against live Polymarket CLOB depth.",
+        resultMessage: "Pending paper limit order triggered by live odds.",
         details: {
           traceId: order.traceId,
           roundId: order.roundId,
@@ -1931,6 +2057,36 @@ export class SimulationEngine {
         })
       );
     }
+  }
+
+  private createTriggeredLimitEstimate(order: OrderRecord, price: number, executedAt: number): ClobExecutionEstimate {
+    const qty =
+      order.action === "buy"
+        ? roundNumber((order.frozenUsdc || order.requestedAmountUsdc || order.notionalUsdc) / Math.max(price, 0.0001), 4)
+        : roundNumber(order.frozenQty || order.requestedQty || order.expectedQty, 4);
+    const matchedNotional = roundNumber(qty * price, 2);
+    return {
+      fullyMatched: true,
+      fills: [
+        {
+          fillId: `${order.id}:limit-trigger:1`,
+          makerOrderId: `${order.bookHash ?? order.bookKey ?? "live"}:${order.action === "buy" ? "ask" : "bid"}`,
+          takerOrderId: order.id,
+          price: roundNumber(price, 4),
+          qty,
+          notional: matchedNotional,
+          makerOwnerId: "external:polymarket",
+          makerOwnerType: "external",
+          executedAt
+        }
+      ],
+      filledQty: qty,
+      matchedNotional,
+      remainingQty: 0,
+      remainingNotional: 0,
+      avgPrice: roundNumber(price, 4),
+      worstPrice: roundNumber(price, 4)
+    };
   }
 
   private async failPendingOrder(user: UserRecord, order: OrderRecord, reason: string) {
@@ -2188,7 +2344,7 @@ export class SimulationEngine {
         round.status = nextStatus;
       }
 
-      if (round.status === "Polling") {
+      if (round.status === "Polling" || this.shouldPrefetchGamma(round, now)) {
         this.scheduleSettlementPoll(round, now);
       }
 
@@ -2242,6 +2398,48 @@ export class SimulationEngine {
       });
   }
 
+  private shouldPrefetchGamma(round: RoundRecord, now: number) {
+    const remainingMs = round.endAt - now;
+    return remainingMs <= GAMMA_PREFETCH_START_MS && remainingMs >= GAMMA_PREFETCH_END_MS && !round.settledSide;
+  }
+
+  private recordChainlinkSample(price: number, ts = Date.now()) {
+    if (!this.config.chainlinkEnabled || !Number.isFinite(price) || price <= 0) {
+      return;
+    }
+    for (const interval of TRADE_CHART_INTERVALS) {
+      this.chainlinkCandlesByInterval[interval] = upsertSampleBar(
+        this.chainlinkCandlesByInterval[interval],
+        interval,
+        price,
+        ts
+      );
+    }
+    const bucketStart = Math.floor(ts / 5000) * 5000;
+    const bucketEnd = bucketStart + 5000;
+    const current = this.chainlinkCandles5s.at(-1);
+    if (current && current.startTs === bucketStart) {
+      current.high = roundNumber(Math.max(current.high, price), 2);
+      current.low = roundNumber(Math.min(current.low, price), 2);
+      current.close = roundNumber(price, 2);
+      current.volume += 1;
+      return;
+    }
+    this.chainlinkCandles5s.push({
+      interval: "5s",
+      startTs: bucketStart,
+      endTs: bucketEnd,
+      open: roundNumber(price, 2),
+      high: roundNumber(price, 2),
+      low: roundNumber(price, 2),
+      close: roundNumber(price, 2),
+      volume: 1
+    });
+    if (this.chainlinkCandles5s.length > 50) {
+      this.chainlinkCandles5s = this.chainlinkCandles5s.slice(-50);
+    }
+  }
+
   private buildSnapshot(): MarketSnapshot {
     const now = Date.now();
     const currentRound = this.store.getCurrentRound(now);
@@ -2249,10 +2447,11 @@ export class SimulationEngine {
     const matchedMarket = this.roundMatchesMarket(currentRound, currentMarket) ? currentMarket : undefined;
     const upBook = matchedMarket ? this.getDisplayedBook("UP") : this.createEmptyOrderBook("UP");
     const downBook = matchedMarket ? this.getDisplayedBook("DOWN") : this.createEmptyOrderBook("DOWN");
-    const upPrice = upBook.midPrice || matchedMarket?.outcomePrices[0] || 0;
-    const downPrice = downBook.midPrice || matchedMarket?.outcomePrices[1] || 0;
+    const upPrice = upBook.bestAsk || upBook.midPrice || matchedMarket?.outcomePrices[0] || 0;
+    const downPrice = downBook.bestAsk || downBook.midPrice || matchedMarket?.outcomePrices[1] || 0;
     const chainlinkPrice =
       this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
+    this.recordChainlinkSample(chainlinkPrice, this.chainlinkState.updatedAt || now);
     const binancePrice = this.binanceState.price > 0 ? roundNumber(this.binanceState.price, 2) : 0;
     const countdownTargetTs = currentRound
       ? currentRound.startAt > now
@@ -2303,7 +2502,15 @@ export class SimulationEngine {
       },
       chainlink: {
         referencePrice: chainlinkPrice,
-        settlementReference: currentRound?.settlementPrice ?? chainlinkPrice
+        settlementReference: currentRound?.settlementPrice ?? chainlinkPrice,
+        candles5s: [...this.chainlinkCandles5s],
+        candlesByInterval: {
+          "1m": [...this.chainlinkCandlesByInterval["1m"]],
+          "5m": [...this.chainlinkCandlesByInterval["5m"]],
+          "15m": [...this.chainlinkCandlesByInterval["15m"]],
+          "1h": [...this.chainlinkCandlesByInterval["1h"]],
+          "1d": []
+        }
       },
       clob: {
         delta: clobDelta,
@@ -2451,17 +2658,11 @@ export class SimulationEngine {
     if ((!round.marketSlug && !round.marketId) || this.pollLocks.has(round.id)) {
       return;
     }
-    if (round.lastPollAt && now - round.lastPollAt < this.config.gammaPollIntervalMs) {
+    const prefetchActive = this.shouldPrefetchGamma(round, now);
+    const pollIntervalMs = prefetchActive ? GAMMA_PREFETCH_INTERVAL_MS : this.config.gammaPollIntervalMs;
+    if (round.lastPollAt && now - round.lastPollAt < pollIntervalMs) {
       return;
     }
-    if (round.pollCount >= this.config.gammaMaxPolls) {
-      round.status = "Manual";
-      round.manualReason = "Gamma polling timed out after maximum retries.";
-      this.getPreliminarySettlements().delete(round.id);
-      await this.writeSettlementLog(round, "timeout", "Gamma polling exceeded retry limit.");
-      return;
-    }
-
     this.pollLocks.add(round.id);
     round.pollCount += 1;
     round.lastPollAt = now;
@@ -2478,43 +2679,32 @@ export class SimulationEngine {
       if (settledSide && typeof settlementPrice === "number") {
         this.finalizeSettlement(round, detail, settledSide, settlementPrice, now);
         await this.writeSettlementLog(round, "success", "Gamma market closed and settlement was confirmed.");
-      } else if (round.pollCount >= this.config.gammaMaxPolls) {
-        round.status = "Manual";
-        round.manualReason = "Gamma market did not publish a result before retry exhaustion.";
-        this.getPreliminarySettlements().delete(round.id);
-        await this.writeSettlementLog(round, "timeout", "Gamma market did not return a final outcome in time.");
       }
+      // If not yet settled, keep polling indefinitely until result comes in.
     } catch (error) {
-      if (round.pollCount >= this.config.gammaMaxPolls) {
-        round.status = "Manual";
-        round.manualReason = "Gamma market lookup failed repeatedly.";
-        this.getPreliminarySettlements().delete(round.id);
-        await this.writeSettlementLog(round, "failed", "Gamma market lookup failed repeatedly.");
-      } else {
-        await this.writeAuditLog({
-          eventId: this.store.newId("evt"),
-          traceId: this.store.newTraceId(),
-          category: "settlement",
-          actionType: "poll_settlement",
-          actionStatus: "failed",
-          pageName: "trade.main",
-          moduleName: "settlement.engine",
-          symbol: round.symbol,
+      await this.writeAuditLog({
+        eventId: this.store.newId("evt"),
+        traceId: this.store.newTraceId(),
+        category: "settlement",
+        actionType: "poll_settlement",
+        actionStatus: "failed",
+        pageName: "trade.main",
+        moduleName: "settlement.engine",
+        symbol: round.symbol,
+        roundId: round.id,
+        serverRecvTs: now,
+        serverPublishTs: now,
+        backendLatencyMs: 0,
+        resultCode: "POLL_FAILED",
+        resultMessage: error instanceof Error ? error.message : "Gamma market lookup failed.",
+        details: {
           roundId: round.id,
-          serverRecvTs: now,
-          serverPublishTs: now,
-          backendLatencyMs: 0,
-          resultCode: "POLL_FAILED",
-          resultMessage: error instanceof Error ? error.message : "Gamma market lookup failed.",
-          details: {
-            roundId: round.id,
-            marketId: round.marketId,
-            marketSlug: round.marketSlug,
-            pollCount: round.pollCount,
-            failureReason: error instanceof Error ? error.message : "Gamma market lookup failed."
-          }
-        });
-      }
+          marketId: round.marketId,
+          marketSlug: round.marketSlug,
+          pollCount: round.pollCount,
+          failureReason: error instanceof Error ? error.message : "Gamma market lookup failed."
+        }
+      });
     } finally {
       this.pollLocks.delete(round.id);
     }
@@ -2768,55 +2958,47 @@ export class SimulationEngine {
     };
   }
 
-  private resolveSettledSide(detail: PolymarketMarketDetail) {
-    if (detail.winningTokenId) {
-      if (detail.winningTokenId === detail.upTokenId) {
-        return "UP";
-      }
-      if (detail.winningTokenId === detail.downTokenId) {
-        return "DOWN";
-      }
+  private resolveSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
+    // Tier 1: outcomePrices — the primary resolution signal for BTC 5m markets.
+    // Check optimistically first (no need for closed flag), then with closed/automaticallyResolved.
+    const [upPrice, downPrice] = detail.outcomePrices;
+    if (upPrice >= 0.99 && downPrice <= 0.01) return "UP";
+    if (downPrice >= 0.99 && upPrice <= 0.01) return "DOWN";
+    if (detail.closed || detail.automaticallyResolved) {
+      if (upPrice === 1 && downPrice === 0) return "UP";
+      if (downPrice === 1 && upPrice === 0) return "DOWN";
     }
+    // Tier 2: winningTokenId
+    if (detail.winningTokenId) {
+      if (detail.winningTokenId === detail.upTokenId) return "UP";
+      if (detail.winningTokenId === detail.downTokenId) return "DOWN";
+    }
+    // Tier 3: winningOutcome text
     if (detail.winningOutcome) {
       const normalized = detail.winningOutcome.toLowerCase();
-      if (normalized === detail.upOutcome.toLowerCase() || normalized.includes("up") || normalized.includes("above")) {
-        return "UP";
-      }
-      if (
-        normalized === detail.downOutcome.toLowerCase() ||
-        normalized.includes("down") ||
-        normalized.includes("below")
-      ) {
-        return "DOWN";
-      }
+      if (normalized === detail.upOutcome.toLowerCase() || normalized.includes("up") || normalized.includes("above")) return "UP";
+      if (normalized === detail.downOutcome.toLowerCase() || normalized.includes("down") || normalized.includes("below")) return "DOWN";
     }
-    if (!detail.closed) {
-      return undefined;
-    }
-    const [upPrice, downPrice] = detail.outcomePrices;
-    if (upPrice >= 0.99 && downPrice <= 0.01) {
-      return "UP";
-    }
-    if (downPrice >= 0.99 && upPrice <= 0.01) {
-      return "DOWN";
-    }
-    if (Math.abs(upPrice - downPrice) < 0.01) {
-      return undefined;
-    }
-    if (upPrice === 0 && downPrice === 0) {
-      return undefined;
-    }
-    return upPrice >= downPrice ? "UP" : "DOWN";
+    return undefined;
   }
 
   private confirmedSettlementPrice(detail: PolymarketMarketDetail, settledSide?: TradeSide) {
-    if (!settledSide || !(detail.closed || detail.settlementStatus === "resolved")) {
-      return undefined;
-    }
-    if (typeof detail.settlementPrice === "number" && Number.isFinite(detail.settlementPrice)) {
-      return detail.settlementPrice;
+    if (!settledSide) return undefined;
+    if (detail.closed || detail.settlementStatus === "resolved" || detail.automaticallyResolved) {
+      if (typeof detail.settlementPrice === "number" && Number.isFinite(detail.settlementPrice)) {
+        return detail.settlementPrice;
+      }
     }
     return settledSide === "UP" ? 1 : 0;
+  }
+
+  private resolveClobSettledSide(round: RoundRecord): TradeSide | undefined {
+    const prices = this.pricesForPreliminarySettlement(round);
+    if (!prices) return undefined;
+    // Require >99% confidence from CLOB for immediate settlement.
+    if (prices.upPrice >= 0.99 && prices.downPrice <= 0.01) return "UP";
+    if (prices.downPrice >= 0.99 && prices.upPrice <= 0.01) return "DOWN";
+    return undefined;
   }
 
   private refreshPreliminarySettlement(round: RoundRecord, now: number) {
@@ -2861,8 +3043,8 @@ export class SimulationEngine {
       const upBook = this.getDisplayedBook("UP");
       const downBook = this.getDisplayedBook("DOWN");
       return {
-        upPrice: roundNumber(upBook.midPrice || this.polymarketState.currentMarket?.outcomePrices[0] || 0, 4),
-        downPrice: roundNumber(downBook.midPrice || this.polymarketState.currentMarket?.outcomePrices[1] || 0, 4)
+        upPrice: roundNumber(upBook.bestAsk || upBook.midPrice || this.polymarketState.currentMarket?.outcomePrices[0] || 0, 4),
+        downPrice: roundNumber(downBook.bestAsk || downBook.midPrice || this.polymarketState.currentMarket?.outcomePrices[1] || 0, 4)
       };
     }
     if (this.store.marketSnapshot.marketSlug === round.marketSlug || this.store.marketSnapshot.marketId === round.marketId) {
@@ -2979,35 +3161,44 @@ export class SimulationEngine {
       round.polymarketClosePrice = undefined;
       round.polymarketClosePriceSource = undefined;
     }
-    const resolutionSource = round.resolutionSource ?? this.polymarketState.currentMarket?.resolutionSource;
-    if (!resolutionSource) {
-      return;
+    // Use Gamma API reference prices from the live market detail (extracted from Polymarket metadata).
+    const liveDetail =
+      this.polymarketState.currentMarket?.slug === round.marketSlug ? this.polymarketState.currentMarket : undefined;
+    if (!round.polymarketOpenPrice && liveDetail?.referenceOpenPrice && round.startAt <= now) {
+      round.polymarketOpenPrice = roundNumber(liveDetail.referenceOpenPrice, 2);
+      round.polymarketOpenPriceSource = liveDetail.referenceOpenPriceSource ?? "Gamma";
     }
-    round.resolutionSource = resolutionSource;
+    if (!round.polymarketClosePrice && liveDetail?.referenceClosePrice && now >= round.endAt) {
+      round.polymarketClosePrice = roundNumber(liveDetail.referenceClosePrice, 2);
+      round.polymarketClosePriceSource = liveDetail.referenceClosePriceSource ?? "Gamma";
+    }
+    const resolutionSource = liveDetail?.resolutionSource ?? round.resolutionSource;
     if (!round.polymarketOpenPrice && round.startAt <= now) {
+      let openReference;
       try {
-        const openReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.startAt, {
+        openReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.startAt, {
           resolutionSource
         });
-        if (openReference) {
-          round.polymarketOpenPrice = roundNumber(openReference.price, 2);
-          round.polymarketOpenPriceSource = openReference.source;
-        }
-      } catch {
-        // Keep the previous round state; the next reconcile will retry.
+      } catch (error) {
+        console.warn(`[simulation] Failed to resolve Chainlink opening reference for ${round.id}:`, error);
+      }
+      if (isBtcReferencePrice(openReference?.price)) {
+        round.polymarketOpenPrice = roundNumber(openReference.price, 2);
+        round.polymarketOpenPriceSource = openReference.source;
       }
     }
     if (!round.polymarketClosePrice && now >= round.endAt) {
+      let closeReference;
       try {
-        const closeReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.endAt, {
+        closeReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.endAt, {
           resolutionSource
         });
-        if (closeReference) {
-          round.polymarketClosePrice = roundNumber(closeReference.price, 2);
-          round.polymarketClosePriceSource = closeReference.source;
-        }
-      } catch {
-        // Keep the previous round state; the next reconcile will retry.
+      } catch (error) {
+        console.warn(`[simulation] Failed to resolve Chainlink closing reference for ${round.id}:`, error);
+      }
+      if (isBtcReferencePrice(closeReference?.price)) {
+        round.polymarketClosePrice = roundNumber(closeReference.price, 2);
+        round.polymarketClosePriceSource = closeReference.source;
       }
     }
   }

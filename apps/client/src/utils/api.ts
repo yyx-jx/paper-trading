@@ -3,7 +3,7 @@ export type Role = "Tester" | "Senior Tester" | "Test Engineer" | "Admin";
 export type TradeSide = "UP" | "DOWN";
 export type OrderAction = "buy" | "sell";
 export type PaperOrderKind = "market" | "limit";
-export type CandleInterval = "1m" | "5m" | "1d";
+export type CandleInterval = "1m" | "5m" | "15m" | "1h" | "1d";
 export type LogSystem = "all" | "audit" | "training" | "matching";
 export type LogCategory = "operation" | "matching" | "settlement" | "latency";
 export type MatchingEventType = "external_book_synced" | "order_executed" | "order_cancelled";
@@ -96,7 +96,7 @@ export interface MarketTrade {
 }
 
 export interface CandleBar {
-  interval: CandleInterval;
+  interval: CandleInterval | "5s";
   startTs: number;
   endTs: number;
   open: number;
@@ -133,6 +133,8 @@ export interface MarketSnapshot {
   chainlink: {
     referencePrice: number;
     settlementReference: number;
+    candles5s: CandleBar[];
+    candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
   clob: {
     delta: number;
@@ -194,7 +196,7 @@ export interface RoundRecord {
   settledSide?: TradeSide;
   settlementPrice?: number;
   settlementTs?: number;
-  settlementSource?: "Polymarket" | "Gamma" | "Chainlink";
+  settlementSource?: "Polymarket" | "Gamma" | "Chainlink" | "CLOB";
   polymarketSettlementPrice?: number;
   polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual";
   polymarketOpenPrice?: number;
@@ -375,6 +377,9 @@ export interface BehaviorActionLog {
   gammaPollCount?: number;
   redeemFinishTimeMs?: number;
   contextJson?: Record<string, unknown>;
+  qualityGrade?: string;
+  strategyClusterLabel?: string;
+  marketRegimeLabel?: string;
 }
 
 export interface AuditLogQuery {
@@ -705,6 +710,12 @@ export const api = {
   },
   getHistory(token: string, limit = 60) {
     return request<HistoryRound[]>(`/api/rounds/history?limit=${limit}`, token);
+  },
+  manualSettleRound(token: string, roundId: string, input: { side: TradeSide; price?: number; reason?: string }) {
+    return request<RoundRecord>(`/api/rounds/${roundId}/manual-settlement`, token, {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
   },
   getOperatedHistory(token: string, limit = 500) {
     return request<HistoryRound[]>(`/api/profile/rounds/operated?limit=${limit}`, token);

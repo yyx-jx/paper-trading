@@ -4,16 +4,22 @@ import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from 
 import type { BinanceConnectorState, CandleBar, CandleInterval, CandlePoint, SourceHealth } from "../../domain/types";
 
 const BAR_LIMITS: Record<CandleInterval, number> = {
-  "1m": 30,
-  "5m": 6,
+  "1m": 180,
+  "5m": 30,
+  "15m": 24,
+  "1h": 24,
   "1d": 2
 };
 
 const INTERVAL_MS: Record<CandleInterval, number> = {
   "1m": 60_000,
   "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "1h": 60 * 60_000,
   "1d": 24 * 60 * 60_000
 };
+
+const LIVE_INTERVALS: CandleInterval[] = ["1m", "5m", "15m", "1h"];
 
 function emptyStatus(symbol: string): SourceHealth {
   const now = Date.now();
@@ -51,12 +57,42 @@ function createEmptyCandles(now: number) {
   return {
     "1m": [emptyBar("1m", now)],
     "5m": [emptyBar("5m", now)],
+    "15m": [emptyBar("15m", now)],
+    "1h": [emptyBar("1h", now)],
     "1d": [emptyBar("1d", now)]
   } satisfies Record<CandleInterval, CandleBar[]>;
 }
 
 function roundNumber(value: number, digits = 2) {
   return Number(value.toFixed(digits));
+}
+
+function updateLiveBar(interval: CandleInterval, currentBar: CandleBar | undefined, price: number, qty: number, ts: number): CandleBar {
+  const bucketSize = INTERVAL_MS[interval];
+  const startTs = Math.floor(ts / bucketSize) * bucketSize;
+  const endTs = startTs + bucketSize - 1;
+  const roundedPrice = roundNumber(price, 2);
+  const roundedQty = roundNumber(qty, 6);
+  if (!currentBar || currentBar.startTs !== startTs) {
+    return {
+      interval,
+      startTs,
+      endTs,
+      open: roundedPrice,
+      high: roundedPrice,
+      low: roundedPrice,
+      close: roundedPrice,
+      volume: roundedQty
+    };
+  }
+  return {
+    ...currentBar,
+    endTs,
+    high: roundNumber(Math.max(currentBar.high, roundedPrice), 2),
+    low: roundNumber(currentBar.low > 0 ? Math.min(currentBar.low, roundedPrice) : roundedPrice, 2),
+    close: roundedPrice,
+    volume: roundNumber(currentBar.volume + roundedQty, 6)
+  };
 }
 
 function toRecentCandlePoints(bars: CandleBar[]) {
@@ -93,7 +129,11 @@ function normalizeBars(interval: CandleInterval, bars: CandleBar[]) {
     .slice(-BAR_LIMITS[interval]);
 }
 
-function aggregateBars(interval: "5m", sourceBars: CandleBar[]) {
+function hasUsableBars(bars: CandleBar[]) {
+  return bars.some((bar) => bar.close > 0 || bar.high > 0 || bar.low > 0);
+}
+
+function aggregateBars(interval: "5m" | "15m" | "1h", sourceBars: CandleBar[]) {
   const grouped = new Map<number, CandleBar>();
   for (const bar of normalizeBars("1m", sourceBars)) {
     const bucketSize = INTERVAL_MS[interval];
@@ -213,8 +253,11 @@ export class BinanceConnector {
 
   private async bootstrapFromRest(message: string) {
     try {
-      const [candles1m, candles1d, pricePayload] = await Promise.all([
+      const [candles1m, candles5m, candles15m, candles1h, candles1d, pricePayload] = await Promise.all([
         this.fetchKlines("1m"),
+        this.fetchKlines("5m"),
+        this.fetchKlines("15m"),
+        this.fetchKlines("1h"),
         this.fetchKlines("1d"),
         this.fetchJson<{ price: string }>(
           `${this.config.restUrl}/api/v3/ticker/price?symbol=${encodeURIComponent(this.symbolPair)}`
@@ -229,7 +272,9 @@ export class BinanceConnector {
         price: latestPrice > 0 ? roundNumber(latestPrice, 2) : this.state.price,
         candlesByInterval: {
           "1m": normalized1m,
-          "5m": aggregateBars("5m", normalized1m),
+          "5m": normalizeBars("5m", candles5m),
+          "15m": normalizeBars("15m", candles15m),
+          "1h": normalizeBars("1h", candles1h),
           "1d": normalized1d
         },
         candles: toRecentCandlePoints(normalized1m),
@@ -265,17 +310,27 @@ export class BinanceConnector {
 
   private async pollRestTicker() {
     try {
-      const [ticker, candle] = await Promise.all([
+      const [ticker, candles1m, candles5m, candles15m, candles1h] = await Promise.all([
         this.fetchJson<{ price: string }>(
           `${this.config.restUrl}/api/v3/ticker/price?symbol=${encodeURIComponent(this.symbolPair)}`
         ),
-        this.fetchKlines("1m", 1)
+        this.fetchKlines("1m", 1),
+        this.fetchKlines("5m", 1),
+        this.fetchKlines("15m", 1),
+        this.fetchKlines("1h", 1)
       ]);
       const now = Date.now();
       const price = Number(ticker.price);
-      const latestBar = candle[0];
-      if (latestBar) {
-        this.upsertBar("1m", latestBar);
+      const latest1mBar = candles1m[0];
+      for (const [interval, bar] of [
+        ["1m", candles1m[0]],
+        ["5m", candles5m[0]],
+        ["15m", candles15m[0]],
+        ["1h", candles1h[0]]
+      ] as Array<[CandleInterval, CandleBar | undefined]>) {
+        if (bar) {
+          this.upsertBar(interval, bar);
+        }
       }
       if (price > 0) {
         this.applyTradeTick(price, 0, now);
@@ -286,11 +341,11 @@ export class BinanceConnector {
           status: {
             ...this.state.status,
             state: "degraded",
-            sourceEventTs: latestBar?.endTs ?? now,
+            sourceEventTs: latest1mBar?.endTs ?? now,
             serverRecvTs: now,
             normalizedTs: now,
             serverPublishTs: now,
-            acquireLatencyMs: latestBar?.endTs ? Math.max(now - latestBar.endTs, 0) : 0,
+            acquireLatencyMs: latest1mBar?.endTs ? Math.max(now - latest1mBar.endTs, 0) : 0,
             publishLatencyMs: 0,
             message: "Binance WebSocket stale; serving REST fallback data."
           }
@@ -369,7 +424,7 @@ export class BinanceConnector {
             i?: string;
           };
           const interval = kline.i as CandleInterval | undefined;
-          if (interval === "1m" || interval === "1d") {
+          if (interval && LIVE_INTERVALS.includes(interval)) {
             this.upsertBar(interval, {
               interval,
               startTs: Number(kline.t ?? sourceEventTs),
@@ -446,11 +501,17 @@ export class BinanceConnector {
     if (price <= 0) {
       return;
     }
+    const nextBar = updateLiveBar("1m", this.state.candlesByInterval["1m"].at(-1), price, qty, ts);
     this.state.price = roundNumber(price, 2);
     this.state.latestTick = {
       ts,
       price: roundNumber(price, 2)
     };
+    this.state.candlesByInterval = {
+      ...this.state.candlesByInterval,
+      "1m": normalizeBars("1m", [...this.state.candlesByInterval["1m"], nextBar])
+    };
+    this.syncDerivedCandles();
   }
 
   private upsertBar(interval: CandleInterval, bar: CandleBar) {
@@ -467,7 +528,18 @@ export class BinanceConnector {
     this.state.candlesByInterval = {
       ...this.state.candlesByInterval,
       "1m": normalized1m,
-      "5m": aggregateBars("5m", normalized1m),
+      "5m": normalizeBars(
+        "5m",
+        hasUsableBars(this.state.candlesByInterval["5m"]) ? this.state.candlesByInterval["5m"] : aggregateBars("5m", normalized1m)
+      ),
+      "15m": normalizeBars(
+        "15m",
+        hasUsableBars(this.state.candlesByInterval["15m"]) ? this.state.candlesByInterval["15m"] : aggregateBars("15m", normalized1m)
+      ),
+      "1h": normalizeBars(
+        "1h",
+        hasUsableBars(this.state.candlesByInterval["1h"]) ? this.state.candlesByInterval["1h"] : aggregateBars("1h", normalized1m)
+      ),
       "1d": normalized1d
     };
     this.state.candles = toRecentCandlePoints(normalized1m);

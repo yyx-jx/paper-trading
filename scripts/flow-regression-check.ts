@@ -327,7 +327,7 @@ async function testRedeemWritesWalletPositionAndAudit() {
     upPrice: 1,
     downPrice: 0,
     serverNow: now,
-    binance: { candlesByInterval: { "1m": [], "5m": [], "1d": [] } },
+    binance: { candlesByInterval: { "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] } },
     clob: {
       upBook: { snapshotId: "up", snapshotTs: now, bestBid: 0.99, bestAsk: 1, midPrice: 1, bids: [], asks: [] },
       downBook: { snapshotId: "down", snapshotTs: now, bestBid: 0, bestAsk: 0.01, midPrice: 0, bids: [], asks: [] },
@@ -348,7 +348,12 @@ async function testRedeemWritesWalletPositionAndAudit() {
     currentPrice: 0,
     priceToBeat: 0,
     candles: [],
-    chainlink: { referencePrice: 0, settlementReference: 0 }
+    chainlink: {
+      referencePrice: 0,
+      settlementReference: 0,
+      candles5s: [],
+      candlesByInterval: { "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] }
+    }
   });
   engine.createBehaviorLog = (input: { actionType: string }) => input;
   engine.writeBehaviorLog = async (log: { actionType: string }) => behaviorLogs.push(log);
@@ -610,40 +615,20 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.doesNotMatch(i18nSource, /Source Event/);
 }
 
-async function testChainlinkAcquireLatencyUsesRpcDuration() {
-  const { buildChainlinkHealthyStatus } = require("../apps/server/src/services/connectors/chainlink.ts") as {
-    buildChainlinkHealthyStatus: (input: {
-      symbol: string;
-      rpcUrl: string;
-      reconnectCount: number;
-      updatedAt: number;
-      requestStartTs: number;
-      requestFinishTs: number;
-    }) => {
-      sourceEventTs: number;
-      serverRecvTs: number;
-      normalizedTs: number;
-      serverPublishTs: number;
-      acquireLatencyMs: number;
-      message?: string;
-    };
-  };
-  const status = buildChainlinkHealthyStatus({
-    symbol: "BTC",
-    rpcUrl: "https://rpc.example/mainnet",
-    reconnectCount: 2,
-    updatedAt: 1_700_000_000_000,
-    requestStartTs: 1_700_000_300_000,
-    requestFinishTs: 1_700_000_300_048
-  });
+async function testChainlinkDisplayUsesStrictRtds() {
+  const chainlinkSource = readFileSync("apps/server/src/services/connectors/chainlink.ts", "utf8");
+  const configSource = readFileSync("apps/server/src/config.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
 
-  assert.equal(status.sourceEventTs, 1_700_000_000_000);
-  assert.equal(status.serverRecvTs, 1_700_000_300_048);
-  assert.equal(status.normalizedTs, 1_700_000_300_048);
-  assert.equal(status.serverPublishTs, 1_700_000_300_048);
-  assert.equal(status.acquireLatencyMs, 48);
-  assert.notEqual(status.acquireLatencyMs, status.serverRecvTs - status.sourceEventTs);
-  assert.match(status.message ?? "", /rpc\.example/);
+  assert.match(configSource, /CHAINLINK_RTDS_WS_URL/);
+  assert.match(configSource, /wss:\/\/ws-live-data\.polymarket\.com/);
+  assert.match(chainlinkSource, /topic: "crypto_prices_chainlink"/);
+  assert.match(chainlinkSource, /filters: JSON\.stringify\(\{ symbol: this\.rtdsSymbol \}\)/);
+  assert.match(chainlinkSource, /this\.ws\.send\("PING"\)/);
+  assert.match(chainlinkSource, /Strict RTDS mode does not fall back to AggregatorV3/);
+  assert.doesNotMatch(chainlinkSource, /createPublicClient/);
+  assert.doesNotMatch(chainlinkSource, /latestRoundData/);
+  assert.match(appSource, /Chainlink RTDS WebSocket/);
 }
 
 async function testProfileUsesOperatedGroupedRoundViews() {
@@ -721,9 +706,13 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(connectorSource, /resolvedMarkets: \[\]/);
   assert.match(connectorSource, /resolvedMarkets: \[\.\.\.\(this\.state\.resolvedMarkets \?\? \[\]\), resolvedEvent\]\.slice\(-20\)/);
   assert.match(configSource, /export function buildServerConfig\(env: NodeJS\.ProcessEnv = process\.env\)/);
-  assert.match(configSource, /pollDelayMs: Number\(env\.POLL_DELAY_MS \?\? 120000\)/);
+  assert.match(configSource, /pollDelayMs: Number\(env\.POLL_DELAY_MS \?\? 0\)/);
   assert.match(simulationSource, /const PRELIMINARY_SETTLEMENT_THRESHOLD = 0\.97/);
-  assert.match(simulationSource, /now - round\.lastPollAt < this\.config\.gammaPollIntervalMs/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_START_MS = 180_000/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_END_MS = 60_000/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_INTERVAL_MS = 5000/);
+  assert.match(simulationSource, /this\.shouldPrefetchGamma\(round, now\)/);
+  assert.match(simulationSource, /now - round\.lastPollAt < pollIntervalMs/);
   assert.doesNotMatch(simulationSource, /HOT_SETTLEMENT_POLL_MS/);
   assert.doesNotMatch(simulationSource, /HOT_SETTLEMENT_WINDOW_MS/);
   assert.doesNotMatch(simulationSource, /MANUAL_SETTLEMENT_RETRY_MS/);
@@ -765,15 +754,45 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(simulationSource, /if \(!isBtcReferencePrice\(round\.polymarketOpenPrice\)\)/);
 
   const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
+  assert.match(connectorSource, /function normalizeMarketOutcomes\(payload: DetailedMarketPayload\)/);
+  assert.match(connectorSource, /function outcomeSide\(value\?: string\): TradeSide \| undefined/);
+  assert.match(connectorSource, /const normalizedOutcomes = normalizeMarketOutcomes\(payload\)/);
   assert.match(connectorSource, /isBtcPrice\(value: number\)/);
   assert.match(connectorSource, /value > 1000/);
-  assert.match(connectorSource, /outcomePrices:\s*\[toFloat\(outcomePrices\[0\]\), toFloat\(outcomePrices\[1\]\)\]/);
+  assert.match(connectorSource, /outcomePrices:\s*\[normalizedOutcomes\.upPrice, normalizedOutcomes\.downPrice\]/);
   assert.match(connectorSource, /referenceOpenPrice/);
   assert.match(connectorSource, /referenceClosePrice/);
 
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   assert.match(storeSource, /sanitizePolymarketBtcReference/);
   assert.match(storeSource, /polymarketOpenPrice = sanitizePolymarketBtcReference/);
+}
+
+async function testRtdsLoginAuditAndBestAskUiRequirements() {
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+  const styleSource = readFileSync("apps/client/src/styles.css", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const binanceSource = readFileSync("apps/server/src/services/connectors/binance.ts", "utf8");
+
+  assert.match(simulationSource, /const upPrice = upBook\.bestAsk \|\| upBook\.midPrice/);
+  assert.match(simulationSource, /const downPrice = downBook\.bestAsk \|\| downBook\.midPrice/);
+  assert.match(binanceSource, /"1m": 180/);
+  assert.match(binanceSource, /"5m": 30/);
+  assert.match(binanceSource, /"15m": 24/);
+  assert.match(binanceSource, /"1h": 24/);
+  assert.match(appSource, /terminal-login-page/);
+  assert.match(appSource, /terminal-login-tabs/);
+  assert.match(appSource, /ht_saved_users/);
+  assert.match(styleSource, /\.terminal-login-card/);
+  assert.match(appSource, /AUDIT_ACTION_LABELS/);
+  assert.match(appSource, /auditActionLabel\(actionType, language\)/);
+  assert.match(appSource, /api\.getHistory\(token, 200\)/);
+  assert.match(appSource, /const TRADE_INTERVAL_OPTIONS = \["1m", "5m", "15m", "1h"\]/);
+  assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
+  assert.match(appSource, /defaultVisibleCountForInterval\(selectedInterval\)/);
+  assert.match(simulationSource, /private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars\(\)/);
+  assert.match(appSource, /title=\{localLabel\(language, "系统追踪号/);
+  assert.match(appSource, /title=\{localLabel\(language, "订单编号/);
 }
 
 async function testPolymarketMarketSelectionUsesSlugTime() {
@@ -903,11 +922,12 @@ async function main() {
   await testSettlementPollIsScheduledOffFastPath();
   await testResolvedEventSchedulesTwoSecondRedeem();
   await testFrontendLatencyUsesReceiptTimestamp();
-  await testChainlinkAcquireLatencyUsesRpcDuration();
+  await testChainlinkDisplayUsesStrictRtds();
   await testProfileUsesOperatedGroupedRoundViews();
   await testSettlementUsesResolvedQueueAndFiveSecondGammaPolling();
   await testBackendTransportStampingKeepsLatencySeparateFromAge();
   await testPolymarketReferencePricesDoNotUseOutcomeOdds();
+  await testRtdsLoginAuditAndBestAskUiRequirements();
   await testPolymarketMarketSelectionUsesSlugTime();
   await testChainlinkReferenceResolverHelpers();
 

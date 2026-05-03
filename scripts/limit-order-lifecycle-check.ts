@@ -86,12 +86,22 @@ function snapshot(upBook: OrderBookSnapshot, downBook: OrderBookSnapshot, round:
       candlesByInterval: {
         "1m": [],
         "5m": [],
+        "15m": [],
+        "1h": [],
         "1d": []
       }
     },
     chainlink: {
       referencePrice: 0,
-      settlementReference: 0
+      settlementReference: 0,
+      candles5s: [],
+      candlesByInterval: {
+        "1m": [],
+        "5m": [],
+        "15m": [],
+        "1h": [],
+        "1d": []
+      }
     },
     sources: {
       binance: source("Binance"),

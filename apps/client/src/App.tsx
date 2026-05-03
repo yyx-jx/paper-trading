@@ -1,8 +1,9 @@
 ﻿import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
+import type { ReactNode } from "react";
 import { useRef } from "react";
 import { useMemo } from "react";
-import type { ChangeEvent } from "react";
+import type { ChangeEvent, WheelEvent as ReactWheelEvent } from "react";
 import {
   api,
   type AuditEvent,
@@ -16,6 +17,7 @@ import {
   type LogFacets,
   type LogSearchQuery,
   type LogSystem,
+  type MarketTrade,
   type MarketPayload,
   type MarketSnapshot,
   type OrderAction,
@@ -393,7 +395,8 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
   };
 }
 
-const CHART_WINDOW_MS = 30 * 60_000;
+const CHART_COUNT_OPTIONS = [10, 20, 30, 50, 100];
+const TRADE_INTERVAL_OPTIONS = ["1m", "5m", "15m", "1h"] as const satisfies readonly CandleInterval[];
 const chartTimeText = (value?: number) => {
   if (!value) {
     return "--";
@@ -439,14 +442,52 @@ function normalizeChartBars(bars: CandleBar[]) {
   return [...deduped.values()].sort((left, right) => left.startTs - right.startTs);
 }
 
-function filterBarsToRecentWindow(bars: CandleBar[], windowMs = CHART_WINDOW_MS) {
-  const visibleBars = normalizeChartBars(bars).filter((bar) => bar.high > 0 || bar.low > 0 || bar.close > 0);
-  const latestEndTs = visibleBars.at(-1)?.endTs;
-  if (!latestEndTs) {
-    return [];
+function filterBarsToRecentWindow(bars: CandleBar[]) {
+  return normalizeChartBars(bars).filter((bar) => bar.high > 0 || bar.low > 0 || bar.close > 0);
+}
+
+function intervalDurationMs(interval: CandleBar["interval"]) {
+  if (interval === "5s") {
+    return 5_000;
   }
-  const windowStartTs = latestEndTs - windowMs + 1;
-  return visibleBars.filter((bar) => bar.endTs >= windowStartTs);
+  if (interval === "1h") {
+    return 60 * 60_000;
+  }
+  if (interval === "15m") {
+    return 15 * 60_000;
+  }
+  if (interval === "5m") {
+    return 5 * 60_000;
+  }
+  if (interval === "1d") {
+    return 24 * 60 * 60_000;
+  }
+  return 60_000;
+}
+
+function defaultVisibleCountForInterval(interval?: CandleBar["interval"]) {
+  if (interval === "1h" || interval === "15m") {
+    return 24;
+  }
+  if (interval === "5m") {
+    return 30;
+  }
+  if (interval === "5s") {
+    return 50;
+  }
+  return 60;
+}
+
+function parseBarCountInput(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+  return clamp(Math.round(parsed), 10, 200);
+}
+
+function shortChartHint(language: Language) {
+  return localLabel(language, "滚轮缩放 · Shift Y · 双击复位", "Wheel zoom · Shift Y · Dbl reset");
 }
 
 function buildAxisLabelIndices(length: number, targetCount: number) {
@@ -593,6 +634,52 @@ function auditStatusTone(status: AuditEvent["actionStatus"]) {
   return "negative";
 }
 
+const AUDIT_ACTION_LABELS: Record<string, { zh: string; en: string }> = {
+  login: { zh: "登录", en: "Login" },
+  switch_language: { zh: "切换语言", en: "Switch Language" },
+  place_order: { zh: "提交订单", en: "Place Order" },
+  cancel_order: { zh: "撤销订单", en: "Cancel Order" },
+  sell_position: { zh: "卖出持仓", en: "Sell Position" },
+  close_side: { zh: "平仓方向", en: "Close Side" },
+  reverse_side: { zh: "一键反手", en: "Reverse Side" },
+  limit_order_triggered: { zh: "限价单触发", en: "Limit Triggered" },
+  limit_order_failed: { zh: "限价单失败", en: "Limit Failed" },
+  capture_price_to_beat: { zh: "记录 PTB", en: "Capture PTB" },
+  poll_settlement: { zh: "轮询结算", en: "Poll Settlement" },
+  settlement_confirmed: { zh: "确认结算", en: "Settlement Confirmed" },
+  manual_settlement: { zh: "手动结算", en: "Manual Settlement" },
+  redeem_position: { zh: "持仓兑付", en: "Redeem Position" },
+  round_closed: { zh: "轮次关闭", en: "Round Closed" },
+  market_latency: { zh: "行情延迟", en: "Market Latency" },
+  user_create: { zh: "创建用户", en: "Create User" },
+  user_disable: { zh: "停用用户", en: "Disable User" },
+  user_enable: { zh: "启用用户", en: "Enable User" },
+  user_reset_password: { zh: "重置密码", en: "Reset Password" },
+  user_changePassword: { zh: "修改密码", en: "Change Password" },
+  "user.changePassword": { zh: "修改密码", en: "Change Password" },
+  "user.resetPassword": { zh: "重置密码", en: "Reset Password" },
+  "user.balance.set": { zh: "设置余额", en: "Set Balance" }
+};
+
+const AUDIT_CATEGORY_LABELS: Record<string, { zh: string; en: string }> = {
+  operation: { zh: "操作", en: "Operation" },
+  matching: { zh: "撮合", en: "Matching" },
+  settlement: { zh: "结算", en: "Settlement" },
+  latency: { zh: "延迟", en: "Latency" }
+};
+
+function auditActionLabel(actionType: string | undefined, language: Language) {
+  if (!actionType) return "--";
+  const label = AUDIT_ACTION_LABELS[actionType];
+  return label ? localLabel(language, label.zh, label.en) : actionType;
+}
+
+function auditCategoryLabel(category: string | undefined, language: Language) {
+  if (!category) return "--";
+  const label = AUDIT_CATEGORY_LABELS[category];
+  return label ? localLabel(language, label.zh, label.en) : category;
+}
+
 function actionTone(action: string) {
   if (action === "buy") {
     return "positive";
@@ -702,6 +789,137 @@ function getSellBlockedReason(input: {
     return localLabel(language, "当前轮次暂不接受卖出订单。", "Current round is not accepting sell orders.");
   }
   return undefined;
+}
+
+function TerminalSection(props: { title: string; meta?: string; children: ReactNode }) {
+  return (
+    <section className="terminal-section">
+      <div className="terminal-section-head">
+        <span>{props.title}</span>
+        {props.meta ? <em>{props.meta}</em> : null}
+      </div>
+      {props.children}
+    </section>
+  );
+}
+
+function buildRiskAlerts(input: {
+  language: Language;
+  countdownMs: number;
+  upPrice: number;
+  downPrice: number;
+  oddsChange: number;
+  sources: Array<SourceHealth | undefined>;
+  clobLatencyMs: number;
+  positions: PositionRecord[];
+  nowMs: number;
+}) {
+  const alerts: Array<{ kind: string; level: "info" | "warn" | "danger"; text: string }> = [];
+  if (input.countdownMs > 0 && input.countdownMs < 10_000) {
+    alerts.push({ kind: "frozen", level: "danger", text: localLabel(input.language, "已封盘：下单按钮禁用", "Frozen: orders disabled") });
+  } else if (input.countdownMs > 0 && input.countdownMs < 30_000) {
+    alerts.push({ kind: "freeze_warning", level: "warn", text: localLabel(input.language, "封盘预警：剩余不足 30 秒", "Freeze warning: under 30s") });
+  }
+  if (Math.abs(input.oddsChange) > 0.05) {
+    alerts.push({ kind: "odds_jump", level: "warn", text: localLabel(input.language, `赔率急变 ${input.oddsChange > 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`, `Odds jump ${input.oddsChange > 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`) });
+  }
+  if (input.upPrice > 0.97 || input.downPrice > 0.97) {
+    alerts.push({ kind: "pre_settle", level: "info", text: localLabel(input.language, `预结算信号：${input.upPrice > input.downPrice ? "UP" : "DOWN"}`, `Pre-settle signal: ${input.upPrice > input.downPrice ? "UP" : "DOWN"}`) });
+  }
+  for (const source of input.sources) {
+    if (source && source.state !== "healthy" && input.nowMs - source.sourceEventTs > 5000) {
+      alerts.push({ kind: `source_${source.source}`, level: "danger", text: localLabel(input.language, `数据中断：${source.source}`, `Data interrupted: ${source.source}`) });
+    }
+  }
+  if (input.clobLatencyMs > 1000) {
+    alerts.push({ kind: "high_lag", level: "warn", text: localLabel(input.language, `盘口延迟高 ${Math.round(input.clobLatencyMs)}ms`, `High book lag ${Math.round(input.clobLatencyMs)}ms`) });
+  }
+  if (input.positions.some((position) => position.displayStatus === "pending_settlement" && input.nowMs - position.openedAt > 8 * 60_000)) {
+    alerts.push({ kind: "settlement_stuck", level: "danger", text: localLabel(input.language, "结算卡死：请手动录入", "Settlement stuck: manual input needed") });
+  }
+  return alerts;
+}
+
+function buildStrategyHints(input: {
+  language: Language;
+  upPrice: number;
+  downPrice: number;
+  oddsChange: number;
+  doubleSideCost: number;
+  countdownMs: number;
+}) {
+  const minutes = Math.floor(input.countdownMs / 60000);
+  const seconds = Math.floor((input.countdownMs % 60000) / 1000);
+  const momentum =
+    Math.abs(input.oddsChange) > 0.03
+      ? localLabel(input.language, input.oddsChange > 0 ? "UP 动量 强" : "DOWN 动量 强", input.oddsChange > 0 ? "UP momentum strong" : "DOWN momentum strong")
+      : localLabel(input.language, "动量 中性", "Momentum neutral");
+  const mean = (input.upPrice + input.downPrice) / 2;
+  const confidence =
+    input.upPrice > mean + 0.06
+      ? localLabel(input.language, `UP 偏强，当前 ${decimal(input.upPrice, 2)}`, `UP firm, now ${decimal(input.upPrice, 2)}`)
+      : input.downPrice > mean + 0.06
+        ? localLabel(input.language, `DOWN 偏强，当前 ${decimal(input.downPrice, 2)}`, `DOWN firm, now ${decimal(input.downPrice, 2)}`)
+        : localLabel(input.language, "方向信心中性", "Directional confidence neutral");
+  const costGrade = input.doubleSideCost > 1.04 ? "C" : input.doubleSideCost > 1.025 ? "B" : "A";
+  return [
+    { label: localLabel(input.language, "赔率动量", "Odds Momentum"), value: `${momentum} (${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)})` },
+    { label: localLabel(input.language, "方向信心度", "Directional Confidence"), value: confidence },
+    { label: localLabel(input.language, "双侧成本", "Two-side Cost"), value: `${decimal(input.doubleSideCost, 4)} (${decimal(Math.max(input.doubleSideCost - 1, 0) * 100, 1)}%)` },
+    { label: localLabel(input.language, "入场质量", "Entry Quality"), value: `${costGrade}+` },
+    { label: localLabel(input.language, "时间提示", "Time Note"), value: `${minutes}:${pad2(seconds)} ${input.countdownMs < 40_000 ? localLabel(input.language, "高风险", "High risk") : ""}` }
+  ];
+}
+
+function OddsMiniChart(props: { trades: MarketTrade[]; language: Language }) {
+  const points = props.trades.filter((trade) => trade.side === "UP").slice(-40);
+  const width = 720;
+  const height = 36;
+  if (points.length < 2) {
+    return <div className="terminal-odds-strip"><span>{localLabel(props.language, "BTC UP odds · this round", "BTC UP odds · this round")}</span></div>;
+  }
+  const min = Math.min(...points.map((point) => point.price));
+  const max = Math.max(...points.map((point) => point.price));
+  const range = Math.max(max - min, 0.01);
+  const d = points
+    .map((point, index) => {
+      const x = (index / Math.max(points.length - 1, 1)) * width;
+      const y = height - ((point.price - min) / range) * height;
+      return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <div className="terminal-odds-strip">
+      <span>BTC UP odds · this round</span>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+        <path d={d} />
+      </svg>
+    </div>
+  );
+}
+
+function ChainlinkComparisonChart(props: {
+  bars: CandleBar[];
+  binancePrice: number;
+  emptyText: string;
+  visibleCount?: number;
+  onVisibleCountChange?: (value: number) => void;
+  timeDomainStartTs?: number;
+  timeDomainEndTs?: number;
+}) {
+  return (
+    <CandlestickChart
+      bars={props.bars}
+      upColor="#4090f0"
+      downColor="#f0a020"
+      emptyText={props.emptyText}
+      latestPrice={props.binancePrice}
+      visibleCount={props.visibleCount}
+      onVisibleCountChange={props.onVisibleCountChange}
+      timeDomainStartTs={props.timeDomainStartTs}
+      timeDomainEndTs={props.timeDomainEndTs}
+    />
+  );
 }
 
 function roundMoveLabel(round: HistoryRound, language: Language) {
@@ -1209,8 +1427,8 @@ function SourceBadge(props: {
         <small className="source-message">
           {localLabel(
             props.language,
-            "当前使用 Chainlink AggregatorV3 链上 Feed；Chainlink Data Streams 尚未接入，接入需申请付费 API。",
-            "Using Chainlink AggregatorV3 on-chain feed; Chainlink Data Streams is not connected and requires paid API credentials."
+            "Chainlink RTDS WebSocket 提供实时 BTC 参考价；严格 RTDS 模式下不会回退到 AggregatorV3。",
+            "Live BTC reference price from Chainlink RTDS WebSocket; strict RTDS mode does not fall back to AggregatorV3."
           )}
         </small>
       ) : null}
@@ -1231,11 +1449,31 @@ function CandlestickChart(props: {
   priceToBeat?: number;
   latestPrice?: number;
   round?: RoundRecord;
+  visibleCount?: number;
+  onVisibleCountChange?: (value: number) => void;
+  timeDomainStartTs?: number;
+  timeDomainEndTs?: number;
+  onTimeDomainChange?: (domain: { startTs: number; endTs: number }) => void;
 }) {
-  const bars = filterBarsToRecentWindow(props.bars);
+  const normalizedBars = filterBarsToRecentWindow(props.bars);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [chartSize, setChartSize] = useState({ width: 900, height: 460 });
   const [hoveredBar, setHoveredBar] = useState<{ index: number; mouseX: number; mouseY: number } | undefined>();
+  const [uncontrolledVisibleCount, setUncontrolledVisibleCount] = useState(60);
+  const [panOffset, setPanOffset] = useState(0);
+  const [yZoom, setYZoom] = useState(1);
+  const lastIntervalRef = useRef<CandleBar["interval"] | undefined>(undefined);
+  const visibleCount = props.visibleCount ?? uncontrolledVisibleCount;
+  const setVisibleCount = props.onVisibleCountChange ?? setUncontrolledVisibleCount;
+
+  useEffect(() => {
+    const lastInterval = normalizedBars.at(-1)?.interval;
+    if (lastInterval && lastInterval !== lastIntervalRef.current) {
+      setVisibleCount(clamp(defaultVisibleCountForInterval(lastInterval), 10, 200));
+      setPanOffset(0);
+    }
+    lastIntervalRef.current = lastInterval;
+  }, [normalizedBars, setVisibleCount]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -1270,9 +1508,42 @@ function CandlestickChart(props: {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (!props.onTimeDomainChange || normalizedBars.length === 0) {
+      return;
+    }
+    const safeVisibleCount = clamp(visibleCount, 10, 200);
+    const end = Math.max(normalizedBars.length - panOffset, 0);
+    const start = Math.max(end - safeVisibleCount, 0);
+    const scopedBars = normalizedBars.slice(start, end);
+    if (scopedBars.length === 0) {
+      return;
+    }
+    props.onTimeDomainChange({
+      startTs: scopedBars[0].startTs,
+      endTs: scopedBars.at(-1)!.endTs
+    });
+  }, [normalizedBars, panOffset, props.onTimeDomainChange, visibleCount]);
+
+  if (normalizedBars.length === 0) {
+    return <div className="chart-empty">{props.emptyText}</div>;
+  }
+
+  const safeVisibleCount = clamp(visibleCount, 10, 200);
+  const end = Math.max(normalizedBars.length - panOffset, 0);
+  const start = Math.max(end - safeVisibleCount, 0);
+  const scopedBars = normalizedBars.slice(start, end);
+  const domainStartTs = props.timeDomainStartTs ?? scopedBars[0].startTs;
+  const domainEndTs = props.timeDomainEndTs ?? scopedBars.at(-1)!.endTs;
+  const bars = scopedBars.filter((bar) => bar.endTs >= domainStartTs && bar.startTs <= domainEndTs);
   if (bars.length === 0) {
     return <div className="chart-empty">{props.emptyText}</div>;
   }
+  const resetChartView = () => {
+    setVisibleCount(clamp(defaultVisibleCountForInterval(normalizedBars.at(-1)?.interval), 10, 200));
+    setPanOffset(0);
+    setYZoom(1);
+  };
 
   const width = chartSize.width;
   const height = chartSize.height;
@@ -1285,21 +1556,27 @@ function CandlestickChart(props: {
   const rawRange = Math.max(max - min, 1);
   const maxWithPadding = max + rawRange * 0.08;
   const minWithPadding = min - rawRange * 0.08;
-  const range = Math.max(maxWithPadding - minWithPadding, 1);
+  const mid = (maxWithPadding + minWithPadding) / 2;
+  const zoomedRange = Math.max((maxWithPadding - minWithPadding) / yZoom, 1);
+  const range = zoomedRange;
+  const zoomMax = mid + zoomedRange / 2;
+  const zoomMin = mid - zoomedRange / 2;
   const innerWidth = width - padding.left - padding.right;
   const innerHeight = height - padding.top - padding.bottom;
-  const slotWidth = innerWidth / Math.max(bars.length, 1);
-  const candleWidth = Math.max(Math.min(slotWidth * 0.58, 16), 3);
+  const domainSpanMs = Math.max(domainEndTs - domainStartTs, 1);
+  const approximateSlotWidth = innerWidth / Math.max(safeVisibleCount, bars.length, 1);
+  const candleWidth = Math.max(Math.min(approximateSlotWidth * 0.58, 16), 3);
 
-  const yForPrice = (value: number) => padding.top + ((maxWithPadding - value) / range) * innerHeight;
-  const xForIndex = (index: number) => padding.left + slotWidth * index + slotWidth / 2;
-  const axisLabelIndices = buildAxisLabelIndices(bars.length, Math.min(bars.length <= 6 ? bars.length : 6, bars.length));
-  const priceTicks = [0, 1, 2, 3, 4].map((step) => maxWithPadding - (range * step) / 4);
+  const yForPrice = (value: number) => padding.top + ((zoomMax - value) / range) * innerHeight;
+  const xForTs = (ts: number) => padding.left + ((ts - domainStartTs) / domainSpanMs) * innerWidth;
+  const barCenterTs = (bar: CandleBar) => bar.startTs + intervalDurationMs(bar.interval) / 2;
+  const axisTicks = Array.from({ length: 6 }, (_, index) => domainStartTs + Math.round((domainSpanMs * index) / 5));
+  const priceTicks = [0, 1, 2, 3, 4].map((step) => zoomMax - (range * step) / 4);
   const tooltipWidth = 126;
   const tooltipHeight = 106;
   const hoveredIndex = hoveredBar?.index;
   const hoveredCandle = typeof hoveredIndex === "number" ? bars[hoveredIndex] : undefined;
-  const hoveredX = typeof hoveredIndex === "number" ? xForIndex(hoveredIndex) : undefined;
+  const hoveredX = typeof hoveredIndex === "number" ? xForTs(barCenterTs(bars[hoveredIndex])) : undefined;
   const latestY = typeof props.latestPrice === "number" && props.latestPrice > 0 ? yForPrice(props.latestPrice) : undefined;
   const targetY = typeof props.priceToBeat === "number" && props.priceToBeat > 0 ? yForPrice(props.priceToBeat) : undefined;
   const targetLabelY =
@@ -1315,12 +1592,12 @@ function CandlestickChart(props: {
         ? latestY + 14
         : undefined;
   const roundStartX =
-    props.round && props.round.startAt >= bars[0].startTs && props.round.startAt <= bars.at(-1)!.endTs
-      ? padding.left + ((props.round.startAt - bars[0].startTs) / Math.max(bars.at(-1)!.endTs - bars[0].startTs, 1)) * innerWidth
+    props.round && props.round.startAt >= domainStartTs && props.round.startAt <= domainEndTs
+      ? xForTs(props.round.startAt)
       : undefined;
   const roundEndX =
-    props.round && props.round.endAt >= bars[0].startTs && props.round.endAt <= bars.at(-1)!.endTs
-      ? padding.left + ((props.round.endAt - bars[0].startTs) / Math.max(bars.at(-1)!.endTs - bars[0].startTs, 1)) * innerWidth
+    props.round && props.round.endAt >= domainStartTs && props.round.endAt <= domainEndTs
+      ? xForTs(props.round.endAt)
       : undefined;
   const tooltipX =
     hoveredBar && hoveredCandle
@@ -1349,19 +1626,38 @@ function CandlestickChart(props: {
     if (!svgRect) {
       setHoveredBar({
         index: fallbackIndex,
-        mouseX: xForIndex(fallbackIndex),
+        mouseX: xForTs(barCenterTs(bars[fallbackIndex])),
         mouseY: padding.top + innerHeight / 2
       });
       return;
     }
     const mouseX = ((event.clientX - svgRect.left) / svgRect.width) * width;
     const mouseY = ((event.clientY - svgRect.top) / svgRect.height) * height;
-    const index = clamp(Math.floor((mouseX - padding.left) / Math.max(slotWidth, 1)), 0, bars.length - 1);
+    const hoveredTs = domainStartTs + ((mouseX - padding.left) / Math.max(innerWidth, 1)) * domainSpanMs;
+    let index = 0;
+    let minDistance = Number.POSITIVE_INFINITY;
+    for (let barIndex = 0; barIndex < bars.length; barIndex += 1) {
+      const distance = Math.abs(barCenterTs(bars[barIndex]) - hoveredTs);
+      if (distance < minDistance) {
+        minDistance = distance;
+        index = barIndex;
+      }
+    }
     setHoveredBar({
       index: Math.round(index),
       mouseX,
       mouseY
     });
+  };
+
+  const handleChartWheel = (event: ReactWheelEvent<SVGSVGElement>) => {
+    event.preventDefault();
+    if (event.shiftKey) {
+      setYZoom((value) => clamp(value * (event.deltaY < 0 ? 1.12 : 0.88), 0.45, 4));
+      return;
+    }
+    setVisibleCount(clamp(Math.round(visibleCount + (event.deltaY > 0 ? 10 : -10)), 10, 200));
+    setPanOffset((value) => clamp(value, 0, Math.max(normalizedBars.length - 10, 0)));
   };
 
   return (
@@ -1371,6 +1667,8 @@ function CandlestickChart(props: {
       className="candle-chart"
       role="img"
       aria-label="candlestick chart"
+      onWheel={handleChartWheel}
+      onDoubleClick={resetChartView}
       onMouseLeave={() => setHoveredBar(undefined)}
     >
       <rect x="0" y="0" width={width} height={height} rx="20" fill="transparent" />
@@ -1386,7 +1684,7 @@ function CandlestickChart(props: {
         );
       })}
       {bars.map((bar, index) => {
-        const x = xForIndex(index);
+        const x = xForTs(barCenterTs(bar));
         const openY = yForPrice(bar.open);
         const closeY = yForPrice(bar.close);
         const highY = yForPrice(bar.high);
@@ -1448,17 +1746,16 @@ function CandlestickChart(props: {
       ) : null}
       {typeof roundStartX === "number" ? <line x1={roundStartX} y1={padding.top} x2={roundStartX} y2={height - padding.bottom} className="chart-round-line" /> : null}
       {typeof roundEndX === "number" ? <line x1={roundEndX} y1={padding.top} x2={roundEndX} y2={height - padding.bottom} className="chart-round-line" /> : null}
-      {axisLabelIndices.map((barIndex) => {
-        const bar = bars[barIndex];
+      {axisTicks.map((tickTs) => {
         return (
           <text
-            key={`${bar.startTs}-${barIndex}`}
-            x={xForIndex(barIndex)}
+            key={tickTs}
+            x={xForTs(tickTs)}
             y={height - 8}
             textAnchor="middle"
             className="chart-axis-label"
           >
-            {chartTimeText(bar.startTs)}
+            {chartTimeText(tickTs)}
           </text>
         );
       })}
@@ -1522,49 +1819,131 @@ function LoginScreen(props: {
   const [username, setUsername] = useState("tester");
   const [password, setPassword] = useState("tester123");
   const [busy, setBusy] = useState(false);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [savedUsers, setSavedUsers] = useState<string[]>([]);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [serverOnline, setServerOnline] = useState(false);
+  const [clock, setClock] = useState(() => new Date().toLocaleTimeString("en-GB", { hour12: false }));
+
+  useEffect(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem("ht_saved_users") ?? "[]") as string[];
+      setSavedUsers(parsed.filter((item) => typeof item === "string").slice(0, 8));
+    } catch {
+      setSavedUsers([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ping = async () => {
+      try {
+        const response = await fetch(`${api.baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
+        if (!cancelled) setServerOnline(response.ok);
+      } catch {
+        if (!cancelled) setServerOnline(false);
+      }
+    };
+    const clockTimer = setInterval(() => {
+      setClock(new Date().toLocaleTimeString("en-GB", { hour12: false }));
+    }, 1000);
+    const pingTimer = setInterval(ping, 5000);
+    void ping();
+    return () => {
+      cancelled = true;
+      clearInterval(clockTimer);
+      clearInterval(pingTimer);
+    };
+  }, []);
+
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await props.onLogin(username, password);
+      const nextSaved = [username, ...savedUsers.filter((item) => item !== username)].filter(Boolean).slice(0, 8);
+      setSavedUsers(nextSaved);
+      localStorage.setItem("ht_saved_users", JSON.stringify(nextSaved));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
-    <div className="login-shell">
-      <div className="login-card">
-        <div className="login-hero">
-          <p className="eyebrow">{t("subtitle")}</p>
-          <h1>{t("appTitle")}</h1>
-          <span>{t("loginHint")}</span>
+    <div className="terminal-login-page">
+      <div className="terminal-login-center">
+        <div className="terminal-login-logo">
+          <span>Hyper</span>
+          <em>liquid</em>
         </div>
-        <label>
-          <span>{t("username")}</span>
-          <input value={username} onChange={(event) => setUsername(event.target.value)} />
-        </label>
-        <label>
-          <span>{t("password")}</span>
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-        </label>
-        <label>
-          <span>{t("language")}</span>
-          <select value={props.language} onChange={(event) => props.onLanguageChange(event.target.value as Language)}>
-            <option value="zh-CN">简体中文</option>
-            <option value="en-US">English</option>
-          </select>
-        </label>
-        <button
-          className="primary-button"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            await props.onLogin(username, password);
-            setBusy(false);
-          }}
-        >
-          {t("login")}
-        </button>
-        {props.error ? <div className="error-banner">{props.error}</div> : null}
-        <div className="account-hints">
-          <strong>{t("testerHints")}</strong>
-          <code>tester / tester123</code>
-          <code>senior / senior123</code>
-          <code>engineer / engineer123</code>
-          <code>admin / admin123</code>
+
+        <div className="terminal-login-tabs">
+          <button className="active">PAPER</button>
+          <button className="locked" disabled>
+            LIVE <span aria-hidden="true">/</span>
+          </button>
         </div>
+
+        <div className="terminal-login-card">
+          {props.error ? <div className="terminal-login-error">{props.error}</div> : null}
+          <label>
+            <span>{t("username")}</span>
+            <div className="terminal-user-wrap">
+              <input
+                value={username}
+                autoComplete="username"
+                onFocus={() => setDropdownOpen(true)}
+                onBlur={() => window.setTimeout(() => setDropdownOpen(false), 120)}
+                onChange={(event) => setUsername(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submit();
+                }}
+              />
+              {dropdownOpen && savedUsers.length > 0 ? (
+                <div className="terminal-user-dropdown">
+                  {savedUsers.map((item) => (
+                    <button key={item} type="button" onMouseDown={() => setUsername(item)}>
+                      {item}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </label>
+          <label>
+            <span>{t("password")}</span>
+            <div className="terminal-password-wrap">
+              <input
+                type={passwordVisible ? "text" : "password"}
+                value={password}
+                autoComplete="current-password"
+                onChange={(event) => setPassword(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void submit();
+                }}
+              />
+              <button type="button" onClick={() => setPasswordVisible((value) => !value)}>
+                {passwordVisible ? "hide" : "show"}
+              </button>
+            </div>
+          </label>
+          <label>
+            <span>{t("language")}</span>
+            <select value={props.language} onChange={(event) => props.onLanguageChange(event.target.value as Language)}>
+              <option value="zh-CN">简体中文</option>
+              <option value="en-US">English</option>
+            </select>
+          </label>
+          <button className="terminal-sign-button" disabled={busy} onClick={submit}>
+            {busy ? t("loading") : localLabel(props.language, "登录", "Sign In")}
+          </button>
+        </div>
+        <div className="terminal-login-version">v1.2.0 · Hyper Terminal</div>
+      </div>
+      <div className="terminal-login-status">
+        <span className={serverOnline ? "login-status-dot" : "login-status-dot off"} />
+        <span>{serverOnline ? localLabel(props.language, "Server connected", "Server connected") : localLabel(props.language, "Backend offline", "Backend offline")}</span>
+        <span>{api.baseUrl}</span>
+        <span className="login-clock">{clock}</span>
       </div>
     </div>
   );
@@ -1606,6 +1985,7 @@ function App() {
   const [orderKind, setOrderKind] = useState<PaperOrderKind>("market");
   const [selectedSide, setSelectedSide] = useState<TradeSide>("UP");
   const [selectedInterval, setSelectedInterval] = useState<CandleInterval>("1m");
+  const [chartVisibleCount, setChartVisibleCount] = useState(60);
   const [nowMs, setNowMs] = useState(Date.now());
   const [tradeBusy, setTradeBusy] = useState(false);
   const [quickBusy, setQuickBusy] = useState(false);
@@ -1624,6 +2004,10 @@ function App() {
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
   const canOpenUserManagement = me?.role === "Admin" || me?.role === "Senior Tester";
+
+  useEffect(() => {
+    setChartVisibleCount(defaultVisibleCountForInterval(selectedInterval));
+  }, [selectedInterval]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -2098,6 +2482,42 @@ function App() {
     }
   };
 
+  const handleManualSettle = async (roundId: string, side: TradeSide) => {
+    if (!token) {
+      return;
+    }
+    try {
+      setError(undefined);
+      await api.manualSettleRound(token, roundId, {
+        side,
+        reason: `Manual settlement entered from ${me?.username ?? "client"}`
+      });
+      const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextLogs] = await Promise.all([
+        api.getCurrentRound(token),
+        api.getHistory(token),
+        api.getProfile(token),
+        api.getPositions(token),
+        api.getOrders(token),
+        api.getLogs(token)
+      ]);
+      setMarketPayload({
+        currentRound: roundData.currentRound,
+        history: nextHistory,
+        snapshot: roundData.snapshot,
+        settlementPreview: roundData.settlementPreview,
+        transportMeta: roundData.transportMeta
+      });
+      setUserPayload({
+        profile: nextProfile,
+        positions: nextPositions,
+        orders: nextOrders,
+        logs: nextLogs
+      });
+    } catch (manualError) {
+      setError(manualError instanceof Error ? manualError.message : "Manual settlement failed.");
+    }
+  };
+
   if (!token || !me) {
     return (
       <LoginScreen
@@ -2110,7 +2530,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell page-${currentPage}`}>
       <header className="topbar">
         <div className="brand-block">
           <p className="eyebrow">{t("subtitle")}</p>
@@ -2184,6 +2604,7 @@ function App() {
             language={(i18n.language as Language) ?? "zh-CN"}
             selectedSide={selectedSide}
             selectedInterval={selectedInterval}
+            chartVisibleCount={chartVisibleCount}
             lastOrderLatencyMs={lastOrderLatencyMs}
             lastMarketRecvTs={lastMarketRecvTs}
             orderAmount={orderAmount}
@@ -2197,12 +2618,14 @@ function App() {
             sellFeedback={sellFeedback}
             canPlaceOrder={me.permissionCodes.includes("trade:order")}
             canSell={me.permissionCodes.includes("trade:sell")}
+            canManualSettle={me.role !== "Tester"}
             onAmountChange={setOrderAmount}
             onQtyChange={setOrderQty}
             onLimitPriceChange={setLimitPrice}
             onOrderActionChange={setOrderAction}
             onOrderKindChange={setOrderKind}
             onIntervalChange={setSelectedInterval}
+            onChartVisibleCountChange={setChartVisibleCount}
             onSelectSide={setSelectedSide}
             onPlaceOrder={handlePlaceOrder}
             onCloseSide={handleCloseSide}
@@ -2210,12 +2633,14 @@ function App() {
             onSell={handleSell}
             onCancel={handleCancelOrder}
             onTimeline={handleOpenTimeline}
+            onManualSettle={handleManualSettle}
             timelineBusyOrderId={timelineBusyOrderId}
             cancelBusyOrderId={cancelBusyOrderId}
           />
         ) : currentPage === "profile" ? (
           <ProfilePage
             t={t}
+            token={token}
             language={(i18n.language as Language) ?? "zh-CN"}
             profile={profile}
             history={history}
@@ -2273,6 +2698,7 @@ function TradePage(props: {
   logs: AuditEvent[];
   selectedSide: TradeSide;
   selectedInterval: CandleInterval;
+  chartVisibleCount: number;
   lastOrderLatencyMs?: number;
   lastMarketRecvTs?: number;
   orderAmount: string;
@@ -2286,12 +2712,14 @@ function TradePage(props: {
   sellFeedback?: { positionId?: string; message: string };
   canPlaceOrder: boolean;
   canSell: boolean;
+  canManualSettle: boolean;
   onAmountChange: (value: string) => void;
   onQtyChange: (value: string) => void;
   onLimitPriceChange: (value: string) => void;
   onOrderActionChange: (value: OrderAction) => void;
   onOrderKindChange: (value: PaperOrderKind) => void;
   onIntervalChange: (value: CandleInterval) => void;
+  onChartVisibleCountChange: (value: number) => void;
   onSelectSide: (side: TradeSide) => void;
   onPlaceOrder: () => Promise<void>;
   onCloseSide: () => Promise<void>;
@@ -2299,6 +2727,7 @@ function TradePage(props: {
   onSell: (positionId: string) => Promise<void>;
   onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
+  onManualSettle: (roundId: string, side: TradeSide) => Promise<void>;
   timelineBusyOrderId?: string;
   cancelBusyOrderId?: string;
 }) {
@@ -2309,6 +2738,7 @@ function TradePage(props: {
   const [tradeOrdersExpanded, setTradeOrdersExpanded] = useState(true);
   const [tradePositionsPage, setTradePositionsPage] = useState(0);
   const [tradeOrdersPage, setTradeOrdersPage] = useState(0);
+  const [sharedChartDomain, setSharedChartDomain] = useState<{ startTs: number; endTs: number }>();
   const sourceBinance = snapshot?.sources.binance;
   const sourceChainlink = snapshot?.sources.chainlink;
   const sourceClob = snapshot?.sources.clob;
@@ -2386,6 +2816,330 @@ function TradePage(props: {
     setTradeOrdersPage((page) => clampPage(page, sortedTradeOrders.length));
   }, [sortedTradeOrders.length]);
 
+  const chainlinkCandles = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
+  const upAsk = snapshot?.clob.bestBidAskSummary.UP.bestAsk ?? 0;
+  const downAsk = snapshot?.clob.bestBidAskSummary.DOWN.bestAsk ?? 0;
+  const doubleSideCost = upAsk + downAsk;
+  const feeCost = doubleSideCost > 0 ? Math.max(doubleSideCost - 1, 0) : 0;
+  const legacySpreadText = snapshot
+    ? decimal(
+        (selectedSide === "UP" ? snapshot.clob.upBook.bestAsk : snapshot.clob.downBook.bestAsk) -
+          (selectedSide === "UP" ? snapshot.clob.upBook.bestBid : snapshot.clob.downBook.bestBid),
+        3
+      )
+    : "--";
+  const oddsChange = (() => {
+    const trades = snapshot?.clob.recentTrades.filter((trade) => trade.side === "UP").slice(-8) ?? [];
+    if (trades.length < 2) return 0;
+    return trades.at(-1)!.price - trades[0].price;
+  })();
+  const countdownMs = snapshot?.uiMeta.countdownMs ?? 0;
+  const sourceRows = [
+    { label: "CLOB", source: sourceClob, warnMs: 2000 },
+    { label: "BNB", source: sourceBinance, warnMs: 3000 },
+    { label: "CL", source: sourceChainlink, warnMs: 10000 },
+    {
+      label: "GAMMA",
+      source: undefined,
+      warnMs: 5 * 60_000,
+      ageMs: props.currentRound?.lastPollAt ? nowMs - props.currentRound.lastPollAt : undefined,
+      state: props.currentRound?.status === "Manual" ? "stale" : "healthy"
+    }
+  ];
+  const riskAlerts = buildRiskAlerts({
+    language,
+    countdownMs,
+    upPrice: snapshot?.upPrice ?? 0,
+    downPrice: snapshot?.downPrice ?? 0,
+    oddsChange,
+    sources: [sourceBinance, sourceChainlink, sourceClob],
+    clobLatencyMs: clobTransportLatency.marketUpdateAgeMs,
+    positions,
+    nowMs
+  });
+  const strategy = buildStrategyHints({
+    language,
+    upPrice: snapshot?.upPrice ?? 0,
+    downPrice: snapshot?.downPrice ?? 0,
+    oddsChange,
+    doubleSideCost,
+    countdownMs
+  });
+  const recentCompactOrders = sortedTradeOrders.slice(0, 8);
+  const compactPositions = currentRoundPositions.slice(0, 8);
+  const canManualSettle =
+    props.canManualSettle &&
+    props.currentRound &&
+    (props.currentRound.status === "Manual" || riskAlerts.some((alert) => alert.kind === "settlement_stuck"));
+
+  return (
+    <section className="terminal-page">
+      <div className="terminal-top">
+        <div className="terminal-logo">
+          <span>Hyper</span><strong>Terminal</strong><em>PAPER</em>
+        </div>
+        <div className="terminal-top-mid">
+          <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
+          <span>UP {decimal(snapshot?.upPrice ?? 0, 4)}</span>
+          <span>DN {decimal(snapshot?.downPrice ?? 0, 4)}</span>
+          <span className={clobTransportLatency.marketUpdateAgeMs > 1000 ? "terminal-lag warn" : "terminal-lag"}>
+            Lag {clobTransportLatency.disabled ? "--" : `${Math.round(clobTransportLatency.marketUpdateAgeMs)}ms`}
+          </span>
+        </div>
+        <div className="terminal-top-right">
+          <span>{profile ? money(profile.totalEquity) : "$--"}</span>
+          <span className="terminal-green">{profile ? money(profile.availableUsdc) : "$--"}</span>
+          <a href={polymarketUrl} target="_blank" rel="noreferrer">Polymarket</a>
+          <a href={binanceUrl} target="_blank" rel="noreferrer">Binance</a>
+        </div>
+      </div>
+
+      <div className="terminal-monitor">
+        <div className="monitor-cell hot monitor-analytics">
+          <small>BTC UP ODDS <b>{oddsChange >= 0 ? "↑" : "↓"} {decimal(Math.abs(oddsChange), 4)}</b></small>
+          <strong>{decimal(snapshot?.upPrice ?? 0, 4)}</strong>
+          <span>DN {decimal(snapshot?.downPrice ?? 0, 4)} · ask sum {decimal(doubleSideCost, 4)}</span>
+        </div>
+        <div className="monitor-cell monitor-spread">
+          <small>BTC Chainlink vs PTB</small>
+          <strong className={Math.abs((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.priceToBeat ?? 0)) > 50 ? "terminal-red" : ""}>
+            {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.priceToBeat ?? 0))}
+          </strong>
+          <span>PTB {money(snapshot?.priceToBeat ?? 0)} · CL {money(snapshot?.chainlink.referencePrice ?? 0)}</span>
+        </div>
+        <div className="monitor-timer monitor-round-state">
+          <small>{props.currentRound?.status ?? "--"}</small>
+          <strong>{formatCountdown(countdownMs, nowMs, "remainingMs")}</strong>
+          <span>{snapshot?.uiMeta.marketSwitchState ?? "--"}</span>
+        </div>
+        <div className="monitor-cell compact monitor-balance">
+          <small>Total Assets</small>
+          <strong>{money(profile?.totalEquity ?? 0)}</strong>
+          <span>Unreal {signedMoney(profile?.unrealizedPnl ?? 0)}</span>
+        </div>
+        <div className="monitor-cell compact monitor-available">
+          <small>Avail Balance</small>
+          <strong className="terminal-green">{money(profile?.availableUsdc ?? 0)}</strong>
+          <span>Today {signedMoney(profile?.realizedPnlToday ?? 0)}</span>
+        </div>
+      </div>
+
+      <div className="terminal-body">
+        <aside className="terminal-left">
+          <TerminalSection title={localLabel(language, "持仓", "Positions")} meta={String(currentRoundPositions.length)}>
+            <div className="terminal-list">
+              {compactPositions.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : compactPositions.map((position) => (
+                <details className={`terminal-position ${position.side === "UP" ? "up" : "down"}`} key={position.id}>
+                  <summary>
+                    <b>{position.side === "UP" ? "▲ UP" : "▼ DN"}</b>
+                    <span>{money(position.notionalSpent)}</span>
+                    <em className={positionDisplayedPnl(position) >= 0 ? "terminal-green" : "terminal-red"}>{signedMoney(positionDisplayedPnl(position))}</em>
+                    <small>{positionStatusLabel(position, language)}</small>
+                  </summary>
+                  <div>
+                    shares {decimal(position.qty, 4)} · entry {decimal(position.averageEntry, 4)} · mark {decimal(position.currentMark, 4)}
+                    {position.displayStatus === "open" ? (
+                      <button onClick={() => props.onSell(position.id)} disabled={props.sellBusyPositionId === position.id}>
+                        {props.sellBusyPositionId === position.id ? t("loading") : t("sell")}
+                      </button>
+                    ) : null}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </TerminalSection>
+
+          <TerminalSection title={localLabel(language, "本轮记录", "This Round")} meta={String(recentCompactOrders.length)}>
+            <div className="terminal-trades">
+              {recentCompactOrders.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : recentCompactOrders.map((order) => (
+                <div className="terminal-trade-row" key={order.id}>
+                  <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
+                  <b>{order.side === "UP" ? "▲UP" : "▼DN"}</b>
+                  <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
+                  <span>@{decimal(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0, 3)}</span>
+                  <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
+                </div>
+              ))}
+            </div>
+          </TerminalSection>
+
+          <TerminalSection title={localLabel(language, "今日", "Today")} meta={localLabel(language, "统计", "Stats")}>
+            <div className="terminal-stat-grid">
+              <div><small>PnL</small><b>{signedMoney(profile?.realizedPnlToday ?? 0)}</b></div>
+              <div><small>Win Rate</small><b>{compactPercent(profile?.winRate ?? 0)}</b></div>
+              <div><small>Trades</small><b>{orders.length}</b></div>
+              <div><small>Rounds</small><b>{profile?.roundsParticipatedToday ?? 0}</b></div>
+            </div>
+            <div className="terminal-round-dots">
+              {props.history.slice(0, 20).map((round) => (
+                <span key={round.id} className={round.userPnl > 0 ? "win" : round.userPnl < 0 ? "loss" : ""} title={`${round.id} ${signedMoney(round.userPnl)}`} />
+              ))}
+            </div>
+          </TerminalSection>
+        </aside>
+
+        <main className="terminal-center">
+          <div className="terminal-chart-block">
+            <div className="chart-toolbar compact">
+              <b>BTC/USD</b>
+              {TRADE_INTERVAL_OPTIONS.map((interval) => (
+                <button key={interval} className={selectedInterval === interval ? "on" : ""} onClick={() => props.onIntervalChange(interval)}>{interval}</button>
+              ))}
+              <div className="chart-count-group">
+                {CHART_COUNT_OPTIONS.map((count) => (
+                  <button
+                    key={count}
+                    className={props.chartVisibleCount === count ? "on" : ""}
+                    onClick={() => props.onChartVisibleCountChange(count)}
+                  >
+                    {count}
+                  </button>
+                ))}
+                <input
+                  aria-label="visible candles"
+                  type="number"
+                  min={10}
+                  max={200}
+                  step={10}
+                  value={props.chartVisibleCount}
+                  onChange={(event) => {
+                    const nextValue = parseBarCountInput(event.target.value);
+                    if (typeof nextValue === "number") {
+                      props.onChartVisibleCountChange(nextValue);
+                    }
+                  }}
+                />
+              </div>
+              <span>{shortChartHint(language)}</span>
+            </div>
+            <CandlestickChart
+              bars={chartBars}
+              upColor="#00f0c0"
+              downColor="#f03060"
+              emptyText={t("noData")}
+              priceToBeat={snapshot?.priceToBeat}
+              latestPrice={snapshot?.binance.spotPrice}
+              round={props.currentRound}
+              visibleCount={props.chartVisibleCount}
+              onVisibleCountChange={props.onChartVisibleCountChange}
+              onTimeDomainChange={setSharedChartDomain}
+            />
+          </div>
+          <OddsMiniChart trades={snapshot?.clob.recentTrades ?? []} language={language} />
+          <div className="terminal-chart-block chainlink">
+            <div className="chart-toolbar compact">
+              <b>BTC Chainlink</b>
+              <span>CL-Binance {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0))}</span>
+            </div>
+            <ChainlinkComparisonChart
+              bars={chainlinkCandles}
+              binancePrice={snapshot?.binance.spotPrice ?? 0}
+              emptyText={t("noData")}
+              visibleCount={props.chartVisibleCount}
+              onVisibleCountChange={props.onChartVisibleCountChange}
+              timeDomainStartTs={sharedChartDomain?.startTs}
+              timeDomainEndTs={sharedChartDomain?.endTs}
+            />
+          </div>
+          <div className="terminal-depth">
+            {(["UP", "DOWN"] as TradeSide[]).map((side) => {
+              const book = snapshot?.orderBooks[side];
+              const bid = book?.bestBid ?? 0;
+              const ask = book?.bestAsk ?? 0;
+              const width = Math.max(Math.min((bid + ask) * 50, 100), 8);
+              return (
+                <div key={side}>
+                  <small>BTC {side} Book</small>
+                  <div className="terminal-depth-bar"><span style={{ width: `${width}%` }} /></div>
+                  <b>{decimal(bid, 3)} / {decimal(ask, 3)}</b>
+                </div>
+              );
+            })}
+          </div>
+        </main>
+
+        <aside className="terminal-right">
+          <TerminalSection title={localLabel(language, "系统健康 + 告警", "System Health + Alerts")} meta="LIVE">
+            <div className="health-grid">
+              {sourceRows.map((item) => {
+                const age = typeof item.ageMs === "number" ? item.ageMs : item.source ? latencyFor(item.source, nowMs, item.source.clientRecvTs ?? props.lastMarketRecvTs).marketUpdateAgeMs : undefined;
+                const tone = item.state ?? (item.source?.state === "healthy" && typeof age === "number" && age <= item.warnMs ? "healthy" : item.source?.state ?? "stale");
+                return (
+                  <div className={`health-dot ${tone}`} key={item.label}>
+                    <b>{item.label}</b><span>{typeof age === "number" ? `${Math.round(age)}ms` : "--"}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="stability-meter">{[1, 2, 3, 4, 5].map((step) => <span key={step} className={step <= sourceRows.filter((row) => (row.source?.state ?? row.state) === "healthy").length + 1 ? "on" : ""} />)}</div>
+            <div className="risk-alerts">
+              {riskAlerts.length === 0 ? <span>{localLabel(language, "暂无告警", "No active alerts")}</span> : riskAlerts.map((alert) => (
+                <button key={alert.kind} className={`risk-alert ${alert.level}`} onClick={() => alert.kind === "settlement_stuck" && props.currentRound ? props.onManualSettle(props.currentRound.id, "UP") : undefined}>
+                  {alert.text}
+                </button>
+              ))}
+            </div>
+          </TerminalSection>
+
+          <TerminalSection title="BTC/USD" meta={`CL ${money(snapshot?.chainlink.referencePrice ?? 0)} · PTB ${money(snapshot?.priceToBeat ?? 0)}`}>
+            <div className="terminal-order">
+              <div className="order-odds">
+                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}>UP <b>{decimal(snapshot?.upPrice ?? 0, 4)}</b></button>
+                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}>DN <b>{decimal(snapshot?.downPrice ?? 0, 4)}</b></button>
+              </div>
+              <div className="terminal-segment">
+                {(["buy", "sell"] as OrderAction[]).map((action) => <button key={action} className={props.orderAction === action ? "on" : ""} onClick={() => props.onOrderActionChange(action)}>{action === "buy" ? "BUY / ENTER" : "SELL / EXIT"}</button>)}
+              </div>
+              <div className="terminal-segment">
+                {(["market", "limit"] as PaperOrderKind[]).map((kind) => <button key={kind} className={props.orderKind === kind ? "on" : ""} onClick={() => props.onOrderKindChange(kind)}>{kind === "market" ? "MARKET ORDER" : "LIMIT ORDER"}</button>)}
+              </div>
+              <div className="amount-grid">
+                {[1, 5, 10, 20, 50].map((amount) => <button key={amount} onClick={() => props.onAmountChange(String(amount))}>${amount}</button>)}
+                <button onClick={() => props.onAmountChange(String(Math.max((profile?.availableUsdc ?? 0) / 2, 0).toFixed(0)))}>1/2</button>
+                <button onClick={() => props.onAmountChange(String(Math.max(profile?.availableUsdc ?? 0, 0).toFixed(0)))}>MAX</button>
+              </div>
+              <label className="terminal-input">
+                <span>{props.orderAction === "buy" ? localLabel(language, "输入金额", "Amount") : localLabel(language, "卖出份额", "Qty")}</span>
+                <input value={props.orderAction === "buy" ? props.orderAmount : props.orderQty} onChange={(event) => props.orderAction === "buy" ? props.onAmountChange(event.target.value) : props.onQtyChange(event.target.value)} />
+              </label>
+              {props.orderKind === "limit" ? (
+                <label className="terminal-input">
+                  <span>{localLabel(language, "指定赔率", "Limit Odds")}</span>
+                  <input value={props.limitPrice} onChange={(event) => props.onLimitPriceChange(event.target.value)} />
+                </label>
+              ) : null}
+              <div className="order-meta">
+                <span>Fee {money(feeCost * Number(props.orderAmount || 0), 2)}</span>
+                <span>{t("available")}: {money(profile?.availableUsdc ?? 0)}</span>
+                <span>{t("estimatedQty")}: {decimal(estimatedQty, 4)}</span>
+              </div>
+              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} onClick={props.onPlaceOrder}>
+                {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `执行 ${selectedSide} 买入` : `执行 ${selectedSide} 卖出`}
+              </button>
+              <div className="quick-row">
+                <button disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onCloseSide}>Exit {selectedSide}</button>
+                <button disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onReverseSide}>Reverse</button>
+              </div>
+              {canManualSettle ? (
+                <div className="manual-settle">
+                  <span>Manual Review</span>
+                  <button onClick={() => props.currentRound && props.onManualSettle(props.currentRound.id, "UP")}>Settle UP</button>
+                  <button onClick={() => props.currentRound && props.onManualSettle(props.currentRound.id, "DOWN")}>Settle DN</button>
+                </div>
+              ) : null}
+            </div>
+          </TerminalSection>
+
+          <TerminalSection title={localLabel(language, "策略提示", "Strategy Hints")} meta="RULES">
+            <div className="strategy-list">
+              {strategy.map((item) => <div key={item.label}><span>{item.label}</span><b>{item.value}</b></div>)}
+            </div>
+          </TerminalSection>
+        </aside>
+      </div>
+    </section>
+  );
+
   return (
     <>
       <section className="market-header">
@@ -2429,7 +3183,7 @@ function TradePage(props: {
               <h2>{t("binanceKline")}</h2>
             </div>
             <div className="interval-tabs">
-              {(["1m", "5m"] as CandleInterval[]).map((interval) => (
+              {TRADE_INTERVAL_OPTIONS.map((interval) => (
                 <button
                   key={interval}
                   className={selectedInterval === interval ? "active" : ""}
@@ -2573,19 +3327,19 @@ function TradePage(props: {
             </div>
             <div>
               <span>{t("slippageHint")}</span>
-              <strong>{orderBook?.bestAsk && orderBook.bestBid ? decimal(orderBook.bestAsk - orderBook.bestBid, 3) : "--"}</strong>
+              <strong>{legacySpreadText}</strong>
             </div>
             <div>
               <span>{t("backendToFrontend")}</span>
-              <strong>{clobTransportLatency.disabled || typeof clobTransportLatency.backendToFrontendLatencyMs !== "number" ? "--" : `${Math.round(clobTransportLatency.backendToFrontendLatencyMs)} ms`}</strong>
+              <strong>{clobTransportLatency.disabled || typeof clobTransportLatency.backendToFrontendLatencyMs !== "number" ? "--" : `${Math.round(Number(clobTransportLatency.backendToFrontendLatencyMs))} ms`}</strong>
             </div>
             <div>
               <span>{localLabel(language, "市场更新年龄", "Market Update Age")}</span>
-              <strong>{clobTransportLatency.disabled ? "--" : `${Math.round(clobTransportLatency.marketUpdateAgeMs)} ms`}</strong>
+              <strong>{clobTransportLatency.disabled || typeof clobTransportLatency.marketUpdateAgeMs !== "number" ? "--" : `${Math.round(clobTransportLatency.marketUpdateAgeMs)} ms`}</strong>
             </div>
             <div className={selectedOrderBookStale ? "tone-warning" : undefined}>
               <span>{t("orderBookAge")}</span>
-              <strong>{typeof selectedOrderBookAgeMs === "number" ? `${Math.round(selectedOrderBookAgeMs)} ms` : "--"}</strong>
+              <strong>{typeof selectedOrderBookAgeMs === "number" ? `${Math.round(Number(selectedOrderBookAgeMs))} ms` : "--"}</strong>
             </div>
           </div>
 
@@ -2712,7 +3466,10 @@ function TradePage(props: {
                     <span className={roundMoveTone(round)}>{roundMoveLabel(round, language)}</span>
                     <small>{dateTimeText(round.startAt)}</small>
                     <small>
-                      {localLabel(language, "Polymarket BTC 开/收", "Polymarket BTC O/C")}:{" "}
+                      {localLabel(language, "Polymarket BTC 开/收", "Polymarket BTC O/C")} ({localLabel(language, "来源", "Source")}:{" "}
+                      {round.polymarketOpenPriceSource ?? round.polymarketClosePriceSource ?? "Gamma"}
+                      {round.settlementReceivedAt ? `, Δ ${Math.round((round.settlementReceivedAt - round.endAt) / 1000)}s` : ""}
+                      ):{" "}
                       {isBtcReferencePrice(round.polymarketOpenPrice) ? money(round.polymarketOpenPrice) : "--"} /{" "}
                       {isBtcReferencePrice(round.polymarketClosePrice) ? money(round.polymarketClosePrice) : "--"}
                     </small>
@@ -2728,7 +3485,7 @@ function TradePage(props: {
                     <small>
                       {localLabel(language, "状态", "Status")}: {round.status} 路 {round.settlementSource ?? "Gamma"}
                     </small>
-                    {preview ? (
+                    {preview && !round.settledSide ? (
                       <div className={`settlement-preview-note tone-${settlementPreviewTone(preview)}`}>
                         <strong>
                           {settlementPreviewLabel(preview, language)}: {settlementPreviewText(preview, language)}
@@ -2966,6 +3723,7 @@ function TradePage(props: {
 
 function ProfilePage(props: {
   t: (key: string) => string;
+  token: string;
   language: Language;
   profile?: ProfileOverview;
   history: HistoryRound[];
@@ -3003,6 +3761,9 @@ function ProfilePage(props: {
   const [profileLogsPage, setProfileLogsPage] = useState(0);
   const [expandedPositionRounds, setExpandedPositionRounds] = useState<string[]>([]);
   const [expandedOrderRounds, setExpandedOrderRounds] = useState<string[]>([]);
+  const [passwordForm, setPasswordForm] = useState({ currentPassword: "", password: "", confirmPassword: "" });
+  const [passwordMessage, setPasswordMessage] = useState<string>();
+  const [passwordBusy, setPasswordBusy] = useState(false);
   const groupedPositions = buildGroupedPositions(props.history, props.positions, props.orders);
   const groupedOrders = buildGroupedOrders(props.history, props.orders);
   const sortedProfileLogs = [...props.logs].sort((left, right) => right.serverRecvTs - left.serverRecvTs);
@@ -3045,6 +3806,19 @@ function ProfilePage(props: {
     );
   };
   const equityWindowOptions: OperatedEquityWindow[] = [10, 30, 60, "all"];
+  const submitPasswordChange = async () => {
+    try {
+      setPasswordBusy(true);
+      setPasswordMessage(undefined);
+      await api.changeMyPassword(props.token, passwordForm);
+      setPasswordForm({ currentPassword: "", password: "", confirmPassword: "" });
+      setPasswordMessage(localLabel(language, "密码已修改。旧密码已失效。", "Password changed. The old password is no longer valid."));
+    } catch (error) {
+      setPasswordMessage(error instanceof Error ? error.message : "Password change failed.");
+    } finally {
+      setPasswordBusy(false);
+    }
+  };
 
   return (
     <>
@@ -3064,6 +3838,33 @@ function ProfilePage(props: {
         />
         <AppMetric label={t("winRate")} value={compactPercent(props.profile?.winRate ?? 0)} />
         <AppMetric label={t("roundsParticipated")} value={String(roundsParticipatedTotal)} />
+      </section>
+
+      <section className="panel password-panel">
+        <div className="section-header">
+          <div>
+            <p className="eyebrow">{localLabel(language, "账户安全", "Account Security")}</p>
+            <h2>{localLabel(language, "修改密码", "Change Password")}</h2>
+          </div>
+          <button className="secondary-button" disabled={passwordBusy} onClick={submitPasswordChange}>
+            {passwordBusy ? t("loading") : localLabel(language, "保存密码", "Save Password")}
+          </button>
+        </div>
+        {passwordMessage ? <div className="inline-info-banner">{passwordMessage}</div> : null}
+        <div className="password-grid">
+          <label>
+            {localLabel(language, "当前密码", "Current Password")}
+            <input type="password" value={passwordForm.currentPassword} onChange={(event) => setPasswordForm((form) => ({ ...form, currentPassword: event.target.value }))} />
+          </label>
+          <label>
+            {localLabel(language, "新密码", "New Password")}
+            <input type="password" value={passwordForm.password} onChange={(event) => setPasswordForm((form) => ({ ...form, password: event.target.value }))} />
+          </label>
+          <label>
+            {localLabel(language, "确认新密码", "Confirm Password")}
+            <input type="password" value={passwordForm.confirmPassword} onChange={(event) => setPasswordForm((form) => ({ ...form, confirmPassword: event.target.value }))} />
+          </label>
+        </div>
       </section>
 
       <section className="profile-insights">
@@ -3408,7 +4209,7 @@ function ProfilePage(props: {
                           <small>{log.category}</small>
                         </div>
                       </td>
-                      <td><FieldChip label={log.actionType} tone={actionTone(log.actionType)} /></td>
+                      <td><FieldChip label={auditActionLabel(log.actionType, language)} tone={actionTone(log.actionType)} /></td>
                       <td><FieldChip label={log.actionStatus} tone={auditStatusTone(log.actionStatus)} /></td>
                       <td>
                         <div className="field-stack">
@@ -3434,6 +4235,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
   const [logs, setLogs] = useState<UnifiedLogRow[]>([]);
   const [nextCursor, setNextCursor] = useState<string>();
   const [users, setUsers] = useState<PublicUser[]>([]);
+  const [roundOptions, setRoundOptions] = useState<HistoryRound[]>([]);
   const [facets, setFacets] = useState<LogFacets>(DEFAULT_LOG_FACETS);
   const [busy, setBusy] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
@@ -3561,6 +4363,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
     if (canFilterUsers) {
       api.getUsers(token).then(setUsers).catch(() => setUsers([]));
     }
+    api.getHistory(token, 200).then(setRoundOptions).catch(() => setRoundOptions([]));
     api.getLogFacets(token).then(setFacets).catch(() => setFacets(DEFAULT_LOG_FACETS));
   }, []);
 
@@ -3798,14 +4601,25 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
         ) : null}
         <label>
           {t("round")}
-          <input value={filters.roundId ?? ""} onChange={(event) => updateFilters({ roundId: event.target.value })} />
+          <select value={filters.roundId ?? ""} onChange={(event) => updateFilters({ roundId: event.target.value })}>
+            <option value="">{t("all")}</option>
+            {roundOptions.map((round) => (
+              <option key={round.id} value={round.id}>
+                {(round.marketSlug ?? round.id).slice(0, 42)}
+              </option>
+            ))}
+          </select>
         </label>
         <label>
-          {t("orderId")}
+          <span title={localLabel(language, "订单编号：用户提交或系统生成的订单唯一 ID", "Order ID: unique id for a user/system order")}>
+            {localLabel(language, "订单编号", "Order ID")}
+          </span>
           <input value={filters.orderId ?? ""} onChange={(event) => updateFilters({ orderId: event.target.value })} />
         </label>
         <label>
-          traceId
+          <span title={localLabel(language, "系统追踪号：用于内部排查一次请求或流程链路", "Trace ID: internal request/process trace for debugging")}>
+            {localLabel(language, "系统追踪号", "Trace ID")}
+          </span>
           <input value={filters.traceId ?? ""} onChange={(event) => updateFilters({ traceId: event.target.value })} />
         </label>
         <label>
@@ -3814,7 +4628,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             <option value="">{t("all")}</option>
             {selectedActionOptions.map((actionType) => (
               <option key={actionType} value={actionType}>
-                {actionType}
+                {auditActionLabel(actionType, language)}
               </option>
             ))}
           </select>
@@ -3834,13 +4648,13 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
           <label>
             category
             <select value={filters.category ?? ""} onChange={(event) => updateFilters({ category: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"}>
-              <option value="">{t("all")}</option>
-              {facets.audit.categories.map((category) => (
-                <option key={category} value={category}>
-                  {category}
-                </option>
-              ))}
-            </select>
+            <option value="">{t("all")}</option>
+            {facets.audit.categories.map((category) => (
+              <option key={category} value={category}>
+                  {auditCategoryLabel(category, language)}
+              </option>
+            ))}
+          </select>
           </label>
           <label>
             {localLabel(language, "日志分组", "Log Group")}
@@ -4032,9 +4846,13 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             <th>{localLabel(language, "系统", "System")}</th>
             <th>{t("userRole")}</th>
             <th>{t("round")}</th>
-            <th>{t("actionType")}</th>
+            <th>{localLabel(language, "操作分类", "Action Type")}</th>
             <th>{t("status")}</th>
-            <th>trace / order</th>
+            <th>
+              <span title={localLabel(language, "系统追踪号 / 订单编号", "Trace ID / Order ID")}>
+                {localLabel(language, "追踪 / 订单", "Trace / Order")}
+              </span>
+            </th>
             <th>{t("message")}</th>
           </tr>
         </thead>
@@ -4057,7 +4875,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
                   <td>
                     <div className="field-stack">
                       <FieldChip label={logSystemLabel(log.system)} tone={log.system === "matching" ? "warning" : log.system === "training" ? "positive" : "info"} />
-                      <small>{log.matchingLogKind ? matchingKindLabel(log.matchingLogKind) : (log.logGroup ? logGroupLabel(log.logGroup) : log.category ?? log.eventType ?? "--")}</small>
+                      <small>{log.matchingLogKind ? matchingKindLabel(log.matchingLogKind) : (log.logGroup ? logGroupLabel(log.logGroup) : log.category ? auditCategoryLabel(log.category, language) : log.eventType ?? "--")}</small>
                     </div>
                   </td>
                   <td>
@@ -4072,12 +4890,12 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
                       <small>{log.marketId ?? log.bookKey ?? "--"}</small>
                     </div>
                   </td>
-                  <td>{log.actionType}</td>
+                  <td>{auditActionLabel(log.actionType, language)}</td>
                   <td>{log.actionStatus ?? "--"}</td>
                   <td>
                     <div className="field-stack">
-                      <span>{log.traceId ?? "--"}</span>
-                      <small>{log.orderId ?? log.positionId ?? "--"}</small>
+                      <span title={localLabel(language, "系统追踪号（用于内部排查）", "Trace ID for internal diagnostics")}>{log.traceId ?? "--"}</span>
+                      <small title={localLabel(language, "订单编号 / 持仓编号", "Order ID / Position ID")}>{log.orderId ?? log.positionId ?? "--"}</small>
                     </div>
                   </td>
                   <td>
@@ -4445,7 +5263,9 @@ function LogExportDialog(props: {
             <input value={form.marketSlug} onChange={(event) => updateForm("marketSlug", event.target.value)} />
           </label>
           <label>
-            {t("orderId")}
+            <span title={localLabel(language, "订单编号：用户提交或系统生成的订单唯一 ID", "Order ID: unique id for a user/system order")}>
+              {localLabel(language, "订单编号", "Order ID")}
+            </span>
             <input value={form.orderId} onChange={(event) => updateForm("orderId", event.target.value)} />
           </label>
           <label>
@@ -4453,11 +5273,13 @@ function LogExportDialog(props: {
             <input value={form.positionId} onChange={(event) => updateForm("positionId", event.target.value)} />
           </label>
           <label>
-            traceId
+            <span title={localLabel(language, "系统追踪号：用于内部排查一次请求或流程链路", "Trace ID: internal request/process trace for debugging")}>
+              {localLabel(language, "系统追踪号", "Trace ID")}
+            </span>
             <input value={form.traceId} onChange={(event) => updateForm("traceId", event.target.value)} />
           </label>
           <label>
-            {t("actionType")}
+            {localLabel(language, "操作分类", "Action Type")}
             <input value={form.actionType} onChange={(event) => updateForm("actionType", event.target.value)} />
           </label>
           <label>
@@ -5279,7 +6101,3 @@ function RoundLogDialog(props: {
 }
 
 export default App;
-
-
-
-

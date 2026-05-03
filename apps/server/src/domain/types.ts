@@ -149,10 +149,10 @@ export interface CandlePoint {
   price: number;
 }
 
-export type CandleInterval = "1m" | "5m" | "1d";
+export type CandleInterval = "1m" | "5m" | "15m" | "1h" | "1d";
 
 export interface CandleBar {
-  interval: CandleInterval;
+  interval: CandleInterval | "5s";
   startTs: number;
   endTs: number;
   open: number;
@@ -220,6 +220,8 @@ export interface MarketSnapshot {
   chainlink: {
     referencePrice: number;
     settlementReference: number;
+    candles5s: CandleBar[];
+    candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
   clob: {
     delta: number;
@@ -361,7 +363,7 @@ export interface RoundRecord {
   settledSide?: TradeSide;
   settlementPrice?: number;
   settlementTs?: number;
-  settlementSource?: "Polymarket" | "Gamma" | "Chainlink";
+  settlementSource?: "Polymarket" | "Gamma" | "Chainlink" | "CLOB";
   polymarketSettlementPrice?: number;
   polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual";
   polymarketOpenPrice?: number;
@@ -765,6 +767,7 @@ export interface PolymarketMarketDetail {
   settlementPrice?: number;
   settlementStatus?: "pending" | "resolved" | "fallback" | "manual";
   settlementReceivedAt?: number;
+  automaticallyResolved?: boolean;
   bestBid: number;
   bestAsk: number;
   lastTradePrice: number;
