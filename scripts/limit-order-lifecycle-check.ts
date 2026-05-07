@@ -12,6 +12,7 @@ import type {
   TradeSide,
   UserRecord
 } from "../apps/server/src/domain/types";
+import type { ClobMarketInfo } from "../apps/server/src/domain/types";
 
 const now = () => Date.now();
 
@@ -84,6 +85,7 @@ function snapshot(upBook: OrderBookSnapshot, downBook: OrderBookSnapshot, round:
     binance: {
       spotPrice: 80_000,
       candlesByInterval: {
+        "30s": [],
         "1m": [],
         "5m": [],
         "15m": [],
@@ -96,6 +98,7 @@ function snapshot(upBook: OrderBookSnapshot, downBook: OrderBookSnapshot, round:
       settlementReference: 0,
       candles5s: [],
       candlesByInterval: {
+        "30s": [],
         "1m": [],
         "5m": [],
         "15m": [],
@@ -179,6 +182,7 @@ function createFixture(input?: {
   downBook?: OrderBookSnapshot;
   round?: RoundRecord;
   positions?: PositionRecord[];
+  marketInfo?: ClobMarketInfo;
 }) {
   const currentRound = input?.round ?? round();
   const books: Record<TradeSide, OrderBookSnapshot> = {
@@ -265,7 +269,8 @@ function createFixture(input?: {
       slug: currentRound.marketSlug,
       conditionId: currentRound.conditionId,
       upTokenId: currentRound.upTokenId,
-      downTokenId: currentRound.downTokenId
+      downTokenId: currentRound.downTokenId,
+      marketInfo: input?.marketInfo
     },
     orderBooks: books
   };
@@ -368,6 +373,49 @@ async function testPendingLimitBuyTriggersFromFutureBook() {
   assert.equal(currentUser.availableUsdc, 50);
   assert.equal(store.positions[0]?.qty, 125);
   assert.equal(store.orderLifecycleLogs.some((log) => log.buyOrderId === order.id), true);
+}
+
+async function testPendingLimitBuyUsesActualClobV2FeeOnTrigger() {
+  const marketInfo: ClobMarketInfo = {
+    conditionId: "condition-1",
+    minimumTickSize: 0.01,
+    minimumOrderSize: 1,
+    makerFeeRate: 0,
+    takerFeeRate: 0.02,
+    platformFeeRate: 0.02,
+    platformFeeExponent: 1,
+    platformFeeTakerOnly: true,
+    feeRateAvailable: true,
+    source: "clob",
+    conservative: false,
+    updatedAt: now()
+  };
+  const { engine, user: currentUser, setBook } = createFixture({
+    marketInfo,
+    upBook: book("up-rest-fee-trigger", [[0.45, 100]], [[0.7, 100]])
+  });
+
+  const { order } = await engine.placeOrder(currentUser, {
+    action: "buy",
+    side: "UP",
+    orderKind: "limit",
+    amount: 50,
+    limitPrice: 0.5
+  });
+
+  assert.equal(order.status, "pending");
+  assert.equal(order.estimatedFee, 0.99);
+  assert.equal(order.frozenUsdc, 50.99);
+  assert.equal(currentUser.availableUsdc, 49.01);
+
+  setBook("UP", book("up-trigger-fee-buy", [[0.45, 100]], [[0.4, 200]]));
+  await engine.processPendingOrders();
+
+  assert.equal(order.status, "filled");
+  assert.equal(order.actualFee, 0.6);
+  assert.equal(order.feeBreakdown?.platformFee, 0.6);
+  assert.equal(order.frozenUsdc, 0);
+  assert.equal(currentUser.availableUsdc, 49.4);
 }
 
 async function testOrderCapturesFullBookSnapshotWithoutReferenceLeak() {
@@ -553,6 +601,7 @@ async function main() {
   await testLimitBuyRestsAndCancelReleasesUsdc();
   await testLimitBuyImmediateFillCreatesPosition();
   await testPendingLimitBuyTriggersFromFutureBook();
+  await testPendingLimitBuyUsesActualClobV2FeeOnTrigger();
   await testOrderCapturesFullBookSnapshotWithoutReferenceLeak();
   await testPendingOrderKeepsInitialBookSnapshotAfterTrigger();
   await testLimitSellRestsLocksQtyAndCancelReleasesQty();

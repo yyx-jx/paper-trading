@@ -76,7 +76,8 @@ async function startPackagedBackend() {
       UPSTREAM_PROXY_URL: "",
       JWT_SECRET: "btc-paper-trading-test-secret",
       DATABASE_URL: "",
-      REDIS_URL: ""
+      REDIS_URL: "",
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, "--max-old-space-size=1536"].filter(Boolean).join(" ")
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
@@ -100,6 +101,32 @@ function stopBackend() {
   backendLogStream = undefined;
 }
 
+function lockRendererZoom(win) {
+  const resetZoom = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.setZoomFactor(1);
+    }
+  };
+
+  win.webContents.setVisualZoomLevelLimits(1, 1).catch(() => {});
+  resetZoom();
+  win.webContents.on("did-finish-load", resetZoom);
+  win.webContents.on("zoom-changed", (event) => {
+    event.preventDefault();
+    resetZoom();
+  });
+  win.webContents.on("before-input-event", (event, input) => {
+    const key = String(input.key || "").toLowerCase();
+    const isZoomShortcut =
+      (input.control || input.meta) &&
+      (key === "+" || key === "=" || key === "-" || key === "_" || key === "0" || key === "numadd" || key === "numsub");
+    if (isZoomShortcut) {
+      event.preventDefault();
+      resetZoom();
+    }
+  });
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1600,
@@ -113,6 +140,7 @@ function createWindow() {
       nodeIntegration: false
     }
   });
+  lockRendererZoom(win);
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173";
   if (!app.isPackaged) {

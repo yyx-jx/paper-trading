@@ -17,7 +17,9 @@ export class MatchingService {
   constructor(private readonly store: MatchingStore) {}
 
   async init() {
+    console.log("[matching] service init start");
     await this.store.init();
+    console.log("[matching] service init done");
   }
 
   async close() {

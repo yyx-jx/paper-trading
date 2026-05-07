@@ -3,7 +3,9 @@ export type Role = "Tester" | "Senior Tester" | "Test Engineer" | "Admin";
 export type TradeSide = "UP" | "DOWN";
 export type OrderAction = "buy" | "sell";
 export type PaperOrderKind = "market" | "limit";
-export type CandleInterval = "1m" | "5m" | "15m" | "1h" | "1d";
+export type CandleInterval = "30s" | "1m" | "5m" | "15m" | "1h" | "1d";
+export type FeeCurrency = "USD";
+export type DisplayPriceSource = "mid" | "last_trade" | "outcome_price";
 export type LogSystem = "all" | "audit" | "training" | "matching";
 export type LogCategory = "operation" | "matching" | "settlement" | "latency";
 export type MatchingEventType = "external_book_synced" | "order_executed" | "order_cancelled";
@@ -58,6 +60,48 @@ export interface SourceHealth {
 export interface MarketTransportMeta {
   serverPublishTs: number;
   payloadSeq: number;
+  coalescedCount?: number;
+  serverQueueMs?: number;
+}
+
+export interface ClobMarketInfo {
+  conditionId?: string;
+  minimumTickSize: number;
+  minimumOrderSize: number;
+  makerFeeRate: number;
+  takerFeeRate: number;
+  platformFeeRate?: number;
+  platformFeeExponent?: number;
+  platformFeeTakerOnly?: boolean;
+  feeRateAvailable?: boolean;
+  feeRateBps?: number;
+  feeDetails?: Record<string, unknown>;
+  tokens?: Array<{ tokenId: string; outcome?: string; minimumTickSize?: number; minimumOrderSize?: number }>;
+  rfqEnabled?: boolean;
+  source: "clob" | "gamma" | "conservative";
+  conservative: boolean;
+  updatedAt: number;
+}
+
+export interface FeeBreakdown {
+  role: "maker" | "taker";
+  feeRate: number;
+  formula: "C * feeRate * p * (1 - p)";
+  price: number;
+  quantity: number;
+  notional: number;
+  platformFee?: number;
+  platformFeeExponent?: number;
+  platformFeeTakerOnly?: boolean;
+  totalFee?: number;
+  amount: number;
+}
+
+export interface LatencyBreakdown {
+  sourceEventAge: Record<"binance" | "chainlink" | "clob", number>;
+  serverIngressLatency: Record<"binance" | "chainlink" | "clob", number>;
+  serverComputeLatency: number;
+  clientTransportLatency?: number;
 }
 
 export interface SettlementPreview {
@@ -69,6 +113,12 @@ export interface SettlementPreview {
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
+  tokenSide?: TradeSide;
+  binanceSide?: TradeSide;
+  binancePrice?: number;
+  priceToBeat?: number;
+  confidence?: "aligned" | "token_only" | "binance_only" | "conflict";
+  conflictReason?: string;
   message?: string;
 }
 
@@ -93,6 +143,11 @@ export interface MarketTrade {
   price: number;
   qty: number;
   ts: number;
+}
+
+export interface CandlePoint {
+  ts: number;
+  price: number;
 }
 
 export interface CandleBar {
@@ -121,6 +176,10 @@ export interface MarketSnapshot {
   priceToBeat: number;
   upPrice: number;
   downPrice: number;
+  displayPrices: Record<TradeSide, number>;
+  displayPriceSource: Record<TradeSide, DisplayPriceSource>;
+  displayPriceSpread: Record<TradeSide, number>;
+  latencyBreakdown: LatencyBreakdown;
   sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
   orderBooks: Record<TradeSide, OrderBookSnapshot>;
   recentTrades: MarketTrade[];
@@ -142,6 +201,8 @@ export interface MarketSnapshot {
     upBook: OrderBookSnapshot;
     downBook: OrderBookSnapshot;
     recentTrades: MarketTrade[];
+    currentRoundUpPriceSeries: CandlePoint[];
+    marketInfo: ClobMarketInfo;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
   };
   uiMeta: {
@@ -168,6 +229,15 @@ export interface UserPayload {
   positions: PositionRecord[];
   orders: OrderRecord[];
   logs: AuditEvent[];
+}
+
+export interface BootstrapPayload extends MarketPayload, UserPayload {
+  me: PublicUser;
+  sourceStatus: SourceHealth[];
+}
+
+export interface LoginResponse extends PublicUser {
+  token: string;
 }
 
 export interface RoundRecord {
@@ -277,6 +347,10 @@ export interface OrderRecord {
   frozenUsdc?: number;
   frozenQty?: number;
   fills?: Array<Record<string, unknown>>;
+  estimatedFee?: number;
+  actualFee?: number;
+  feeBreakdown?: FeeBreakdown;
+  feeCurrency?: FeeCurrency;
   sourceLatencyMs?: number;
   marketSlug?: string;
   orderBookSnapshotRef?: string;
@@ -575,16 +649,20 @@ async function request<T>(path: string, token?: string, init?: RequestInit): Pro
   });
 
   const text = await response.text();
-  let data: (T & { error?: boolean; message?: string }) | undefined;
+  let data: (T & { message?: string; code?: string }) | undefined;
   if (text) {
     try {
-      data = JSON.parse(text) as T & { error?: boolean; message?: string };
+      data = JSON.parse(text) as T & { message?: string; code?: string };
     } catch {
       throw new Error(text || "Request failed.");
     }
   }
-  if (!response.ok || data?.error) {
-    throw new Error(data?.message ?? "Request failed.");
+  if (!response.ok) {
+    const error = new Error(data?.message ?? "Request failed.") as Error & { code?: string };
+    if (data?.code) {
+      error.code = data.code;
+    }
+    throw error;
   }
   return (data ?? ({} as T)) as T;
 }
@@ -660,30 +738,53 @@ function buildQuery(query?: object) {
   return search.toString() ? `?${search.toString()}` : "";
 }
 
+type LoginWireResponse = {
+  token: string;
+  user_id: string;
+  role: Role;
+  language: Language;
+  display_name: string;
+  permission_codes: string[];
+  username: string;
+  available_usdc: number;
+  is_active: boolean;
+  senior_tester_id?: string;
+  created_at: number;
+  updated_at: number;
+};
+
+function mapLoginResponse(input: LoginWireResponse): LoginResponse {
+  return {
+    token: input.token,
+    id: input.user_id,
+    username: input.username,
+    displayName: input.display_name,
+    role: input.role,
+    language: input.language,
+    permissionCodes: input.permission_codes,
+    availableUsdc: input.available_usdc,
+    isActive: input.is_active,
+    seniorTesterId: input.senior_tester_id,
+    createdAt: input.created_at,
+    updatedAt: input.updated_at
+  };
+}
+
 export const api = {
   baseUrl: API_BASE_URL,
   createWsUrl(path: string, token: string) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
     return `${base}${path}?token=${token}`;
   },
-  login(username: string, password: string) {
-    return request<{
-      token: string;
-      user_id: string;
-      role: Role;
-      language: Language;
-      display_name: string;
-      permission_codes: string[];
-      username: string;
-      available_usdc: number;
-      is_active: boolean;
-      senior_tester_id?: string;
-      created_at: number;
-      updated_at: number;
-    }>("/api/auth/login", undefined, {
+  async login(username: string, password: string) {
+    const data = await request<LoginWireResponse>("/api/auth/login", undefined, {
       method: "POST",
       body: JSON.stringify({ username, password })
     });
+    return mapLoginResponse(data);
+  },
+  getBootstrap(token: string) {
+    return request<BootstrapPayload>("/api/bootstrap/full", token);
   },
   getMe(token: string) {
     return request<PublicUser>("/api/me", token);

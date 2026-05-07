@@ -1,4 +1,5 @@
-import type { BookLevel, MatchingFill, OrderAction, OrderBookSnapshot } from "../domain/types";
+import type { BookLevel, FeeBreakdown, MatchingFill, OrderAction, OrderBookSnapshot } from "../domain/types";
+import { calculateClobFees } from "./clob-fees";
 
 const PRICE_EPSILON = 0.0000001;
 const QTY_EPSILON = 0.0000001;
@@ -12,6 +13,11 @@ export interface ClobExecutionInput {
   notional?: number;
   qty?: number;
   limitPrice?: number;
+  feeRate?: number;
+  platformFeeRate?: number;
+  platformFeeExponent?: number;
+  platformFeeTakerOnly?: boolean;
+  feeRole?: "maker" | "taker";
   executedAt: number;
 }
 
@@ -24,6 +30,8 @@ export interface ClobExecutionEstimate {
   remainingNotional: number;
   avgPrice?: number;
   worstPrice?: number;
+  estimatedFee: number;
+  feeBreakdown?: FeeBreakdown;
   failureReason?: string;
 }
 
@@ -104,6 +112,20 @@ export function estimateClobExecution(input: ClobExecutionInput): ClobExecutionE
 
   const fullyMatched = input.action === "buy" ? remainingNotional <= 0.01 : remainingQty <= QTY_EPSILON;
   const avgPrice = filledQty > QTY_EPSILON ? roundNumber(matchedNotional / filledQty) : undefined;
+  const feeRole = input.feeRole ?? "taker";
+  const feePrice = avgPrice ?? input.limitPrice ?? (input.action === "buy" ? input.book.bestAsk : input.book.bestBid);
+  const feeResult = calculateClobFees({
+    role: feeRole,
+    feeRate: input.feeRate,
+    platformFeeRate: input.platformFeeRate,
+    platformFeeExponent: input.platformFeeExponent,
+    platformFeeTakerOnly: input.platformFeeTakerOnly,
+    price: feePrice,
+    quantity: filledQty,
+    notional: matchedNotional
+  });
+  const estimatedFee = feeResult.fee;
+  const feeBreakdown = feeResult.breakdown;
   const failureReason = fullyMatched
     ? undefined
     : typeof input.limitPrice === "number"
@@ -119,7 +141,8 @@ export function estimateClobExecution(input: ClobExecutionInput): ClobExecutionE
     remainingNotional: roundNumber(remainingNotional),
     avgPrice,
     worstPrice,
+    estimatedFee,
+    feeBreakdown,
     failureReason
   };
 }
-

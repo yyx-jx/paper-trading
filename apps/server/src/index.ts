@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import { WebSocket as WsWebSocket } from "ws";
 import { z } from "zod";
 import { serverConfig } from "./config";
+import { sendApiError } from "./http-errors";
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
@@ -44,6 +45,10 @@ import { LOG_FACETS } from "./services/log-facets";
 
 const app = Fastify({ logger: false });
 
+function logStartupStage(stage: string) {
+  console.log(`[startup] ${new Date().toISOString()} ${stage}`);
+}
+
 const store = new AppStore({
   initialBalance: serverConfig.initialBalance,
   logRetentionMs: serverConfig.logRetentionMs,
@@ -52,7 +57,24 @@ const store = new AppStore({
   databaseUrl: serverConfig.databaseUrl,
   redisUrl: serverConfig.redisUrl,
   persistenceMode: serverConfig.persistenceMode,
-  chainlinkEnabled: serverConfig.chainlinkEnabled
+  chainlinkEnabled: serverConfig.chainlinkEnabled,
+  strictPersistence: serverConfig.strictPersistence,
+  pgConnectionTimeoutMs: serverConfig.pgConnectionTimeoutMs,
+  pgIdleTimeoutMs: serverConfig.pgIdleTimeoutMs,
+  pgMaxConnections: serverConfig.pgMaxConnections,
+  pgKeepAlive: serverConfig.pgKeepAlive,
+  pgReconnectIntervalMs: serverConfig.pgReconnectIntervalMs,
+  pgReconnectMaxIntervalMs: serverConfig.pgReconnectMaxIntervalMs,
+  orderBookSnapshotsMemoryMax: serverConfig.orderBookSnapshotsMemoryMax,
+  orderBookSnapshotsMemoryMaxAgeMs: serverConfig.orderBookSnapshotsMemoryMaxAgeMs,
+  ordersMemoryMax: serverConfig.ordersMemoryMax,
+  positionsMemoryMax: serverConfig.positionsMemoryMax,
+  auditLogsMemoryMax: serverConfig.auditLogsMemoryMax,
+  behaviorLogsMemoryMax: serverConfig.behaviorLogsMemoryMax,
+  orderLifecycleMemoryMax: serverConfig.orderLifecycleMemoryMax,
+  roundsMemoryMax: serverConfig.roundsMemoryMax,
+  serverHeapWarnMb: serverConfig.serverHeapWarnMb,
+  serverHeapProtectMb: serverConfig.serverHeapProtectMb
 });
 
 const matchingClient = new MatchingServiceClient({
@@ -92,11 +114,22 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketDiscoveryKeywords: serverConfig.polymarketDiscoveryKeywords,
   marketDiscoveryIntervalMs: serverConfig.marketDiscoveryIntervalMs,
   polymarketBookPollMs: serverConfig.polymarketBookPollMs,
+  polymarketBookCalibrationMs: serverConfig.polymarketBookCalibrationMs,
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
 });
 
 let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
+const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
+const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
+
+type CachedMarketHistory = {
+  revision: number;
+  limit: number;
+  rows: Array<RoundRecord & { userPnl: number }>;
+};
+
+const marketHistoryCache = new Map<string, CachedMarketHistory>();
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -748,6 +781,10 @@ function stampSourceForTransport(source: SourceHealth, serverPublishTs: number):
 function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = Date.now()): MarketSnapshot {
   return {
     ...snapshot,
+    latencyBreakdown: {
+      ...snapshot.latencyBreakdown,
+      serverComputeLatency: Math.max(serverPublishTs - snapshot.serverNow, 0)
+    },
     sources: {
       binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
       chainlink: stampSourceForTransport(snapshot.sources.chainlink, serverPublishTs),
@@ -756,11 +793,13 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
   };
 }
 
-function nextMarketTransportMeta(): MarketTransportMeta {
+function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number): MarketTransportMeta {
   marketPayloadSeq += 1;
   return {
     serverPublishTs: Date.now(),
-    payloadSeq: marketPayloadSeq
+    payloadSeq: marketPayloadSeq,
+    coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
+    serverQueueMs: pendingSince ? Math.max(Date.now() - pendingSince, 0) : undefined
   };
 }
 
@@ -771,16 +810,34 @@ function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: 
   return settlementPreview ? { ...round, settlementPreview } : round;
 }
 
+function getCachedHistory(limit: number, userId?: string) {
+  const revision = store.getHistoryRevision();
+  const cacheKey = `${userId ?? "__public__"}:${limit}`;
+  const cached = marketHistoryCache.get(cacheKey);
+  if (cached && cached.revision === revision && cached.limit === limit) {
+    return cached.rows;
+  }
+  const rows = store.getHistory(limit, userId);
+  marketHistoryCache.set(cacheKey, { revision, limit, rows });
+  if (marketHistoryCache.size > MARKET_HISTORY_CACHE_MAX_USERS) {
+    const oldestKey = marketHistoryCache.keys().next().value;
+    if (oldestKey) {
+      marketHistoryCache.delete(oldestKey);
+    }
+  }
+  return rows;
+}
+
 function getHistoryWithSettlementPreview(limit: number, userId?: string) {
-  return store.getHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
+  return getCachedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
 }
 
 function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) {
   return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
 }
 
-function createCurrentRoundPayload() {
-  const transportMeta = nextMarketTransportMeta();
+function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
+  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince);
   const currentRound = store.getCurrentRound();
   const history = getHistoryWithSettlementPreview(10);
   const settlementPreview =
@@ -794,10 +851,25 @@ function createCurrentRoundPayload() {
   };
 }
 
-function createMarketPayload(userId: string): MarketPayload {
+function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: number): MarketPayload {
   return {
-    ...createCurrentRoundPayload(),
+    ...createCurrentRoundPayload(coalescedCount, pendingSince),
     history: getHistoryWithSettlementPreview(10, userId)
+  };
+}
+
+function createBootstrapPayload(user: UserRecord) {
+  const market = createCurrentRoundPayload();
+  return {
+    ...market,
+    history: getHistoryWithSettlementPreview(60, user.id),
+    me: store.sanitizeUser(user),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
+    profile: store.getProfile(user.id),
+    positions: store.getPositions(user.id),
+    orders: store.getOrders(user.id),
+    logs: store.getRecentLogs(user.id),
+    sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
   };
 }
 
@@ -1057,14 +1129,7 @@ async function buildLogsExportZip(actor: UserRecord, query: ExportQuery) {
 }
 
 async function safeRoute<T>(handler: () => Promise<T>) {
-  try {
-    return await handler();
-  } catch (error) {
-    return {
-      error: true,
-      message: error instanceof Error ? error.message : "Unexpected server error."
-    } as T;
-  }
+  return handler();
 }
 
 function warnForLocalMisconfiguration() {
@@ -1112,37 +1177,57 @@ process.on("SIGTERM", () => {
 });
 
 async function bootstrap() {
+  logStartupStage("bootstrap start");
   warnForLocalMisconfiguration();
   if (serverConfig.embeddedMatchingService) {
+    logStartupStage("embedded matching bootstrap start");
     matchingRuntime = await createMatchingServiceApp({
       databaseUrl: serverConfig.databaseUrl,
       redisUrl: serverConfig.redisUrl,
       persistenceMode: serverConfig.persistenceMode,
-      redisSnapshotSeconds: serverConfig.snapshotRetentionSeconds
+      redisSnapshotSeconds: serverConfig.snapshotRetentionSeconds,
+      strictPersistence: serverConfig.strictPersistence,
+      pgConnectionTimeoutMs: serverConfig.pgConnectionTimeoutMs,
+      pgIdleTimeoutMs: serverConfig.pgIdleTimeoutMs,
+      pgMaxConnections: serverConfig.pgMaxConnections,
+      pgKeepAlive: serverConfig.pgKeepAlive,
+      pgReconnectIntervalMs: serverConfig.pgReconnectIntervalMs,
+      pgReconnectMaxIntervalMs: serverConfig.pgReconnectMaxIntervalMs,
+      eventsMemoryMax: serverConfig.matchingEventsMemoryMax,
+      eventsMemoryMaxAgeMs: serverConfig.matchingEventsMemoryMaxAgeMs,
+      booksMemoryMax: serverConfig.matchingBooksMemoryMax
     });
     await matchingRuntime.app.listen({
       host: "0.0.0.0",
       port: serverConfig.matchingServicePort
     });
+    logStartupStage(`embedded matching bootstrap done port=${serverConfig.matchingServicePort}`);
   }
 
+  logStartupStage("store.init start");
   await store.init();
+  logStartupStage("store.init done");
 
   await app.register(cors, {
     origin: true,
     credentials: true
   });
   await app.register(websocket);
+  app.setErrorHandler((error, _request, reply) => sendApiError(reply, error));
 
   app.get("/health", async () => {
     const matching = await engine.getMatchingHealth().catch(() => undefined);
     const sources = store.getSourceStatus();
     const currentRound = store.getCurrentRound();
+    const memory = store.getMemoryStatus();
     return {
       ok: true,
       serverNow: Date.now(),
       symbol: serverConfig.symbol,
       persistence: store.getPersistenceStatus(),
+      heapUsedMb: memory.heapUsedMb,
+      heapLimitMb: memory.heapLimitMb,
+      memoryProtectionState: memory.memoryProtectionState,
       sources,
       currentRoundPresent: Boolean(currentRound),
       currentMarketSlug: store.marketSnapshot.marketSlug ?? null,
@@ -1174,7 +1259,7 @@ async function bootstrap() {
         resultMessage: "Invalid login payload."
       });
       reply.code(400);
-      return { message: "Invalid login payload." };
+      return { message: "Invalid login payload.", code: "VALIDATION_FAILED" };
     }
     const candidate = store.findUserByUsername(parsed.data.username);
     const user = store.findUserByCredentials(parsed.data.username, parsed.data.password);
@@ -1187,7 +1272,7 @@ async function bootstrap() {
         serverRecvTs,
         resultMessage: disabledMatch ? "User account is disabled." : "Invalid username or password."
       });
-      reply.code(401);
+      reply.code(disabledMatch ? 403 : 401);
       return {
         message: disabledMatch ? "User account is disabled." : "Invalid username or password.",
         code: disabledMatch ? "ACCOUNT_DISABLED" : "AUTH_FAILED"
@@ -1221,6 +1306,15 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       return store.sanitizeUser(user);
+    })
+  );
+
+  app.get("/api/bootstrap/full", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      requirePermission(user, "trade:view");
+      requirePermission(user, "profile:view");
+      return createBootstrapPayload(user);
     })
   );
 
@@ -1558,6 +1652,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:order");
+      store.assertWritablePersistence("Order placement");
       const parsed = orderSchema.parse(request.body);
       const result = await engine.placeOrder(
         user,
@@ -1579,6 +1674,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:cancel");
+      store.assertWritablePersistence("Order cancellation");
       const params = request.params as { id: string };
       return store.sanitizeOrder(await engine.cancelOrder(user, params.id));
     })
@@ -1588,6 +1684,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:sell");
+      store.assertWritablePersistence("Position sell");
       const params = request.params as { id: string };
       return store.sanitizeOrder(await engine.sellPosition(user, params.id));
     })
@@ -1597,6 +1694,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:sell");
+      store.assertWritablePersistence("Close side");
       const parsed = quickSideSchema.parse(request.body);
       return await engine.closeSide(user, parsed as { side: TradeSide; clientSendTs?: number });
     })
@@ -1607,6 +1705,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:sell");
       requirePermission(user, "trade:order");
+      store.assertWritablePersistence("Reverse side");
       const parsed = quickSideSchema.parse(request.body);
       const result = await engine.reverseSide(user, parsed as { side: TradeSide; clientSendTs?: number });
       return {
@@ -1661,11 +1760,7 @@ async function bootstrap() {
         );
       return reply.send(body);
     } catch (error) {
-      reply.code(400);
-      return {
-        error: true,
-        message: error instanceof Error ? error.message : "Log export failed."
-      };
+      return sendApiError(reply, error, "Log export failed.");
     }
   });
 
@@ -1683,11 +1778,7 @@ async function bootstrap() {
         );
       return reply.send(body);
     } catch (error) {
-      reply.code(400);
-      return {
-        error: true,
-        message: error instanceof Error ? error.message : "Log export failed."
-      };
+      return sendApiError(reply, error, "Log export failed.");
     }
   });
 
@@ -1705,11 +1796,7 @@ async function bootstrap() {
         );
       return reply.send(body ? `${body}\n` : "");
     } catch (error) {
-      reply.code(400);
-      return {
-        error: true,
-        message: error instanceof Error ? error.message : "Training log export failed."
-      };
+      return sendApiError(reply, error, "Training log export failed.");
     }
   });
 
@@ -1747,11 +1834,7 @@ async function bootstrap() {
         );
       return reply.send(body ? `${body}\n` : "");
     } catch (error) {
-      reply.code(400);
-      return {
-        error: true,
-        message: error instanceof Error ? error.message : "Audit log export failed."
-      };
+      return sendApiError(reply, error, "Audit log export failed.");
     }
   });
 
@@ -1796,8 +1879,12 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "system:status:view");
+      const memory = store.getMemoryStatus();
       return {
         serverNow: Date.now(),
+        heapUsedMb: memory.heapUsedMb,
+        heapLimitMb: memory.heapLimitMb,
+        memoryProtectionState: memory.memoryProtectionState,
         currentRoundPresent: Boolean(store.getCurrentRound()),
         currentMarketSlug: store.marketSnapshot.marketSlug ?? null,
         sources: store.getSourceStatus().map((source) => ({
@@ -1856,13 +1943,16 @@ async function bootstrap() {
       }
 
       let lastSentSeq = 0;
+      let lastSentAt = 0;
       let sending = false;
       let pendingLatest = false;
+      let pendingSince: number | undefined;
+      let coalescedCount = 0;
       let retryTimer: NodeJS.Timeout | undefined;
       let closed = false;
 
       const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
-      const scheduleRetry = () => {
+      const scheduleRetry = (delayMs = MARKET_WS_RETRY_MS) => {
         if (closed || retryTimer) {
           return;
         }
@@ -1872,12 +1962,16 @@ async function bootstrap() {
             pendingLatest = false;
             sendPayload();
           }
-        }, MARKET_WS_RETRY_MS);
+        }, Math.max(delayMs, MARKET_WS_RETRY_MS));
       };
 
       const deferLatest = () => {
         pendingLatest = true;
-        scheduleRetry();
+        pendingSince ??= Date.now();
+        coalescedCount += 1;
+        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
+        const pacingDelay = Math.max(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend, 0);
+        scheduleRetry(pacingDelay);
       };
 
       const sendPayload = () => {
@@ -1893,7 +1987,14 @@ async function bootstrap() {
           deferLatest();
           return;
         }
-        const data = createMarketPayload(user.id);
+        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
+        if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
+          deferLatest();
+          return;
+        }
+        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
+        coalescedCount = 0;
+        pendingSince = undefined;
         const seq = data.transportMeta.payloadSeq;
         if (seq <= lastSentSeq) {
           return;
@@ -1903,6 +2004,7 @@ async function bootstrap() {
           sending = false;
           if (!error) {
             lastSentSeq = Math.max(lastSentSeq, seq);
+            lastSentAt = Date.now();
           }
           if (pendingLatest) {
             scheduleRetry();
@@ -1978,11 +2080,16 @@ async function bootstrap() {
     }
   });
 
-  await engine.start();
+  logStartupStage("app.listen start");
   await app.listen({
     host: "0.0.0.0",
     port: serverConfig.port
   });
+  logStartupStage(`app.listen done port=${serverConfig.port}`);
+
+  logStartupStage("engine.start start");
+  await engine.start();
+  logStartupStage("engine.start done");
 }
 
 bootstrap().catch(async (error) => {

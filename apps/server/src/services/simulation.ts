@@ -2,12 +2,17 @@ import type {
   AuditEvent,
   BehaviorActionLog,
   BinanceConnectorState,
+  CandlePoint,
   CandleBar,
   ChainlinkConnectorState,
+  ClobMarketInfo,
+  DisplayPriceSource,
+  FeeBreakdown,
   Language,
   MatchingBookState,
   MatchingFill,
   MarketSnapshot,
+  MarketTrade,
   OrderLifecycleExitType,
   OrderRecord,
   OrderBookSnapshot,
@@ -27,6 +32,7 @@ import type {
 import { BinanceConnector } from "./connectors/binance";
 import { ChainlinkConnector } from "./connectors/chainlink";
 import { estimateClobExecution, type ClobExecutionEstimate } from "./clob-execution";
+import { calculateClobFees } from "./clob-fees";
 import { MatchingServiceClient } from "./matching/client";
 import { PolymarketConnector } from "./connectors/polymarket";
 import { PolymarketReferenceResolver } from "./connectors/polymarket-reference";
@@ -34,26 +40,165 @@ import { AppStore } from "./store";
 
 const LATENCY_LOG_INTERVAL_MS = 15000;
 const REDEEM_DELAY_MS = 2000;
-const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.97;
+const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.9;
 const QTY_EPSILON = 0.0001;
 const FIVE_MINUTE_MS = 5 * 60_000;
 const EXECUTION_BOOK_FRESHNESS_FLOOR_MS = 5000;
 const GAMMA_PREFETCH_START_MS = 180_000;
-const GAMMA_PREFETCH_END_MS = 60_000;
-const GAMMA_PREFETCH_INTERVAL_MS = 5000;
-const TRADE_CHART_INTERVALS = ["1m", "5m", "15m", "1h"] as const;
+const GAMMA_PREFETCH_FAST_START_MS = 60_000;
+const GAMMA_PREFETCH_END_MS = 0;
+const GAMMA_PREFETCH_INTERVAL_MS = 2000;
+const CONSERVATIVE_CLOB_MARKET_INFO: ClobMarketInfo = {
+  minimumTickSize: 0.01,
+  minimumOrderSize: 1,
+  makerFeeRate: 0,
+  takerFeeRate: 0,
+  platformFeeRate: 0,
+  platformFeeExponent: 1,
+  platformFeeTakerOnly: true,
+  feeRateAvailable: false,
+  source: "conservative",
+  conservative: true,
+  updatedAt: 0
+};
+const TRADE_CHART_INTERVALS = ["30s", "1m", "5m", "15m", "1h"] as const;
 const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+  "30s": 120,
   "1m": 60,
   "5m": 30,
   "15m": 24,
   "1h": 24
 };
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+  "30s": 30_000,
   "1m": 60_000,
   "5m": 5 * 60_000,
   "15m": 15 * 60_000,
   "1h": 60 * 60_000
 };
+
+function isPositivePrice(value?: number): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function latestTradePrice(trades: MarketTrade[], side: TradeSide): number | undefined {
+  for (let index = trades.length - 1; index >= 0; index -= 1) {
+    const trade = trades[index];
+    if (trade.side === side && isPositivePrice(trade.price)) {
+      return trade.price;
+    }
+  }
+  return undefined;
+}
+
+function resolveDisplayPrice(input: {
+  bestBid: number;
+  bestAsk: number;
+  lastTradePrice?: number;
+  outcomePrice?: number;
+}): { value: number; source: DisplayPriceSource; spread: number } {
+  const bestBid = isPositivePrice(input.bestBid) ? input.bestBid : undefined;
+  const bestAsk = isPositivePrice(input.bestAsk) ? input.bestAsk : undefined;
+  if (bestBid === undefined || bestAsk === undefined) {
+    return {
+      value: 0,
+      source: "outcome_price",
+      spread: 0
+    };
+  }
+  const spread = bestBid !== undefined && bestAsk !== undefined ? Math.max(bestAsk - bestBid, 0) : 0;
+  const midPrice = bestBid !== undefined && bestAsk !== undefined ? (bestBid + bestAsk) / 2 : undefined;
+
+  if (midPrice !== undefined) {
+    if (spread > 0.1) {
+      if (isPositivePrice(input.lastTradePrice)) {
+        return {
+          value: roundNumber(input.lastTradePrice, 4),
+          source: "last_trade",
+          spread: roundNumber(spread, 4)
+        };
+      }
+      return {
+        value: 0,
+        source: "outcome_price",
+        spread: roundNumber(spread, 4)
+      };
+    }
+    return {
+      value: roundNumber(midPrice, 4),
+      source: "mid",
+      spread: roundNumber(spread, 4)
+    };
+  }
+
+  if (isPositivePrice(input.lastTradePrice)) {
+    return {
+      value: roundNumber(input.lastTradePrice, 4),
+      source: "last_trade",
+      spread: roundNumber(spread, 4)
+    };
+  }
+
+  if (isPositivePrice(input.outcomePrice)) {
+    return {
+      value: roundNumber(input.outcomePrice, 4),
+      source: "outcome_price",
+      spread: roundNumber(spread, 4)
+    };
+  }
+
+  return {
+    value: 0,
+    source: "outcome_price",
+    spread: roundNumber(spread, 4)
+  };
+}
+
+function resolvePairedDisplayPrices(input: {
+  upBook: OrderBookSnapshot;
+  downBook: OrderBookSnapshot;
+  recentTrades: MarketTrade[];
+  outcomePrices?: [number, number];
+}): Record<TradeSide, { value: number; source: DisplayPriceSource; spread: number }> {
+  const upAskDepthAvailable = input.upBook.asks.length > 0 && isPositivePrice(input.upBook.bestAsk);
+  const downAskDepthAvailable = input.downBook.asks.length > 0 && isPositivePrice(input.downBook.bestAsk);
+  if (!upAskDepthAvailable && !downAskDepthAvailable) {
+    return {
+      UP: { value: 0, source: "outcome_price", spread: 0 },
+      DOWN: { value: 0, source: "outcome_price", spread: 0 }
+    };
+  }
+  if (!upAskDepthAvailable) {
+    return {
+      UP: { value: 0, source: "outcome_price", spread: 0 },
+      DOWN: { value: 0.01, source: "outcome_price", spread: 0 }
+    };
+  }
+  if (!downAskDepthAvailable) {
+    return {
+      UP: { value: 0.01, source: "outcome_price", spread: 0 },
+      DOWN: { value: 0, source: "outcome_price", spread: 0 }
+    };
+  }
+  return {
+    UP: resolveDisplayPrice({
+      bestBid: input.upBook.bestBid,
+      bestAsk: input.upBook.bestAsk,
+      lastTradePrice: latestTradePrice(input.recentTrades, "UP"),
+      outcomePrice: input.outcomePrices?.[0]
+    }),
+    DOWN: resolveDisplayPrice({
+      bestBid: input.downBook.bestBid,
+      bestAsk: input.downBook.bestAsk,
+      lastTradePrice: latestTradePrice(input.recentTrades, "DOWN"),
+      outcomePrice: input.outcomePrices?.[1]
+    })
+  };
+}
 
 function isMarketResolved(detail: PolymarketMarketDetail): boolean {
   if (detail.automaticallyResolved) return true;
@@ -72,9 +217,49 @@ function isBtcReferencePrice(value?: number): value is number {
 }
 
 const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
+const roundCurrency = (value: number) => roundNumber(value, 6);
+
+function clobMarketInfoFor(market?: PolymarketMarketDetail): ClobMarketInfo {
+  return market?.marketInfo ?? {
+    ...CONSERVATIVE_CLOB_MARKET_INFO,
+    conditionId: market?.conditionId,
+    updatedAt: Date.now()
+  };
+}
+
+function isAlignedToTick(price: number, tickSize: number) {
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(tickSize) || tickSize <= 0) {
+    return false;
+  }
+  const units = price / tickSize;
+  return Math.abs(units - Math.round(units)) < 0.000001;
+}
+
+function calculateClobFee(input: {
+  role: "maker" | "taker";
+  marketInfo: ClobMarketInfo;
+  price?: number;
+  quantity: number;
+  notional: number;
+}): { fee: number; breakdown?: FeeBreakdown } {
+  const price = input.price ?? input.notional / Math.max(input.quantity, QTY_EPSILON);
+  const result = calculateClobFees({
+    role: input.role,
+    feeRate: input.marketInfo.takerFeeRate,
+    platformFeeRate: input.marketInfo.platformFeeRate ?? input.marketInfo.takerFeeRate,
+    platformFeeExponent: input.marketInfo.platformFeeExponent,
+    platformFeeTakerOnly: input.marketInfo.platformFeeTakerOnly,
+    price,
+    quantity: input.quantity,
+    notional: input.notional,
+    digits: 6
+  });
+  return { fee: roundCurrency(result.fee), breakdown: result.breakdown };
+}
 
 function createEmptyChainlinkIntervalBars() {
   return {
+    "30s": [] as CandleBar[],
     "1m": [] as CandleBar[],
     "5m": [] as CandleBar[],
     "15m": [] as CandleBar[],
@@ -131,6 +316,13 @@ function hasOrderBookDepth(snapshot?: OrderBookSnapshot) {
   return Boolean(snapshot && (snapshot.bids.length > 0 || snapshot.asks.length > 0));
 }
 
+function cloneCandlePoint(point: CandlePoint): CandlePoint {
+  return {
+    ts: point.ts,
+    price: point.price
+  };
+}
+
 type ExecutionBookResult = {
   book: OrderBookSnapshot;
   source: "cache" | "stale_cache" | "rest" | "rest_empty_cache_fallback";
@@ -180,17 +372,24 @@ export class SimulationEngine {
   private chainlinkCandles5s: CandleBar[] = [];
   private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars();
   private polymarketState: PolymarketConnectorState;
+  private currentRoundUpPriceSeries: CandlePoint[] = [];
+  private currentRoundUpPriceSeriesRoundId?: string;
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
   private reconcileRunning = false;
   private reconcileQueued = false;
   private readonly pollLocks = new Set<string>();
+  private redeemLocks = new Set<string>();
   private readonly lastLatencyLogAt = new Map<string, number>();
   private readonly lastLatencyState = new Map<string, string>();
+  private queuedLatencySnapshot?: MarketSnapshot;
+  private latencyLogsRunning = false;
   private readonly matchingBooks = new Map<string, MatchingBookState>();
   private readonly currentBookKeys = new Map<TradeSide, string>();
   private readonly lastSyncedSnapshotIds = new Map<string, string>();
   private preliminarySettlements = new Map<string, SettlementPreview>();
+  private gammaOutcomeConfirmations = new Map<string, { side: TradeSide; count: number; observedAt: number }>();
+  private gammaSettlementDiagnostics = new Set<string>();
   private marketSyncSlug?: string;
   private pendingOrdersRunning = false;
 
@@ -229,6 +428,7 @@ export class SimulationEngine {
       polymarketDiscoveryKeywords: string[];
       marketDiscoveryIntervalMs: number;
       polymarketBookPollMs: number;
+      polymarketBookCalibrationMs: number;
       polymarketTradesPollMs: number;
     }
   ) {
@@ -260,7 +460,7 @@ export class SimulationEngine {
       discoveryKeywords: config.polymarketDiscoveryKeywords,
       discoveryTimeoutMs: config.polymarketDiscoveryTimeoutMs,
       discoveryIntervalMs: config.marketDiscoveryIntervalMs,
-      bookPollMs: config.polymarketBookPollMs,
+      bookPollMs: config.polymarketBookCalibrationMs,
       tradesPollMs: config.polymarketTradesPollMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
@@ -344,7 +544,7 @@ export class SimulationEngine {
         message: round.manualReason ?? "Gamma polling timed out."
       };
     }
-    return this.getPreliminarySettlements().get(round.id);
+    return this.getPreliminarySettlements().get(round.id) ?? this.createPreliminarySettlementPreview(round, Date.now());
   }
 
   getLatestSettlementPreview(rounds: RoundRecord[] = this.store.getHistory(10)): SettlementPreview | undefined {
@@ -446,9 +646,6 @@ export class SimulationEngine {
       if (action === "sell" && (!payload.qty || payload.qty <= 0)) {
         throw new Error("Sell orders require a positive quantity.");
       }
-      if (action === "buy" && user.availableUsdc < (payload.amount ?? 0)) {
-        throw new Error("Insufficient virtual balance.");
-      }
       if (action === "sell") {
         const availableQty = this.availableSellQty(user.id, currentRound.id, payload.side, payload.positionIds);
         if (availableQty + QTY_EPSILON < (payload.qty ?? 0)) {
@@ -466,6 +663,14 @@ export class SimulationEngine {
       const orderBookSnapshot = cloneOrderBookSnapshot(book);
       const tokenId = this.resolveTokenId(payload.side, currentRound);
       const { bookKey, marketId } = this.resolveBookContext(payload.side, currentRound);
+      const marketInfo = clobMarketInfoFor(this.polymarketState.currentMarket);
+      if (orderKind === "limit" && !isAlignedToTick(payload.limitPrice ?? 0, marketInfo.minimumTickSize)) {
+        throw new Error(`Limit price must align to CLOB tick size ${marketInfo.minimumTickSize}.`);
+      }
+      const requestedSize = action === "buy" ? payload.amount ?? 0 : payload.qty ?? 0;
+      if (requestedSize + QTY_EPSILON < marketInfo.minimumOrderSize) {
+        throw new Error(`Order size must be at least CLOB minimum order size ${marketInfo.minimumOrderSize}.`);
+      }
       const expectedQty =
         action === "buy"
           ? roundNumber((payload.amount ?? 0) / Math.max(payload.limitPrice ?? book.bestAsk, 0.0001), 4)
@@ -478,6 +683,11 @@ export class SimulationEngine {
         notional: action === "buy" ? payload.amount : undefined,
         qty: action === "sell" ? payload.qty : undefined,
         limitPrice: payload.limitPrice,
+        feeRate: marketInfo.takerFeeRate,
+        platformFeeRate: marketInfo.platformFeeRate ?? marketInfo.takerFeeRate,
+        platformFeeExponent: marketInfo.platformFeeExponent,
+        platformFeeTakerOnly: marketInfo.platformFeeTakerOnly,
+        feeRole: "taker",
         executedAt: engineStartTs
       });
       const engineFinishTs = Date.now();
@@ -486,6 +696,22 @@ export class SimulationEngine {
       const localMatchLatencyMs = Math.max(engineFinishTs - localMatchStartTs, 1);
       const shouldRest = orderKind === "limit" && !estimate.fullyMatched;
       const status = shouldRest ? "pending" : estimate.fullyMatched ? "filled" : "failed";
+      const pendingFeeEstimate = shouldRest
+        ? calculateClobFee({
+            role: "taker",
+            marketInfo,
+            price: action === "buy" ? Math.max(marketInfo.minimumTickSize, 0.0001) : payload.limitPrice,
+            quantity:
+              action === "buy"
+                ? roundNumber((payload.amount ?? 0) / Math.max(marketInfo.minimumTickSize, 0.0001), 4)
+                : expectedQty,
+            notional: payload.amount ?? expectedQty * (payload.limitPrice ?? book.bestBid)
+          })
+        : undefined;
+      const orderFee = status === "filled" ? estimate.estimatedFee : status === "pending" ? pendingFeeEstimate?.fee ?? 0 : 0;
+      if (action === "buy" && status !== "failed" && user.availableUsdc < (payload.amount ?? 0) + orderFee) {
+        throw new Error("Insufficient virtual balance.");
+      }
       const order: OrderRecord = {
         id: orderId,
         traceId,
@@ -509,6 +735,10 @@ export class SimulationEngine {
         frozenUsdc: 0,
         frozenQty: 0,
         fills: estimate.fills,
+        estimatedFee: orderFee,
+        actualFee: status === "filled" ? orderFee : 0,
+        feeBreakdown: status === "filled" ? estimate.feeBreakdown : pendingFeeEstimate?.breakdown,
+        feeCurrency: "USD",
         sourceLatencyMs,
         marketSlug: currentRound.marketSlug,
         orderBookSnapshot,
@@ -546,7 +776,7 @@ export class SimulationEngine {
       const persistStartTs = Date.now();
       if (status === "pending") {
         if (action === "buy") {
-          const frozen = roundNumber(payload.amount ?? 0, 2);
+          const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
           user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
           order.frozenUsdc = frozen;
         } else {
@@ -633,6 +863,11 @@ export class SimulationEngine {
           executionBookFallbackReason: executionBook.fallbackReason,
           sourceLatencyMs,
           slippageBps: order.slippageBps,
+          estimatedFee: order.estimatedFee,
+          actualFee: order.actualFee,
+          feeBreakdown: order.feeBreakdown,
+          feeCurrency: order.feeCurrency,
+          marketInfo,
           failureReason: order.failureReason
         }
       });
@@ -656,6 +891,10 @@ export class SimulationEngine {
           partialFilled: order.partialFilled,
           unfilledQty: order.unfilledQty,
           executionLatencyMs: order.matchLatencyMs,
+          estimatedFee: order.estimatedFee,
+          actualFee: order.actualFee,
+          feeBreakdown: order.feeBreakdown,
+          feeCurrency: order.feeCurrency,
           failureReason: order.failureReason,
           contextJson: {
             roundStatus: currentRound.status,
@@ -674,7 +913,8 @@ export class SimulationEngine {
             totalOrderLatencyMs: order.totalOrderLatencyMs,
             executionBookSource: executionBook.source,
             executionBookAgeMs: executionBook.ageMs,
-            executionBookFallbackReason: executionBook.fallbackReason
+            executionBookFallbackReason: executionBook.fallbackReason,
+            marketInfo
           }
         })
       );
@@ -1133,8 +1373,8 @@ export class SimulationEngine {
       }
 
       const totalQty = roundNumber(order.filledQty, 4);
-      const totalProceeds = roundNumber(order.notionalUsdc, 2);
-      const avgFillPrice = totalQty > 0 ? roundNumber(totalProceeds / totalQty, 4) : undefined;
+      const totalProceeds = roundCurrency(order.notionalUsdc - (order.actualFee ?? 0));
+      const avgFillPrice = totalQty > 0 ? roundNumber(order.notionalUsdc / totalQty, 4) : undefined;
       const closedPositionsCount = positions.filter((position) => position.status === "closed").length;
       const serverNow = Date.now();
 
@@ -1390,6 +1630,10 @@ export class SimulationEngine {
     partialFilled?: boolean;
     unfilledQty?: number;
     executionLatencyMs?: number;
+    estimatedFee?: number;
+    actualFee?: number;
+    feeBreakdown?: FeeBreakdown;
+    feeCurrency?: "USD";
     settlementDirection?: TradeSide;
     settlementTimeMs?: number;
     gammaPollCount?: number;
@@ -1422,6 +1666,10 @@ export class SimulationEngine {
             marketId: input.order.marketId,
             marketSlug: input.order.marketSlug,
             fills: input.order.fills,
+            estimatedFee: input.order.estimatedFee,
+            actualFee: input.order.actualFee,
+            feeBreakdown: input.order.feeBreakdown,
+            feeCurrency: input.order.feeCurrency,
             failureReason: input.order.failureReason
           }
         : {}),
@@ -1473,6 +1721,10 @@ export class SimulationEngine {
       partialFilled: input.partialFilled,
       unfilledQty: input.unfilledQty,
       executionLatencyMs: input.executionLatencyMs,
+      estimatedFee: input.estimatedFee,
+      actualFee: input.actualFee,
+      feeBreakdown: input.feeBreakdown,
+      feeCurrency: input.feeCurrency,
       settlementDirection: input.settlementDirection,
       settlementTimeMs: input.settlementTimeMs,
       gammaPollCount: input.gammaPollCount,
@@ -1514,7 +1766,16 @@ export class SimulationEngine {
     try {
       do {
         this.reconcileQueued = false;
-        await this.reconcileOnce();
+        try {
+          await this.reconcileOnce();
+        } catch (error) {
+          if (this.store.isPersistenceUnavailableError(error)) {
+            console.warn("[simulation] Reconcile deferred while PostgreSQL is unavailable:", error);
+            await sleep(250);
+            continue;
+          }
+          throw error;
+        }
       } while (this.reconcileQueued);
     } finally {
       this.reconcileRunning = false;
@@ -1670,7 +1931,10 @@ export class SimulationEngine {
     const fallbackTokenId =
       side === "UP" ? this.polymarketState.currentMarket?.upTokenId : this.polymarketState.currentMarket?.downTokenId;
     const fallbackMatchesToken = !tokenId || !fallbackTokenId || tokenId === fallbackTokenId;
-    const fallbackFreshMs = Math.max(this.config.polymarketBookPollMs * 3, EXECUTION_BOOK_FRESHNESS_FLOOR_MS);
+      const fallbackFreshMs = Math.max(
+        (this.config.polymarketBookCalibrationMs || this.config.polymarketBookPollMs) * 3,
+        EXECUTION_BOOK_FRESHNESS_FLOOR_MS
+      );
     const fallbackAgeMs = Math.max(Date.now() - fallback.snapshotTs, 0);
 
     if (fallbackMatchesToken && hasOrderBookDepth(fallback)) {
@@ -1804,24 +2068,29 @@ export class SimulationEngine {
     order.unfilledQty = 0;
     order.notionalUsdc = roundNumber(estimate.matchedNotional, 2);
     order.avgFillPrice = estimate.avgPrice ? roundNumber(estimate.avgPrice, 4) : undefined;
+    order.actualFee = roundCurrency(estimate.estimatedFee ?? order.actualFee ?? 0);
+    order.estimatedFee = roundCurrency(order.actualFee);
+    order.feeBreakdown = estimate.feeBreakdown ?? order.feeBreakdown;
+    order.feeCurrency = "USD";
     order.failureReason = undefined;
     order.partialFilled = false;
     order.serverPublishTs = Date.now();
 
     if (order.action === "buy") {
       const spend = roundNumber(estimate.matchedNotional, 2);
+      const totalSpend = roundCurrency(spend + (order.actualFee ?? 0));
       if (order.frozenUsdc && order.frozenUsdc > 0) {
-        user.availableUsdc = roundNumber(user.availableUsdc + Math.max(order.frozenUsdc - spend, 0), 2);
+        user.availableUsdc = roundCurrency(user.availableUsdc + order.frozenUsdc - totalSpend);
         order.frozenUsdc = 0;
       } else {
-        user.availableUsdc = roundNumber(user.availableUsdc - spend, 2);
+        user.availableUsdc = roundCurrency(user.availableUsdc - totalSpend);
       }
       const position = this.upsertBuyPosition(
         user.id,
         round.id,
         order.side,
         order.filledQty,
-        estimate.matchedNotional,
+        roundCurrency(estimate.matchedNotional + (order.actualFee ?? 0)),
         order.midPrice || order.avgFillPrice || 0
       );
       await Promise.all([
@@ -1836,6 +2105,7 @@ export class SimulationEngine {
     }
 
     let remainingQty = order.filledQty;
+    const feePerQty = (order.actualFee ?? 0) / Math.max(order.filledQty, QTY_EPSILON);
     const proceedsPerQty = estimate.matchedNotional / Math.max(order.filledQty, QTY_EPSILON);
     const positions = this.scopedPositions(user.id, round.id, order.side, positionIds);
     const changedPositions: PositionRecord[] = [];
@@ -1850,7 +2120,9 @@ export class SimulationEngine {
       if (take <= QTY_EPSILON) {
         continue;
       }
-      const proceeds = roundNumber(take * proceedsPerQty, 8);
+      const grossProceeds = roundNumber(take * proceedsPerQty, 8);
+      const allocatedFee = roundNumber(take * feePerQty, 8);
+      const proceeds = roundNumber(grossProceeds - allocatedFee, 8);
       const releasedCost = roundNumber(position.averageEntry * take, 8);
       const realizedPnl = proceeds - releasedCost;
       position.qty = roundNumber(Math.max(position.qty - take, 0), 4);
@@ -1880,7 +2152,7 @@ export class SimulationEngine {
     if (remainingQty > QTY_EPSILON) {
       throw new Error("Filled sell order could not be applied to local positions.");
     }
-    user.availableUsdc = roundNumber(user.availableUsdc + estimate.matchedNotional, 2);
+    user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
     await Promise.all([
       ...changedPositions.map((position) => this.store.persistPosition(position)),
@@ -1892,7 +2164,8 @@ export class SimulationEngine {
         side: order.side,
         qty: order.filledQty,
         exitType,
-        exitTokenPrice: order.avgFillPrice
+        exitTokenPrice: order.avgFillPrice,
+        exitFee: order.actualFee ?? 0
       })
     ]);
     if (emitUserPayload) {
@@ -1940,12 +2213,14 @@ export class SimulationEngine {
       volumeTokenQty: order.filledQty,
       remainingTokenQty: order.filledQty,
       closedTokenQty: 0,
-      positionNotional: order.notionalUsdc,
+      positionNotional: roundCurrency(order.notionalUsdc + (order.actualFee ?? 0)),
       exitNotional: 0,
       orderBookSnapshotRef: order.orderBookSnapshotRef,
       actualFillPrice: order.avgFillPrice,
       slippageBps: order.slippageBps,
       matchLatencyMs: order.matchLatencyMs,
+      entryFee: order.actualFee ?? 0,
+      feeCurrency: order.feeCurrency,
       createdAt: now,
       updatedAt: now
     });
@@ -1990,7 +2265,13 @@ export class SimulationEngine {
       if (!triggerReached) {
         continue;
       }
-      const estimate = this.createTriggeredLimitEstimate(order, currentOdds, Date.now());
+      const marketInfo = clobMarketInfoFor(this.polymarketState.currentMarket);
+      const estimate = this.createTriggeredLimitEstimate(
+        order,
+        currentOdds,
+        Date.now(),
+        marketInfo
+      );
 
       order.bookHash = book.snapshotId;
       order.bestBid = book.bestBid;
@@ -2059,12 +2340,24 @@ export class SimulationEngine {
     }
   }
 
-  private createTriggeredLimitEstimate(order: OrderRecord, price: number, executedAt: number): ClobExecutionEstimate {
+  private createTriggeredLimitEstimate(
+    order: OrderRecord,
+    price: number,
+    executedAt: number,
+    marketInfo: ClobMarketInfo
+  ): ClobExecutionEstimate {
     const qty =
       order.action === "buy"
-        ? roundNumber((order.frozenUsdc || order.requestedAmountUsdc || order.notionalUsdc) / Math.max(price, 0.0001), 4)
+        ? roundNumber((order.requestedAmountUsdc || order.notionalUsdc) / Math.max(price, 0.0001), 4)
         : roundNumber(order.frozenQty || order.requestedQty || order.expectedQty, 4);
     const matchedNotional = roundNumber(qty * price, 2);
+    const feeResult = calculateClobFee({
+      role: "taker",
+      marketInfo,
+      price,
+      quantity: qty,
+      notional: matchedNotional
+    });
     return {
       fullyMatched: true,
       fills: [
@@ -2085,7 +2378,9 @@ export class SimulationEngine {
       remainingQty: 0,
       remainingNotional: 0,
       avgPrice: roundNumber(price, 4),
-      worstPrice: roundNumber(price, 4)
+      worstPrice: roundNumber(price, 4),
+      estimatedFee: feeResult.fee,
+      feeBreakdown: feeResult.breakdown
     };
   }
 
@@ -2182,16 +2477,43 @@ export class SimulationEngine {
   private async reconcileOnce() {
     await this.syncDiscoveredRounds();
     await this.syncCurrentRoundMarket();
-    await this.capturePriceToBeat();
     const roundChangedUsers = await this.processRounds();
     const snapshot = this.buildSnapshot();
     const changedUsers = this.refreshOpenPositions(snapshot);
     await this.store.setMarketSnapshot(snapshot);
-    await this.emitLatencyLogs(snapshot);
+    this.scheduleLatencyLogs(snapshot);
     for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
       this.store.emitUserPayload(userId);
     }
     this.schedulePendingOrderProcessing();
+  }
+
+  private scheduleLatencyLogs(snapshot: MarketSnapshot) {
+    this.queuedLatencySnapshot = snapshot;
+    if (this.latencyLogsRunning) {
+      return;
+    }
+    this.latencyLogsRunning = true;
+    setImmediate(() => {
+      void this.flushLatencyLogs();
+    });
+  }
+
+  private async flushLatencyLogs() {
+    try {
+      while (this.queuedLatencySnapshot) {
+        const snapshot = this.queuedLatencySnapshot;
+        this.queuedLatencySnapshot = undefined;
+        await this.emitLatencyLogs(snapshot);
+      }
+    } catch (error) {
+      console.warn("[simulation] Latency log flush failed:", error);
+    } finally {
+      this.latencyLogsRunning = false;
+      if (this.queuedLatencySnapshot) {
+        this.scheduleLatencyLogs(this.queuedLatencySnapshot);
+      }
+    }
   }
 
   private async syncDiscoveredRounds() {
@@ -2212,12 +2534,10 @@ export class SimulationEngine {
         downTokenId: discovered.downTokenId ?? existing?.downTokenId,
         title: discovered.title ?? existing?.title,
         resolutionSource: discovered.resolutionSource ?? existing?.resolutionSource,
-        priceToBeat:
-          existing?.priceToBeat && existing.priceToBeat > 0
-            ? existing.priceToBeat
-            : discovered.startAt <= now && discovered.endAt > now
-              ? this.captureReferencePrice().price
-              : 0,
+        priceToBeat: existing?.priceToBeat && existing.priceToBeat > 0 ? existing.priceToBeat : 0,
+        priceToBeatSource: existing?.priceToBeat && existing.priceToBeat > 0 ? existing.priceToBeatSource : undefined,
+        priceToBeatCapturedAt:
+          existing?.priceToBeat && existing.priceToBeat > 0 ? existing.priceToBeatCapturedAt : undefined,
         status: existing?.status ?? discovered.status,
         pollCount: existing?.pollCount ?? discovered.pollCount,
         pollStartAt: existing?.pollStartAt,
@@ -2252,43 +2572,6 @@ export class SimulationEngine {
     }
   }
 
-  private async capturePriceToBeat() {
-    const now = Date.now();
-    const activeRound = this.store.rounds.find((round) => round.startAt <= now && round.endAt > now);
-    if (!activeRound || activeRound.priceToBeat > 0) {
-      return;
-    }
-
-    const reference = this.captureReferencePrice();
-    if (reference.price <= 0) {
-      return;
-    }
-
-    activeRound.priceToBeat = reference.price;
-    await this.store.upsertRound(activeRound);
-    await this.writeAuditLog({
-      eventId: this.store.newId("evt"),
-      traceId: this.store.newTraceId(),
-      category: "operation",
-      actionType: "capture_price_to_beat",
-      actionStatus: "success",
-      pageName: "trade.main",
-      moduleName: "round.lifecycle",
-      symbol: activeRound.symbol,
-      roundId: activeRound.id,
-      serverRecvTs: now,
-      serverPublishTs: now,
-      backendLatencyMs: 0,
-      resultCode: "PRICE_TO_BEAT_CAPTURED",
-      resultMessage: `Captured round reference price from ${reference.source}.`,
-      details: {
-        marketSlug: activeRound.marketSlug,
-        priceToBeat: activeRound.priceToBeat,
-        source: reference.source
-      }
-    });
-  }
-
   private async processRounds() {
     const now = Date.now();
     const changedUsers = new Set<string>();
@@ -2305,13 +2588,6 @@ export class SimulationEngine {
         this.applyMarketMetadata(round, liveDetail);
       }
 
-      if (!round.priceToBeat && round.startAt <= now && round.endAt > now) {
-        const reference = this.captureReferencePrice();
-        if (reference.price > 0) {
-          round.priceToBeat = reference.price;
-        }
-      }
-
       if (!round.binanceOpenPrice && round.startAt <= now && this.binanceState.price > 0) {
         round.binanceOpenPrice = roundNumber(round.priceToBeat || this.binanceState.price, 2);
       }
@@ -2325,6 +2601,7 @@ export class SimulationEngine {
         round.closingPriceSource = "Gamma";
       }
       await this.hydrateRoundPolymarketReferencePrices(round, now);
+      this.syncPriceToBeatFromPolymarketOpenPrice(round, now);
       this.refreshPreliminarySettlement(round, now);
 
       const resolved = this.findResolvedMarketForRound(round);
@@ -2334,8 +2611,10 @@ export class SimulationEngine {
         this.roundMatchesResolvedMarket(round, resolved)
       ) {
         if (now >= round.endAt && round.status !== "Closed") {
-          this.finalizeSettlementFromResolved(round, resolved);
-          await this.writeSettlementLog(round, "success", "Polymarket market_resolved event confirmed settlement.");
+          const confirmed = this.confirmSettlementFromResolved(round, resolved);
+          if (confirmed) {
+            await this.writeSettlementLog(round, "success", "Polymarket market_resolved event confirmed settlement.");
+          }
         }
       }
 
@@ -2348,11 +2627,7 @@ export class SimulationEngine {
         this.scheduleSettlementPoll(round, now);
       }
 
-      if (round.status === "Settled") {
-        round.redeemStartTs = round.redeemStartTs ?? round.settlementReceivedAt ?? round.settlementTs ?? now;
-        round.redeemScheduledAt = round.redeemScheduledAt ?? round.redeemStartTs + REDEEM_DELAY_MS;
-        round.status = "Redeeming";
-      }
+      this.scheduleRedeem(round, now);
 
       if (round.status === "Redeeming" && round.redeemStartTs && !round.redeemScheduledAt) {
         round.redeemScheduledAt = round.redeemStartTs + REDEEM_DELAY_MS;
@@ -2387,6 +2662,13 @@ export class SimulationEngine {
       .then(async () => {
         if (this.roundSignature(round) !== before) {
           await this.store.upsertRound(round);
+          if (typeof (this.store as unknown as { getCurrentRound?: unknown }).getCurrentRound === "function") {
+            try {
+              await this.store.setMarketSnapshot(this.buildSnapshot());
+            } catch (error) {
+              console.warn(`[simulation] Settlement market snapshot refresh failed for ${round.id}:`, error);
+            }
+          }
           for (const userId of this.collectRoundPositionUsers(round.id)) {
             this.store.emitUserPayload(userId);
           }
@@ -2401,6 +2683,14 @@ export class SimulationEngine {
   private shouldPrefetchGamma(round: RoundRecord, now: number) {
     const remainingMs = round.endAt - now;
     return remainingMs <= GAMMA_PREFETCH_START_MS && remainingMs >= GAMMA_PREFETCH_END_MS && !round.settledSide;
+  }
+
+  private gammaPollIntervalFor(round: RoundRecord, now: number) {
+    const remainingMs = round.endAt - now;
+    if (remainingMs > GAMMA_PREFETCH_FAST_START_MS) {
+      return GAMMA_PREFETCH_INTERVAL_MS;
+    }
+    return this.config.gammaPollIntervalMs;
   }
 
   private recordChainlinkSample(price: number, ts = Date.now()) {
@@ -2440,6 +2730,58 @@ export class SimulationEngine {
     }
   }
 
+  private recordCurrentRoundUpPricePoint(round: RoundRecord | undefined, price: number, ts: number) {
+    if (!round || !Number.isFinite(price) || price <= 0) {
+      this.currentRoundUpPriceSeries = [];
+      this.currentRoundUpPriceSeriesRoundId = undefined;
+      return;
+    }
+    if (this.currentRoundUpPriceSeriesRoundId !== round.id) {
+      this.currentRoundUpPriceSeriesRoundId = round.id;
+      this.currentRoundUpPriceSeries = [];
+    }
+    const clampedTs = Math.max(round.startAt, Math.min(ts, round.endAt));
+    const normalizedPrice = roundNumber(price, 4);
+    const lastPoint = this.currentRoundUpPriceSeries.at(-1);
+    if (!lastPoint) {
+      this.currentRoundUpPriceSeries = [{ ts: round.startAt, price: normalizedPrice }];
+      if (clampedTs !== round.startAt) {
+        this.currentRoundUpPriceSeries.push({ ts: clampedTs, price: normalizedPrice });
+      }
+      return;
+    }
+    if (clampedTs <= lastPoint.ts) {
+      lastPoint.ts = Math.max(lastPoint.ts, clampedTs);
+      lastPoint.price = normalizedPrice;
+      return;
+    }
+    if (lastPoint.price === normalizedPrice && clampedTs - lastPoint.ts < 1000) {
+      lastPoint.ts = clampedTs;
+      return;
+    }
+    this.currentRoundUpPriceSeries.push({ ts: clampedTs, price: normalizedPrice });
+  }
+
+  private currentRoundUpPriceSeriesSnapshot(round: RoundRecord | undefined, now: number) {
+    if (!round || this.currentRoundUpPriceSeriesRoundId !== round.id || this.currentRoundUpPriceSeries.length === 0) {
+      return [] as CandlePoint[];
+    }
+    const points = this.currentRoundUpPriceSeries
+      .filter((point) => point.ts >= round.startAt && point.ts <= round.endAt)
+      .map(cloneCandlePoint);
+    const lastPoint = points.at(-1);
+    if (lastPoint) {
+      const trailingTs = Math.max(round.startAt, Math.min(now, round.endAt));
+      if (trailingTs > lastPoint.ts) {
+        points.push({
+          ts: trailingTs,
+          price: lastPoint.price
+        });
+      }
+    }
+    return points;
+  }
+
   private buildSnapshot(): MarketSnapshot {
     const now = Date.now();
     const currentRound = this.store.getCurrentRound(now);
@@ -2447,8 +2789,17 @@ export class SimulationEngine {
     const matchedMarket = this.roundMatchesMarket(currentRound, currentMarket) ? currentMarket : undefined;
     const upBook = matchedMarket ? this.getDisplayedBook("UP") : this.createEmptyOrderBook("UP");
     const downBook = matchedMarket ? this.getDisplayedBook("DOWN") : this.createEmptyOrderBook("DOWN");
-    const upPrice = upBook.bestAsk || upBook.midPrice || matchedMarket?.outcomePrices[0] || 0;
-    const downPrice = downBook.bestAsk || downBook.midPrice || matchedMarket?.outcomePrices[1] || 0;
+    const upPrice = isPositivePrice(upBook.bestAsk) ? upBook.bestAsk : 0;
+    const downPrice = isPositivePrice(downBook.bestAsk) ? downBook.bestAsk : 0;
+    const recentTrades = matchedMarket ? [...this.polymarketState.recentTrades] : [];
+    const displayPrices = resolvePairedDisplayPrices({
+      upBook,
+      downBook,
+      recentTrades,
+      outcomePrices: matchedMarket?.outcomePrices
+    });
+    const upDisplayPrice = displayPrices.UP;
+    const downDisplayPrice = displayPrices.DOWN;
     const chainlinkPrice =
       this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
     this.recordChainlinkSample(chainlinkPrice, this.chainlinkState.updatedAt || now);
@@ -2459,15 +2810,36 @@ export class SimulationEngine {
         : currentRound.endAt
       : undefined;
     const countdownMs = countdownTargetTs ? Math.max(Math.min(countdownTargetTs - now, FIVE_MINUTE_MS), 0) : 0;
-    const marketTitle = currentRound
+      const marketTitle = currentRound
       ? `${this.config.symbol} 5-Min Round ${utcRangeText(currentRound.startAt, currentRound.endAt)}`
       : matchedMarket
         ? `${this.config.symbol} 5-Min Round ${utcRangeText(matchedMarket.startAt, matchedMarket.endAt)}`
         : `${this.config.symbol} 5-Min Round UTC`;
-    const candlesByInterval = this.binanceState.candlesByInterval;
-    const recentTrades = matchedMarket ? [...this.polymarketState.recentTrades] : [];
-    const clobDelta = matchedMarket ? roundNumber(this.polymarketState.delta, 4) : 0;
-    const clobVolume = matchedMarket ? roundNumber(this.polymarketState.volume, 4) : 0;
+      const candlesByInterval = this.binanceState.candlesByInterval;
+      const clobDelta = matchedMarket ? roundNumber(this.polymarketState.delta, 4) : 0;
+      const clobVolume = matchedMarket ? roundNumber(this.polymarketState.volume, 4) : 0;
+      const currentRoundUpPrice = upDisplayPrice.value;
+      this.recordCurrentRoundUpPricePoint(currentRound, currentRoundUpPrice, now);
+      const currentRoundUpPriceSeries = this.currentRoundUpPriceSeriesSnapshot(currentRound, now);
+      const marketInfo = clobMarketInfoFor(matchedMarket);
+      const sources = {
+        binance: this.normalizeSourceHealth(this.binanceState.status, now),
+        chainlink: this.normalizeSourceHealth(this.chainlinkState.status, now),
+        clob: this.normalizeSourceHealth(this.polymarketState.status, now)
+      };
+      const latencyBreakdown = {
+        sourceEventAge: {
+          binance: Math.max(now - sources.binance.sourceEventTs, 0),
+          chainlink: Math.max(now - sources.chainlink.sourceEventTs, 0),
+          clob: Math.max(now - sources.clob.sourceEventTs, 0)
+        },
+        serverIngressLatency: {
+          binance: Math.max(sources.binance.serverRecvTs - sources.binance.sourceEventTs, 0),
+          chainlink: Math.max(sources.chainlink.serverRecvTs - sources.chainlink.sourceEventTs, 0),
+          clob: Math.max(sources.clob.serverRecvTs - sources.clob.sourceEventTs, 0)
+        },
+        serverComputeLatency: Math.max(Date.now() - now, 0)
+      };
 
     return {
       symbol: this.config.symbol,
@@ -2484,11 +2856,20 @@ export class SimulationEngine {
       priceToBeat: currentRound?.priceToBeat ?? 0,
       upPrice: roundNumber(upPrice, 4),
       downPrice: roundNumber(downPrice, 4),
-      sources: {
-        binance: this.normalizeSourceHealth(this.binanceState.status, now),
-        chainlink: this.normalizeSourceHealth(this.chainlinkState.status, now),
-        clob: this.normalizeSourceHealth(this.polymarketState.status, now)
+      displayPrices: {
+        UP: upDisplayPrice.value,
+        DOWN: downDisplayPrice.value
       },
+      displayPriceSource: {
+        UP: upDisplayPrice.source,
+        DOWN: downDisplayPrice.source
+      },
+      displayPriceSpread: {
+        UP: upDisplayPrice.spread,
+        DOWN: downDisplayPrice.spread
+      },
+      latencyBreakdown,
+      sources,
       orderBooks: {
         UP: upBook,
         DOWN: downBook
@@ -2505,6 +2886,7 @@ export class SimulationEngine {
         settlementReference: currentRound?.settlementPrice ?? chainlinkPrice,
         candles5s: [...this.chainlinkCandles5s],
         candlesByInterval: {
+          "30s": [...this.chainlinkCandlesByInterval["30s"]],
           "1m": [...this.chainlinkCandlesByInterval["1m"]],
           "5m": [...this.chainlinkCandlesByInterval["5m"]],
           "15m": [...this.chainlinkCandlesByInterval["15m"]],
@@ -2512,13 +2894,15 @@ export class SimulationEngine {
           "1d": []
         }
       },
-      clob: {
-        delta: clobDelta,
-        volume: clobVolume,
-        upBook,
-        downBook,
-        recentTrades,
-        bestBidAskSummary: {
+        clob: {
+          delta: clobDelta,
+          volume: clobVolume,
+          upBook,
+          downBook,
+          recentTrades,
+          currentRoundUpPriceSeries,
+          marketInfo,
+          bestBidAskSummary: {
           UP: {
             bestBid: upBook.bestBid,
             bestAsk: upBook.bestAsk
@@ -2655,30 +3039,40 @@ export class SimulationEngine {
   }
 
   private async pollSettlement(round: RoundRecord, now: number) {
+    if (round.settledSide || round.redeemFinishTs || round.status === "Closed" || round.status === "Manual") {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      return;
+    }
     if ((!round.marketSlug && !round.marketId) || this.pollLocks.has(round.id)) {
       return;
     }
-    const prefetchActive = this.shouldPrefetchGamma(round, now);
-    const pollIntervalMs = prefetchActive ? GAMMA_PREFETCH_INTERVAL_MS : this.config.gammaPollIntervalMs;
-    if (round.lastPollAt && now - round.lastPollAt < pollIntervalMs) {
+    const pollIntervalMs = this.gammaPollIntervalFor(round, now);
+    const formalPollJustOpened = now >= round.endAt && Boolean(round.lastPollAt && round.lastPollAt < round.endAt);
+    if (!formalPollJustOpened && round.lastPollAt && now - round.lastPollAt < pollIntervalMs) {
       return;
     }
     this.pollLocks.add(round.id);
     round.pollCount += 1;
     round.lastPollAt = now;
     round.pollStartAt = round.pollStartAt ?? now;
+    this.gammaSettlementDiagnostics ??= new Set<string>();
+    if (now >= round.endAt && !this.gammaSettlementDiagnostics.has(`${round.id}:formal_poll_started`)) {
+      this.gammaSettlementDiagnostics.add(`${round.id}:formal_poll_started`);
+      void this.writeSettlementDiagnostic(round, "GAMMA_FORMAL_POLL_STARTED", "Gamma formal settlement polling started.");
+    }
 
     try {
-      const detail =
-        round.marketId && String(round.marketId).trim()
-          ? await this.polymarketConnector.fetchMarketById(String(round.marketId))
-          : await this.polymarketConnector.fetchMarketBySlug(String(round.marketSlug));
+      const detail = await this.fetchBestGammaSettlementDetail(round, now);
+      if (!detail) {
+        return;
+      }
       this.applyMarketMetadata(round, detail);
-      const settledSide = this.resolveSettledSide(detail);
-      const settlementPrice = this.confirmedSettlementPrice(detail, settledSide);
-      if (settledSide && typeof settlementPrice === "number") {
-        this.finalizeSettlement(round, detail, settledSide, settlementPrice, now);
-        await this.writeSettlementLog(round, "success", "Gamma market closed and settlement was confirmed.");
+      const settlement = this.resolveTrustedGammaSettlement(round, detail, now);
+      if (settlement) {
+        const confirmed = this.confirmGammaSettlement(round, detail, settlement.side, settlement.price, now);
+        if (confirmed) {
+          await this.writeSettlementLog(round, "success", settlement.message);
+        }
       }
       // If not yet settled, keep polling indefinitely until result comes in.
     } catch (error) {
@@ -2710,7 +3104,46 @@ export class SimulationEngine {
     }
   }
 
-  private finalizeSettlement(
+  private async fetchBestGammaSettlementDetail(round: RoundRecord, now: number) {
+    const tasks: Array<Promise<PolymarketMarketDetail>> = [];
+    const seen = new Set<string>();
+    const marketId = String(round.marketId ?? "").trim();
+    if (marketId) {
+      seen.add(`id:${marketId}`);
+      tasks.push(this.polymarketConnector.fetchMarketById(marketId));
+    }
+    const marketSlug = String(round.marketSlug ?? "").trim();
+    if (marketSlug && !seen.has(`slug:${marketSlug}`)) {
+      tasks.push(this.polymarketConnector.fetchMarketBySlug(marketSlug));
+    }
+    if (!tasks.length) {
+      return undefined;
+    }
+    const settled = await Promise.allSettled(tasks);
+    const details = settled
+      .filter((result): result is PromiseFulfilledResult<PolymarketMarketDetail> => result.status === "fulfilled")
+      .map((result) => result.value);
+    if (!details.length) {
+      const firstError = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (firstError?.reason) {
+        throw firstError.reason;
+      }
+      return undefined;
+    }
+    const winnerDetail = details.find((detail) => this.resolveWinnerSettledSide(detail));
+    if (winnerDetail) {
+      await this.writeGammaObservationOnce(round, "winner", "Gamma winner field was observed.");
+      return winnerDetail;
+    }
+    const exactDetail = details.find((detail) => this.resolveExactOutcomeSettledSide(detail));
+    if (exactDetail && now >= round.endAt) {
+      await this.writeGammaObservationOnce(round, "exact_outcome", "Gamma exact 1/0 outcome prices were observed.");
+      return exactDetail;
+    }
+    return details[0];
+  }
+
+  private confirmGammaSettlement(
     round: RoundRecord,
     detail: PolymarketMarketDetail | undefined,
     settledSide: TradeSide | undefined,
@@ -2718,7 +3151,22 @@ export class SimulationEngine {
     now: number
   ) {
     if (!settledSide || !detail || !Number.isFinite(settlementPrice)) {
-      return;
+      return false;
+    }
+    this.gammaOutcomeConfirmations ??= new Map<string, { side: TradeSide; count: number; observedAt: number }>();
+    if (round.redeemFinishTs || round.status === "Closed") {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      void this.writeSettlementDiagnostic(round, "SETTLEMENT_ALREADY_CLOSED", "Gamma settlement confirmation skipped because the round is already closed.");
+      return false;
+    }
+    if (round.settledSide) {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      if (round.settledSide !== settledSide) {
+        void this.writeSettlementDiagnostic(round, "SETTLEMENT_CONFLICT_SKIPPED", `Gamma settlement conflict skipped: existing ${round.settledSide}, incoming ${settledSide}.`);
+      } else {
+        void this.writeSettlementDiagnostic(round, "SETTLEMENT_DUPLICATE_SKIPPED", "Duplicate Gamma settlement confirmation skipped.");
+      }
+      return false;
     }
     if (!round.closingSpotPrice && this.binanceState.price > 0) {
       round.closingSpotPrice = roundNumber(this.binanceState.price, 2);
@@ -2736,16 +3184,32 @@ export class SimulationEngine {
     round.manualReason = undefined;
     this.getPreliminarySettlements().delete(round.id);
     this.applyMarketMetadata(round, detail);
+    this.gammaOutcomeConfirmations.delete(round.id);
+    this.scheduleRedeem(round, now);
+    return true;
   }
 
-  private finalizeSettlementFromResolved(
+  private confirmSettlementFromResolved(
     round: RoundRecord,
     resolved: NonNullable<PolymarketConnectorState["lastResolvedMarket"]>
   ) {
     if (!resolved.settledSide) {
-      return;
+      return false;
     }
+    this.gammaOutcomeConfirmations ??= new Map<string, { side: TradeSide; count: number; observedAt: number }>();
     const receivedAt = resolved.receivedAt;
+    if (round.redeemFinishTs || round.status === "Closed") {
+      void this.writeSettlementDiagnostic(round, "SETTLEMENT_ALREADY_CLOSED", "Polymarket resolved event skipped because the round is already closed.");
+      return false;
+    }
+    if (round.settledSide) {
+      if (round.settledSide !== resolved.settledSide) {
+        void this.writeSettlementDiagnostic(round, "SETTLEMENT_CONFLICT_SKIPPED", `Polymarket resolved event conflict skipped: existing ${round.settledSide}, incoming ${resolved.settledSide}.`);
+      } else {
+        void this.writeSettlementDiagnostic(round, "SETTLEMENT_DUPLICATE_SKIPPED", "Duplicate Polymarket resolved event skipped.");
+      }
+      return false;
+    }
     if (!round.closingSpotPrice && this.binanceState.price > 0) {
       round.closingSpotPrice = roundNumber(this.binanceState.price, 2);
       round.closingPriceSource = "Gamma";
@@ -2763,12 +3227,28 @@ export class SimulationEngine {
     round.manualReason = undefined;
     round.lastPollAt = undefined;
     this.getPreliminarySettlements().delete(round.id);
+    this.gammaOutcomeConfirmations.delete(round.id);
+    this.scheduleRedeem(round, receivedAt);
+    return true;
+  }
+
+  private scheduleRedeem(round: RoundRecord, now: number) {
+    if (!round.settledSide || round.redeemFinishTs || round.status === "Closed") {
+      return;
+    }
+    const start = round.redeemStartTs ?? round.settlementReceivedAt ?? round.settlementTs ?? now;
+    round.redeemStartTs = start;
+    round.redeemScheduledAt = round.redeemScheduledAt ?? start + REDEEM_DELAY_MS;
+    round.status = "Redeeming";
   }
 
   private async applyRedeem(round: RoundRecord) {
-    if (!round.settledSide || round.redeemFinishTs) {
+    this.redeemLocks ??= new Set<string>();
+    if (!round.settledSide || round.redeemFinishTs || this.redeemLocks.has(round.id)) {
       return;
     }
+    this.redeemLocks.add(round.id);
+    try {
     const closedAt = Date.now();
     const userIds = new Set<string>();
     const positions = this.store.positions.filter(
@@ -2897,6 +3377,10 @@ export class SimulationEngine {
     for (const userId of userIds) {
       this.store.emitUserPayload(userId);
     }
+    await this.publishSettlementMarketSnapshot(round, "redeem_completed");
+    } finally {
+      this.redeemLocks.delete(round.id);
+    }
   }
 
   private upsertBuyPosition(
@@ -2939,41 +3423,11 @@ export class SimulationEngine {
     return position;
   }
 
-  private captureReferencePrice() {
-    if (this.config.chainlinkEnabled && this.chainlinkState.price > 0) {
-      return {
-        price: roundNumber(this.chainlinkState.price, 2),
-        source: "Chainlink" as const
-      };
-    }
-    if (this.binanceState.price > 0) {
-      return {
-        price: roundNumber(this.binanceState.price, 2),
-        source: "Binance" as const
-      };
-    }
-    return {
-      price: 0,
-      source: "Unavailable" as const
-    };
-  }
-
-  private resolveSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
-    // Tier 1: outcomePrices — the primary resolution signal for BTC 5m markets.
-    // Check optimistically first (no need for closed flag), then with closed/automaticallyResolved.
-    const [upPrice, downPrice] = detail.outcomePrices;
-    if (upPrice >= 0.99 && downPrice <= 0.01) return "UP";
-    if (downPrice >= 0.99 && upPrice <= 0.01) return "DOWN";
-    if (detail.closed || detail.automaticallyResolved) {
-      if (upPrice === 1 && downPrice === 0) return "UP";
-      if (downPrice === 1 && upPrice === 0) return "DOWN";
-    }
-    // Tier 2: winningTokenId
+  private resolveWinnerSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
     if (detail.winningTokenId) {
       if (detail.winningTokenId === detail.upTokenId) return "UP";
       if (detail.winningTokenId === detail.downTokenId) return "DOWN";
     }
-    // Tier 3: winningOutcome text
     if (detail.winningOutcome) {
       const normalized = detail.winningOutcome.toLowerCase();
       if (normalized === detail.upOutcome.toLowerCase() || normalized.includes("up") || normalized.includes("above")) return "UP";
@@ -2982,23 +3436,75 @@ export class SimulationEngine {
     return undefined;
   }
 
-  private confirmedSettlementPrice(detail: PolymarketMarketDetail, settledSide?: TradeSide) {
-    if (!settledSide) return undefined;
-    if (detail.closed || detail.settlementStatus === "resolved" || detail.automaticallyResolved) {
-      if (typeof detail.settlementPrice === "number" && Number.isFinite(detail.settlementPrice)) {
-        return detail.settlementPrice;
-      }
-    }
-    return settledSide === "UP" ? 1 : 0;
+  private resolveExactOutcomeSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
+    const [upPrice, downPrice] = detail.outcomePrices;
+    if (upPrice === 1 && downPrice === 0) return "UP";
+    if (downPrice === 1 && upPrice === 0) return "DOWN";
+    return undefined;
   }
 
-  private resolveClobSettledSide(round: RoundRecord): TradeSide | undefined {
-    const prices = this.pricesForPreliminarySettlement(round);
-    if (!prices) return undefined;
-    // Require >99% confidence from CLOB for immediate settlement.
-    if (prices.upPrice >= 0.99 && prices.downPrice <= 0.01) return "UP";
-    if (prices.downPrice >= 0.99 && prices.upPrice <= 0.01) return "DOWN";
-    return undefined;
+  private settlementPriceForSide(detail: PolymarketMarketDetail, side: TradeSide) {
+    return typeof detail.settlementPrice === "number" && Number.isFinite(detail.settlementPrice)
+      ? detail.settlementPrice
+      : side === "UP"
+        ? 1
+        : 0;
+  }
+
+  private confirmExactGammaOutcome(roundId: string, side: TradeSide, now: number) {
+    this.gammaOutcomeConfirmations ??= new Map<string, { side: TradeSide; count: number; observedAt: number }>();
+    const previous = this.gammaOutcomeConfirmations.get(roundId);
+    if (!previous || previous.side !== side || now - previous.observedAt > 10_000) {
+      this.gammaOutcomeConfirmations.set(roundId, { side, count: 1, observedAt: now });
+      return false;
+    }
+    const next = { side, count: previous.count + 1, observedAt: now };
+    this.gammaOutcomeConfirmations.set(roundId, next);
+    return next.count >= 2;
+  }
+
+  private resolveTrustedGammaSettlement(
+    round: RoundRecord,
+    detail: PolymarketMarketDetail,
+    now: number
+  ): { side: TradeSide; price: number; message: string } | undefined {
+    if (now < round.endAt) {
+      return undefined;
+    }
+
+    const winnerSide = this.resolveWinnerSettledSide(detail);
+    if (winnerSide) {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      return {
+        side: winnerSide,
+        price: this.settlementPriceForSide(detail, winnerSide),
+        message: "Gamma winner field confirmed settlement."
+      };
+    }
+
+    const exactOutcomeSide = this.resolveExactOutcomeSettledSide(detail);
+    if (!exactOutcomeSide) {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      return undefined;
+    }
+
+    if (detail.closed || detail.settlementStatus === "resolved" || detail.automaticallyResolved) {
+      this.gammaOutcomeConfirmations.delete(round.id);
+      return {
+        side: exactOutcomeSide,
+        price: this.settlementPriceForSide(detail, exactOutcomeSide),
+        message: "Gamma resolved market detail confirmed settlement."
+      };
+    }
+
+    if (!this.confirmExactGammaOutcome(round.id, exactOutcomeSide, now)) {
+      return undefined;
+    }
+    return {
+      side: exactOutcomeSide,
+      price: this.settlementPriceForSide(detail, exactOutcomeSide),
+      message: "Gamma exact outcome prices confirmed settlement on consecutive polls."
+    };
   }
 
   private refreshPreliminarySettlement(round: RoundRecord, now: number) {
@@ -3008,34 +3514,78 @@ export class SimulationEngine {
       }
       return;
     }
-    if (this.getPreliminarySettlements().has(round.id)) {
-      return;
+    const preview = this.createPreliminarySettlementPreview(round, now);
+    if (preview) {
+      this.getPreliminarySettlements().set(round.id, preview);
+    }
+  }
+
+  private createPreliminarySettlementPreview(round: RoundRecord, now: number): SettlementPreview | undefined {
+    if (round.settledSide || round.status === "Closed" || round.status === "Manual" || now < round.endAt) {
+      return undefined;
     }
     const prices = this.pricesForPreliminarySettlement(round);
-    if (!prices) {
-      return;
+    const binancePrice = this.preliminaryBinancePrice(round);
+    const binanceSide = this.preliminaryBinanceSide(round, binancePrice);
+    if (!prices && !binanceSide) {
+      return undefined;
     }
-    const side =
-      prices.upPrice > PRELIMINARY_SETTLEMENT_THRESHOLD
+    const tokenSide = prices
+      ? prices.upPrice > PRELIMINARY_SETTLEMENT_THRESHOLD
         ? "UP"
         : prices.downPrice > PRELIMINARY_SETTLEMENT_THRESHOLD
           ? "DOWN"
-          : undefined;
-    if (!side) {
-      return;
+          : undefined
+      : undefined;
+    if (!tokenSide && !binanceSide) {
+      return undefined;
     }
-    const price = side === "UP" ? prices.upPrice : prices.downPrice;
-    this.getPreliminarySettlements().set(round.id, {
+    const side = tokenSide === binanceSide ? tokenSide : tokenSide ?? binanceSide;
+    if (!side) return undefined;
+    const price = prices ? (side === "UP" ? prices.upPrice : prices.downPrice) : undefined;
+    const confidence =
+      tokenSide && binanceSide
+        ? tokenSide === binanceSide
+          ? "aligned"
+          : "conflict"
+        : tokenSide
+          ? "token_only"
+          : "binance_only";
+    return {
       roundId: round.id,
       state: "preliminary",
       side,
       price,
       source: "CLOB",
       detectedAt: now,
-      upPrice: prices.upPrice,
-      downPrice: prices.downPrice,
-      message: `Preliminary ${side} from CLOB odds above 97%.`
-    });
+      upPrice: prices?.upPrice,
+      downPrice: prices?.downPrice,
+      tokenSide,
+      binanceSide,
+      binancePrice,
+      priceToBeat: round.priceToBeat,
+      confidence,
+      conflictReason:
+        confidence === "conflict"
+          ? `Token indicates ${tokenSide}; Binance close ${binancePrice ?? "--"} vs PTB ${round.priceToBeat} indicates ${binanceSide}.`
+          : undefined,
+      message:
+        confidence === "conflict"
+          ? "Preliminary conflict between CLOB token price and Binance/PTB direction."
+          : `Preliminary ${side} from ${confidence === "aligned" ? "CLOB token price and Binance/PTB" : tokenSide ? "CLOB token price" : "Binance/PTB"}.`
+    };
+  }
+
+  private preliminaryBinancePrice(round: RoundRecord) {
+    const price = round.closingSpotPrice ?? round.binanceClosePrice ?? this.binanceState.price;
+    return isBtcReferencePrice(price) ? roundNumber(price, 2) : undefined;
+  }
+
+  private preliminaryBinanceSide(round: RoundRecord, price?: number): TradeSide | undefined {
+    if (!isBtcReferencePrice(price) || !isBtcReferencePrice(round.priceToBeat)) {
+      return undefined;
+    }
+    return price >= round.priceToBeat ? "UP" : "DOWN";
   }
 
   private pricesForPreliminarySettlement(round: RoundRecord) {
@@ -3152,6 +3702,21 @@ export class SimulationEngine {
     };
   }
 
+  private syncPriceToBeatFromPolymarketOpenPrice(round: RoundRecord, now: number) {
+    if (!isBtcReferencePrice(round.polymarketOpenPrice)) {
+      return;
+    }
+    const officialPriceToBeat = roundNumber(round.polymarketOpenPrice, 2);
+    const isSamePrice =
+      isBtcReferencePrice(round.priceToBeat) && Math.abs(round.priceToBeat - officialPriceToBeat) < 0.005;
+    if (isSamePrice && round.priceToBeatSource && round.priceToBeatCapturedAt) {
+      return;
+    }
+    round.priceToBeat = officialPriceToBeat;
+    round.priceToBeatSource = round.polymarketOpenPriceSource ?? "Gamma";
+    round.priceToBeatCapturedAt = now;
+  }
+
   private async hydrateRoundPolymarketReferencePrices(round: RoundRecord, now: number) {
     if (!isBtcReferencePrice(round.polymarketOpenPrice)) {
       round.polymarketOpenPrice = undefined;
@@ -3164,20 +3729,29 @@ export class SimulationEngine {
     // Use Gamma API reference prices from the live market detail (extracted from Polymarket metadata).
     const liveDetail =
       this.polymarketState.currentMarket?.slug === round.marketSlug ? this.polymarketState.currentMarket : undefined;
-    if (!round.polymarketOpenPrice && liveDetail?.referenceOpenPrice && round.startAt <= now) {
-      round.polymarketOpenPrice = roundNumber(liveDetail.referenceOpenPrice, 2);
-      round.polymarketOpenPriceSource = liveDetail.referenceOpenPriceSource ?? "Gamma";
+    if (isBtcReferencePrice(liveDetail?.referenceOpenPrice) && round.startAt <= now) {
+      const liveOpenPrice = roundNumber(liveDetail.referenceOpenPrice, 2);
+      const shouldUseLiveOpenPrice =
+        !isBtcReferencePrice(round.polymarketOpenPrice) ||
+        Math.abs(round.polymarketOpenPrice - liveOpenPrice) >= 0.005 ||
+        !round.polymarketOpenPriceSource;
+      if (shouldUseLiveOpenPrice) {
+        round.polymarketOpenPrice = liveOpenPrice;
+        round.polymarketOpenPriceSource = liveDetail.referenceOpenPriceSource ?? "Gamma";
+      }
     }
     if (!round.polymarketClosePrice && liveDetail?.referenceClosePrice && now >= round.endAt) {
       round.polymarketClosePrice = roundNumber(liveDetail.referenceClosePrice, 2);
       round.polymarketClosePriceSource = liveDetail.referenceClosePriceSource ?? "Gamma";
     }
     const resolutionSource = liveDetail?.resolutionSource ?? round.resolutionSource;
+    const isActiveRound = round.startAt <= now && round.endAt > now;
     if (!round.polymarketOpenPrice && round.startAt <= now) {
       let openReference;
       try {
         openReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.startAt, {
-          resolutionSource
+          resolutionSource,
+          historyCacheMs: isActiveRound ? 2_000 : undefined
         });
       } catch (error) {
         console.warn(`[simulation] Failed to resolve Chainlink opening reference for ${round.id}:`, error);
@@ -3228,6 +3802,8 @@ export class SimulationEngine {
       round.startAt,
       round.endAt,
       round.priceToBeat,
+      round.priceToBeatSource,
+      round.priceToBeatCapturedAt,
       round.status,
       round.pollCount,
       round.pollStartAt,
@@ -3297,6 +3873,59 @@ export class SimulationEngine {
 
   private async writeAuditLog(event: AuditEvent) {
     await this.store.recordLog(event);
+  }
+
+  private async publishSettlementMarketSnapshot(round: RoundRecord, reason: string) {
+    if (typeof (this.store as unknown as { getCurrentRound?: unknown }).getCurrentRound !== "function") {
+      return;
+    }
+    try {
+      await this.store.setMarketSnapshot(this.buildSnapshot());
+    } catch (error) {
+      console.warn(`[simulation] Settlement market snapshot publish failed for ${round.id} (${reason}):`, error);
+    }
+  }
+
+  private async writeSettlementDiagnostic(round: RoundRecord, code: string, message: string) {
+    this.gammaSettlementDiagnostics ??= new Set<string>();
+    const key = `${round.id}:${code}:${round.settledSide ?? "none"}:${round.status}`;
+    if (this.gammaSettlementDiagnostics.has(key)) {
+      return;
+    }
+    this.gammaSettlementDiagnostics.add(key);
+    try {
+      const now = Date.now();
+      await this.writeAuditLog({
+        eventId: this.store.newId("evt"),
+        traceId: this.store.newTraceId(),
+        category: "settlement",
+        actionType: "poll_settlement",
+        actionStatus: "success",
+        pageName: "trade.main",
+        moduleName: "settlement.engine",
+        symbol: round.symbol,
+        roundId: round.id,
+        serverRecvTs: now,
+        serverPublishTs: now,
+        backendLatencyMs: 0,
+        resultCode: code,
+        resultMessage: message,
+        details: {
+          roundId: round.id,
+          marketId: round.marketId,
+          marketSlug: round.marketSlug,
+          pollCount: round.pollCount,
+          status: round.status,
+          settledSide: round.settledSide
+        }
+      });
+    } catch (error) {
+      console.warn(`[simulation] Settlement diagnostic log failed for ${round.id}:`, error);
+    }
+  }
+
+  private async writeGammaObservationOnce(round: RoundRecord, observation: string, message: string) {
+    await this.writeSettlementDiagnostic(round, `GAMMA_${observation.toUpperCase()}_OBSERVED`, message);
   }
 
   private async writeSettlementLog(

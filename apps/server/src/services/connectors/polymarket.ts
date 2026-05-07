@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import type { Agent } from "node:http";
 import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from "./network";
 import type {
+  ClobMarketInfo,
   MarketTrade,
   OrderBookSnapshot,
   PolymarketConnectorState,
@@ -32,6 +33,28 @@ interface DetailedMarketPayload {
   bestBid?: number;
   bestAsk?: number;
   lastTradePrice?: number;
+  minimum_tick_size?: number | string;
+  minimumTickSize?: number | string;
+  minimum_order_size?: number | string;
+  minimumOrderSize?: number | string;
+  fee_rate_bps?: number | string;
+  feeRateBps?: number | string;
+  fee_details?: Record<string, unknown>;
+  feeDetails?: Record<string, unknown>;
+  fee_schedule?: {
+    rate?: number | string;
+    exponent?: number | string;
+    takerOnly?: boolean | string;
+    taker_only?: boolean | string;
+  };
+  feeSchedule?: {
+    rate?: number | string;
+    exponent?: number | string;
+    takerOnly?: boolean | string;
+    taker_only?: boolean | string;
+  };
+  rfq_enabled?: boolean;
+  rfqEnabled?: boolean;
   acceptingOrders?: boolean;
   closed?: boolean;
   winner?: string;
@@ -88,6 +111,214 @@ function emptyBook(side: TradeSide): OrderBookSnapshot {
     midPrice: 0,
     bids: [],
     asks: []
+  };
+}
+
+function normalizeWsTimestamp(value: unknown, fallback = Date.now()) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return normalizeWsTimestamp(numeric, fallback);
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return value < 10_000_000_000 ? Math.round(value * 1000) : Math.round(value);
+}
+
+function recomputeBookTop(book: Pick<OrderBookSnapshot, "bids" | "asks">) {
+  const bids = [...book.bids]
+    .filter((level) => level.price > 0 && level.qty > 0)
+    .sort((left, right) => right.price - left.price);
+  const asks = [...book.asks]
+    .filter((level) => level.price > 0 && level.qty > 0)
+    .sort((left, right) => left.price - right.price);
+  const bestBid = bids[0]?.price ?? 0;
+  const bestAsk = asks[0]?.price ?? 0;
+  return {
+    bids,
+    asks,
+    bestBid,
+    bestAsk,
+    midPrice: bestBid && bestAsk ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : bestBid || bestAsk
+  };
+}
+
+function applyTopToBook(
+  book: OrderBookSnapshot,
+  input: { bestBid?: number; bestAsk?: number; snapshotTs: number; snapshotId?: string }
+): OrderBookSnapshot | undefined {
+  if (input.snapshotTs < book.snapshotTs) {
+    return undefined;
+  }
+  const bestBid = typeof input.bestBid === "number" && Number.isFinite(input.bestBid) && input.bestBid > 0
+    ? input.bestBid
+    : book.bestBid;
+  const bestAsk = typeof input.bestAsk === "number" && Number.isFinite(input.bestAsk) && input.bestAsk > 0
+    ? input.bestAsk
+    : book.bestAsk;
+  return {
+    ...book,
+    snapshotId: input.snapshotId ?? `ws_top_${input.snapshotTs}`,
+    snapshotTs: input.snapshotTs,
+    bestBid,
+    bestAsk,
+    midPrice: bestBid && bestAsk ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : bestBid || bestAsk
+  };
+}
+
+function upsertBookLevel(
+  levels: Array<{ price: number; qty: number }>,
+  input: { price: number; qty: number }
+) {
+  const nextLevels = levels.filter((level) => Math.abs(level.price - input.price) > 0.0000001);
+  if (input.qty > 0) {
+    nextLevels.push({ price: input.price, qty: input.qty });
+  }
+  return nextLevels;
+}
+
+function applyPriceChangeToBook(
+  book: OrderBookSnapshot,
+  input: { side: "BUY" | "SELL"; price: number; qty: number; snapshotTs: number; snapshotId?: string }
+): OrderBookSnapshot | undefined {
+  if (input.snapshotTs < book.snapshotTs) {
+    return undefined;
+  }
+  const nextBook =
+    input.side === "BUY"
+      ? { ...book, bids: upsertBookLevel(book.bids, input) }
+      : { ...book, asks: upsertBookLevel(book.asks, input) };
+  const top = recomputeBookTop(nextBook);
+  return {
+    ...nextBook,
+    ...top,
+    snapshotId: input.snapshotId ?? `ws_delta_${input.snapshotTs}`,
+    snapshotTs: input.snapshotTs
+  };
+}
+
+function numberFromUnknown(value: unknown): number | undefined {
+  const parsed = typeof value === "string" || typeof value === "number" ? Number(value) : undefined;
+  return typeof parsed === "number" && Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function decimalFeeRateFromUnknown(value: unknown): number | undefined {
+  const parsed = numberFromUnknown(value);
+  if (typeof parsed !== "number") {
+    return undefined;
+  }
+  return parsed > 1 ? parsed / 10_000 : parsed;
+}
+
+function boolFromUnknown(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes"].includes(normalized)) return true;
+    if (["false", "0", "no"].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+function conservativeMarketInfo(conditionId?: string): ClobMarketInfo {
+  return {
+    conditionId,
+    minimumTickSize: 0.01,
+    minimumOrderSize: 1,
+    makerFeeRate: 0,
+    takerFeeRate: 0,
+    platformFeeRate: 0,
+    platformFeeExponent: 1,
+    platformFeeTakerOnly: true,
+    feeRateAvailable: false,
+    source: "conservative",
+    conservative: true,
+    updatedAt: Date.now()
+  };
+}
+
+function normalizeMarketInfo(input: Record<string, unknown>, conditionId?: string, source: ClobMarketInfo["source"] = "clob"): ClobMarketInfo {
+  const minimumTickSize =
+    numberFromUnknown(input.minimum_tick_size) ??
+    numberFromUnknown(input.minimumTickSize) ??
+    numberFromUnknown(input.mts) ??
+    0.01;
+  const minimumOrderSize =
+    numberFromUnknown(input.minimum_order_size) ??
+    numberFromUnknown(input.minimumOrderSize) ??
+    numberFromUnknown(input.mos) ??
+    1;
+  const feeRateBps = numberFromUnknown(input.fee_rate_bps) ?? numberFromUnknown(input.feeRateBps);
+  const feeDetails = (input.fee_details ?? input.feeDetails ?? input.fd) as Record<string, unknown> | undefined;
+  const feeSchedule = (input.fee_schedule ?? input.feeSchedule) as Record<string, unknown> | undefined;
+  const rawPlatformFeeRate =
+    decimalFeeRateFromUnknown(feeSchedule?.rate) ??
+    decimalFeeRateFromUnknown(feeDetails?.r) ??
+    decimalFeeRateFromUnknown(input.platform_fee_rate) ??
+    decimalFeeRateFromUnknown(input.platformFeeRate);
+  const platformFeeExponent =
+    numberFromUnknown(feeSchedule?.exponent) ??
+    numberFromUnknown(feeDetails?.e) ??
+    numberFromUnknown(input.platformFeeExponent) ??
+    1;
+  const platformFeeTakerOnly =
+    boolFromUnknown(feeSchedule?.takerOnly) ??
+    boolFromUnknown(feeSchedule?.taker_only) ??
+    boolFromUnknown(feeDetails?.to) ??
+    boolFromUnknown(input.platformFeeTakerOnly) ??
+    true;
+  const rawMakerFeeRate =
+    decimalFeeRateFromUnknown(input.maker_fee_rate) ??
+    decimalFeeRateFromUnknown(input.makerFeeRate);
+  const rawTakerFeeRate =
+    rawPlatformFeeRate ??
+    decimalFeeRateFromUnknown(input.taker_fee_rate) ??
+    decimalFeeRateFromUnknown(input.takerFeeRate) ??
+    (typeof feeRateBps === "number" ? feeRateBps / 10_000 : undefined);
+  const makerFeeRate = rawMakerFeeRate ?? 0;
+  const takerFeeRate = rawTakerFeeRate ?? 0;
+  const feeRateAvailable =
+    rawPlatformFeeRate !== undefined ||
+    rawMakerFeeRate !== undefined ||
+    rawTakerFeeRate !== undefined ||
+    typeof feeRateBps === "number";
+  const rawTokens = Array.isArray(input.tokens) ? input.tokens : Array.isArray(input.t) ? input.t : undefined;
+  return {
+    conditionId: String(input.condition_id ?? input.conditionId ?? conditionId ?? "") || undefined,
+    minimumTickSize,
+    minimumOrderSize,
+    makerFeeRate,
+    takerFeeRate,
+    platformFeeRate: takerFeeRate,
+    platformFeeExponent,
+    platformFeeTakerOnly,
+    feeRateAvailable,
+    feeRateBps,
+    feeDetails,
+    tokens: rawTokens
+      ?.flatMap((token) => {
+        const raw = token as Record<string, unknown>;
+        const tokenId = String(raw.token_id ?? raw.tokenId ?? raw.id ?? raw.t ?? "");
+        return tokenId
+          ? [{
+              tokenId,
+              outcome: raw.outcome || raw.o ? String(raw.outcome ?? raw.o) : undefined,
+              minimumTickSize: numberFromUnknown(raw.minimum_tick_size ?? raw.minimumTickSize),
+              minimumOrderSize: numberFromUnknown(raw.minimum_order_size ?? raw.minimumOrderSize)
+            }]
+          : [];
+      }),
+    rfqEnabled: Boolean(input.rfq_enabled ?? input.rfqEnabled ?? input.rfqe ?? false),
+    source,
+    conservative: source === "conservative",
+    updatedAt: Date.now()
   };
 }
 
@@ -376,14 +607,33 @@ export class PolymarketConnector {
     return this.fetchBook(tokenId);
   }
 
+  async fetchClobMarketInfo(conditionId?: string): Promise<ClobMarketInfo> {
+    if (!conditionId) {
+      return conservativeMarketInfo();
+    }
+    const urls = [
+      `${this.config.clobBaseUrl}/markets/${encodeURIComponent(conditionId)}`,
+      `${this.config.clobBaseUrl}/market?condition_id=${encodeURIComponent(conditionId)}`
+    ];
+    for (const url of urls) {
+      try {
+        return normalizeMarketInfo(await this.fetchJson<Record<string, unknown>>(url), conditionId, "clob");
+      } catch {
+        // Try the next public CLOB shape before falling back.
+      }
+    }
+    return conservativeMarketInfo(conditionId);
+  }
+
   async focusMarket(round?: RoundRecord | Pick<RoundRecord, "marketSlug" | "marketId">) {
     if (!round?.marketSlug && !round?.marketId) {
       return;
     }
 
-    const detail =
+    const rawDetail =
       this.detailFromRound(round) ??
       (round.marketSlug ? await this.fetchMarketBySlug(round.marketSlug) : await this.fetchMarketById(String(round.marketId)));
+    const detail = await this.withMarketInfo(rawDetail);
     const switched = this.state.currentMarket?.slug !== detail.slug;
     const now = Date.now();
 
@@ -449,8 +699,19 @@ export class PolymarketConnector {
       lastTradePrice: 0,
       acceptingOrders: round.acceptingOrders ?? now < round.endAt,
       closed: now >= round.endAt,
-      resolutionSource: round.resolutionSource
+      resolutionSource: round.resolutionSource,
+      marketInfo: round.marketInfo
     } satisfies PolymarketMarketDetail;
+  }
+
+  private async withMarketInfo(detail: PolymarketMarketDetail): Promise<PolymarketMarketDetail> {
+    if (detail.marketInfo && !detail.marketInfo.conservative) {
+      return detail;
+    }
+    return {
+      ...detail,
+      marketInfo: await this.fetchClobMarketInfo(detail.conditionId)
+    };
   }
 
   async fetchMarketById(id: string) {
@@ -663,23 +924,28 @@ export class PolymarketConnector {
 
     try {
       const targetSlug = targetMarket.slug;
-      const [upBookPayload, downBookPayload, marketDetail] = await Promise.all([
+      const [upBookPayload, downBookPayload, rawMarketDetail] = await Promise.all([
         this.fetchBook(targetMarket.upTokenId),
         this.fetchBook(targetMarket.downTokenId),
         this.fetchMarketBySlug(targetSlug)
       ]);
+      const marketDetail = await this.withMarketInfo(rawMarketDetail);
       if (this.state.currentMarket?.slug !== targetSlug) {
         return;
       }
-      const sourceEventTs = Math.max(upBookPayload.snapshotTs, downBookPayload.snapshotTs);
+      const existingUpBook = this.state.orderBooks.UP;
+      const existingDownBook = this.state.orderBooks.DOWN;
+      const upBook = upBookPayload.snapshotTs >= existingUpBook.snapshotTs ? upBookPayload : existingUpBook;
+      const downBook = downBookPayload.snapshotTs >= existingDownBook.snapshotTs ? downBookPayload : existingDownBook;
+      const sourceEventTs = Math.max(upBook.snapshotTs, downBook.snapshotTs);
       const now = Date.now();
 
       this.state = {
         ...this.state,
         currentMarket: marketDetail,
         orderBooks: {
-          UP: upBookPayload,
-          DOWN: downBookPayload
+          UP: upBook,
+          DOWN: downBook
         },
         status: {
           source: "CLOB",
@@ -909,6 +1175,122 @@ export class PolymarketConnector {
       return;
     }
 
+    if (eventType === "best_bid_ask") {
+      if (this.state.currentMarket?.slug !== market.slug) {
+        return;
+      }
+      const assetId = String(message.asset_id ?? message.assetId ?? message.asset ?? "");
+      const side = this.sideForAsset(assetId, market);
+      if (!side) {
+        return;
+      }
+      const snapshotTs = normalizeWsTimestamp(message.timestamp ?? message.ts, now);
+      const existingBook = this.state.orderBooks[side];
+      const nextBook = applyTopToBook(existingBook, {
+        bestBid: numberFromUnknown(message.best_bid ?? message.bestBid ?? message.bid),
+        bestAsk: numberFromUnknown(message.best_ask ?? message.bestAsk ?? message.ask),
+        snapshotTs,
+        snapshotId: String(message.hash ?? `ws_best_${side}_${snapshotTs}`)
+      });
+      if (!nextBook) {
+        return;
+      }
+      this.state = {
+        ...this.state,
+        orderBooks: {
+          ...this.state.orderBooks,
+          [side]: nextBook
+        },
+        status: {
+          source: "CLOB",
+          symbol: this.config.symbol,
+          state: "healthy",
+          reconnectCount: this.reconnectCount,
+          sourceEventTs: snapshotTs,
+          serverRecvTs: now,
+          normalizedTs: now,
+          serverPublishTs: now,
+          acquireLatencyMs: Math.max(now - snapshotTs, 0),
+          publishLatencyMs: 0,
+          frontendLatencyMs: 0,
+          message: `Streaming best bid/ask for ${market.slug}.`
+        }
+      };
+      this.emit();
+      return;
+    }
+
+    if (eventType === "price_change") {
+      if (this.state.currentMarket?.slug !== market.slug) {
+        return;
+      }
+      const changes = Array.isArray(message.price_changes)
+        ? message.price_changes
+        : Array.isArray(message.priceChanges)
+          ? message.priceChanges
+          : [];
+      let nextOrderBooks = this.state.orderBooks;
+      let latestTs = 0;
+      let applied = false;
+      for (const rawChange of changes) {
+        const change = rawChange as Record<string, unknown>;
+        const assetId = String(change.asset_id ?? change.assetId ?? message.asset_id ?? "");
+        const side = this.sideForAsset(assetId, market);
+        const bookSide = String(change.side ?? "").toUpperCase();
+        const price = numberFromUnknown(change.price);
+        const qty = numberFromUnknown(change.size ?? change.qty);
+        if (!side || (bookSide !== "BUY" && bookSide !== "SELL") || typeof price !== "number" || typeof qty !== "number") {
+          continue;
+        }
+        const snapshotTs = normalizeWsTimestamp(change.timestamp ?? message.timestamp ?? message.ts, now);
+        const nextBook = applyPriceChangeToBook(nextOrderBooks[side], {
+          side: bookSide,
+          price,
+          qty,
+          snapshotTs,
+          snapshotId: String(change.hash ?? message.hash ?? `ws_delta_${side}_${snapshotTs}`)
+        });
+        if (!nextBook) {
+          continue;
+        }
+        const bestBook = applyTopToBook(nextBook, {
+          bestBid: numberFromUnknown(change.best_bid ?? change.bestBid),
+          bestAsk: numberFromUnknown(change.best_ask ?? change.bestAsk),
+          snapshotTs,
+          snapshotId: nextBook.snapshotId
+        }) ?? nextBook;
+        nextOrderBooks = {
+          ...nextOrderBooks,
+          [side]: bestBook
+        };
+        latestTs = Math.max(latestTs, snapshotTs);
+        applied = true;
+      }
+      if (!applied) {
+        return;
+      }
+      this.state = {
+        ...this.state,
+        orderBooks: nextOrderBooks,
+        status: {
+          source: "CLOB",
+          symbol: this.config.symbol,
+          state: "healthy",
+          reconnectCount: this.reconnectCount,
+          sourceEventTs: latestTs || now,
+          serverRecvTs: now,
+          normalizedTs: now,
+          serverPublishTs: now,
+          acquireLatencyMs: latestTs ? Math.max(now - latestTs, 0) : 0,
+          publishLatencyMs: 0,
+          frontendLatencyMs: 0,
+          message: `Streaming price changes for ${market.slug}.`
+        }
+      };
+      this.emit();
+      return;
+    }
+
     if (eventType === "last_trade_price") {
       if (this.state.currentMarket?.slug !== market.slug) {
         return;
@@ -975,18 +1357,18 @@ export class PolymarketConnector {
   }
 
   private bookFromWsMessage(message: Record<string, unknown>, side: TradeSide): OrderBookSnapshot {
-    const bids = this.parseWsLevels(message.bids).sort((left, right) => right.price - left.price);
-    const asks = this.parseWsLevels(message.asks).sort((left, right) => left.price - right.price);
-    const bestBid = bids[0]?.price ?? 0;
-    const bestAsk = asks[0]?.price ?? 0;
+    const top = recomputeBookTop({
+      bids: this.parseWsLevels(message.bids),
+      asks: this.parseWsLevels(message.asks)
+    });
     return {
       snapshotId: String(message.hash ?? `ws_book_${nanoid(8)}`),
-      snapshotTs: Number(message.timestamp ?? Date.now()),
-      bestBid,
-      bestAsk,
-      midPrice: bestBid && bestAsk ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : bestBid || bestAsk,
-      bids,
-      asks
+      snapshotTs: normalizeWsTimestamp(message.timestamp, Date.now()),
+      bestBid: top.bestBid,
+      bestAsk: top.bestAsk,
+      midPrice: top.midPrice,
+      bids: top.bids,
+      asks: top.asks
     };
   }
 
@@ -1042,30 +1424,24 @@ export class PolymarketConnector {
       asks: Array<{ price: string; size: string }>;
     }>(`${this.config.clobBaseUrl}/book?token_id=${encodeURIComponent(tokenId)}`);
 
-    const bids = payload.bids
-      .map((level) => ({
+    const top = recomputeBookTop({
+      bids: payload.bids.map((level) => ({
+        price: Number(level.price),
+        qty: Number(level.size)
+      })),
+      asks: payload.asks.map((level) => ({
         price: Number(level.price),
         qty: Number(level.size)
       }))
-      .sort((left, right) => right.price - left.price);
-    const asks = payload.asks
-      .map((level) => ({
-        price: Number(level.price),
-        qty: Number(level.size)
-      }))
-      .sort((left, right) => left.price - right.price);
-
-    const bestBid = bids[0]?.price ?? 0;
-    const bestAsk = asks[0]?.price ?? 0;
-    const midPrice = bestBid && bestAsk ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : bestBid || bestAsk;
+    });
     return {
       snapshotId: payload.hash || `book_${nanoid(8)}`,
-      snapshotTs: Number(payload.timestamp),
-      bestBid,
-      bestAsk,
-      midPrice,
-      bids,
-      asks
+      snapshotTs: normalizeWsTimestamp(payload.timestamp),
+      bestBid: top.bestBid,
+      bestAsk: top.bestAsk,
+      midPrice: top.midPrice,
+      bids: top.bids,
+      asks: top.asks
     };
   }
 
@@ -1105,6 +1481,7 @@ export class PolymarketConnector {
       priceToBeat: 0,
       status: "Trading",
       pollCount: 0,
+      marketInfo: detail.marketInfo,
       acceptingOrders: detail.acceptingOrders
     };
   }
@@ -1161,7 +1538,8 @@ export class PolymarketConnector {
       lastTradePrice: toFloat(payload.lastTradePrice),
       acceptingOrders: Boolean(payload.acceptingOrders),
       closed: Boolean(payload.closed),
-      resolutionSource: payload.resolutionSource
+      resolutionSource: payload.resolutionSource,
+      marketInfo: normalizeMarketInfo(raw, payload.conditionId, "gamma")
     };
   }
 

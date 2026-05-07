@@ -139,10 +139,11 @@ export class PolymarketReferenceResolver {
     input?: {
       resolutionSource?: string;
       maxSkewMs?: number;
+      historyCacheMs?: number;
     }
   ): Promise<PolymarketReferenceResolution | undefined> {
     const metadata = await this.getStreamMetadata(input?.resolutionSource);
-    const samples = await this.getHistoricalSamples(metadata);
+    const samples = await this.getHistoricalSamples(metadata, input?.historyCacheMs);
     const sample = pickFirstSampleAtOrAfter(samples, boundaryTs, input?.maxSkewMs ?? MAX_BOUNDARY_SKEW_MS);
     if (!sample) {
       return undefined;
@@ -179,9 +180,9 @@ export class PolymarketReferenceResolver {
     return request;
   }
 
-  private async getHistoricalSamples(metadata: ChainlinkStreamMetadata) {
+  private async getHistoricalSamples(metadata: ChainlinkStreamMetadata, cacheMs = HISTORY_CACHE_MS) {
     const cached = this.historyCache.get(metadata.feedId);
-    if (cached && Date.now() - cached.fetchedAt < HISTORY_CACHE_MS) {
+    if (cached && Date.now() - cached.fetchedAt < cacheMs) {
       return cached.samples;
     }
     const existing = this.historyInFlight.get(metadata.feedId);

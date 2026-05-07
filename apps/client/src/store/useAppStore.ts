@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
   AuditEvent,
+  BootstrapPayload,
   HistoryRound,
   MarketPayload,
   MarketSnapshot,
@@ -18,7 +19,7 @@ import type {
 interface AppState {
   token?: string;
   me?: PublicUser;
-  currentPage: "trade" | "profile" | "logs" | "users";
+  currentPage: "trade" | "profile" | "logs" | "replay" | "users";
   currentRound?: RoundRecord;
   history: HistoryRound[];
   operatedHistory: HistoryRound[];
@@ -36,19 +37,8 @@ interface AppState {
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
   clearAuth: () => void;
-  setCurrentPage: (page: "trade" | "profile" | "logs" | "users") => void;
-  setShellData: (data: {
-    currentRound?: RoundRecord;
-    history: HistoryRound[];
-    operatedHistory: HistoryRound[];
-    snapshot: MarketSnapshot;
-    profile: ProfileOverview;
-    positions: PositionRecord[];
-    orders: OrderRecord[];
-    logs: AuditEvent[];
-    settlementPreview?: SettlementPreview;
-    transportMeta?: MarketTransportMeta;
-  }) => void;
+  setCurrentPage: (page: "trade" | "profile" | "logs" | "replay" | "users") => void;
+  setBootstrap: (data: BootstrapPayload) => void;
   setMarketPayload: (data: MarketPayload, clientRecvTs?: number) => boolean;
   setUserPayload: (data: UserPayload) => void;
   setSourceStatus: (status: SourceHealth[]) => void;
@@ -100,6 +90,10 @@ function stampSnapshotReceipt(
 ): MarketSnapshot {
   return {
     ...snapshot,
+    latencyBreakdown: {
+      ...snapshot.latencyBreakdown,
+      clientTransportLatency: Math.max(clientRecvTs - transportMeta.serverPublishTs, 0)
+    },
     sources: {
       binance: stampSourceReceipt(snapshot.sources.binance, clientRecvTs, transportMeta.serverPublishTs),
       chainlink: stampSourceReceipt(snapshot.sources.chainlink, clientRecvTs, transportMeta.serverPublishTs),
@@ -145,12 +139,19 @@ export const useAppStore = create<AppState>((set) => ({
     });
   },
   setCurrentPage: (currentPage) => set({ currentPage }),
-  setShellData: (data) => {
+  setBootstrap: (data) => {
     const clientRecvTs = Date.now();
     const transportMeta = data.transportMeta ?? fallbackTransportMeta(data.snapshot);
-    const { transportMeta: _transportMeta, ...shellData } = data;
     set({
-      ...shellData,
+      me: data.me,
+      currentRound: data.currentRound,
+      history: data.history,
+      operatedHistory: data.operatedHistory ?? [],
+      profile: data.profile,
+      positions: data.positions,
+      orders: data.orders,
+      logs: data.logs,
+      sourceStatus: data.sourceStatus ?? [],
       snapshot: stampSnapshotReceipt(data.snapshot, clientRecvTs, transportMeta),
       lastMarketRecvTs: clientRecvTs,
       lastMarketPayloadSeq: transportMeta.payloadSeq,

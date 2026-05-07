@@ -35,6 +35,44 @@ assert.equal(buyFilled.filledQty, 148.07692308);
 assert.equal(buyFilled.worstPrice, 0.52);
 assert.equal(buyFilled.fills[0]?.makerOwnerId, "external:polymarket");
 
+const takerFeeFilled = estimateClobExecution({
+  action: "buy",
+  book,
+  orderId: "fee-taker",
+  notional: 50,
+  feeRate: 0.02,
+  feeRole: "taker",
+  executedAt: Date.now()
+});
+assert.equal(takerFeeFilled.estimatedFee, 0.5);
+assert.equal(takerFeeFilled.feeBreakdown?.role, "taker");
+assert.equal(takerFeeFilled.feeBreakdown?.formula, "C * feeRate * p * (1 - p)");
+
+const makerFeeFilled = estimateClobExecution({
+  action: "sell",
+  book,
+  orderId: "fee-maker",
+  qty: 100,
+  feeRate: 0.02,
+  feeRole: "maker",
+  executedAt: Date.now()
+});
+assert.equal(makerFeeFilled.estimatedFee, 0);
+assert.equal(makerFeeFilled.feeBreakdown?.role, "maker");
+
+const makerPlatformFeeSkipped = estimateClobExecution({
+  action: "sell",
+  book,
+  orderId: "fee-maker-platform-skip",
+  qty: 100,
+  platformFeeRate: 0.02,
+  platformFeeTakerOnly: true,
+  feeRole: "maker",
+  executedAt: Date.now()
+});
+assert.equal(makerPlatformFeeSkipped.estimatedFee, 0);
+assert.equal(makerPlatformFeeSkipped.feeBreakdown?.platformFee, 0);
+
 const buyAcrossLevels = estimate({ action: "buy", notional: 80 });
 assert.equal(buyAcrossLevels.fullyMatched, true);
 assert.equal(buyAcrossLevels.fills.length, 2);

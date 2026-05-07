@@ -1,6 +1,16 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import v8 from "node:v8";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
 import path from "node:path";
 import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
@@ -41,6 +51,24 @@ const FIVE_MINUTE_ROUND_MS = 5 * 60_000;
 const QTY_EPSILON = 0.0000001;
 const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
 const BCRYPT_COST = 10;
+const LOG_FILE_TAIL_BYTES = 512 * 1024;
+const MEMORY_GUARD_INTERVAL_MS = 15_000;
+const PERSISTENCE_FAILURE_THRESHOLD = 3;
+
+type MemoryProtectionState = "normal" | "warning" | "protect";
+
+type PersistenceHealth = {
+  enabled: boolean;
+  writable: boolean;
+  strict: boolean;
+  state: "healthy" | "reconnecting" | "blocked";
+  reconnecting: boolean;
+  reconnectAttempts: number;
+  consecutiveFailures: number;
+  lastError?: string;
+  lastFailureAt?: number;
+  lastRecoveryAt?: number;
+};
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -104,6 +132,45 @@ function inferFiveMinuteWindow(input: { roundId: string; marketSlug?: string; fa
 
 function sanitizePolymarketBtcReference(price?: number) {
   return typeof price === "number" && Number.isFinite(price) && price > 1000 ? price : undefined;
+}
+
+function readUtf8Tail(filePath: string, maxBytes: number) {
+  if (!existsSync(filePath)) {
+    return "";
+  }
+  const stats = statSync(filePath);
+  const bytesToRead = Math.max(0, Math.min(maxBytes, stats.size));
+  if (!bytesToRead) {
+    return "";
+  }
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const start = Math.max(0, stats.size - bytesToRead);
+    const bytesRead = readSync(fd, buffer, 0, bytesToRead, start);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readJsonlTail<T>(filePath: string, maxBytes: number, guard: (value: unknown) => value is T) {
+  const text = readUtf8Tail(filePath, maxBytes);
+  if (!text) {
+    return [] as T[];
+  }
+  const normalized = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : text;
+  return normalized
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as T;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter(guard);
 }
 
 const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
@@ -241,6 +308,10 @@ CREATE TABLE IF NOT EXISTS orders (
   frozen_usdc DOUBLE PRECISION,
   frozen_qty DOUBLE PRECISION,
   fills JSONB,
+  estimated_fee DOUBLE PRECISION,
+  actual_fee DOUBLE PRECISION,
+  fee_breakdown JSONB,
+  fee_currency TEXT,
   source_latency_ms DOUBLE PRECISION,
   market_slug TEXT,
   order_book_snapshot_ref TEXT,
@@ -302,6 +373,9 @@ CREATE TABLE IF NOT EXISTS order_lifecycle_logs (
   match_latency_ms DOUBLE PRECISION NOT NULL,
   settlement_time_ms BIGINT,
   settlement_direction TEXT,
+  entry_fee DOUBLE PRECISION,
+  exit_fee DOUBLE PRECISION,
+  fee_currency TEXT,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL
 );
@@ -461,6 +535,10 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS requested_qty DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_usdc DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_qty DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS fills JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS estimated_fee DOUBLE PRECISION;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS actual_fee DOUBLE PRECISION;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_breakdown JSONB;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_currency TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS market_slug TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_book_snapshot_ref TEXT;
@@ -475,6 +553,9 @@ ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_ask DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_mid DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_value DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
+ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS entry_fee DOUBLE PRECISION;
+ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS exit_fee DOUBLE PRECISION;
+ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS fee_currency TEXT;
 `;
 
 const LOG_DIR = path.resolve(process.cwd(), "data/logs");
@@ -523,6 +604,23 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     priceToBeat: 0,
     upPrice: 0,
     downPrice: 0,
+    displayPrices: {
+      UP: 0,
+      DOWN: 0
+    },
+    displayPriceSource: {
+      UP: "outcome_price",
+      DOWN: "outcome_price"
+    },
+    displayPriceSpread: {
+      UP: 0,
+      DOWN: 0
+    },
+    latencyBreakdown: {
+      sourceEventAge: { binance: 0, chainlink: 0, clob: 0 },
+      serverIngressLatency: { binance: 0, chainlink: 0, clob: 0 },
+      serverComputeLatency: 0
+    },
     sources: {
       binance: emptySource("Binance"),
       chainlink: emptySource("Chainlink"),
@@ -557,6 +655,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
         price: 0
       },
       candlesByInterval: {
+        "30s": [createEmptyCandleBar("30s", now)],
         "1m": [createEmptyCandleBar("1m", now)],
         "5m": [createEmptyCandleBar("5m", now)],
         "15m": [createEmptyCandleBar("15m", now)],
@@ -569,6 +668,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       settlementReference: 0,
       candles5s: [],
       candlesByInterval: {
+        "30s": [createEmptyCandleBar("30s", now)],
         "1m": [createEmptyCandleBar("1m", now)],
         "5m": [createEmptyCandleBar("5m", now)],
         "15m": [createEmptyCandleBar("15m", now)],
@@ -598,6 +698,17 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
         asks: []
       },
       recentTrades: [],
+      currentRoundUpPriceSeries: [],
+      marketInfo: {
+        minimumTickSize: 0.01,
+        minimumOrderSize: 1,
+        makerFeeRate: 0,
+        takerFeeRate: 0,
+        feeRateAvailable: false,
+        source: "conservative",
+        conservative: true,
+        updatedAt: Date.now()
+      },
       bestBidAskSummary: {
         UP: {
           bestBid: 0,
@@ -649,6 +760,7 @@ export class AppStore {
   public readonly logs: AuditEvent[] = [];
   public readonly behaviorLogs: BehaviorActionLog[] = [];
   public marketSnapshot: MarketSnapshot;
+  private historyRevision = 0;
 
   private pool?: Pool;
   private redis?: ReturnType<typeof createClient>;
@@ -656,12 +768,22 @@ export class AppStore {
   private readonly sourcesCacheKey: string;
   private postgresEnabled = false;
   private redisEnabled = false;
+  private queuedMarketSnapshot?: MarketSnapshot;
+  private marketSnapshotPersistRunning = false;
   private lastRetentionCleanupAt = 0;
+  private lastMemoryGuardAt = 0;
   private readonly orderIndexById = new Map<string, number>();
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
   private readonly pendingUserPayloadIds = new Set<string>();
   private userPayloadFlushScheduled = false;
+  private memoryProtectionState: MemoryProtectionState = "normal";
+  private postgresReconnectTask?: Promise<void>;
+  private closed = false;
+  private readonly persistenceHealth: {
+    postgres: PersistenceHealth;
+    redis: PersistenceHealth;
+  };
   private readonly config: {
     initialBalance: number;
     logRetentionMs: number;
@@ -671,6 +793,23 @@ export class AppStore {
     redisUrl: string;
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
+    strictPersistence: boolean;
+    pgConnectionTimeoutMs: number;
+    pgIdleTimeoutMs: number;
+    pgMaxConnections: number;
+    pgKeepAlive: boolean;
+    pgReconnectIntervalMs: number;
+    pgReconnectMaxIntervalMs: number;
+    orderBookSnapshotsMemoryMax: number;
+    orderBookSnapshotsMemoryMaxAgeMs: number;
+    ordersMemoryMax: number;
+    positionsMemoryMax: number;
+    auditLogsMemoryMax: number;
+    behaviorLogsMemoryMax: number;
+    orderLifecycleMemoryMax: number;
+    roundsMemoryMax: number;
+    serverHeapWarnMb: number;
+    serverHeapProtectMb: number;
   };
 
   constructor(config: {
@@ -682,28 +821,70 @@ export class AppStore {
     redisUrl: string;
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
+    strictPersistence: boolean;
+    pgConnectionTimeoutMs: number;
+    pgIdleTimeoutMs: number;
+    pgMaxConnections: number;
+    pgKeepAlive: boolean;
+    pgReconnectIntervalMs: number;
+    pgReconnectMaxIntervalMs: number;
+    orderBookSnapshotsMemoryMax: number;
+    orderBookSnapshotsMemoryMaxAgeMs: number;
+    ordersMemoryMax: number;
+    positionsMemoryMax: number;
+    auditLogsMemoryMax: number;
+    behaviorLogsMemoryMax: number;
+    orderLifecycleMemoryMax: number;
+    roundsMemoryMax: number;
+    serverHeapWarnMb: number;
+    serverHeapProtectMb: number;
   }) {
     this.config = config;
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
     this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.chainlinkEnabled);
+    this.persistenceHealth = {
+      postgres: {
+        enabled: config.persistenceMode !== "memory",
+        writable: config.persistenceMode !== "memory",
+        strict: config.strictPersistence,
+        state: config.persistenceMode === "memory" ? "blocked" : "healthy",
+        reconnecting: false,
+        reconnectAttempts: 0,
+        consecutiveFailures: 0
+      },
+      redis: {
+        enabled: config.persistenceMode !== "memory",
+        writable: config.persistenceMode !== "memory",
+        strict: false,
+        state: config.persistenceMode === "memory" ? "blocked" : "healthy",
+        reconnecting: false,
+        reconnectAttempts: 0,
+        consecutiveFailures: 0
+      }
+    };
     mkdirSync(LOG_DIR, { recursive: true });
   }
 
   async init() {
+    console.log("[store] init start");
     await this.connectPostgres();
+    console.log(`[store] connectPostgres done enabled=${this.postgresEnabled}`);
     await this.seedUsers();
+    console.log("[store] seedUsers done");
     await this.connectRedis();
+    console.log(`[store] connectRedis done enabled=${this.redisEnabled}`);
     await this.loadStateFromPersistence();
+    console.log("[store] loadStateFromPersistence done");
   }
 
   async close() {
+    this.closed = true;
     if (this.redis?.isOpen) {
       await this.redis.quit().catch(() => undefined);
     }
-    if (this.pool) {
-      await this.pool.end().catch(() => undefined);
-    }
+    await this.closePostgresPool();
+    await this.postgresReconnectTask?.catch(() => undefined);
   }
 
   sanitizeUser(user: UserRecord): PublicUser {
@@ -759,8 +940,43 @@ export class AppStore {
   getPersistenceStatus() {
     return {
       postgres: this.postgresEnabled,
-      redis: this.redisEnabled
+      redis: this.redisEnabled,
+      strict: this.config.strictPersistence,
+      state: this.persistenceHealth,
+      memoryProtectionState: this.memoryProtectionState,
+      heapUsedMb: this.heapUsedMb(),
+      heapLimitMb: this.heapLimitMb()
     };
+  }
+
+  getMemoryStatus() {
+    return {
+      heapUsedMb: this.heapUsedMb(),
+      heapLimitMb: this.heapLimitMb(),
+      memoryProtectionState: this.memoryProtectionState
+    };
+  }
+
+  assertWritablePersistence(context: string) {
+    if (
+      this.config.persistenceMode === "external" &&
+      this.config.strictPersistence &&
+      (!this.postgresEnabled || !this.persistenceHealth.postgres.writable)
+    ) {
+      void this.schedulePostgresReconnect(`${context} blocked`);
+      throw new Error(this.persistenceUnavailableMessage(context));
+    }
+  }
+
+  isPersistenceUnavailableError(error: unknown) {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+    return (
+      error.message.includes("PostgreSQL persistence is unavailable") ||
+      error.message.includes("persistent storage is unavailable") ||
+      error.message.includes("Matching PostgreSQL persistence is unavailable")
+    );
   }
 
   private upsertIndexedRecord<T extends { id: string }>(records: T[], indexById: Map<string, number>, record: T) {
@@ -780,6 +996,103 @@ export class AppStore {
     this.orders.forEach((order, index) => this.orderIndexById.set(order.id, index));
     this.positions.forEach((position, index) => this.positionIndexById.set(position.id, index));
     this.orderLifecycleLogs.forEach((log, index) => this.orderLifecycleIndexById.set(log.id, index));
+  }
+
+  private trimArrayByCreatedAt<T>(
+    records: T[],
+    maxItems: number,
+    getCreatedAt: (record: T) => number,
+    onTrim?: (trimmed: T[]) => void
+  ) {
+    if (records.length <= maxItems) {
+      return;
+    }
+    const retained = [...records]
+      .sort((left, right) => getCreatedAt(right) - getCreatedAt(left))
+      .slice(0, maxItems);
+    const retainedSet = new Set(retained);
+    const trimmed = records.filter((record) => !retainedSet.has(record));
+    records.splice(0, records.length, ...retained);
+    onTrim?.(trimmed);
+  }
+
+  private pruneMemoryCaches(now = Date.now()) {
+    this.trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
+    this.trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
+    this.trimArrayByCreatedAt(
+      this.orderLifecycleLogs,
+      this.config.orderLifecycleMemoryMax,
+      (log) => log.updatedAt ?? log.createdAt,
+      () => this.rebuildHotIndexes()
+    );
+    this.trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt, () =>
+      this.rebuildHotIndexes()
+    );
+    this.trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
+    this.trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
+    this.pruneOrderBookSnapshots(now);
+    this.rebuildHotIndexes();
+  }
+
+  private pruneOrderBookSnapshots(now = Date.now()) {
+    if (this.orderBookSnapshots.size <= this.config.orderBookSnapshotsMemoryMax) {
+      const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
+      for (const [ref, snapshot] of this.orderBookSnapshots.entries()) {
+        if (snapshot.createdAt < cutoff && !this.isSnapshotRefReferenced(ref)) {
+          this.orderBookSnapshots.delete(ref);
+        }
+      }
+      return;
+    }
+
+    const referenced = new Set<string>();
+    for (const order of this.orders) {
+      if (order.orderBookSnapshotRef) {
+        referenced.add(order.orderBookSnapshotRef);
+      }
+    }
+    for (const log of this.orderLifecycleLogs) {
+      if (log.orderBookSnapshotRef) {
+        referenced.add(log.orderBookSnapshotRef);
+      }
+    }
+
+    const snapshots = [...this.orderBookSnapshots.values()].sort((left, right) => right.createdAt - left.createdAt);
+    let retainedCount = 0;
+    const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
+    for (const snapshot of snapshots) {
+      const mustKeep = referenced.has(snapshot.ref);
+      const withinLimit = retainedCount < this.config.orderBookSnapshotsMemoryMax;
+      const withinAge = snapshot.createdAt >= cutoff;
+      if (mustKeep || withinLimit || withinAge) {
+        retainedCount += 1;
+        continue;
+      }
+      this.orderBookSnapshots.delete(snapshot.ref);
+    }
+  }
+
+  private isSnapshotRefReferenced(ref: string) {
+    return this.orders.some((order) => order.orderBookSnapshotRef === ref) ||
+      this.orderLifecycleLogs.some((log) => log.orderBookSnapshotRef === ref);
+  }
+
+  private heapUsedMb() {
+    return Number((process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1));
+  }
+
+  private heapLimitMb() {
+    return Math.round(v8.getHeapStatistics().heap_size_limit / 1024 / 1024);
+  }
+
+  private updateMemoryProtectionState() {
+    const heapUsedMb = this.heapUsedMb();
+    this.memoryProtectionState =
+      heapUsedMb >= this.config.serverHeapProtectMb
+        ? "protect"
+        : heapUsedMb >= this.config.serverHeapWarnMb
+          ? "warning"
+          : "normal";
   }
 
   async setUserLanguage(userId: string, language: Language) {
@@ -922,29 +1235,90 @@ export class AppStore {
 
   async setMarketSnapshot(snapshot: MarketSnapshot) {
     this.marketSnapshot = snapshot;
-    if (this.redisEnabled && this.redis?.isOpen) {
-      try {
-        await Promise.all([
-          this.redis.set(this.snapshotCacheKey, JSON.stringify(snapshot), {
-            expiration: {
-              type: "EX",
-              value: this.config.snapshotRetentionSeconds
-            }
-          }),
-          this.redis.set(this.sourcesCacheKey, JSON.stringify(Object.values(snapshot.sources)), {
-            expiration: {
-              type: "EX",
-              value: this.config.snapshotRetentionSeconds
-            }
-          }),
-          this.redis.publish(`market:update:${this.config.symbol}`, JSON.stringify(snapshot))
-        ]);
-      } catch (error) {
-        this.redisEnabled = false;
-        console.warn("[store] Redis snapshot cache is unavailable:", error);
+    this.emitter.emit("market:update", snapshot);
+    if (!this.redisEnabled || !this.redis?.isOpen) {
+      return;
+    }
+    this.queuedMarketSnapshot = snapshot;
+    if (this.marketSnapshotPersistRunning) {
+      return;
+    }
+    this.marketSnapshotPersistRunning = true;
+    setImmediate(() => {
+      void this.flushMarketSnapshotCache();
+    });
+  }
+
+  private async flushMarketSnapshotCache() {
+    try {
+      while (this.queuedMarketSnapshot) {
+        const snapshot = this.queuedMarketSnapshot;
+        this.queuedMarketSnapshot = undefined;
+        await this.persistMarketSnapshotCache(snapshot);
+      }
+    } finally {
+      this.marketSnapshotPersistRunning = false;
+      if (this.queuedMarketSnapshot) {
+        this.marketSnapshotPersistRunning = true;
+        setImmediate(() => {
+          void this.flushMarketSnapshotCache();
+        });
       }
     }
-    this.emitter.emit("market:update", snapshot);
+  }
+
+  private async persistMarketSnapshotCache(snapshot: MarketSnapshot) {
+    if (!this.redisEnabled || !this.redis?.isOpen) {
+      return;
+    }
+    try {
+      await Promise.all([
+        this.redis.set(this.snapshotCacheKey, JSON.stringify(snapshot), {
+          expiration: {
+            type: "EX",
+            value: this.config.snapshotRetentionSeconds
+          }
+        }),
+        this.redis.set(this.sourcesCacheKey, JSON.stringify(Object.values(snapshot.sources)), {
+          expiration: {
+            type: "EX",
+            value: this.config.snapshotRetentionSeconds
+          }
+        }),
+        this.redis.publish(`market:update:${this.config.symbol}`, JSON.stringify(snapshot))
+      ]);
+    } catch (error) {
+      this.redisEnabled = false;
+      this.notePersistenceFailure("redis", error);
+      console.warn("[store] Redis snapshot cache is unavailable:", error);
+    }
+  }
+
+  getHistoryRevision() {
+    return this.historyRevision;
+  }
+
+  private bumpHistoryRevision() {
+    this.historyRevision += 1;
+  }
+
+  private roundHistorySignature(round: RoundRecord) {
+    return JSON.stringify({
+      id: round.id,
+      marketId: round.marketId,
+      marketSlug: round.marketSlug,
+      title: round.title,
+      startAt: round.startAt,
+      endAt: round.endAt,
+      priceToBeat: round.priceToBeat,
+      status: round.status,
+      acceptingOrders: round.acceptingOrders,
+      settledSide: round.settledSide,
+      settlementPrice: round.settlementPrice,
+      settlementTs: round.settlementTs,
+      settlementSource: round.settlementSource,
+      manualReason: round.manualReason
+    });
   }
 
   getCurrentRound(now = Date.now()) {
@@ -1457,7 +1831,7 @@ export class AppStore {
     const positionValue = livePositions.reduce((sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark), 0);
 
     const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    todayStart.setUTCHours(0, 0, 0, 0);
     const todayTs = todayStart.getTime();
 
     const realizedPnlToday = positions
@@ -1834,12 +2208,18 @@ export class AppStore {
 
   async upsertRound(round: RoundRecord) {
     const index = this.rounds.findIndex((item) => item.id === round.id);
+    const previous = index >= 0 ? this.rounds[index] : undefined;
+    const historyChanged = !previous || this.roundHistorySignature(previous) !== this.roundHistorySignature(round);
     if (index >= 0) {
       this.rounds[index] = round;
     } else {
       this.rounds.push(round);
     }
     this.rounds.sort((left, right) => right.startAt - left.startAt);
+    this.pruneMemoryCaches();
+    if (historyChanged) {
+      this.bumpHistoryRevision();
+    }
 
     await this.runDb(
       `
@@ -1986,6 +2366,8 @@ export class AppStore {
 
   async persistOrderLifecycle(log: OrderLifecycleRecord) {
     this.upsertIndexedRecord(this.orderLifecycleLogs, this.orderLifecycleIndexById, log);
+    this.pruneMemoryCaches();
+    this.bumpHistoryRevision();
 
     await this.runDb(
       `
@@ -1995,11 +2377,12 @@ export class AppStore {
         btc_open_price_to_beat, delta_btc, volume_token_qty, remaining_token_qty,
         closed_token_qty, position_notional, exit_type, exit_token_price, exit_notional,
         settlement_result, order_book_snapshot_ref, actual_fill_price, slippage_bps,
-        match_latency_ms, settlement_time_ms, settlement_direction, created_at, updated_at
+        match_latency_ms, settlement_time_ms, settlement_direction, entry_fee, exit_fee, fee_currency, created_at, updated_at
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,
+        $33,$34,$35
       )
       ON CONFLICT (id) DO UPDATE SET
         remaining_token_qty = EXCLUDED.remaining_token_qty,
@@ -2010,6 +2393,8 @@ export class AppStore {
         settlement_result = EXCLUDED.settlement_result,
         settlement_time_ms = EXCLUDED.settlement_time_ms,
         settlement_direction = EXCLUDED.settlement_direction,
+        exit_fee = EXCLUDED.exit_fee,
+        fee_currency = EXCLUDED.fee_currency,
         updated_at = EXCLUDED.updated_at
       `,
       [
@@ -2043,6 +2428,9 @@ export class AppStore {
         log.matchLatencyMs,
         log.settlementTimeMs ?? null,
         log.settlementDirection ?? null,
+        log.entryFee ?? null,
+        log.exitFee ?? null,
+        log.feeCurrency ?? null,
         log.createdAt,
         log.updatedAt
       ]
@@ -2056,6 +2444,7 @@ export class AppStore {
     qty: number;
     exitType: Exclude<OrderLifecycleExitType, "settlement">;
     exitTokenPrice?: number;
+    exitFee?: number;
   }) {
     if (input.qty <= QTY_EPSILON || typeof input.exitTokenPrice !== "number") {
       return;
@@ -2071,6 +2460,7 @@ export class AppStore {
       )
       .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
 
+    const feePerQty = (input.exitFee ?? 0) / Math.max(input.qty, QTY_EPSILON);
     for (const log of logs) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2083,6 +2473,8 @@ export class AppStore {
       log.remainingTokenQty = roundNumber(Math.max(log.remainingTokenQty - take, 0), 4);
       log.closedTokenQty = roundNumber(log.closedTokenQty + take, 4);
       log.exitNotional = roundNumber(log.exitNotional + exitNotionalDelta, 8);
+      log.exitFee = roundNumber((log.exitFee ?? 0) + take * feePerQty, 8);
+      log.feeCurrency = "USD";
       log.exitTokenPrice = roundNumber(log.exitNotional / Math.max(log.closedTokenQty, QTY_EPSILON), 4);
       log.exitType = log.exitType && log.exitType !== input.exitType ? "mixed" : input.exitType;
       log.updatedAt = Date.now();
@@ -2117,6 +2509,7 @@ export class AppStore {
       log.settlementResult = input.settlementResult;
       log.settlementDirection = input.settlementDirection;
       log.settlementTimeMs = input.settlementTimeMs;
+      log.feeCurrency = log.feeCurrency ?? "USD";
       log.updatedAt = Date.now();
       await this.persistOrderLifecycle(log);
     }
@@ -2128,13 +2521,16 @@ export class AppStore {
       order.orderBookSnapshot = undefined;
     }
     this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    this.pruneMemoryCaches();
+    this.bumpHistoryRevision();
 
     await this.runDb(
       `
       INSERT INTO orders (
         id, trace_id, user_id, round_id, symbol, market_id, order_kind, time_in_force, limit_price,
         lifecycle_status, result_type, token_id, book_key, book_hash, requested_amount_usdc,
-        requested_qty, frozen_usdc, frozen_qty, fills, source_latency_ms, market_slug, order_book_snapshot_ref, order_book_snapshot,
+        requested_qty, frozen_usdc, frozen_qty, fills, estimated_fee, actual_fee, fee_breakdown, fee_currency,
+        source_latency_ms, market_slug, order_book_snapshot_ref, order_book_snapshot,
         action, side, status, notional_usdc,
         expected_qty, filled_qty, unfilled_qty, avg_fill_price, best_bid, best_ask, mid_price,
         book_snapshot_ts, partial_filled, slippage_bps, match_latency_ms,
@@ -2145,7 +2541,8 @@ export class AppStore {
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
         $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
-        $41,$42,$43,$44,$45,$46,$47
+        $41,$42,$43,$44,$45,$46,$47,$48,$49,$50,
+        $51
       )
       ON CONFLICT (id) DO UPDATE SET
         lifecycle_status = EXCLUDED.lifecycle_status,
@@ -2165,6 +2562,10 @@ export class AppStore {
         frozen_usdc = EXCLUDED.frozen_usdc,
         frozen_qty = EXCLUDED.frozen_qty,
         fills = EXCLUDED.fills,
+        estimated_fee = EXCLUDED.estimated_fee,
+        actual_fee = EXCLUDED.actual_fee,
+        fee_breakdown = EXCLUDED.fee_breakdown,
+        fee_currency = EXCLUDED.fee_currency,
         order_book_snapshot_ref = EXCLUDED.order_book_snapshot_ref,
         failure_reason = EXCLUDED.failure_reason,
         server_publish_ts = EXCLUDED.server_publish_ts
@@ -2189,6 +2590,10 @@ export class AppStore {
         order.frozenUsdc ?? null,
         order.frozenQty ?? null,
         JSON.stringify(order.fills ?? []),
+        order.estimatedFee ?? null,
+        order.actualFee ?? null,
+        JSON.stringify(order.feeBreakdown ?? null),
+        order.feeCurrency ?? null,
         order.sourceLatencyMs ?? null,
         order.marketSlug ?? null,
         order.orderBookSnapshotRef ?? null,
@@ -2223,6 +2628,8 @@ export class AppStore {
 
   async persistPosition(position: PositionRecord) {
     this.upsertIndexedRecord(this.positions, this.positionIndexById, position);
+    this.pruneMemoryCaches();
+    this.bumpHistoryRevision();
 
     await this.runDb(
       `
@@ -2278,6 +2685,7 @@ export class AppStore {
 
   async recordLog(event: AuditEvent) {
     this.logs.unshift(event);
+    this.pruneMemoryCaches(event.serverRecvTs);
     appendFileSync(LOG_FILE, `${JSON.stringify(event)}\n`, "utf-8");
     void this.runDb(
       `
@@ -2317,7 +2725,11 @@ export class AppStore {
         event.frontendLatencyMs ?? null,
         JSON.stringify(event.details ?? {})
       ]
-    );
+    ).catch((error) => {
+      if (!this.isPersistenceUnavailableError(error)) {
+        console.warn("[store] audit event persistence failed:", error);
+      }
+    });
     void this.cleanupRetentionIfDue(event.serverRecvTs);
     if (event.userId) {
       this.emitUserPayload(event.userId);
@@ -2326,6 +2738,7 @@ export class AppStore {
 
   async recordBehaviorLog(log: BehaviorActionLog) {
     this.behaviorLogs.unshift(log);
+    this.pruneMemoryCaches(log.timestampMs);
     appendFileSync(BEHAVIOR_LOG_FILE, `${JSON.stringify(log)}\n`, "utf-8");
     void this.runDb(
       `
@@ -2403,7 +2816,11 @@ export class AppStore {
         log.qualityGrade ?? null,
         JSON.stringify(log.contextJson ?? {})
       ]
-    );
+    ).catch((error) => {
+      if (!this.isPersistenceUnavailableError(error)) {
+        console.warn("[store] behavior log persistence failed:", error);
+      }
+    });
   }
 
   anonymizeUserId(userId: string) {
@@ -2418,9 +2835,144 @@ export class AppStore {
     return `${prefix}_${nanoid(12)}`;
   }
 
+  private notePersistenceSuccess(target: "postgres" | "redis") {
+    const health = this.persistenceHealth[target];
+    const recovered = target === "postgres" && (health.state !== "healthy" || health.reconnecting || !health.lastRecoveryAt);
+    health.enabled = true;
+    health.writable = true;
+    health.state = "healthy";
+    health.reconnecting = false;
+    health.reconnectAttempts = 0;
+    health.consecutiveFailures = 0;
+    health.lastError = undefined;
+    health.lastFailureAt = undefined;
+    if (recovered) {
+      health.lastRecoveryAt = Date.now();
+    }
+  }
+
+  private notePersistenceFailure(target: "postgres" | "redis", error: unknown) {
+    const health = this.persistenceHealth[target];
+    health.enabled = false;
+    health.state = "blocked";
+    health.reconnecting = false;
+    health.consecutiveFailures += 1;
+    health.lastError = error instanceof Error ? error.message : String(error);
+    health.lastFailureAt = Date.now();
+    if (health.strict && health.consecutiveFailures >= PERSISTENCE_FAILURE_THRESHOLD) {
+      health.writable = false;
+    }
+  }
+
+  private createPostgresPool() {
+    const pool = new Pool({
+      connectionString: this.config.databaseUrl,
+      connectionTimeoutMillis: this.config.pgConnectionTimeoutMs,
+      idleTimeoutMillis: this.config.pgIdleTimeoutMs,
+      max: this.config.pgMaxConnections,
+      keepAlive: this.config.pgKeepAlive,
+      keepAliveInitialDelayMillis: this.config.pgKeepAlive ? 10_000 : undefined
+    });
+    pool.on("error", (error) => {
+      if (this.closed) {
+        return;
+      }
+      void this.handlePostgresFailure(error, "pool error");
+    });
+    return pool;
+  }
+
+  private async closePostgresPool() {
+    const pool = this.pool;
+    this.pool = undefined;
+    if (pool) {
+      await pool.end().catch(() => undefined);
+    }
+  }
+
+  private persistenceUnavailableMessage(context: string) {
+    const health = this.persistenceHealth.postgres;
+    const base = `${context} is blocked because persistent storage is unavailable.`;
+    if (health.reconnecting || health.state === "reconnecting") {
+      return `${base} PostgreSQL is reconnecting.`;
+    }
+    if (health.lastError) {
+      return `${base} ${health.lastError}`;
+    }
+    return `${base} PostgreSQL persistence is unavailable.`;
+  }
+
+  private async handlePostgresFailure(error: unknown, source: string) {
+    this.postgresEnabled = false;
+    this.notePersistenceFailure("postgres", error);
+    await this.closePostgresPool();
+    console.warn(`[store] PostgreSQL ${source} failed:`, error);
+    void this.schedulePostgresReconnect(source);
+  }
+
+  private async schedulePostgresReconnect(reason: string) {
+    if (this.closed || this.config.persistenceMode === "memory") {
+      return;
+    }
+    if (this.postgresReconnectTask) {
+      return this.postgresReconnectTask;
+    }
+    const health = this.persistenceHealth.postgres;
+    health.enabled = false;
+    health.writable = false;
+    health.state = "reconnecting";
+    health.reconnecting = true;
+    console.warn(`[store] PostgreSQL entering reconnecting state (${reason}).`);
+    this.postgresReconnectTask = this.reconnectPostgresLoop()
+      .catch((error) => {
+        console.warn("[store] PostgreSQL reconnect loop stopped with error:", error);
+      })
+      .finally(() => {
+        this.postgresReconnectTask = undefined;
+        if (!this.postgresEnabled && !this.closed) {
+          health.state = "blocked";
+          health.reconnecting = false;
+        }
+      });
+    return this.postgresReconnectTask;
+  }
+
+  private async reconnectPostgresLoop() {
+    const health = this.persistenceHealth.postgres;
+    let delayMs = this.config.pgReconnectIntervalMs;
+    while (!this.closed && this.config.persistenceMode !== "memory" && !this.postgresEnabled) {
+      health.reconnectAttempts += 1;
+      try {
+        await this.closePostgresPool();
+        const pool = this.createPostgresPool();
+        await pool.query("SELECT 1");
+        await pool.query(SCHEMA_SQL);
+        this.pool = pool;
+        this.postgresEnabled = true;
+        this.notePersistenceSuccess("postgres");
+        console.log("[store] PostgreSQL reconnect succeeded.");
+        return;
+      } catch (error) {
+        this.postgresEnabled = false;
+        this.notePersistenceFailure("postgres", error);
+        health.state = "reconnecting";
+        health.reconnecting = true;
+        console.warn(
+          `[store] PostgreSQL reconnect attempt ${health.reconnectAttempts} failed; retrying in ${delayMs}ms:`,
+          error
+        );
+        await sleep(delayMs);
+        delayMs = Math.min(delayMs * 2, this.config.pgReconnectMaxIntervalMs);
+      }
+    }
+  }
+
   private async connectPostgres() {
     if (this.config.persistenceMode === "memory") {
       console.warn("[store] PERSISTENCE_MODE=memory; skipping PostgreSQL connection.");
+      this.persistenceHealth.postgres.enabled = false;
+      this.persistenceHealth.postgres.writable = false;
+      this.persistenceHealth.postgres.state = "blocked";
       return;
     }
 
@@ -2428,21 +2980,17 @@ export class AppStore {
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {
       try {
-        this.pool = new Pool({
-          connectionString: this.config.databaseUrl,
-          connectionTimeoutMillis: 3000
-        });
+        this.pool = this.createPostgresPool();
         await this.pool.query("SELECT 1");
         await this.pool.query(SCHEMA_SQL);
         this.postgresEnabled = true;
+        this.notePersistenceSuccess("postgres");
         return;
       } catch (error) {
         lastError = error;
         this.postgresEnabled = false;
-        if (this.pool) {
-          await this.pool.end().catch(() => undefined);
-          this.pool = undefined;
-        }
+        this.notePersistenceFailure("postgres", error);
+        await this.closePostgresPool();
         if (attempt < STARTUP_CONNECT_RETRY_ATTEMPTS) {
           console.warn(
             `[store] PostgreSQL is not ready yet (attempt ${attempt}/${STARTUP_CONNECT_RETRY_ATTEMPTS}); retrying in ${STARTUP_CONNECT_RETRY_DELAY_MS}ms`
@@ -2452,12 +3000,21 @@ export class AppStore {
       }
     }
 
+    if (this.config.strictPersistence) {
+      throw new Error(
+        `[store] PostgreSQL is required but unavailable: ${
+          lastError instanceof Error ? lastError.message : String(lastError)
+        }`
+      );
+    }
     console.warn("[store] PostgreSQL is unavailable, using in-memory persistence only:", lastError);
   }
 
   private async connectRedis() {
     if (this.config.persistenceMode === "memory") {
       console.warn("[store] PERSISTENCE_MODE=memory; skipping Redis connection.");
+      this.persistenceHealth.redis.enabled = false;
+      this.persistenceHealth.redis.writable = false;
       return;
     }
 
@@ -2474,15 +3031,18 @@ export class AppStore {
         });
         client.on("error", (error) => {
           this.redisEnabled = false;
+          this.notePersistenceFailure("redis", error);
           console.warn("[store] Redis connection error:", error);
         });
         await client.connect();
         this.redis = client;
         this.redisEnabled = true;
+        this.notePersistenceSuccess("redis");
         return;
       } catch (error) {
         lastError = error;
         this.redisEnabled = false;
+        this.notePersistenceFailure("redis", error);
         if (this.redis?.isOpen) {
           await this.redis.quit().catch(() => undefined);
         }
@@ -2622,6 +3182,7 @@ export class AppStore {
         ...behaviorRows.rows.map((row) => this.rowToBehaviorLog(row))
       );
       this.rebuildHotIndexes();
+      this.pruneMemoryCaches();
     }
 
     if (this.redisEnabled && this.redis?.isOpen) {
@@ -2633,11 +3194,17 @@ export class AppStore {
   }
 
   private async cleanupRetentionIfDue(now = Date.now()) {
-    if (now - this.lastRetentionCleanupAt < RETENTION_CLEANUP_INTERVAL_MS) {
-      return;
+    if (now - this.lastMemoryGuardAt >= MEMORY_GUARD_INTERVAL_MS) {
+      this.lastMemoryGuardAt = now;
+      this.updateMemoryProtectionState();
+      if (this.memoryProtectionState !== "normal") {
+        this.pruneMemoryCaches(now);
+      }
     }
-    this.lastRetentionCleanupAt = now;
-    await this.cleanupRetention(now);
+    if (now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
+      this.lastRetentionCleanupAt = now;
+      await this.cleanupRetention(now);
+    }
   }
 
   private async cleanupRetention(now = Date.now()) {
@@ -2654,17 +3221,17 @@ export class AppStore {
     if (!existsSync(LOG_FILE)) {
       return;
     }
-    const filtered = readFileSync(LOG_FILE, "utf-8")
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => {
-        try {
-          return JSON.parse(line) as AuditEvent;
-        } catch {
-          return undefined;
-        }
-      })
-      .filter((event): event is AuditEvent => Boolean(event && event.serverRecvTs >= threshold));
+    const filtered = readJsonlTail<AuditEvent>(
+      LOG_FILE,
+      LOG_FILE_TAIL_BYTES,
+      (event): event is AuditEvent =>
+        Boolean(
+          event &&
+            typeof event === "object" &&
+            typeof (event as AuditEvent).eventId === "string" &&
+            typeof (event as AuditEvent).serverRecvTs === "number"
+        )
+    ).filter((event) => event.serverRecvTs >= threshold);
     writeFileSync(
       LOG_FILE,
       filtered.map((event) => JSON.stringify(event)).join("\n") + (filtered.length ? "\n" : ""),
@@ -2794,6 +3361,9 @@ export class AppStore {
       matchLatencyMs: Number(row.match_latency_ms),
       settlementTimeMs: numberOrUndefined(row.settlement_time_ms),
       settlementDirection: row.settlement_direction ? (String(row.settlement_direction) as TradeSide) : undefined,
+      entryFee: numberOrUndefined(row.entry_fee),
+      exitFee: numberOrUndefined(row.exit_fee),
+      feeCurrency: row.fee_currency ? "USD" : undefined,
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at)
     };
@@ -2834,6 +3404,10 @@ export class AppStore {
       frozenUsdc: numberOrUndefined(row.frozen_usdc),
       frozenQty: numberOrUndefined(row.frozen_qty),
       fills: parseJson(row.fills, []),
+      estimatedFee: numberOrUndefined(row.estimated_fee),
+      actualFee: numberOrUndefined(row.actual_fee),
+      feeBreakdown: parseJson(row.fee_breakdown, undefined),
+      feeCurrency: row.fee_currency ? "USD" : undefined,
       sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
       marketSlug: row.market_slug ? String(row.market_slug) : undefined,
       orderBookSnapshotRef: row.order_book_snapshot_ref ? String(row.order_book_snapshot_ref) : undefined,
@@ -2994,12 +3568,20 @@ export class AppStore {
 
   private async runDb(query: string, params: unknown[]) {
     if (!this.postgresEnabled || !this.pool) {
+      if (this.config.persistenceMode === "external" && this.config.strictPersistence) {
+        void this.schedulePostgresReconnect("write requested while unavailable");
+        throw new Error(this.persistenceUnavailableMessage("Write"));
+      }
       return;
     }
     try {
       await this.pool.query(query, params as never[]);
+      this.notePersistenceSuccess("postgres");
     } catch (error) {
-      console.warn("[store] PostgreSQL write failed:", error);
+      await this.handlePostgresFailure(error, "write");
+      if (this.config.strictPersistence) {
+        throw new Error(this.persistenceUnavailableMessage("Write"));
+      }
     }
   }
 }

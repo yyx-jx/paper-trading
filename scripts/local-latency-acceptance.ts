@@ -202,7 +202,7 @@ async function api<T>(
       : response.ok
         ? undefined
         : text.slice(0, 200);
-  const ok = response.ok && !(parsed && typeof parsed === "object" && "error" in parsed);
+  const ok = response.ok;
   recordRequest({
     ts: Date.now(),
     iso: new Date().toISOString(),

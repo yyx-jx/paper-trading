@@ -688,9 +688,9 @@ function crc32(buffer: Buffer) {
 }
 
 function dosDateTime(date = new Date()) {
-  const year = Math.max(date.getFullYear(), 1980);
-  const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
-  const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  const year = Math.max(date.getUTCFullYear(), 1980);
+  const dosTime = (date.getUTCHours() << 11) | (date.getUTCMinutes() << 5) | Math.floor(date.getUTCSeconds() / 2);
+  const dosDate = ((year - 1980) << 9) | ((date.getUTCMonth() + 1) << 5) | date.getUTCDate();
   return { dosDate, dosTime };
 }
 

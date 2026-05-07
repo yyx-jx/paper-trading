@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { z } from "zod";
 import type { MatchingExecutionRequest, MatchingSyncRequest, TradeSide } from "../../domain/types";
+import { sendApiError } from "../../http-errors";
 import { MatchingStore } from "./store";
 import { MatchingService } from "./service";
 
@@ -81,21 +82,25 @@ export async function createMatchingServiceApp(config: {
   redisUrl: string;
   persistenceMode: "external" | "memory";
   redisSnapshotSeconds: number;
+  strictPersistence: boolean;
+  pgConnectionTimeoutMs: number;
+  pgIdleTimeoutMs: number;
+  pgMaxConnections: number;
+  pgKeepAlive: boolean;
+  pgReconnectIntervalMs: number;
+  pgReconnectMaxIntervalMs: number;
+  eventsMemoryMax: number;
+  eventsMemoryMaxAgeMs: number;
+  booksMemoryMax: number;
 }) {
   const app = Fastify({ logger: false });
   const store = new MatchingStore(config);
   const service = new MatchingService(store);
   await service.init();
+  app.setErrorHandler((error, _request, reply) => sendApiError(reply, error, "Unexpected matching service error."));
 
   async function safeRoute<T>(handler: () => Promise<T>) {
-    try {
-      return await handler();
-    } catch (error) {
-      return {
-        error: true,
-        message: error instanceof Error ? error.message : "Unexpected matching service error."
-      } as T;
-    }
+    return handler();
   }
 
   app.get("/health", async () => ({

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import path from "node:path";
 import { nanoid } from "nanoid";
 import { Pool } from "pg";
@@ -13,9 +13,44 @@ import type {
 
 const STARTUP_CONNECT_RETRY_ATTEMPTS = 10;
 const STARTUP_CONNECT_RETRY_DELAY_MS = 2000;
+const MATCHING_FILE_TAIL_BYTES = 512 * 1024;
+const PERSISTENCE_FAILURE_THRESHOLD = 3;
+
+type PersistenceHealth = {
+  enabled: boolean;
+  writable: boolean;
+  strict: boolean;
+  state: "healthy" | "reconnecting" | "blocked";
+  reconnecting: boolean;
+  reconnectAttempts: number;
+  consecutiveFailures: number;
+  lastError?: string;
+  lastFailureAt?: number;
+  lastRecoveryAt?: number;
+};
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readUtf8Tail(filePath: string, maxBytes: number) {
+  if (!existsSync(filePath)) {
+    return "";
+  }
+  const stats = statSync(filePath);
+  const bytesToRead = Math.max(0, Math.min(maxBytes, stats.size));
+  if (!bytesToRead) {
+    return "";
+  }
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    const start = Math.max(0, stats.size - bytesToRead);
+    const bytesRead = readSync(fd, buffer, 0, bytesToRead, start);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const SCHEMA_SQL = `
@@ -86,8 +121,14 @@ export class MatchingStore {
   private redis?: ReturnType<typeof createClient>;
   private postgresEnabled = false;
   private redisEnabled = false;
+  private postgresReconnectTask?: Promise<void>;
+  private closed = false;
   private readonly books = new Map<string, MatchingBookState>();
   private readonly events: MatchingEventRecord[] = [];
+  private readonly persistenceHealth: {
+    postgres: PersistenceHealth;
+    redis: PersistenceHealth;
+  };
 
   constructor(
     private readonly config: {
@@ -95,8 +136,38 @@ export class MatchingStore {
       redisUrl: string;
       persistenceMode: "external" | "memory";
       redisSnapshotSeconds: number;
+      strictPersistence: boolean;
+      pgConnectionTimeoutMs: number;
+      pgIdleTimeoutMs: number;
+      pgMaxConnections: number;
+      pgKeepAlive: boolean;
+      pgReconnectIntervalMs: number;
+      pgReconnectMaxIntervalMs: number;
+      eventsMemoryMax: number;
+      eventsMemoryMaxAgeMs: number;
+      booksMemoryMax: number;
     }
   ) {
+    this.persistenceHealth = {
+      postgres: {
+        enabled: config.persistenceMode !== "memory",
+        writable: config.persistenceMode !== "memory",
+        strict: config.strictPersistence,
+        state: config.persistenceMode === "memory" ? "blocked" : "healthy",
+        reconnecting: false,
+        reconnectAttempts: 0,
+        consecutiveFailures: 0
+      },
+      redis: {
+        enabled: config.persistenceMode !== "memory",
+        writable: config.persistenceMode !== "memory",
+        strict: false,
+        state: config.persistenceMode === "memory" ? "blocked" : "healthy",
+        reconnecting: false,
+        reconnectAttempts: 0,
+        consecutiveFailures: 0
+      }
+    };
     mkdirSync(LOG_DIR, { recursive: true });
   }
 
@@ -107,19 +178,174 @@ export class MatchingStore {
   }
 
   async close() {
+    this.closed = true;
     if (this.redis?.isOpen) {
       await this.redis.quit().catch(() => undefined);
     }
-    if (this.pool) {
-      await this.pool.end().catch(() => undefined);
-    }
+    await this.closePostgresPool();
+    await this.postgresReconnectTask?.catch(() => undefined);
   }
 
   getPersistenceStatus() {
     return {
       postgres: this.postgresEnabled,
-      redis: this.redisEnabled
+      redis: this.redisEnabled,
+      strict: this.config.strictPersistence,
+      state: this.persistenceHealth
     };
+  }
+
+  private notePersistenceSuccess(target: "postgres" | "redis") {
+    const health = this.persistenceHealth[target];
+    const recovered = target === "postgres" && (health.state !== "healthy" || health.reconnecting || !health.lastRecoveryAt);
+    health.enabled = true;
+    health.writable = true;
+    health.state = "healthy";
+    health.reconnecting = false;
+    health.reconnectAttempts = 0;
+    health.consecutiveFailures = 0;
+    health.lastError = undefined;
+    health.lastFailureAt = undefined;
+    if (recovered) {
+      health.lastRecoveryAt = Date.now();
+    }
+  }
+
+  private notePersistenceFailure(target: "postgres" | "redis", error: unknown) {
+    const health = this.persistenceHealth[target];
+    health.enabled = false;
+    health.state = "blocked";
+    health.reconnecting = false;
+    health.consecutiveFailures += 1;
+    health.lastError = error instanceof Error ? error.message : String(error);
+    health.lastFailureAt = Date.now();
+    if (health.strict && health.consecutiveFailures >= PERSISTENCE_FAILURE_THRESHOLD) {
+      health.writable = false;
+    }
+  }
+
+  private createPostgresPool() {
+    const pool = new Pool({
+      connectionString: this.config.databaseUrl,
+      connectionTimeoutMillis: this.config.pgConnectionTimeoutMs,
+      idleTimeoutMillis: this.config.pgIdleTimeoutMs,
+      max: this.config.pgMaxConnections,
+      keepAlive: this.config.pgKeepAlive,
+      keepAliveInitialDelayMillis: this.config.pgKeepAlive ? 10_000 : undefined
+    });
+    pool.on("error", (error) => {
+      if (this.closed) {
+        return;
+      }
+      void this.handlePostgresFailure(error, "pool error");
+    });
+    return pool;
+  }
+
+  private async closePostgresPool() {
+    const pool = this.pool;
+    this.pool = undefined;
+    if (pool) {
+      await pool.end().catch(() => undefined);
+    }
+  }
+
+  private persistenceUnavailableMessage() {
+    const health = this.persistenceHealth.postgres;
+    const base = "Matching PostgreSQL persistence is unavailable.";
+    if (health.reconnecting || health.state === "reconnecting") {
+      return `${base} PostgreSQL is reconnecting.`;
+    }
+    if (health.lastError) {
+      return `${base} ${health.lastError}`;
+    }
+    return base;
+  }
+
+  private async handlePostgresFailure(error: unknown, source: string) {
+    this.postgresEnabled = false;
+    this.notePersistenceFailure("postgres", error);
+    await this.closePostgresPool();
+    console.warn(`[matching] PostgreSQL ${source} failed:`, error);
+    void this.schedulePostgresReconnect(source);
+  }
+
+  private async schedulePostgresReconnect(reason: string) {
+    if (this.closed || this.config.persistenceMode === "memory") {
+      return;
+    }
+    if (this.postgresReconnectTask) {
+      return this.postgresReconnectTask;
+    }
+    const health = this.persistenceHealth.postgres;
+    health.enabled = false;
+    health.writable = false;
+    health.state = "reconnecting";
+    health.reconnecting = true;
+    console.warn(`[matching] PostgreSQL entering reconnecting state (${reason}).`);
+    this.postgresReconnectTask = this.reconnectPostgresLoop()
+      .catch((error) => {
+        console.warn("[matching] PostgreSQL reconnect loop stopped with error:", error);
+      })
+      .finally(() => {
+        this.postgresReconnectTask = undefined;
+        if (!this.postgresEnabled && !this.closed) {
+          health.state = "blocked";
+          health.reconnecting = false;
+        }
+      });
+    return this.postgresReconnectTask;
+  }
+
+  private async reconnectPostgresLoop() {
+    const health = this.persistenceHealth.postgres;
+    let delayMs = this.config.pgReconnectIntervalMs;
+    while (!this.closed && this.config.persistenceMode !== "memory" && !this.postgresEnabled) {
+      health.reconnectAttempts += 1;
+      try {
+        await this.closePostgresPool();
+        const pool = this.createPostgresPool();
+        await pool.query("SELECT 1");
+        await pool.query(SCHEMA_SQL);
+        this.pool = pool;
+        this.postgresEnabled = true;
+        this.notePersistenceSuccess("postgres");
+        console.log("[matching] PostgreSQL reconnect succeeded.");
+        return;
+      } catch (error) {
+        this.postgresEnabled = false;
+        this.notePersistenceFailure("postgres", error);
+        health.state = "reconnecting";
+        health.reconnecting = true;
+        console.warn(
+          `[matching] PostgreSQL reconnect attempt ${health.reconnectAttempts} failed; retrying in ${delayMs}ms:`,
+          error
+        );
+        await sleep(delayMs);
+        delayMs = Math.min(delayMs * 2, this.config.pgReconnectMaxIntervalMs);
+      }
+    }
+  }
+
+  private pruneMemory(now = Date.now()) {
+    const cutoff = now - this.config.eventsMemoryMaxAgeMs;
+    const retainedEvents = this.events
+      .filter((event) => event.createdAt >= cutoff)
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(0, this.config.eventsMemoryMax)
+      .reverse();
+    this.events.splice(0, this.events.length, ...retainedEvents);
+
+    const activeBookKeys = new Set(this.events.map((event) => event.bookKey));
+    const sortedBooks = [...this.books.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+    let retainedCount = 0;
+    for (const book of sortedBooks) {
+      if (activeBookKeys.has(book.bookKey) || retainedCount < this.config.booksMemoryMax) {
+        retainedCount += 1;
+        continue;
+      }
+      this.books.delete(book.bookKey);
+    }
   }
 
   getCurrentBook(bookKey: string) {
@@ -128,9 +354,13 @@ export class MatchingStore {
   }
 
   async saveStep(event: MatchingEventRecord, state: MatchingBookState) {
+    if (this.config.persistenceMode === "external" && this.config.strictPersistence && !this.persistenceHealth.postgres.writable) {
+      throw new Error("Matching persistence is unavailable.");
+    }
     const stateCopy = this.cloneState(state);
     this.books.set(state.bookKey, stateCopy);
     this.events.push({ ...event, payload: { ...event.payload } });
+    this.pruneMemory(event.createdAt);
 
     appendFileSync(EVENT_LOG_FILE, `${JSON.stringify(event)}\n`, "utf-8");
     appendFileSync(
@@ -289,11 +519,15 @@ export class MatchingStore {
       })
       .slice(-limit);
 
+    const snapshotsBySequence = new Map(
+      this.booksFromFile()
+        .filter((line) => line.bookKey === bookKey)
+        .map((line) => [line.state.sequence, line.state] as const)
+    );
+
     const steps = filteredEvents
       .map((event) => {
-        const snapshot = this.booksFromFile()
-          .filter((line) => line.bookKey === bookKey && line.state.sequence === event.sequence)
-          .map((line) => line.state)[0];
+        const snapshot = snapshotsBySequence.get(event.sequence);
         return snapshot
           ? {
               event: { ...event, payload: { ...event.payload } },
@@ -397,6 +631,9 @@ export class MatchingStore {
   private async connectPostgres() {
     if (this.config.persistenceMode === "memory") {
       console.warn("[matching] PERSISTENCE_MODE=memory; skipping PostgreSQL connection.");
+      this.persistenceHealth.postgres.enabled = false;
+      this.persistenceHealth.postgres.writable = false;
+      this.persistenceHealth.postgres.state = "blocked";
       return;
     }
 
@@ -404,21 +641,17 @@ export class MatchingStore {
 
     for (let attempt = 1; attempt <= STARTUP_CONNECT_RETRY_ATTEMPTS; attempt += 1) {
       try {
-        this.pool = new Pool({
-          connectionString: this.config.databaseUrl,
-          connectionTimeoutMillis: 3000
-        });
+        this.pool = this.createPostgresPool();
         await this.pool.query("SELECT 1");
         await this.pool.query(SCHEMA_SQL);
         this.postgresEnabled = true;
+        this.notePersistenceSuccess("postgres");
         return;
       } catch (error) {
         lastError = error;
         this.postgresEnabled = false;
-        if (this.pool) {
-          await this.pool.end().catch(() => undefined);
-          this.pool = undefined;
-        }
+        this.notePersistenceFailure("postgres", error);
+        await this.closePostgresPool();
         if (attempt < STARTUP_CONNECT_RETRY_ATTEMPTS) {
           console.warn(
             `[matching] PostgreSQL is not ready yet (attempt ${attempt}/${STARTUP_CONNECT_RETRY_ATTEMPTS}); retrying in ${STARTUP_CONNECT_RETRY_DELAY_MS}ms`
@@ -428,12 +661,21 @@ export class MatchingStore {
       }
     }
 
+    if (this.config.strictPersistence) {
+      throw new Error(
+        `[matching] PostgreSQL is required but unavailable: ${
+          lastError instanceof Error ? lastError.message : String(lastError)
+        }`
+      );
+    }
     console.warn("[matching] PostgreSQL is unavailable, using file-backed replay only:", lastError);
   }
 
   private async connectRedis() {
     if (this.config.persistenceMode === "memory") {
       console.warn("[matching] PERSISTENCE_MODE=memory; skipping Redis connection.");
+      this.persistenceHealth.redis.enabled = false;
+      this.persistenceHealth.redis.writable = false;
       return;
     }
 
@@ -450,15 +692,18 @@ export class MatchingStore {
         });
         client.on("error", (error) => {
           this.redisEnabled = false;
+          this.notePersistenceFailure("redis", error);
           console.warn("[matching] Redis connection error:", error);
         });
         await client.connect();
         this.redis = client;
         this.redisEnabled = true;
+        this.notePersistenceSuccess("redis");
         return;
       } catch (error) {
         lastError = error;
         this.redisEnabled = false;
+        this.notePersistenceFailure("redis", error);
         if (this.redis?.isOpen) {
           await this.redis.quit().catch(() => undefined);
         }
@@ -498,6 +743,7 @@ export class MatchingStore {
         this.events.length,
         ...eventRows.rows.reverse().map((row) => this.rowToEvent(row))
       );
+      this.pruneMemory();
       return;
     }
 
@@ -511,6 +757,7 @@ export class MatchingStore {
     for (const event of this.eventsFromFile().slice(-1000)) {
       this.events.push(event);
     }
+    this.pruneMemory();
   }
 
   private async writeRedisSnapshot(state: MatchingBookState) {
@@ -524,24 +771,37 @@ export class MatchingStore {
           value: this.config.redisSnapshotSeconds
         }
       });
+      this.notePersistenceSuccess("redis");
     } catch (error) {
       this.redisEnabled = false;
+      this.notePersistenceFailure("redis", error);
       console.warn("[matching] Redis cache write failed:", error);
     }
   }
 
   private async runDb(query: string, values: unknown[]) {
     if (!this.postgresEnabled || !this.pool) {
+      if (this.config.persistenceMode === "external" && this.config.strictPersistence) {
+        void this.schedulePostgresReconnect("write requested while unavailable");
+        throw new Error(this.persistenceUnavailableMessage());
+      }
       return;
     }
-    await this.pool.query(query, values);
+    try {
+      await this.pool.query(query, values);
+      this.notePersistenceSuccess("postgres");
+    } catch (error) {
+      await this.handlePostgresFailure(error, "write");
+      if (this.config.strictPersistence) {
+        throw new Error(this.persistenceUnavailableMessage());
+      }
+    }
   }
 
   private booksFromFile() {
-    if (!existsSync(SNAPSHOT_LOG_FILE)) {
-      return [] as StoredSnapshotLine[];
-    }
-    return readFileSync(SNAPSHOT_LOG_FILE, "utf-8")
+    const text = readUtf8Tail(SNAPSHOT_LOG_FILE, MATCHING_FILE_TAIL_BYTES);
+    const normalized = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : text;
+    return normalized
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => {
@@ -555,10 +815,9 @@ export class MatchingStore {
   }
 
   private eventsFromFile() {
-    if (!existsSync(EVENT_LOG_FILE)) {
-      return [] as MatchingEventRecord[];
-    }
-    return readFileSync(EVENT_LOG_FILE, "utf-8")
+    const text = readUtf8Tail(EVENT_LOG_FILE, MATCHING_FILE_TAIL_BYTES);
+    const normalized = text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : text;
+    return normalized
       .split(/\r?\n/)
       .filter(Boolean)
       .map((line) => {

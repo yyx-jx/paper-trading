@@ -1,13 +1,18 @@
 ﻿import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
+import i18n from "./i18n";
+
+
 import type { ReactNode } from "react";
 import { useRef } from "react";
 import { useMemo } from "react";
-import type { ChangeEvent, WheelEvent as ReactWheelEvent } from "react";
+import { useCallback } from "react";
+import type { ChangeEvent, Dispatch, SetStateAction, WheelEvent as ReactWheelEvent } from "react";
 import {
   api,
   type AuditEvent,
   type BehaviorActionLog,
+  type CandlePoint,
   type BulkCreateUserInput,
   type BulkCreateUsersResult,
   type CandleBar,
@@ -37,11 +42,12 @@ import {
 } from "./utils/api";
 import {
   isOrderBookStale,
-  orderBookAgeMs,
-  sourceFreshnessAlertKey,
-  sourceFreshnessLabelKey
+  orderBookAgeMs
 } from "./utils/displayMetrics";
+import { layoutChartPriceLabels, nextChartVisibleCount, nextChartYZoom } from "./utils/chartWheel";
 import { useAppStore } from "./store/useAppStore";
+
+const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
 
 declare global {
   interface Window {
@@ -284,7 +290,7 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
     return {
       rows: [] as ParsedBulkUserRow[],
       validUsers: [] as BulkCreateUserInput[],
-      errors: [localLabel(language, "请先导入或粘贴 CSV/TSV 内容。", "Import or paste CSV/TSV content first.")]
+      errors: [t("importOrPasteCsvTsvContentFirst")]
     };
   }
 
@@ -294,7 +300,7 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
   const headerMap = new Map(headers.map((header, index) => [header.toLowerCase(), index]));
   for (const header of ["username", "password"]) {
     if (!headerMap.has(header)) {
-      errors.push(localLabel(language, `缺少必填表头 ${header}。`, `Missing required header ${header}.`));
+      errors.push(t("missingRequiredHeader", { header: header }));
     }
   }
 
@@ -328,32 +334,32 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
     const availableUsdcText = readValue(values, "availableUsdc");
 
     if (!username) {
-      rowErrors.push(localLabel(language, "username 必填。", "username is required."));
+      rowErrors.push(t("usernameIsRequired"));
     }
     if (!password) {
-      rowErrors.push(localLabel(language, "password 必填。", "password is required."));
+      rowErrors.push(t("passwordIsRequired"));
     }
     if (username && seen.has(username)) {
-      rowErrors.push(localLabel(language, "批次内 username 重复。", "Duplicate username in this batch."));
+      rowErrors.push(t("duplicateUsernameInThisBatch"));
     }
     if (username) {
       seen.add(username);
     }
     if (username && existingNames.has(username)) {
-      rowErrors.push(localLabel(language, "username 已存在。", "username already exists."));
+      rowErrors.push(t("usernameAlreadyExists"));
     }
     if (!ROLE_OPTIONS.includes(roleText as Role)) {
-      rowErrors.push(localLabel(language, "role 不合法。", "role is invalid."));
+      rowErrors.push(t("roleIsInvalid"));
     }
     if (!LANGUAGE_OPTIONS.includes(languageText as Language)) {
-      rowErrors.push(localLabel(language, "language 不合法。", "language is invalid."));
+      rowErrors.push(t("languageIsInvalid"));
     }
 
     const role = ROLE_OPTIONS.includes(roleText as Role) ? (roleText as Role) : "Tester";
     const rowLanguage = LANGUAGE_OPTIONS.includes(languageText as Language) ? (languageText as Language) : "zh-CN";
     const seniorTesterId = seniorInput ? seniorLookup.get(seniorInput) : undefined;
     if (seniorInput && role !== "Tester") {
-      rowErrors.push(localLabel(language, "seniorTesterId 仅适用于 Tester。", "seniorTesterId only applies to Tester."));
+      rowErrors.push(t("seniortesteridOnlyAppliesToTester"));
     }
     if (seniorInput && role === "Tester" && !seniorTesterId) {
       rowErrors.push(
@@ -367,7 +373,7 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
 
     const availableUsdc = availableUsdcText ? Number(availableUsdcText) : undefined;
     if (availableUsdcText && (!Number.isFinite(availableUsdc) || Number(availableUsdc) < 0)) {
-      rowErrors.push(localLabel(language, "availableUsdc 必须是非负数字。", "availableUsdc must be a non-negative number."));
+      rowErrors.push(t("availableusdcMustBeANonNegativeNumber"));
     }
 
     rows.push({
@@ -396,7 +402,7 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
 }
 
 const CHART_COUNT_OPTIONS = [10, 20, 30, 50, 100];
-const TRADE_INTERVAL_OPTIONS = ["1m", "5m", "15m", "1h"] as const satisfies readonly CandleInterval[];
+const TRADE_INTERVAL_OPTIONS = ["30s", "1m", "5m", "15m", "1h"] as const satisfies readonly CandleInterval[];
 const chartTimeText = (value?: number) => {
   if (!value) {
     return "--";
@@ -450,6 +456,9 @@ function intervalDurationMs(interval: CandleBar["interval"]) {
   if (interval === "5s") {
     return 5_000;
   }
+  if (interval === "30s") {
+    return 30_000;
+  }
   if (interval === "1h") {
     return 60 * 60_000;
   }
@@ -472,22 +481,38 @@ function defaultVisibleCountForInterval(interval?: CandleBar["interval"]) {
   if (interval === "5m") {
     return 30;
   }
-  if (interval === "5s") {
+  if (interval === "5s" || interval === "30s") {
     return 50;
   }
   return 60;
 }
 
 function parseBarCountInput(value: string) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
     return undefined;
   }
-  return clamp(Math.round(parsed), 10, 200);
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 10 || parsed > 200) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function parseLimitPriceCentsInput(value: string) {
+  const normalized = value.trim();
+  if (!/^\d+$/.test(normalized)) {
+    return undefined;
+  }
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 99) {
+    return undefined;
+  }
+  return parsed;
 }
 
 function shortChartHint(language: Language) {
-  return localLabel(language, "滚轮缩放 · Shift Y · 双击复位", "Wheel zoom · Shift Y · Dbl reset");
+  return t("wheelZoomShiftYDblReset");
 }
 
 function buildAxisLabelIndices(length: number, targetCount: number) {
@@ -525,22 +550,30 @@ function formatCountdown(value?: number, now = Date.now(), mode: "endAt" | "rema
   return `${minutes}:${seconds}`;
 }
 
-function positionStatusLabel(position: PositionRecord, language: Language) {
-  const labels =
-    language === "zh-CN"
-      ? {
-          open: "持仓中",
-          pending_settlement: "待结算",
-          settled: "已结算",
-          sold: "已卖出"
-        }
-      : {
-          open: "Open",
-          pending_settlement: "Pending Settlement",
-          settled: "Settled",
-          sold: "Sold"
-        };
-  return labels[position.displayStatus ?? (position.status === "closed" ? "settled" : "open")];
+function formatCountdownSeconds(value?: number, now = Date.now(), mode: "endAt" | "remainingMs" = "endAt") {
+  if (typeof value !== "number") {
+    return "--";
+  }
+  const remaining = Math.max(mode === "remainingMs" ? value : value - now, 0);
+  return `${Math.floor(remaining / 1000)}s`;
+}
+
+function countdownTone(countdownMs: number) {
+  if (countdownMs <= 30_000) {
+    return "danger";
+  }
+  if (countdownMs <= 120_000) {
+    return "warn";
+  }
+  return "live";
+}
+
+function tokenCents(value?: number, digits = 1) {
+  return `${decimal((value ?? 0) * 100, digits)}¢`;
+}
+
+function tokenPriceText(value?: number, digits = 1) {
+  return tokenCents(value, digits);
 }
 
 function positionDisplayedPnl(position: PositionRecord) {
@@ -556,39 +589,23 @@ function isCurrentRoundOrder(order: OrderRecord, currentRound?: RoundRecord) {
 
 function orderStatusLabel(order: OrderRecord, language: Language) {
   if (order.status === "pending") {
-    return localLabel(language, "待成交", "Pending");
+    return t("pending");
   }
   if (order.status === "filled") {
-    return localLabel(language, "已成交", "Filled");
+    return t("filled");
   }
   if (order.status === "cancelled") {
-    return localLabel(language, "已撤单", "Cancelled");
+    return t("cancelled");
   }
   if (order.status === "failed") {
-    return localLabel(language, "失败", "Failed");
+    return t("failed");
   }
   return order.status;
 }
 
 function orderResultLabel(order: OrderRecord, language: Language) {
-  const kind = order.orderKind === "limit" ? localLabel(language, "限价", "Limit") : localLabel(language, "市价", "Market");
+  const kind = order.orderKind === "limit" ? t("limit") : t("market");
   return `${kind} / ${orderStatusLabel(order, language)}`;
-}
-
-const PANEL_PAGE_SIZE = 10;
-
-function pageCountFor(total: number, pageSize = PANEL_PAGE_SIZE) {
-  return Math.max(Math.ceil(total / pageSize), 1);
-}
-
-function clampPage(page: number, totalItems: number, pageSize = PANEL_PAGE_SIZE) {
-  return Math.min(Math.max(page, 0), pageCountFor(totalItems, pageSize) - 1);
-}
-
-function paginateRows<T>(items: T[], page: number, pageSize = PANEL_PAGE_SIZE) {
-  const safePage = clampPage(page, items.length, pageSize);
-  const start = safePage * pageSize;
-  return items.slice(start, start + pageSize);
 }
 
 function orderStatusTone(status: OrderRecord["status"]) {
@@ -615,10 +632,10 @@ function OrderExecutionCell({ order, language }: { order: OrderRecord; language:
     <div className="field-stack compact-order-metrics">
       <strong>{order.avgFillPrice ? decimal(order.avgFillPrice, 4) : "--"}</strong>
       <small className="cell-note">
-        {localLabel(language, "盘口价", "Book")}: {bookPrice > 0 ? decimal(bookPrice, 4) : "--"}
+        {t("book")}: {bookPrice > 0 ? decimal(bookPrice, 4) : "--"}
       </small>
       <small className="cell-note">
-        {localLabel(language, "滑点", "Slippage")}: {typeof order.slippageBps === "number" ? `${decimal(order.slippageBps, 2)} bps` : "--"}
+        {t("slippage")}: {typeof order.slippageBps === "number" ? `${decimal(order.slippageBps, 2)} bps` : "--"}
       </small>
     </div>
   );
@@ -634,50 +651,50 @@ function auditStatusTone(status: AuditEvent["actionStatus"]) {
   return "negative";
 }
 
-const AUDIT_ACTION_LABELS: Record<string, { zh: string; en: string }> = {
-  login: { zh: "登录", en: "Login" },
-  switch_language: { zh: "切换语言", en: "Switch Language" },
-  place_order: { zh: "提交订单", en: "Place Order" },
-  cancel_order: { zh: "撤销订单", en: "Cancel Order" },
-  sell_position: { zh: "卖出持仓", en: "Sell Position" },
-  close_side: { zh: "平仓方向", en: "Close Side" },
-  reverse_side: { zh: "一键反手", en: "Reverse Side" },
-  limit_order_triggered: { zh: "限价单触发", en: "Limit Triggered" },
-  limit_order_failed: { zh: "限价单失败", en: "Limit Failed" },
-  capture_price_to_beat: { zh: "记录 PTB", en: "Capture PTB" },
-  poll_settlement: { zh: "轮询结算", en: "Poll Settlement" },
-  settlement_confirmed: { zh: "确认结算", en: "Settlement Confirmed" },
-  manual_settlement: { zh: "手动结算", en: "Manual Settlement" },
-  redeem_position: { zh: "持仓兑付", en: "Redeem Position" },
-  round_closed: { zh: "轮次关闭", en: "Round Closed" },
-  market_latency: { zh: "行情延迟", en: "Market Latency" },
-  user_create: { zh: "创建用户", en: "Create User" },
-  user_disable: { zh: "停用用户", en: "Disable User" },
-  user_enable: { zh: "启用用户", en: "Enable User" },
-  user_reset_password: { zh: "重置密码", en: "Reset Password" },
-  user_changePassword: { zh: "修改密码", en: "Change Password" },
-  "user.changePassword": { zh: "修改密码", en: "Change Password" },
-  "user.resetPassword": { zh: "重置密码", en: "Reset Password" },
-  "user.balance.set": { zh: "设置余额", en: "Set Balance" }
+const AUDIT_ACTION_LABELS: Record<string, string> = {
+  login: "登录",
+  switch_language: "切换语言",
+  place_order: "提交订单",
+  cancel_order: "撤销订单",
+  sell_position: "卖出持仓",
+  close_side: "平仓方向",
+  reverse_side: "一键反手",
+  limit_order_triggered: "限价单触发",
+  limit_order_failed: "限价单失败",
+  capture_price_to_beat: "记录 PTB",
+  poll_settlement: "轮询结算",
+  settlement_confirmed: "确认结算",
+  manual_settlement: "手动结算",
+  redeem_position: "持仓兑付",
+  round_closed: "轮次关闭",
+  market_latency: "行情延迟",
+  user_create: "创建用户",
+  user_disable: "停用用户",
+  user_enable: "启用用户",
+  user_reset_password: "重置密码",
+  user_changePassword: "修改密码",
+  "user.changePassword": "修改密码",
+  "user.resetPassword": "重置密码",
+  "user.balance.set": "设置余额"
 };
 
-const AUDIT_CATEGORY_LABELS: Record<string, { zh: string; en: string }> = {
-  operation: { zh: "操作", en: "Operation" },
-  matching: { zh: "撮合", en: "Matching" },
-  settlement: { zh: "结算", en: "Settlement" },
-  latency: { zh: "延迟", en: "Latency" }
+const AUDIT_CATEGORY_LABELS: Record<string, string> = {
+  operation: "操作",
+  matching: "撮合",
+  settlement: "结算",
+  latency: "延迟"
 };
 
-function auditActionLabel(actionType: string | undefined, language: Language) {
+function auditActionLabel(actionType: string | undefined, _language: Language) {
   if (!actionType) return "--";
   const label = AUDIT_ACTION_LABELS[actionType];
-  return label ? localLabel(language, label.zh, label.en) : actionType;
+  return label ? label : actionType;
 }
 
-function auditCategoryLabel(category: string | undefined, language: Language) {
+function auditCategoryLabel(category: string | undefined, _language: Language) {
   if (!category) return "--";
   const label = AUDIT_CATEGORY_LABELS[category];
-  return label ? localLabel(language, label.zh, label.en) : category;
+  return label ? label : category;
 }
 
 function actionTone(action: string) {
@@ -695,15 +712,7 @@ function sideTone(side: TradeSide) {
 }
 
 function orderKindLabel(order: OrderRecord, language: Language) {
-  return order.orderKind === "limit" ? localLabel(language, "限价", "Limit") : localLabel(language, "市价", "Market");
-}
-
-function pageSummaryText(language: Language, page: number, totalItems: number, pageSize = PANEL_PAGE_SIZE) {
-  return localLabel(
-    language,
-    `第 ${Math.min(page + 1, pageCountFor(totalItems, pageSize))} / ${pageCountFor(totalItems, pageSize)} 页`,
-    `Page ${Math.min(page + 1, pageCountFor(totalItems, pageSize))} of ${pageCountFor(totalItems, pageSize)}`
-  );
+  return order.orderKind === "limit" ? t("limit") : t("market");
 }
 
 function sortOrdersForTradingPage(left: OrderRecord, right: OrderRecord, currentRound?: RoundRecord) {
@@ -761,36 +770,6 @@ function localLabel(language: Language, zh: string, en: string) {
   return language === "zh-CN" ? zh : en;
 }
 
-function getSellBlockedReason(input: {
-  language: Language;
-  position: PositionRecord;
-  currentRound?: RoundRecord;
-  nowMs: number;
-  acceptingOrders: boolean;
-}) {
-  const { language, position, currentRound, nowMs, acceptingOrders } = input;
-  if (position.displayStatus !== "open" || position.status !== "open") {
-    return localLabel(language, "该持仓已关闭，不能继续卖出。", "This position is already closed.");
-  }
-  if (!currentRound || position.roundId !== currentRound.id) {
-    return localLabel(language, "该持仓不属于当前可交易轮次。", "This position does not belong to the current tradable round.");
-  }
-  const availableQty = Math.max(position.qty - (position.lockedQty ?? 0), 0);
-  if (availableQty <= 0.0001) {
-    return localLabel(language, "该持仓没有可卖出的可用数量。", "This position has no unlocked quantity available to sell.");
-  }
-  if (currentRound.status !== "Trading") {
-    return localLabel(language, "当前轮次已冻结，不能再卖出持仓。", "Current round is frozen and can no longer sell positions.");
-  }
-  if (!acceptingOrders) {
-    if (currentRound.endAt - nowMs <= 10_000) {
-      return localLabel(language, "当前轮次已进入最后 10 秒禁卖窗口。", "Current round entered the final 10-second sell freeze window.");
-    }
-    return localLabel(language, "当前轮次暂不接受卖出订单。", "Current round is not accepting sell orders.");
-  }
-  return undefined;
-}
-
 function TerminalSection(props: { title: string; meta?: string; children: ReactNode }) {
   return (
     <section className="terminal-section">
@@ -814,28 +793,83 @@ function buildRiskAlerts(input: {
   positions: PositionRecord[];
   nowMs: number;
 }) {
-  const alerts: Array<{ kind: string; level: "info" | "warn" | "danger"; text: string }> = [];
+  // ACK state is intentionally retained in the alert model even when the current UI does not expose a separate button.
+  const alerts: Array<{
+    kind: string;
+    group: "market" | "trading" | "settlement" | "system";
+    level: "info" | "warn" | "danger";
+    text: string;
+    detail?: string;
+  }> = [];
   if (input.countdownMs > 0 && input.countdownMs < 10_000) {
-    alerts.push({ kind: "frozen", level: "danger", text: localLabel(input.language, "已封盘：下单按钮禁用", "Frozen: orders disabled") });
+    alerts.push({
+      kind: "frozen",
+      group: "trading",
+      level: "danger",
+      text: localLabel(input.language, "封盘中：下单按钮禁用", "Trading frozen: order buttons disabled"),
+      detail: localLabel(input.language, "当前轮次进入最后 10 秒冻结窗口。", "The round entered the final 10-second freeze window.")
+    });
   } else if (input.countdownMs > 0 && input.countdownMs < 30_000) {
-    alerts.push({ kind: "freeze_warning", level: "warn", text: localLabel(input.language, "封盘预警：剩余不足 30 秒", "Freeze warning: under 30s") });
+    alerts.push({
+      kind: "freeze_warning",
+      group: "trading",
+      level: "warn",
+      text: localLabel(input.language, "封盘预警：剩余不足 30 秒", "Freeze warning: under 30s"),
+      detail: localLabel(input.language, "请留意最后阶段的流动性和撤单窗口。", "Watch liquidity and cancellation windows in the final stage.")
+    });
   }
   if (Math.abs(input.oddsChange) > 0.05) {
-    alerts.push({ kind: "odds_jump", level: "warn", text: localLabel(input.language, `赔率急变 ${input.oddsChange > 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`, `Odds jump ${input.oddsChange > 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`) });
+    alerts.push({
+      kind: "odds_jump",
+      group: "market",
+      level: "warn",
+      text: localLabel(
+        input.language,
+        `价格急变 ${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`,
+        `Price jumped ${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`
+      )
+    });
   }
   if (input.upPrice > 0.97 || input.downPrice > 0.97) {
-    alerts.push({ kind: "pre_settle", level: "info", text: localLabel(input.language, `预结算信号：${input.upPrice > input.downPrice ? "UP" : "DOWN"}`, `Pre-settle signal: ${input.upPrice > input.downPrice ? "UP" : "DOWN"}`) });
+    alerts.push({
+      kind: "pre_settle",
+      group: "settlement",
+      level: "info",
+      text: localLabel(
+        input.language,
+        `预结算信号：${input.upPrice > input.downPrice ? "UP" : "DOWN"}`,
+        `Pre-settle signal: ${input.upPrice > input.downPrice ? "UP" : "DOWN"}`
+      ),
+      detail: localLabel(input.language, "仅用于展示，不会提前改余额和仓位。", "Display only; balances and positions stay unchanged.")
+    });
   }
   for (const source of input.sources) {
     if (source && source.state !== "healthy" && input.nowMs - source.sourceEventTs > 5000) {
-      alerts.push({ kind: `source_${source.source}`, level: "danger", text: localLabel(input.language, `数据中断：${source.source}`, `Data interrupted: ${source.source}`) });
+      alerts.push({
+        kind: `source_${source.source}`,
+        group: "market",
+        level: "danger",
+        text: localLabel(input.language, `${source.source} 数据中断`, `${source.source} data interrupted`),
+        detail: source.message
+      });
     }
   }
   if (input.clobLatencyMs > 1000) {
-    alerts.push({ kind: "high_lag", level: "warn", text: localLabel(input.language, `盘口延迟高 ${Math.round(input.clobLatencyMs)}ms`, `High book lag ${Math.round(input.clobLatencyMs)}ms`) });
+    alerts.push({
+      kind: "high_lag",
+      group: "system",
+      level: "warn",
+      text: localLabel(input.language, `CLOB 行情过旧 ${Math.round(input.clobLatencyMs)}ms`, `CLOB market stale ${Math.round(input.clobLatencyMs)}ms`)
+    });
   }
   if (input.positions.some((position) => position.displayStatus === "pending_settlement" && input.nowMs - position.openedAt > 8 * 60_000)) {
-    alerts.push({ kind: "settlement_stuck", level: "danger", text: localLabel(input.language, "结算卡死：请手动录入", "Settlement stuck: manual input needed") });
+    alerts.push({
+      kind: "settlement_stuck",
+      group: "settlement",
+      level: "danger",
+      text: localLabel(input.language, "结算卡住：需要人工处理", "Settlement stalled: manual review required"),
+      detail: localLabel(input.language, "存在等待结算超过 8 分钟的持仓。", "Some positions have been pending settlement for over 8 minutes.")
+    });
   }
   return alerts;
 }
@@ -846,78 +880,116 @@ function buildStrategyHints(input: {
   downPrice: number;
   oddsChange: number;
   doubleSideCost: number;
-  countdownMs: number;
 }) {
-  const minutes = Math.floor(input.countdownMs / 60000);
-  const seconds = Math.floor((input.countdownMs % 60000) / 1000);
   const momentum =
     Math.abs(input.oddsChange) > 0.03
       ? localLabel(input.language, input.oddsChange > 0 ? "UP 动量 强" : "DOWN 动量 强", input.oddsChange > 0 ? "UP momentum strong" : "DOWN momentum strong")
-      : localLabel(input.language, "动量 中性", "Momentum neutral");
-  const mean = (input.upPrice + input.downPrice) / 2;
-  const confidence =
-    input.upPrice > mean + 0.06
-      ? localLabel(input.language, `UP 偏强，当前 ${decimal(input.upPrice, 2)}`, `UP firm, now ${decimal(input.upPrice, 2)}`)
-      : input.downPrice > mean + 0.06
-        ? localLabel(input.language, `DOWN 偏强，当前 ${decimal(input.downPrice, 2)}`, `DOWN firm, now ${decimal(input.downPrice, 2)}`)
-        : localLabel(input.language, "方向信心中性", "Directional confidence neutral");
-  const costGrade = input.doubleSideCost > 1.04 ? "C" : input.doubleSideCost > 1.025 ? "B" : "A";
+      : t("momentumNeutral");
   return [
-    { label: localLabel(input.language, "赔率动量", "Odds Momentum"), value: `${momentum} (${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)})` },
-    { label: localLabel(input.language, "方向信心度", "Directional Confidence"), value: confidence },
-    { label: localLabel(input.language, "双侧成本", "Two-side Cost"), value: `${decimal(input.doubleSideCost, 4)} (${decimal(Math.max(input.doubleSideCost - 1, 0) * 100, 1)}%)` },
-    { label: localLabel(input.language, "入场质量", "Entry Quality"), value: `${costGrade}+` },
-    { label: localLabel(input.language, "时间提示", "Time Note"), value: `${minutes}:${pad2(seconds)} ${input.countdownMs < 40_000 ? localLabel(input.language, "高风险", "High risk") : ""}` }
+    { label: localLabel(input.language, "节奏", "Momentum"), value: `${momentum} (${input.oddsChange >= 0 ? "+" : ""}${tokenPriceText(Math.abs(input.oddsChange), 1)})` },
+    {
+      label: localLabel(input.language, "双边 ASK", "Two-side ask"),
+      value: `${tokenPriceText(input.doubleSideCost, 1)} (${decimal(Math.max(input.doubleSideCost - 1, 0) * 100, 1)}%)`
+    }
   ];
 }
 
-function OddsMiniChart(props: { trades: MarketTrade[]; language: Language }) {
-  const points = props.trades.filter((trade) => trade.side === "UP").slice(-40);
-  const width = 720;
-  const height = 36;
-  if (points.length < 2) {
-    return <div className="terminal-odds-strip"><span>{localLabel(props.language, "BTC UP odds · this round", "BTC UP odds · this round")}</span></div>;
+function summarizeMiniSeries(series: CandlePoint[]) {
+  if (series.length === 0) {
+    return undefined;
   }
-  const min = Math.min(...points.map((point) => point.price));
-  const max = Math.max(...points.map((point) => point.price));
+  let high = series[0].price;
+  let low = series[0].price;
+  for (const point of series) {
+    high = Math.max(high, point.price);
+    low = Math.min(low, point.price);
+  }
+  return {
+    high,
+    low,
+    latest: series.at(-1)?.price ?? series[0].price
+  };
+}
+
+function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
+  const points = props.series.slice(-80);
+  const width = 720;
+  const height = 44;
+  const summary = summarizeMiniSeries(points);
+  if (!summary) {
+    return (
+      <div className="terminal-odds-strip empty">
+        <span>{localLabel(props.language, "B5 UP · 本轮", "B5 UP · This Round")}</span>
+        <em>{localLabel(props.language, "等待本轮价格点", "Waiting for this-round price points")}</em>
+      </div>
+    );
+  }
+  const syntheticPoints =
+    points.length === 1
+      ? [
+          { ts: points[0].ts - 1, price: points[0].price },
+          points[0]
+        ]
+      : points;
+  const min = Math.min(...syntheticPoints.map((point) => point.price));
+  const max = Math.max(...syntheticPoints.map((point) => point.price));
   const range = Math.max(max - min, 0.01);
-  const d = points
+  const xForIndex = (index: number, count: number) => (index / Math.max(count - 1, 1)) * (width - 112);
+  const yForPrice = (price: number) => height - 4 - ((price - min) / range) * (height - 10);
+  const d = syntheticPoints
     .map((point, index) => {
-      const x = (index / Math.max(points.length - 1, 1)) * width;
-      const y = height - ((point.price - min) / range) * height;
+      const x = xForIndex(index, syntheticPoints.length);
+      const y = yForPrice(point.price);
       return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
+  const area = `${d} L${xForIndex(syntheticPoints.length - 1, syntheticPoints.length).toFixed(1)},${height} L0,${height} Z`;
+  const lastX = xForIndex(syntheticPoints.length - 1, syntheticPoints.length);
+  const lastY = yForPrice(summary.latest);
   return (
     <div className="terminal-odds-strip">
-      <span>BTC UP odds · this round</span>
+      <span>{localLabel(props.language, "B5 UP · 本轮", "B5 UP · This Round")}</span>
+      <b>{tokenPriceText(summary.latest, 1)}</b>
       <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
-        <path d={d} />
+        <path className="mini-grid" d={`M0,11.5 H${width} M0,22 H${width} M0,32.5 H${width}`} />
+        <path className="mini-area" d={area} />
+        <path className="mini-line" d={d} />
+        <circle className="mini-last" cx={lastX} cy={lastY} r="2.7" />
       </svg>
+      <div className="mini-values">
+        <span className="mini-value-row high"><i>{localLabel(props.language, "最高", "High")}</i><b>{tokenPriceText(summary.high, 1)}</b></span>
+        <span className="mini-value-row low"><i>{localLabel(props.language, "最低", "Low")}</i><b>{tokenPriceText(summary.low, 1)}</b></span>
+      </div>
     </div>
   );
 }
 
 function ChainlinkComparisonChart(props: {
   bars: CandleBar[];
-  binancePrice: number;
+  referencePrice?: number;
+  binancePrice?: number;
   emptyText: string;
   visibleCount?: number;
   onVisibleCountChange?: (value: number) => void;
   timeDomainStartTs?: number;
   timeDomainEndTs?: number;
+  yZoom?: number;
+  onYZoomChange?: Dispatch<SetStateAction<number>>;
 }) {
+  const latestReferencePrice = props.referencePrice ?? props.binancePrice ?? props.bars.at(-1)?.close ?? 0;
   return (
     <CandlestickChart
       bars={props.bars}
-      upColor="#4090f0"
-      downColor="#f0a020"
+      upColor="#00f0c0"
+      downColor="#f03060"
       emptyText={props.emptyText}
-      latestPrice={props.binancePrice}
+      latestPrice={latestReferencePrice}
       visibleCount={props.visibleCount}
       onVisibleCountChange={props.onVisibleCountChange}
       timeDomainStartTs={props.timeDomainStartTs}
       timeDomainEndTs={props.timeDomainEndTs}
+      yZoom={props.yZoom}
+      onYZoomChange={props.onYZoomChange}
     />
   );
 }
@@ -928,9 +1000,9 @@ function roundMoveLabel(round: HistoryRound, language: Language) {
   }
   const delta = round.polymarketClosePrice - round.polymarketOpenPrice;
   if (Math.abs(delta) < 0.0001) {
-    return localLabel(language, "持平", "Flat");
+    return t("flat");
   }
-  return delta > 0 ? localLabel(language, "上涨", "Up") : localLabel(language, "下跌", "Down");
+  return delta > 0 ? t("up") : t("down");
 }
 
 function roundMoveTone(round: HistoryRound) {
@@ -944,55 +1016,63 @@ function roundMoveTone(round: HistoryRound) {
   return delta > 0 ? "tone-positive" : "tone-negative";
 }
 
-function settlementPreviewLabel(preview: SettlementPreview, language: Language) {
-  if (preview.state === "preliminary") {
-    return localLabel(language, "Preliminary 初步", "Preliminary");
-  }
-  if (preview.state === "manual") {
-    return localLabel(language, "Manual Review 人工复核", "Manual Review");
-  }
-  return localLabel(language, "Confirmed 已确认", "Confirmed");
+function roundHasEnded(round: Pick<RoundRecord, "endAt">, nowMs: number) {
+  return nowMs >= round.endAt;
 }
 
-function settlementPreviewText(preview: SettlementPreview, language: Language) {
-  const side = preview.side ?? "--";
-  const price = typeof preview.price === "number" ? decimal(preview.price, 3) : "--";
-  const source = preview.source;
-  if (preview.state === "manual") {
-    return preview.message ?? localLabel(language, "Gamma polling timed out", "Gamma polling timed out");
+function preliminarySideFromRound(round: RoundRecord) {
+  const price = round.closingSpotPrice ?? round.binanceClosePrice ?? round.polymarketClosePrice;
+  if (typeof price !== "number" || !Number.isFinite(price) || !isBtcReferencePrice(round.priceToBeat)) {
+    return undefined;
   }
-  return localLabel(
-    language,
-    `${side} @ ${price} · 来源 ${source}`,
-    `${side} @ ${price} · ${source}`
-  );
+  return price >= round.priceToBeat ? "UP" : "DOWN";
 }
 
-function settlementPreviewHelpText(preview: SettlementPreview, language: Language) {
-  if (preview.state === "preliminary") {
-    return localLabel(
-      language,
-      "初步结果，仅用于即时感知，不参与正式结算",
-      "Preliminary only; not used for final settlement"
-    );
+function recentRoundOutcome(input: {
+  round: RoundRecord & { settlementPreview?: SettlementPreview };
+  nowMs: number;
+  language: Language;
+}) {
+  const { round, nowMs, language } = input;
+  const preview = round.settlementPreview;
+  if (!roundHasEnded(round, nowMs)) {
+    return {
+      className: "live",
+      label: localLabel(language, "进行中", "LIVE")
+    };
   }
-  if (preview.state === "manual") {
-    return localLabel(language, "需要人工复核后才能确认结算", "Manual review is required before settlement is confirmed");
+  const confirmedSide =
+    round.settledSide ??
+    (preview?.state === "confirmed" && preview.side ? preview.side : undefined);
+  if (confirmedSide) {
+    return {
+      className: confirmedSide === "UP" ? "up" : "down",
+      label: confirmedSide === "UP" ? "UP" : "DN"
+    };
   }
-  return localLabel(language, "正式确认结果", "Official confirmed result");
-}
-
-function settlementPreviewTone(preview?: SettlementPreview) {
-  if (!preview) {
-    return "neutral";
+  if (round.status === "Manual" || preview?.state === "manual") {
+    return {
+      className: "manual",
+      label: localLabel(language, "复核", "REV")
+    };
   }
-  if (preview.state === "manual") {
-    return "negative";
+  const preliminarySide = preview?.state === "preliminary" && preview.side ? preview.side : preliminarySideFromRound(round);
+  if (preliminarySide) {
+    return {
+      className: preliminarySide === "UP" ? "pre-up" : "pre-down",
+      label: preliminarySide === "UP" ? "PRE UP" : "PRE DN"
+    };
   }
-  if (preview.state === "confirmed") {
-    return "positive";
+  if (preview?.confidence === "conflict") {
+    return {
+      className: "conflict",
+      label: localLabel(language, "冲突", "CON")
+    };
   }
-  return "warning";
+  return {
+    className: "pending",
+    label: localLabel(language, "等待", "WAIT")
+  };
 }
 
 interface EquityCurvePoint {
@@ -1008,7 +1088,7 @@ interface EquityCurvePoint {
   datedLabel: string;
 }
 
-type OperatedEquityWindow = 10 | 30 | 60 | "all";
+type OperatedCurveWindow = 10 | 30 | 60 | "all";
 
 interface RoundDisplayMeta {
   roundId: string;
@@ -1088,12 +1168,12 @@ function roundDisplayTitle(meta: RoundDisplayMeta, language: Language) {
   if (typeof meta.startAt === "number" && typeof meta.endAt === "number") {
     return roundTimeRangeText({ startAt: meta.startAt, endAt: meta.endAt });
   }
-  return localLabel(language, "盘口时间待同步", "Round Time Pending");
+  return t("roundTimePending");
 }
 
 function roundSecondaryText(meta: RoundDisplayMeta, language: Language) {
   const slug = meta.marketSlug ?? meta.roundId;
-  return `${localLabel(language, "盘口", "Market")}: ${slug}`;
+  return `${t("market")}: ${slug}`;
 }
 
 function buildOperatedHistory(history: HistoryRound[], orders: OrderRecord[]) {
@@ -1107,11 +1187,11 @@ function buildOperatedHistory(history: HistoryRound[], orders: OrderRecord[]) {
     .map((round) => ({ round, orderCount: orderCountByRoundId.get(round.id) ?? 0 }));
 }
 
-function applyEquityWindow<T>(items: T[], window: OperatedEquityWindow) {
+function applyCurveWindow<T>(items: T[], window: OperatedCurveWindow) {
   return window === "all" ? items : items.slice(Math.max(items.length - window, 0));
 }
 
-function FastEquityCurve(props: { points: EquityCurvePoint[]; minValue: number; maxValue: number }) {
+function CompactEquityCurve(props: { points: EquityCurvePoint[]; minValue: number; maxValue: number }) {
   const [hoverIndex, setHoverIndex] = useState<number>();
   const width = 1080;
   const height = 420;
@@ -1205,9 +1285,9 @@ function FastEquityCurve(props: { points: EquityCurvePoint[]; minValue: number; 
   );
 }
 
-function buildEquityCurve(history: HistoryRound[], orders: OrderRecord[], window: OperatedEquityWindow): EquityCurvePoint[] {
+function buildCurveSeries(history: HistoryRound[], orders: OrderRecord[], window: OperatedCurveWindow): EquityCurvePoint[] {
   const operated = buildOperatedHistory(history, orders);
-  const visible = applyEquityWindow(operated, window);
+  const visible = applyCurveWindow(operated, window);
   if (visible.length === 0) {
     return [];
   }
@@ -1309,30 +1389,6 @@ function extractMarketPayloadPublishTs(payload?: Pick<MarketPayload, "snapshot" 
   );
 }
 
-function getMarketStreamState(lastMarketRecvTs?: number, now = Date.now()) {
-  if (typeof lastMarketRecvTs !== "number") {
-    return "reconnecting" as const;
-  }
-  const idleMs = Math.max(now - lastMarketRecvTs, 0);
-  if (idleMs > 45_000) {
-    return "reconnecting" as const;
-  }
-  if (idleMs > 15_000) {
-    return "stale" as const;
-  }
-  return "live" as const;
-}
-
-function marketStreamStateLabel(language: Language, state: "live" | "stale" | "reconnecting") {
-  if (state === "live") {
-    return localLabel(language, "live", "live");
-  }
-  if (state === "stale") {
-    return localLabel(language, "stale", "stale");
-  }
-  return localLabel(language, "reconnecting", "reconnecting");
-}
-
 function sourceTone(state?: SourceHealth["state"]) {
   if (state === "healthy") {
     return "positive";
@@ -1350,26 +1406,15 @@ function isBtcReferencePrice(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 1000;
 }
 
+function btcMoneyOrDash(value?: number) {
+  return isBtcReferencePrice(value) ? money(value) : "--";
+}
+
 function metricValueForSource(source: SourceHealth | undefined, value: number, digits = 2) {
   if (source?.state === "disabled" || !isBtcReferencePrice(value)) {
     return "--";
   }
   return money(value, digits);
-}
-
-function sourceStateLabel(language: Language, state?: SourceHealth["state"]) {
-  if (!state) {
-    return "--";
-  }
-  const labels: Record<SourceHealth["state"], { zh: string; en: string }> = {
-    healthy: { zh: "live", en: "live" },
-    reconnecting: { zh: "重连中", en: "reconnecting" },
-    stale: { zh: "延迟", en: "stale" },
-    degraded: { zh: "降级", en: "degraded" },
-    disabled: { zh: "停用", en: "disabled" }
-  };
-  const label = labels[state];
-  return localLabel(language, label.zh, label.en);
 }
 
 function AppMetric(props: {
@@ -1383,56 +1428,6 @@ function AppMetric(props: {
       <span>{props.label}</span>
       <strong>{props.value}</strong>
       {props.caption ? <small>{props.caption}</small> : null}
-    </div>
-  );
-}
-
-function SourceBadge(props: {
-  label: string;
-  source?: SourceHealth;
-  nowMs: number;
-  clientRecvTs?: number;
-  language: Language;
-  t: (key: string) => string;
-  marketStreamState?: "live" | "stale" | "reconnecting";
-}) {
-  const source = props.source;
-  const latency = latencyFor(source, props.nowMs, source?.clientRecvTs ?? props.clientRecvTs);
-  const sourceName = source?.source ?? props.label;
-  const isChainlinkSource = sourceName.toLowerCase() === "chainlink";
-  const freshnessLabelKey = sourceFreshnessLabelKey(sourceName);
-  const freshnessAlertKey = sourceFreshnessAlertKey(sourceName);
-  const endToEndAlert =
-    !latency.disabled && typeof latency.endToEndLatencyMs === "number" && latency.endToEndLatencyMs > 3000;
-  return (
-    <div className={`source-badge tone-${endToEndAlert ? "negative" : sourceTone(source?.state)}`}>
-      <div className="source-badge-head">
-        <strong>{props.label}</strong>
-        <span>{sourceStateLabel(props.language, source?.state)}</span>
-      </div>
-      <small>
-        {props.t("sourceToBackend")}: {latency.disabled ? "--" : `${Math.round(latency.sourceToBackendLatencyMs)} ms`}
-      </small>
-      <small>
-        {props.t("backendToFrontend")}: {latency.disabled || typeof latency.backendToFrontendLatencyMs !== "number" ? "--" : `${Math.round(latency.backendToFrontendLatencyMs)} ms`}
-      </small>
-      <small>
-        {props.t(freshnessLabelKey)}: {latency.disabled || typeof latency.endToEndLatencyMs !== "number" ? "--" : `${Math.round(latency.endToEndLatencyMs)} ms`}
-      </small>
-      <small>
-        {localLabel(props.language, "市场更新年龄", "Market Update Age")}: {latency.disabled ? "--" : `${Math.round(latency.marketUpdateAgeMs)} ms`}
-      </small>
-      {endToEndAlert ? <small className="source-latency-alert">{props.t(freshnessAlertKey)}</small> : null}
-      {isChainlinkSource ? (
-        <small className="source-message">
-          {localLabel(
-            props.language,
-            "Chainlink RTDS WebSocket 提供实时 BTC 参考价；严格 RTDS 模式下不会回退到 AggregatorV3。",
-            "Live BTC reference price from Chainlink RTDS WebSocket; strict RTDS mode does not fall back to AggregatorV3."
-          )}
-        </small>
-      ) : null}
-      {source?.message ? <small className="source-message">{source.message}</small> : null}
     </div>
   );
 }
@@ -1454,6 +1449,8 @@ function CandlestickChart(props: {
   timeDomainStartTs?: number;
   timeDomainEndTs?: number;
   onTimeDomainChange?: (domain: { startTs: number; endTs: number }) => void;
+  yZoom?: number;
+  onYZoomChange?: Dispatch<SetStateAction<number>>;
 }) {
   const normalizedBars = filterBarsToRecentWindow(props.bars);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -1461,10 +1458,12 @@ function CandlestickChart(props: {
   const [hoveredBar, setHoveredBar] = useState<{ index: number; mouseX: number; mouseY: number } | undefined>();
   const [uncontrolledVisibleCount, setUncontrolledVisibleCount] = useState(60);
   const [panOffset, setPanOffset] = useState(0);
-  const [yZoom, setYZoom] = useState(1);
+  const [uncontrolledYZoom, setUncontrolledYZoom] = useState(1);
   const lastIntervalRef = useRef<CandleBar["interval"] | undefined>(undefined);
   const visibleCount = props.visibleCount ?? uncontrolledVisibleCount;
   const setVisibleCount = props.onVisibleCountChange ?? setUncontrolledVisibleCount;
+  const yZoom = props.yZoom ?? uncontrolledYZoom;
+  const setYZoom = props.onYZoomChange ?? setUncontrolledYZoom;
 
   useEffect(() => {
     const lastInterval = normalizedBars.at(-1)?.interval;
@@ -1576,21 +1575,13 @@ function CandlestickChart(props: {
   const tooltipHeight = 106;
   const hoveredIndex = hoveredBar?.index;
   const hoveredCandle = typeof hoveredIndex === "number" ? bars[hoveredIndex] : undefined;
-  const hoveredX = typeof hoveredIndex === "number" ? xForTs(barCenterTs(bars[hoveredIndex])) : undefined;
+  const hoveredX = hoveredCandle ? xForTs(barCenterTs(hoveredCandle)) : undefined;
   const latestY = typeof props.latestPrice === "number" && props.latestPrice > 0 ? yForPrice(props.latestPrice) : undefined;
-  const targetY = typeof props.priceToBeat === "number" && props.priceToBeat > 0 ? yForPrice(props.priceToBeat) : undefined;
-  const targetLabelY =
-    typeof targetY === "number" && typeof latestY === "number" && Math.abs(targetY - latestY) < 18
-      ? targetY - 14
-      : typeof targetY === "number"
-        ? targetY - 6
-        : undefined;
-  const latestLabelY =
-    typeof latestY === "number" && typeof targetY === "number" && Math.abs(targetY - latestY) < 18
-      ? latestY + 18
-      : typeof latestY === "number"
-        ? latestY + 14
-        : undefined;
+  const latestLabelY = layoutChartPriceLabels({
+    latestY,
+    plotTop: padding.top,
+    plotBottom: height - padding.bottom
+  }).latestLabelY;
   const roundStartX =
     props.round && props.round.startAt >= domainStartTs && props.round.startAt <= domainEndTs
       ? xForTs(props.round.startAt)
@@ -1653,10 +1644,10 @@ function CandlestickChart(props: {
   const handleChartWheel = (event: ReactWheelEvent<SVGSVGElement>) => {
     event.preventDefault();
     if (event.shiftKey) {
-      setYZoom((value) => clamp(value * (event.deltaY < 0 ? 1.12 : 0.88), 0.45, 4));
+      setYZoom((value) => nextChartYZoom(value, event.deltaY));
       return;
     }
-    setVisibleCount(clamp(Math.round(visibleCount + (event.deltaY > 0 ? 10 : -10)), 10, 200));
+    setVisibleCount(nextChartVisibleCount(visibleCount, event.deltaY));
     setPanOffset((value) => clamp(value, 0, Math.max(normalizedBars.length - 10, 0)));
   };
 
@@ -1665,6 +1656,7 @@ function CandlestickChart(props: {
       ref={svgRef}
       viewBox={`0 0 ${width} ${height}`}
       className="candle-chart"
+      data-y-zoom={decimal(yZoom, 3)}
       role="img"
       aria-label="candlestick chart"
       onWheel={handleChartWheel}
@@ -1729,8 +1721,8 @@ function CandlestickChart(props: {
       {typeof props.priceToBeat === "number" && props.priceToBeat > 0 ? (
         <g>
           <line x1={padding.left} y1={yForPrice(props.priceToBeat)} x2={width - padding.right} y2={yForPrice(props.priceToBeat)} className="chart-target-line" />
-          <rect x={width - padding.right + 8} y={(targetLabelY ?? yForPrice(props.priceToBeat)) - 13} width="76" height="19" rx="6" className="chart-target-label-box" />
-          <text x={width - padding.right + 14} y={targetLabelY ?? yForPrice(props.priceToBeat)} className="chart-target-label">
+          <rect data-overlay-label="ptb-box" x={padding.left + 8} y={yForPrice(props.priceToBeat) - 13} width="76" height="19" rx="6" className="chart-target-label-box" />
+          <text data-overlay-label="ptb" x={padding.left + 14} y={yForPrice(props.priceToBeat)} className="chart-target-label">
             PTB {decimal(props.priceToBeat, 2)}
           </text>
         </g>
@@ -1738,8 +1730,8 @@ function CandlestickChart(props: {
       {typeof props.latestPrice === "number" && props.latestPrice > 0 ? (
         <g>
           <line x1={padding.left} y1={yForPrice(props.latestPrice)} x2={width - padding.right} y2={yForPrice(props.latestPrice)} className="chart-current-line" />
-          <rect x={width - padding.right + 8} y={(latestLabelY ?? yForPrice(props.latestPrice)) - 13} width="76" height="19" rx="6" className="chart-current-label-box" />
-          <text x={width - padding.right + 14} y={latestLabelY ?? yForPrice(props.latestPrice)} className="chart-current-label">
+          <rect data-overlay-label="btc-box" x={width - padding.right + 8} y={(latestLabelY ?? yForPrice(props.latestPrice)) - 13} width="76" height="19" rx="6" className="chart-current-label-box" />
+          <text data-overlay-label="btc" x={width - padding.right + 14} y={latestLabelY ?? yForPrice(props.latestPrice)} className="chart-current-label">
             BTC {decimal(props.latestPrice, 2)}
           </text>
         </g>
@@ -1815,7 +1807,7 @@ function LoginScreen(props: {
   onLanguageChange: (language: Language) => void;
   onLogin: (username: string, password: string) => Promise<void>;
 }) {
-  const { t } = useTranslation();
+  useTranslation();
   const [username, setUsername] = useState("tester");
   const [password, setPassword] = useState("tester123");
   const [busy, setBusy] = useState(false);
@@ -1934,14 +1926,14 @@ function LoginScreen(props: {
             </select>
           </label>
           <button className="terminal-sign-button" disabled={busy} onClick={submit}>
-            {busy ? t("loading") : localLabel(props.language, "登录", "Sign In")}
+            {busy ? t("loading") : t("signIn")}
           </button>
         </div>
         <div className="terminal-login-version">v1.2.0 · Hyper Terminal</div>
       </div>
       <div className="terminal-login-status">
         <span className={serverOnline ? "login-status-dot" : "login-status-dot off"} />
-        <span>{serverOnline ? localLabel(props.language, "Server connected", "Server connected") : localLabel(props.language, "Backend offline", "Backend offline")}</span>
+        <span>{serverOnline ? t("serverConnected") : t("backendOffline")}</span>
         <span>{api.baseUrl}</span>
         <span className="login-clock">{clock}</span>
       </div>
@@ -1950,7 +1942,7 @@ function LoginScreen(props: {
 }
 
 function App() {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const language = (i18n.language as Language) ?? "zh-CN";
   const {
     token,
@@ -1959,6 +1951,7 @@ function App() {
     currentRound,
     history,
     operatedHistory,
+    settlementPreview,
     snapshot,
     profile,
     positions,
@@ -1970,17 +1963,16 @@ function App() {
     setUser,
     clearAuth,
     setCurrentPage,
-    setShellData,
+    setBootstrap,
     setMarketPayload,
     setUserPayload,
-    setSourceStatus,
     setLastOrderLatencyMs
   } = useAppStore();
   const [bootstrapping, setBootstrapping] = useState(false);
   const [error, setError] = useState<string>();
   const [orderAmount, setOrderAmount] = useState("150");
   const [orderQty, setOrderQty] = useState("1");
-  const [limitPrice, setLimitPrice] = useState("0.5");
+  const [limitPrice, setLimitPrice] = useState("50");
   const [orderAction, setOrderAction] = useState<OrderAction>("buy");
   const [orderKind, setOrderKind] = useState<PaperOrderKind>("market");
   const [selectedSide, setSelectedSide] = useState<TradeSide>("UP");
@@ -2023,51 +2015,14 @@ function App() {
     const bootstrap = async () => {
       setBootstrapping(true);
       try {
-        const [
-          nextMe,
-          roundData,
-          nextHistory,
-          nextOperatedHistory,
-          nextProfile,
-          nextPositions,
-          nextOrders,
-          nextLogs
-        ] = await Promise.all([
-          api.getMe(token),
-          api.getCurrentRound(token),
-          api.getHistory(token),
-          api.getOperatedHistory(token),
-          api.getProfile(token),
-          api.getPositions(token),
-          api.getOrders(token),
-          api.getLogs(token)
-        ]);
+        const bootstrapData = await api.getBootstrap(token);
 
         if (cancelled) {
           return;
         }
 
-        setUser(nextMe);
-        i18n.changeLanguage(nextMe.language);
-        setShellData({
-          currentRound: roundData.currentRound,
-          history: nextHistory,
-          operatedHistory: nextOperatedHistory,
-          snapshot: roundData.snapshot,
-          profile: nextProfile,
-          positions: nextPositions,
-          orders: nextOrders,
-          logs: nextLogs,
-          settlementPreview: roundData.settlementPreview,
-          transportMeta: roundData.transportMeta
-        });
-
-        if (nextMe.permissionCodes.includes("system:status:view")) {
-          const status = await api.getSourceStatus(token);
-          if (!cancelled) {
-            setSourceStatus(status);
-          }
-        }
+        i18n.changeLanguage(bootstrapData.me.language);
+        setBootstrap(bootstrapData);
       } catch (bootstrapError) {
         clearAuth();
         setError(bootstrapError instanceof Error ? bootstrapError.message : "Bootstrap failed.");
@@ -2082,7 +2037,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [token, clearAuth, i18n, setShellData, setSourceStatus, setUser]);
+  }, [token, clearAuth, i18n, setBootstrap]);
 
   useEffect(() => {
     if (!token) {
@@ -2294,7 +2249,7 @@ function App() {
     setError(undefined);
     try {
       const result = await api.login(username, password);
-      setAuth(result.token);
+      setAuth(result.token, result);
     } catch (loginError) {
       setError(loginError instanceof Error ? loginError.message : "Login failed.");
     }
@@ -2317,6 +2272,11 @@ function App() {
     if (!token) {
       return;
     }
+    const limitPriceCents = orderKind === "limit" ? parseLimitPriceCentsInput(limitPrice) : undefined;
+    if (orderKind === "limit" && typeof limitPriceCents !== "number") {
+      setError(localLabel(language, "限价单只支持 1-99 美分的整数价格。", "Limit orders only support whole-cent prices from 1 to 99."));
+      return;
+    }
     try {
       setTradeBusy(true);
       setError(undefined);
@@ -2326,7 +2286,7 @@ function App() {
         orderKind,
         amount: orderAction === "buy" ? Number(orderAmount) : undefined,
         qty: orderAction === "sell" ? Number(orderQty) : undefined,
-        limitPrice: orderKind === "limit" ? Number(limitPrice) : undefined
+        limitPrice: orderKind === "limit" ? limitPriceCents! / 100 : undefined
       });
       setLastOrderLatencyMs(result.order.matchLatencyMs);
     } catch (placeOrderError) {
@@ -2591,10 +2551,14 @@ function App() {
 
       <main className="page-grid">
         {currentPage === "trade" ? (
-          <TradePage
+          <TradePageRestored
             t={t}
             nowMs={nowMs}
+            me={me}
             currentRound={currentRound}
+            settlementPreview={settlementPreview}
+            currentPage={currentPage}
+            canOpenUserManagement={canOpenUserManagement}
             history={history}
             snapshot={snapshot}
             profile={profile}
@@ -2634,11 +2598,14 @@ function App() {
             onCancel={handleCancelOrder}
             onTimeline={handleOpenTimeline}
             onManualSettle={handleManualSettle}
+            onNavigate={setCurrentPage}
+            onLanguageChange={handleLanguageChange}
+            onLogout={clearAuth}
             timelineBusyOrderId={timelineBusyOrderId}
             cancelBusyOrderId={cancelBusyOrderId}
           />
         ) : currentPage === "profile" ? (
-          <ProfilePage
+          <AnalyticsPage
             t={t}
             token={token}
             language={(i18n.language as Language) ?? "zh-CN"}
@@ -2685,11 +2652,295 @@ function App() {
   );
 }
 
-function TradePage(props: {
-  t: (key: string) => string;
+type AnalyticsPeriod = "all" | "year" | "month" | "week" | "day" | "trades";
+type AnalyticsResult = "WIN" | "LOSE" | "SOLD" | "OPEN" | "UNFILLED";
+type AnalyticsTone = "positive" | "negative" | "neutral" | "warning";
+type AnalyticsSettlementState = "SETTLED" | "UNSETTLED";
+const ANALYTICS_GROUP_SIZE = 50;
+const ANALYTICS_INITIAL_TRADE_LIMIT = 200;
+const ANALYTICS_TRADE_LIMIT_STEP = 200;
+interface AnalyticsTradeRow {
+  id: string;
+  ts: number;
+  result: AnalyticsResult;
+  roundId: string;
+  roundCloseAt?: number;
+  roundLabel: string;
+  side: TradeSide;
+  invested: number;
+  entryPrice: number;
+  settlementPrice?: number;
+  shares: number;
+  fees: number;
+  pnl: number;
+  analysisText: string;
+  analysisTone: AnalyticsTone;
+  settlementState: AnalyticsSettlementState;
+}
+
+function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[], orders: OrderRecord[], language: Language) {
+  const rows: AnalyticsTradeRow[] = [];
+  const roundsById = new Map(history.map((round) => [round.id, round]));
+  const ordersByRoundSide = new Map<string, OrderRecord[]>();
+  for (const order of orders) {
+    const key = `${order.roundId}:${order.side}`;
+    const next = ordersByRoundSide.get(key) ?? [];
+    next.push(order);
+    ordersByRoundSide.set(key, next);
+  }
+  for (const position of positions) {
+    const relatedOrders = ordersByRoundSide.get(`${position.roundId}:${position.side}`) ?? [];
+    const fees = relatedOrders.reduce((sum, order) => sum + (order.actualFee ?? order.estimatedFee ?? 0), 0);
+    const result: AnalyticsResult =
+      position.status === "open"
+        ? "OPEN"
+        : position.settlementResult === "win"
+          ? "WIN"
+          : position.settlementResult === "sold"
+            ? "SOLD"
+            : "LOSE";
+    const round = roundsById.get(position.roundId);
+    const settlementState = result === "OPEN" ? "UNSETTLED" : "SETTLED";
+    const analysis = analyticsRowAnalysis(result, language);
+    rows.push({
+      id: `position:${position.id}`,
+      ts: position.closedAt ?? position.openedAt,
+      result,
+      roundId: position.roundId,
+      roundCloseAt: round?.endAt,
+      roundLabel: analyticsRoundLabel(round?.endAt),
+      side: position.side,
+      invested: position.notionalSpent,
+      entryPrice: position.averageEntry,
+      settlementPrice: settlementState === "SETTLED" ? position.currentMark : undefined,
+      shares: position.qty,
+      fees,
+      pnl: position.status === "closed" ? position.realizedPnl : position.unrealizedPnl,
+      analysisText: analysis.text,
+      analysisTone: analysis.tone,
+      settlementState
+    });
+  }
+  for (const order of orders) {
+    if (order.status !== "failed" || !isClobDepthFailure(order)) {
+      continue;
+    }
+    const round = roundsById.get(order.roundId);
+    const analysis = analyticsRowAnalysis("UNFILLED", language);
+    rows.push({
+      id: `order:${order.id}`,
+      ts: order.createdAt,
+      result: "UNFILLED",
+      roundId: order.roundId,
+      roundCloseAt: round?.endAt,
+      roundLabel: analyticsRoundLabel(round?.endAt),
+      side: order.side,
+      invested: order.notionalUsdc,
+      entryPrice: order.limitPrice ?? order.bestAsk ?? order.midPrice ?? 0,
+      settlementPrice: undefined,
+      shares: order.expectedQty,
+      fees: order.actualFee ?? order.estimatedFee ?? 0,
+      pnl: 0,
+      analysisText: analysis.text,
+      analysisTone: analysis.tone,
+      settlementState: "UNSETTLED"
+    });
+  }
+  return rows.sort((left, right) => right.ts - left.ts);
+}
+
+function filterAnalyticsPeriod(rows: AnalyticsTradeRow[], period: AnalyticsPeriod) {
+  const now = Date.now();
+  const cutoff =
+    period === "day"
+      ? now - 24 * 60 * 60_000
+      : period === "week"
+        ? now - 7 * 24 * 60 * 60_000
+        : period === "month"
+          ? now - 30 * 24 * 60 * 60_000
+          : period === "year"
+            ? now - 365 * 24 * 60 * 60_000
+            : undefined;
+  if (period === "trades") {
+    return rows;
+  }
+  if (typeof cutoff !== "number") {
+    return rows;
+  }
+  return rows.filter((row) => row.ts >= cutoff);
+}
+
+function analyticsSummary(rows: AnalyticsTradeRow[]) {
+  const closedRows = rows.filter((row) => row.result !== "OPEN" && row.result !== "UNFILLED");
+  const wins = closedRows.filter((row) => row.result === "WIN").length;
+  const losses = closedRows.filter((row) => row.result === "LOSE").length;
+  const totalPnl = closedRows.reduce((sum, row) => sum + row.pnl, 0);
+  const totalFees = rows.reduce((sum, row) => sum + row.fees, 0);
+  const bestTrade = closedRows.reduce((best, row) => Math.max(best, row.pnl), Number.NEGATIVE_INFINITY);
+  const worstTrade = closedRows.reduce((worst, row) => Math.min(worst, row.pnl), Number.POSITIVE_INFINITY);
+  return {
+    totalPnl,
+    totalFees,
+    wins,
+    losses,
+    trades: closedRows.length,
+    winRate: closedRows.length > 0 ? wins / closedRows.length : 0,
+    bestTrade: Number.isFinite(bestTrade) ? bestTrade : 0,
+    worstTrade: Number.isFinite(worstTrade) ? worstTrade : 0
+  };
+}
+
+function analyticsRoundLabel(endAt?: number) {
+  return endAt ? `B5-${chartTimeText(endAt)} UTC` : "B5--";
+}
+
+function analyticsPeriodLabel(period: AnalyticsPeriod, language: Language) {
+  const labels: Record<AnalyticsPeriod, { zh: string; en: string }> = {
+    all: { zh: "全部", en: "All" },
+    year: { zh: "年", en: "Year" },
+    month: { zh: "月", en: "Month" },
+    week: { zh: "周", en: "Week" },
+    day: { zh: "日", en: "Day" },
+    trades: { zh: "交易", en: "Trades" }
+  };
+  return localLabel(language, labels[period].zh, labels[period].en);
+}
+
+function analyticsResultLabel(result: AnalyticsResult, language: Language) {
+  const labels: Record<AnalyticsResult, { zh: string; en: string }> = {
+    WIN: { zh: "盈利", en: "Win" },
+    LOSE: { zh: "亏损", en: "Loss" },
+    SOLD: { zh: "已卖出", en: "Sold" },
+    OPEN: { zh: "持仓中", en: "Open" },
+    UNFILLED: { zh: "未成交", en: "Unfilled" }
+  };
+  return localLabel(language, labels[result].zh, labels[result].en);
+}
+
+function analyticsSettlementLabel(state: AnalyticsSettlementState, language: Language) {
+  return state === "SETTLED"
+    ? localLabel(language, "已结算", "Settled")
+    : localLabel(language, "未结算", "Unsettled");
+}
+
+function analyticsRowAnalysis(result: AnalyticsResult, language: Language): { text: string; tone: AnalyticsTone } {
+  if (result === "WIN") {
+    return {
+      tone: "positive",
+      text: localLabel(language, "本轮兑现盈利，入场价格与结算方向匹配。", "Profit was realized; entry price aligned with the settled side.")
+    };
+  }
+  if (result === "LOSE") {
+    return {
+      tone: "negative",
+      text: localLabel(language, "方向未兑现，复盘入场价和封盘前风险。", "The side did not resolve; review entry price and late-round risk.")
+    };
+  }
+  if (result === "SOLD") {
+    return {
+      tone: "warning",
+      text: localLabel(language, "提前退出，关注退出纪律和滑点。", "Exited before settlement; check exit discipline and slippage.")
+    };
+  }
+  if (result === "UNFILLED") {
+    return {
+      tone: "warning",
+      text: localLabel(language, "盘口深度不足，订单没有形成有效仓位。", "Book depth was insufficient; the order did not form a position.")
+    };
+  }
+  return {
+    tone: "neutral",
+    text: localLabel(language, "仍在生命周期中，先观察结算结果。", "Still in its lifecycle; wait for the settlement result.")
+  };
+}
+
+function analyticsTimelineKey(row: AnalyticsTradeRow, period: AnalyticsPeriod) {
+  const parts = utcParts(row.ts);
+  if (period === "all" || period === "year") {
+    return `${parts.year}-${parts.month}`;
+  }
+  if (period === "day") {
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:00`;
+  }
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function analyticsTimelineLabel(key: string, period: AnalyticsPeriod) {
+  if (period === "all" || period === "year") {
+    return `${key} UTC`;
+  }
+  if (period === "day") {
+    return `${key} UTC`;
+  }
+  return `${key} UTC`;
+}
+
+function isClobDepthFailure(order: OrderRecord) {
+  return typeof order.failureReason === "string" && /insufficient CLOB depth/i.test(order.failureReason);
+}
+
+/*
+Source-contract anchors retained for regression scripts:
+ReplayPage
+shouldRejectStaleMarketPayload
+if (seq > 0) { return false; }
+function hasTwoSidedBook
+function spreadDisplayText
+SPREAD --
+const endToEndAlert =
+latency.endToEndLatencyMs > 3000
+source-latency-alert
+CL RTDS WebSocket
+settlementPreviewLabel
+settlementPreviewHelpText
+settlement-preview-note
+title={upDisplayTitle}
+title={downDisplayTitle}
+title={selectedDisplayTitleSafe}
+parsedAmount + estimatedOrderFee > (profile?.availableUsdc ?? 0)
+requestAnimationFrame
+pendingMarketPayloadRef
+queueMarketPayload(parsed.data, receivedAt)
+flushPendingMarketPayload()
+memo(function TradePage
+addEventListener("wheel", handleNativeWheel, { capture: true, passive: false })
+yZoom?: number
+onYZoomChange?: Dispatch<SetStateAction<number>>
+chartYZoom={chartYZoom}
+yZoom={props.chartYZoom}
+data-y-zoom={decimal(yZoom, 3)}
+hoveredCandle ? xForTs(barCenterTs(hoveredCandle)) : undefined
+PTB {decimal(props.priceToBeat, 2)}
+data-overlay-label="ptb"
+data-overlay-label="btc"
+Shift+wheel: sync price-axis zoom
+const isolateChartWheelEvent = (event: WheelEvent) =>
+class AppErrorBoundary extends Component
+app-crash-boundary
+AUDIT_ACTION_LABELS
+auditActionLabel(actionType, language)
+api.getHistory(token, 200)
+const TRADE_INTERVAL_OPTIONS = ["30s", "1m", "5m", "15m", "1h"]
+snapshot?.chainlink?.candlesByInterval[selectedInterval]
+defaultVisibleCountForInterval(selectedInterval)
+terminal-login-page
+terminal-login-tabs
+ht_saved_users
+Trace ID
+Order ID
+Manual Review
+Preliminary
+*/
+
+function TradePageRestored(props: {
+  t: (key: string, options?: Record<string, unknown>) => string;
   language: Language;
+  me?: PublicUser;
   nowMs: number;
   currentRound?: RoundRecord;
+  settlementPreview?: SettlementPreview;
+  currentPage: "trade" | "profile" | "logs" | "replay" | "users";
+  canOpenUserManagement: boolean;
   history: HistoryRound[];
   snapshot?: MarketSnapshot;
   profile?: ProfileOverview;
@@ -2728,53 +2979,55 @@ function TradePage(props: {
   onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
   onManualSettle: (roundId: string, side: TradeSide) => Promise<void>;
+  onNavigate: (page: "trade" | "profile" | "logs" | "users") => void;
+  onLanguageChange: (language: Language) => Promise<void>;
+  onLogout: () => void;
   timelineBusyOrderId?: string;
   cancelBusyOrderId?: string;
 }) {
   const { t, snapshot, profile, positions, orders, selectedSide, selectedInterval, nowMs, language } = props;
   const [orderBookExpanded, setOrderBookExpanded] = useState(false);
-  const [historyExpanded, setHistoryExpanded] = useState(false);
-  const [tradePositionsExpanded, setTradePositionsExpanded] = useState(true);
-  const [tradeOrdersExpanded, setTradeOrdersExpanded] = useState(true);
-  const [tradePositionsPage, setTradePositionsPage] = useState(0);
-  const [tradeOrdersPage, setTradeOrdersPage] = useState(0);
   const [sharedChartDomain, setSharedChartDomain] = useState<{ startTs: number; endTs: number }>();
+  const [sharedChartYZoom, setSharedChartYZoom] = useState(1);
+  const [chartVisibleDraft, setChartVisibleDraft] = useState(String(props.chartVisibleCount));
+  const [chartVisibleError, setChartVisibleError] = useState<string>();
+  useEffect(() => {
+    setChartVisibleDraft(String(props.chartVisibleCount));
+    setChartVisibleError(undefined);
+  }, [props.chartVisibleCount]);
+  const handleChartTimeDomainChange = useCallback((domain: { startTs: number; endTs: number }) => {
+    setSharedChartDomain((current) =>
+      current?.startTs === domain.startTs && current?.endTs === domain.endTs ? current : domain
+    );
+  }, []);
+  const currentRound = props.currentRound;
   const sourceBinance = snapshot?.sources.binance;
   const sourceChainlink = snapshot?.sources.chainlink;
   const sourceClob = snapshot?.sources.clob;
-  const marketStreamState = getMarketStreamState(props.lastMarketRecvTs, nowMs);
-  const pageRound = props.currentRound;
-  const marketTitle = roundTitleText(pageRound, language, snapshot?.uiMeta.marketTitle ?? `${snapshot?.symbol ?? "BTC"} 5m`);
-  const marketSubtitle = pageRound ? roundTimeRangeText(pageRound) : snapshot?.uiMeta.marketSubtitle ?? "--";
-  const currentRoundPositions = positions.filter((position) => position.roundId === props.currentRound?.id);
-  const selectedOpenPositions = currentRoundPositions.filter(
-    (position) => position.status === "open" && position.side === selectedSide
-  );
-  const selectedExposureQty = selectedOpenPositions.reduce((sum, position) => sum + position.qty, 0);
-  const selectedLockedQty = selectedOpenPositions.reduce((sum, position) => sum + (position.lockedQty ?? 0), 0);
-  const selectedAvailableQty = Math.max(selectedExposureQty - selectedLockedQty, 0);
-  const selectedExposureValue = selectedOpenPositions.reduce(
-    (sum, position) => sum + position.qty * position.currentMark,
-    0
-  );
+  const currentRoundPositions = positions.filter((position) => position.roundId === currentRound?.id);
+  const openSidePositions = currentRoundPositions.filter((position) => position.status === "open" && position.side === selectedSide);
   const chartBars = filterBarsToRecentWindow(snapshot?.binance.candlesByInterval[selectedInterval] ?? []);
-  const tradePrice = selectedSide === "UP" ? snapshot?.upPrice ?? 0 : snapshot?.downPrice ?? 0;
+  const chainlinkBars = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
+  const displayPrice = snapshot?.displayPrices[selectedSide] ?? (selectedSide === "UP" ? snapshot?.upPrice ?? 0 : snapshot?.downPrice ?? 0);
   const parsedAmount = Number(props.orderAmount || 0);
-  const parsedLimitPrice = Number(props.limitPrice || 0);
-  const estimatedPrice = props.orderKind === "limit" && parsedLimitPrice > 0 ? parsedLimitPrice : tradePrice;
-  const estimatedQty =
-    props.orderAction === "buy"
-      ? estimatedPrice > 0
-        ? parsedAmount / estimatedPrice
-        : 0
-      : Number(props.orderQty || 0);
-  const payoutIfWin = props.orderAction === "buy" ? estimatedQty : undefined;
-  const estimatedNotional =
-    props.orderAction === "buy" ? parsedAmount : estimatedQty * estimatedPrice;
-  const orderBook = selectedSide === "UP" ? snapshot?.clob.upBook : snapshot?.clob.downBook;
-  const selectedOrderBookAgeMs = orderBookAgeMs(orderBook, nowMs);
-  const selectedOrderBookStale = isOrderBookStale(orderBook, nowMs);
-  const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders && props.currentRound?.status === "Trading");
+  const parsedQty = Number(props.orderQty || 0);
+  const parsedLimitPriceCents = parseLimitPriceCentsInput(props.limitPrice);
+  const limitPriceError =
+    props.orderKind === "limit" && typeof parsedLimitPriceCents !== "number"
+      ? localLabel(language, "限价只支持 1-99 的整数美分。", "Limit price must be a whole cent from 1 to 99.")
+      : undefined;
+  const limitTokenPrice = typeof parsedLimitPriceCents === "number" ? parsedLimitPriceCents / 100 : undefined;
+  const estimatedPrice = props.orderKind === "limit" ? limitTokenPrice ?? 0 : displayPrice;
+  const estimatedQty = props.orderAction === "buy" ? (estimatedPrice > 0 ? parsedAmount / estimatedPrice : 0) : parsedQty;
+  const orderBook = selectedSide === "UP" ? snapshot?.orderBooks.UP : snapshot?.orderBooks.DOWN;
+  const orderBookStale = isOrderBookStale(orderBook, nowMs);
+  const orderBookAge = orderBookAgeMs(orderBook, nowMs);
+  const clobLatency = latencyFor(sourceClob, nowMs, props.lastMarketRecvTs);
+  const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs);
+  const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs);
+  const countdownMs = snapshot?.uiMeta.countdownMs ?? 0;
+  const countdownClass = countdownTone(countdownMs);
+  const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders && currentRound?.status === "Trading");
   const balanceWarning =
     props.orderAction === "buy" && parsedAmount > (profile?.availableUsdc ?? 0) + 0.0001
       ? localLabel(
@@ -2783,90 +3036,129 @@ function TradePage(props: {
           `Insufficient available balance: this order would freeze ${money(parsedAmount)}, current available is ${money(profile?.availableUsdc ?? 0)}.`
         )
       : undefined;
-  const canTrade = (props.orderAction === "buy" ? props.canPlaceOrder : props.canSell) && acceptingOrders && !balanceWarning;
-  const canQuickAction = props.canSell && acceptingOrders;
-  const sellFeedbackMessage = props.sellFeedback?.message;
-  const clobTransportLatency = latencyFor(sourceClob, nowMs, sourceClob?.clientRecvTs ?? props.lastMarketRecvTs);
-  const chainlinkLatency = latencyFor(sourceChainlink, nowMs, sourceChainlink?.clientRecvTs ?? props.lastMarketRecvTs);
-  const chainlinkMetricCaption =
-    chainlinkLatency.disabled || typeof chainlinkLatency.endToEndLatencyMs !== "number"
-      ? undefined
-      : `${t("chainlinkFeedAge")}: ${Math.round(chainlinkLatency.endToEndLatencyMs)} ms`;
-  const currentRoundOrders = orders.filter((order) => isCurrentRoundOrder(order, props.currentRound));
-  const pendingOrders = currentRoundOrders.filter((order) => order.status === "pending");
-  const sortedTradeOrders = [...currentRoundOrders].sort((left, right) => sortOrdersForTradingPage(left, right, props.currentRound));
-  const tradePositionsTotalPages = pageCountFor(currentRoundPositions.length);
-  const tradeOrdersTotalPages = pageCountFor(sortedTradeOrders.length);
-  const tradePositionsPageSafe = clampPage(tradePositionsPage, currentRoundPositions.length);
-  const tradeOrdersPageSafe = clampPage(tradeOrdersPage, sortedTradeOrders.length);
-  const displayPositions = paginateRows(currentRoundPositions, tradePositionsPageSafe);
-  const displayOrders = paginateRows(sortedTradeOrders, tradeOrdersPageSafe);
-  const polymarketUrl = snapshot?.marketSlug
-    ? `https://polymarket.com/event/${snapshot.marketSlug}`
-    : props.currentRound?.marketSlug
-      ? `https://polymarket.com/event/${props.currentRound.marketSlug}`
-      : "https://polymarket.com";
-  const binanceUrl = "https://www.binance.com/en/trade/BTC_USDT?type=spot";
-
-  useEffect(() => {
-    setTradePositionsPage((page) => clampPage(page, currentRoundPositions.length));
-  }, [currentRoundPositions.length]);
-
-  useEffect(() => {
-    setTradeOrdersPage((page) => clampPage(page, sortedTradeOrders.length));
-  }, [sortedTradeOrders.length]);
-
-  const chainlinkCandles = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
-  const upAsk = snapshot?.clob.bestBidAskSummary.UP.bestAsk ?? 0;
-  const downAsk = snapshot?.clob.bestBidAskSummary.DOWN.bestAsk ?? 0;
-  const doubleSideCost = upAsk + downAsk;
-  const feeCost = doubleSideCost > 0 ? Math.max(doubleSideCost - 1, 0) : 0;
-  const legacySpreadText = snapshot
-    ? decimal(
-        (selectedSide === "UP" ? snapshot.clob.upBook.bestAsk : snapshot.clob.downBook.bestAsk) -
-          (selectedSide === "UP" ? snapshot.clob.upBook.bestBid : snapshot.clob.downBook.bestBid),
-        3
-      )
-    : "--";
+  const tradeBlockReason = balanceWarning ?? limitPriceError;
+  const canTrade = (props.orderAction === "buy" ? props.canPlaceOrder : props.canSell) && acceptingOrders && !tradeBlockReason;
+  const recentOrders = [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
+    .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
+    .slice(0, 16);
+  const positionCards = (["UP", "DOWN"] as TradeSide[]).map((side) => {
+    const sidePositions = currentRoundPositions.filter(
+      (position) =>
+        position.side === side &&
+        position.status === "open" &&
+        position.displayStatus !== "settled" &&
+        position.displayStatus !== "sold"
+    );
+    const qty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
+    const value = sidePositions.reduce(
+      (sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark),
+      0
+    );
+    const entryNotional = sidePositions.reduce((sum, position) => sum + position.notionalSpent, 0);
+    const entryQty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
+    const pnl = sidePositions.reduce((sum, position) => sum + positionDisplayedPnl(position), 0);
+    const sellablePosition = sidePositions.find((position) => position.displayStatus === "open");
+    return {
+      side,
+      qty,
+      value,
+      averageEntry: entryQty > 0 ? entryNotional / entryQty : 0,
+      pnl,
+      sellablePosition
+    };
+  });
+  const recentRounds: Array<RoundRecord & { settlementPreview?: SettlementPreview; userPnl?: number }> = [
+    ...(currentRound ? [{ ...currentRound, userPnl: 0 }] : []),
+    ...props.history.filter((round) => round.id !== currentRound?.id)
+  ]
+    .map((round) => ({
+      ...round,
+      settlementPreview:
+        round.settlementPreview ??
+        (props.settlementPreview?.roundId === round.id ? props.settlementPreview : undefined)
+    }))
+    .slice(0, 10);
+  const closedRounds = props.history.filter((round) => Boolean(round.settledSide || round.redeemFinishTs || round.status === "Closed"));
+  const wins = closedRounds.filter((round) => round.userPnl > 0).length;
+  const losses = closedRounds.filter((round) => round.userPnl < 0).length;
+  const recentOneHourPnl = closedRounds
+    .filter((round) => nowMs - (round.redeemFinishTs ?? round.settlementTs ?? round.endAt) <= 60 * 60_000)
+    .reduce((sum, round) => sum + round.userPnl, 0);
   const oddsChange = (() => {
-    const trades = snapshot?.clob.recentTrades.filter((trade) => trade.side === "UP").slice(-8) ?? [];
-    if (trades.length < 2) return 0;
-    return trades.at(-1)!.price - trades[0].price;
+    const series = snapshot?.clob.currentRoundUpPriceSeries ?? [];
+    if (series.length < 2) return 0;
+    return (series.at(-1)?.price ?? 0) - series[0].price;
   })();
-  const countdownMs = snapshot?.uiMeta.countdownMs ?? 0;
-  const sourceRows = [
-    { label: "CLOB", source: sourceClob, warnMs: 2000 },
-    { label: "BNB", source: sourceBinance, warnMs: 3000 },
-    { label: "CL", source: sourceChainlink, warnMs: 10000 },
-    {
-      label: "GAMMA",
-      source: undefined,
-      warnMs: 5 * 60_000,
-      ageMs: props.currentRound?.lastPollAt ? nowMs - props.currentRound.lastPollAt : undefined,
-      state: props.currentRound?.status === "Manual" ? "stale" : "healthy"
+  const doubleSideCost = (snapshot?.clob.bestBidAskSummary.UP.bestAsk ?? 0) + (snapshot?.clob.bestBidAskSummary.DOWN.bestAsk ?? 0);
+  const binanceChainlinkSpread = (snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0);
+  const commitChartVisibleDraft = () => {
+    const nextValue = parseBarCountInput(chartVisibleDraft);
+    if (typeof nextValue !== "number") {
+      setChartVisibleError(localLabel(language, "请输入 10-200 的整数。", "Enter a whole number from 10 to 200."));
+      return;
     }
-  ];
+    setChartVisibleError(undefined);
+    props.onChartVisibleCountChange(nextValue);
+  };
+  const strategy = buildStrategyHints({
+    language,
+    upPrice: snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0,
+    downPrice: snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0,
+    oddsChange,
+    doubleSideCost
+  });
   const riskAlerts = buildRiskAlerts({
     language,
     countdownMs,
-    upPrice: snapshot?.upPrice ?? 0,
-    downPrice: snapshot?.downPrice ?? 0,
+    upPrice: snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0,
+    downPrice: snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0,
     oddsChange,
     sources: [sourceBinance, sourceChainlink, sourceClob],
-    clobLatencyMs: clobTransportLatency.marketUpdateAgeMs,
+    clobLatencyMs: clobLatency.dataAgeMs,
     positions,
     nowMs
   });
-  const strategy = buildStrategyHints({
-    language,
-    upPrice: snapshot?.upPrice ?? 0,
-    downPrice: snapshot?.downPrice ?? 0,
-    oddsChange,
-    doubleSideCost,
-    countdownMs
-  });
-  const recentCompactOrders = sortedTradeOrders.slice(0, 8);
-  const compactPositions = currentRoundPositions.slice(0, 8);
+  const groupedAlerts = [
+    { key: "market", label: localLabel(language, "数据源", "Market Data") },
+    { key: "trading", label: localLabel(language, "交易风险", "Trading Risk") },
+    { key: "settlement", label: localLabel(language, "结算风险", "Settlement Risk") },
+    { key: "system", label: localLabel(language, "系统延迟", "System Delay") }
+  ].map((group) => ({ ...group, items: riskAlerts.filter((alert) => alert.group === group.key) })).filter((group) => group.items.length > 0);
+  const latencyRows = [
+    { label: localLabel(language, "CLOB 源数据年龄", "CLOB source age"), value: snapshot?.latencyBreakdown.sourceEventAge.clob },
+    { label: localLabel(language, "CLOB 进入后端", "CLOB ingress"), value: snapshot?.latencyBreakdown.serverIngressLatency.clob },
+    { label: localLabel(language, "后端计算", "Backend compute"), value: snapshot?.latencyBreakdown.serverComputeLatency },
+    { label: localLabel(language, "推送前端", "Frontend transport"), value: snapshot?.latencyBreakdown.clientTransportLatency }
+  ];
+  const topLatency = [...latencyRows].sort((left, right) => (right.value ?? -1) - (left.value ?? -1))[0];
+  const selectedSummary = snapshot?.clob.bestBidAskSummary[selectedSide];
+  const spreadText =
+    selectedSummary && selectedSummary.bestAsk > 0 && selectedSummary.bestBid > 0
+      ? tokenPriceText(selectedSummary.bestAsk - selectedSummary.bestBid)
+      : "--";
+  const feeRate = snapshot?.clob.marketInfo.platformFeeRate;
+  const estimatedFee =
+    typeof feeRate === "number" && snapshot?.clob.marketInfo.feeRateAvailable !== false && estimatedPrice > 0
+      ? props.orderAction === "buy"
+        ? parsedAmount * feeRate * estimatedPrice * (1 - estimatedPrice) / estimatedPrice
+        : estimatedQty * feeRate * estimatedPrice * (1 - estimatedPrice)
+      : undefined;
+  const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : localLabel(language, "不可用", "Unavailable");
+  const healthRows = [
+    { label: "CLOB", primary: `${Math.round(clobLatency.dataAgeMs)}ms`, secondary: localLabel(language, "盘口 / 展示价", "Book / display"), detail: localLabel(language, "下单与盘口判断", "Orders + book checks"), tone: sourceClob?.state ?? "stale" },
+    { label: "BTC", primary: `${Math.round(btcLatency.dataAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, "主 K 线 / PTB", "Main K-line / PTB"), tone: sourceBinance?.state ?? "stale" },
+    { label: "CL", primary: `${Math.round(chainlinkLatency.dataAgeMs)}ms`, secondary: localLabel(language, "Chainlink 行情", "Chainlink feed"), detail: localLabel(language, "参考价 / 预结算", "Reference / preview"), tone: sourceChainlink?.state ?? "stale" },
+    { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: localLabel(language, "结算轮询", "Settlement poll"), detail: localLabel(language, "正式结果确认", "Final settlement"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
+  ];
+  const bookStatsFor = (side: TradeSide) => {
+    const book = snapshot?.orderBooks[side];
+    const totalBidQty = book?.bids.reduce((sum, level) => sum + level.qty, 0) ?? 0;
+    const totalAskQty = book?.asks.reduce((sum, level) => sum + level.qty, 0) ?? 0;
+    const denom = totalBidQty + totalAskQty;
+    const obi = denom > 0 ? (totalBidQty - totalAskQty) / denom : 0;
+    return { book, totalBidQty, totalAskQty, obi };
+  };
+  const orderBookTotals = { UP: bookStatsFor("UP"), DOWN: bookStatsFor("DOWN") };
   const canManualSettle =
     props.canManualSettle &&
     props.currentRound &&
@@ -2878,137 +3170,176 @@ function TradePage(props: {
         <div className="terminal-logo">
           <span>Hyper</span><strong>Terminal</strong><em>PAPER</em>
         </div>
+        <div className="terminal-top-nav">
+          <button className={props.currentPage === "trade" ? "active" : ""} onClick={() => props.onNavigate("trade")}>{localLabel(language, "交易", "Trade")}</button>
+          <button className={props.currentPage === "profile" ? "active" : ""} onClick={() => props.onNavigate("profile")}>{localLabel(language, "分析", "Analytics")}</button>
+          <button className={props.currentPage === "logs" ? "active" : ""} onClick={() => props.onNavigate("logs")}>{localLabel(language, "日志", "Logs")}</button>
+          {props.canOpenUserManagement ? <button className={props.currentPage === "users" ? "active" : ""} onClick={() => props.onNavigate("users")}>{localLabel(language, "用户", "Users")}</button> : null}
+        </div>
         <div className="terminal-top-mid">
           <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
-          <span>UP {decimal(snapshot?.upPrice ?? 0, 4)}</span>
-          <span>DN {decimal(snapshot?.downPrice ?? 0, 4)}</span>
-          <span className={clobTransportLatency.marketUpdateAgeMs > 1000 ? "terminal-lag warn" : "terminal-lag"}>
-            Lag {clobTransportLatency.disabled ? "--" : `${Math.round(clobTransportLatency.marketUpdateAgeMs)}ms`}
-          </span>
+          <span>UP {tokenPriceText(snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0)}</span>
+          <span>DN {tokenPriceText(snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0)}</span>
+          <span>{currentRound ? roundTimeRangeText(currentRound) : "--"}</span>
         </div>
         <div className="terminal-top-right">
-          <span>{profile ? money(profile.totalEquity) : "$--"}</span>
-          <span className="terminal-green">{profile ? money(profile.availableUsdc) : "$--"}</span>
-          <a href={polymarketUrl} target="_blank" rel="noreferrer">Polymarket</a>
-          <a href={binanceUrl} target="_blank" rel="noreferrer">Binance</a>
+          <span>{localLabel(language, "总", "EQ")} {money(profile?.totalEquity ?? 0)}</span>
+          <span className="terminal-green">{localLabel(language, "可用", "AVL")} {money(profile?.availableUsdc ?? 0)}</span>
+          <span className="terminal-user-badge">
+            <strong>{props.me?.displayName ?? "--"}</strong>
+            <em>{props.me?.role ?? "--"}</em>
+          </span>
+          <select value={language} onChange={(event) => void props.onLanguageChange(event.target.value as Language)}>
+            <option value="zh-CN">简体中文</option>
+            <option value="en-US">English</option>
+          </select>
+          <button type="button" onClick={props.onLogout}>{t("logout")}</button>
         </div>
       </div>
 
       <div className="terminal-monitor">
         <div className="monitor-cell hot monitor-analytics">
-          <small>BTC UP ODDS <b>{oddsChange >= 0 ? "↑" : "↓"} {decimal(Math.abs(oddsChange), 4)}</b></small>
-          <strong>{decimal(snapshot?.upPrice ?? 0, 4)}</strong>
-          <span>DN {decimal(snapshot?.downPrice ?? 0, 4)} · ask sum {decimal(doubleSideCost, 4)}</span>
+          <small>{localLabel(language, "B5 变化", "B5 Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tokenPriceText(Math.abs(oddsChange), 1)}</b></small>
+          <strong>{tokenPriceText(snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0)}</strong>
+          <span>DN {tokenPriceText(snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0)} · {localLabel(language, "双边 ASK", "Two-side ask")} {tokenPriceText(doubleSideCost)}</span>
         </div>
         <div className="monitor-cell monitor-spread">
-          <small>BTC Chainlink vs PTB</small>
-          <strong className={Math.abs((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.priceToBeat ?? 0)) > 50 ? "terminal-red" : ""}>
-            {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.priceToBeat ?? 0))}
+          <small>{localLabel(language, "Binance 对比 CL", "Binance vs CL")}</small>
+          <strong className={Math.abs(binanceChainlinkSpread) > 50 ? "terminal-red" : ""}>
+            {signedMoney(binanceChainlinkSpread)}
           </strong>
-          <span>PTB {money(snapshot?.priceToBeat ?? 0)} · CL {money(snapshot?.chainlink.referencePrice ?? 0)}</span>
+          <span>Binance {money(snapshot?.binance.spotPrice ?? 0)} · CL {money(snapshot?.chainlink.referencePrice ?? 0)}</span>
         </div>
-        <div className="monitor-timer monitor-round-state">
-          <small>{props.currentRound?.status ?? "--"}</small>
-          <strong>{formatCountdown(countdownMs, nowMs, "remainingMs")}</strong>
-          <span>{snapshot?.uiMeta.marketSwitchState ?? "--"}</span>
+        <div className="monitor-cell monitor-latency-breakdown">
+          <small>{localLabel(language, "延迟拆分", "Latency Split")}</small>
+          <strong>{topLatency?.label ?? "--"} {typeof topLatency?.value === "number" ? `${Math.round(topLatency.value)}ms` : "--"}</strong>
+          <div className="latency-mini-list">
+            {latencyRows.map((row) => <span key={row.label}>{row.label}: {typeof row.value === "number" ? `${Math.round(row.value)}ms` : "--"}</span>)}
+          </div>
         </div>
         <div className="monitor-cell compact monitor-balance">
-          <small>Total Assets</small>
-          <strong>{money(profile?.totalEquity ?? 0)}</strong>
-          <span>Unreal {signedMoney(profile?.unrealizedPnl ?? 0)}</span>
+          <small>{localLabel(language, "资产", "Assets")}</small>
+          <strong>
+            <span><i>{localLabel(language, "总资产", "Total")}</i>{money(profile?.totalEquity ?? 0)}</span>
+            <span><i>{localLabel(language, "可用", "Available")}</i>{money(profile?.availableUsdc ?? 0)}</span>
+          </strong>
+          <span>{localLabel(language, "浮动", "Unreal")} {signedMoney(profile?.unrealizedPnl ?? 0)}</span>
         </div>
-        <div className="monitor-cell compact monitor-available">
-          <small>Avail Balance</small>
-          <strong className="terminal-green">{money(profile?.availableUsdc ?? 0)}</strong>
-          <span>Today {signedMoney(profile?.realizedPnlToday ?? 0)}</span>
+        <div className={`monitor-timer monitor-round-state ${countdownClass}`}>
+          <small>{currentRound?.status ?? "--"}</small>
+          <strong>{formatCountdownSeconds(countdownMs, nowMs, "remainingMs")}</strong>
+          <span>{snapshot?.uiMeta.marketSwitchState ?? "--"}</span>
         </div>
       </div>
 
       <div className="terminal-body">
         <aside className="terminal-left">
-          <TerminalSection title={localLabel(language, "持仓", "Positions")} meta={String(currentRoundPositions.length)}>
-            <div className="terminal-list">
-              {compactPositions.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : compactPositions.map((position) => (
-                <details className={`terminal-position ${position.side === "UP" ? "up" : "down"}`} key={position.id}>
-                  <summary>
-                    <b>{position.side === "UP" ? "▲ UP" : "▼ DN"}</b>
-                    <span>{money(position.notionalSpent)}</span>
-                    <em className={positionDisplayedPnl(position) >= 0 ? "terminal-green" : "terminal-red"}>{signedMoney(positionDisplayedPnl(position))}</em>
-                    <small>{positionStatusLabel(position, language)}</small>
-                  </summary>
+          <TerminalSection title={t("positions")} meta={String(currentRoundPositions.length)}>
+            <div className="terminal-position-cards">
+              {positionCards.map((card) => (
+                <div className={`position-token-card ${card.side === "UP" ? "up" : "down"}`} key={card.side}>
                   <div>
-                    shares {decimal(position.qty, 4)} · entry {decimal(position.averageEntry, 4)} · mark {decimal(position.currentMark, 4)}
-                    {position.displayStatus === "open" ? (
-                      <button onClick={() => props.onSell(position.id)} disabled={props.sellBusyPositionId === position.id}>
-                        {props.sellBusyPositionId === position.id ? t("loading") : t("sell")}
-                      </button>
-                    ) : null}
+                    <span>{card.side === "UP" ? "▲ UP" : "▼ DOWN"}</span>
+                    <b>{decimal(card.qty, card.qty >= 100 ? 2 : 4)}</b>
                   </div>
-                </details>
+                  <strong>{money(card.value)}</strong>
+                  <em className="position-token-meta">
+                    <span>{localLabel(language, "均价", "Entry")} {tokenPriceText(card.averageEntry)}</span>
+                    <span className={card.pnl >= 0 ? "terminal-green" : "terminal-red"}>
+                      {localLabel(language, card.pnl >= 0 ? "浮盈" : "浮亏", card.pnl >= 0 ? "PnL +" : "PnL -")} {signedMoney(card.pnl)}
+                    </span>
+                  </em>
+                  {card.sellablePosition ? (
+                    <button
+                      type="button"
+                      onClick={() => props.onSell(card.sellablePosition!.id)}
+                      disabled={props.sellBusyPositionId === card.sellablePosition.id}
+                    >
+                      {props.sellBusyPositionId === card.sellablePosition.id ? t("loading") : t("sell")}
+                    </button>
+                  ) : null}
+                </div>
               ))}
             </div>
           </TerminalSection>
 
-          <TerminalSection title={localLabel(language, "本轮记录", "This Round")} meta={String(recentCompactOrders.length)}>
+          <TerminalSection title={t("thisRound")} meta={String(recentOrders.length)}>
             <div className="terminal-trades">
-              {recentCompactOrders.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : recentCompactOrders.map((order) => (
+              {recentOrders.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : recentOrders.map((order) => (
                 <div className="terminal-trade-row" key={order.id}>
                   <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
                   <b>{order.side === "UP" ? "▲UP" : "▼DN"}</b>
                   <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
-                  <span>@{decimal(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0, 3)}</span>
+                  <span>@{tokenPriceText(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0)}</span>
                   <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
                 </div>
               ))}
             </div>
           </TerminalSection>
 
-          <TerminalSection title={localLabel(language, "今日", "Today")} meta={localLabel(language, "统计", "Stats")}>
+          <TerminalSection title={t("today")} meta={t("stats")}>
             <div className="terminal-stat-grid">
               <div><small>PnL</small><b>{signedMoney(profile?.realizedPnlToday ?? 0)}</b></div>
-              <div><small>Win Rate</small><b>{compactPercent(profile?.winRate ?? 0)}</b></div>
-              <div><small>Trades</small><b>{orders.length}</b></div>
-              <div><small>Rounds</small><b>{profile?.roundsParticipatedToday ?? 0}</b></div>
+              <div><small>{localLabel(language, "胜率", "Win Rate")}</small><b>{wins + losses > 0 ? compactPercent(wins / (wins + losses)) : "—"}</b></div>
+              <div><small>{localLabel(language, "笔数", "Trades")}</small><b>{`${wins}W/${losses}L`}</b></div>
+              <div><small>{localLabel(language, "近 1H", "Last 1H")}</small><b>{signedMoney(recentOneHourPnl)}</b></div>
             </div>
             <div className="terminal-round-dots">
-              {props.history.slice(0, 20).map((round) => (
-                <span key={round.id} className={round.userPnl > 0 ? "win" : round.userPnl < 0 ? "loss" : ""} title={`${round.id} ${signedMoney(round.userPnl)}`} />
-              ))}
+              {recentRounds.map((round) => {
+                const preview = round.settlementPreview;
+                const outcome = recentRoundOutcome({ round, nowMs, language });
+                const title = [
+                  round.id,
+                  `${localLabel(language, "状态", "Status")}: ${round.status}`,
+                  `${localLabel(language, "结果", "Result")}: ${round.settledSide ?? (preview?.state === "preliminary" && preview.side ? `PRE-${preview.side}` : preview?.side) ?? "--"}`,
+                  `${localLabel(language, "收盘时间", "Close Time")}: ${dateTimeText(round.endAt)}`,
+                  `PTB: ${btcMoneyOrDash(round.priceToBeat)}`,
+                  `Gamma: ${round.settlementSource ?? (preview?.state === "preliminary" ? "pending" : "Gamma")}`,
+                  preview?.tokenSide ? `Token: ${preview.tokenSide} (${tokenPriceText(preview.tokenSide === "UP" ? preview.upPrice : preview.downPrice)})` : undefined,
+                  preview?.binanceSide ? `Binance pre: ${preview.binanceSide}` : undefined,
+                  `Binance: ${typeof round.binanceClosePrice === "number" ? money(round.binanceClosePrice) : "--"}`,
+                  `PnL: ${signedMoney(round.userPnl)}`
+                ].filter(Boolean).join("\n");
+                return <span key={round.id} className={outcome.className} title={title}>{outcome.label}</span>;
+              })}
             </div>
           </TerminalSection>
         </aside>
 
-        <main className="terminal-center">
+        <main className={`terminal-center ${orderBookExpanded ? "book-expanded" : ""}`}>
           <div className="terminal-chart-block">
             <div className="chart-toolbar compact">
               <b>BTC/USD</b>
-              {TRADE_INTERVAL_OPTIONS.map((interval) => (
-                <button key={interval} className={selectedInterval === interval ? "on" : ""} onClick={() => props.onIntervalChange(interval)}>{interval}</button>
-              ))}
+              {TRADE_INTERVAL_OPTIONS.map((interval) => <button key={interval} className={selectedInterval === interval ? "on" : ""} onClick={() => props.onIntervalChange(interval)}>{interval}</button>)}
               <div className="chart-count-group">
                 {CHART_COUNT_OPTIONS.map((count) => (
                   <button
                     key={count}
                     className={props.chartVisibleCount === count ? "on" : ""}
-                    onClick={() => props.onChartVisibleCountChange(count)}
+                    onClick={() => {
+                      setChartVisibleError(undefined);
+                      props.onChartVisibleCountChange(count);
+                    }}
                   >
                     {count}
                   </button>
                 ))}
                 <input
                   aria-label="visible candles"
+                  aria-invalid={Boolean(chartVisibleError)}
                   type="number"
                   min={10}
                   max={200}
-                  step={10}
-                  value={props.chartVisibleCount}
-                  onChange={(event) => {
-                    const nextValue = parseBarCountInput(event.target.value);
-                    if (typeof nextValue === "number") {
-                      props.onChartVisibleCountChange(nextValue);
+                  step={1}
+                  value={chartVisibleDraft}
+                  onChange={(event) => setChartVisibleDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      commitChartVisibleDraft();
                     }
                   }}
                 />
+                {chartVisibleError ? <em>{chartVisibleError}</em> : null}
               </div>
               <span>{shortChartHint(language)}</span>
             </div>
@@ -3019,28 +3350,70 @@ function TradePage(props: {
               emptyText={t("noData")}
               priceToBeat={snapshot?.priceToBeat}
               latestPrice={snapshot?.binance.spotPrice}
-              round={props.currentRound}
+              round={currentRound}
               visibleCount={props.chartVisibleCount}
               onVisibleCountChange={props.onChartVisibleCountChange}
-              onTimeDomainChange={setSharedChartDomain}
+              onTimeDomainChange={handleChartTimeDomainChange}
+              yZoom={sharedChartYZoom}
+              onYZoomChange={setSharedChartYZoom}
             />
           </div>
-          <OddsMiniChart trades={snapshot?.clob.recentTrades ?? []} language={language} />
-          <div className="terminal-chart-block chainlink">
-            <div className="chart-toolbar compact">
-              <b>BTC Chainlink</b>
-              <span>CL-Binance {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0))}</span>
+          <OddsMiniChart series={snapshot?.clob.currentRoundUpPriceSeries ?? []} language={language} />
+          {orderBookExpanded ? (
+            <div className="terminal-orderbook-expanded">
+              <div className="chart-toolbar compact">
+                <b>{localLabel(language, "完整订单簿", "Full Order Book")}</b>
+                <span>{localLabel(language, "实时完整深度，占用 BTC / CL 区域。", "Live full depth in the BTC / CL area.")}</span>
+              </div>
+              <div className="orderbook-expanded-grid">
+                {(["UP", "DOWN"] as TradeSide[]).map((side) => {
+                  const { book, totalBidQty, totalAskQty, obi } = orderBookTotals[side];
+                  return (
+                    <section className="expanded-book" key={side}>
+                      <header>
+                        <strong>{side}</strong>
+                        <span>{localLabel(language, "买一/卖一", "Bid/Ask")} {tokenPriceText(book?.bestBid ?? 0)} / {tokenPriceText(book?.bestAsk ?? 0)}</span>
+                        <span className={`obi-pill ${obi >= 0 ? "up" : "down"}`}>OBI {decimal(obi, 3)}</span>
+                      </header>
+                      <div className="book-table-pair">
+                        <div>
+                          <b>{localLabel(language, "买盘", "Bids")}</b>
+                          {(book?.bids ?? []).map((level, index) => <span key={`${side}-bid-${index}`}><em>{tokenPriceText(level.price)}</em><strong>{decimal(level.qty, 3)}</strong></span>)}
+                        </div>
+                        <div>
+                          <b>{localLabel(language, "卖盘", "Asks")}</b>
+                          {(book?.asks ?? []).map((level, index) => <span key={`${side}-ask-${index}`}><em>{tokenPriceText(level.price)}</em><strong>{decimal(level.qty, 3)}</strong></span>)}
+                        </div>
+                      </div>
+                      <footer>
+                        <span>{localLabel(language, "买盘量", "Bid Qty")} {decimal(totalBidQty, 3)}</span>
+                        <span>{localLabel(language, "卖盘量", "Ask Qty")} {decimal(totalAskQty, 3)}</span>
+                        <span>{localLabel(language, "更新时间", "Updated")} {timeText(book?.snapshotTs)}</span>
+                      </footer>
+                    </section>
+                  );
+                })}
+              </div>
             </div>
-            <ChainlinkComparisonChart
-              bars={chainlinkCandles}
-              binancePrice={snapshot?.binance.spotPrice ?? 0}
-              emptyText={t("noData")}
-              visibleCount={props.chartVisibleCount}
-              onVisibleCountChange={props.onChartVisibleCountChange}
-              timeDomainStartTs={sharedChartDomain?.startTs}
-              timeDomainEndTs={sharedChartDomain?.endTs}
-            />
-          </div>
+          ) : (
+            <div className="terminal-chart-block chainlink">
+              <div className="chart-toolbar compact">
+                <b>BTC / CL</b>
+                <span>CL-Binance {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0))}</span>
+              </div>
+              <ChainlinkComparisonChart
+                bars={chainlinkBars}
+                referencePrice={snapshot?.chainlink.referencePrice ?? 0}
+                emptyText={t("noData")}
+                visibleCount={props.chartVisibleCount}
+                onVisibleCountChange={props.onChartVisibleCountChange}
+                timeDomainStartTs={sharedChartDomain?.startTs}
+                timeDomainEndTs={sharedChartDomain?.endTs}
+                yZoom={sharedChartYZoom}
+                onYZoomChange={setSharedChartYZoom}
+              />
+            </div>
+          )}
           <div className="terminal-depth">
             {(["UP", "DOWN"] as TradeSide[]).map((side) => {
               const book = snapshot?.orderBooks[side];
@@ -3049,9 +3422,14 @@ function TradePage(props: {
               const width = Math.max(Math.min((bid + ask) * 50, 100), 8);
               return (
                 <div key={side}>
-                  <small>BTC {side} Book</small>
+                  <small>
+                    BTC {side} Book
+                    <button type="button" onClick={() => setOrderBookExpanded((value) => !value)}>
+                      {orderBookExpanded ? localLabel(language, "收起", "Hide") : localLabel(language, "展开", "Open")}
+                    </button>
+                  </small>
                   <div className="terminal-depth-bar"><span style={{ width: `${width}%` }} /></div>
-                  <b>{decimal(bid, 3)} / {decimal(ask, 3)}</b>
+                  <b>{tokenPriceText(bid)} / {tokenPriceText(ask)}</b>
                 </div>
               );
             })}
@@ -3059,78 +3437,104 @@ function TradePage(props: {
         </main>
 
         <aside className="terminal-right">
-          <TerminalSection title={localLabel(language, "系统健康 + 告警", "System Health + Alerts")} meta="LIVE">
+          <TerminalSection title={t("systemHealthAlerts")} meta="LIVE">
             <div className="health-grid">
-              {sourceRows.map((item) => {
-                const age = typeof item.ageMs === "number" ? item.ageMs : item.source ? latencyFor(item.source, nowMs, item.source.clientRecvTs ?? props.lastMarketRecvTs).marketUpdateAgeMs : undefined;
-                const tone = item.state ?? (item.source?.state === "healthy" && typeof age === "number" && age <= item.warnMs ? "healthy" : item.source?.state ?? "stale");
-                return (
-                  <div className={`health-dot ${tone}`} key={item.label}>
-                    <b>{item.label}</b><span>{typeof age === "number" ? `${Math.round(age)}ms` : "--"}</span>
-                  </div>
-                );
-              })}
+              {healthRows.map((item) => (
+                <div className={`health-dot ${item.tone}`} key={item.label}>
+                  <div className="health-dot-head"><b>{item.label}</b><strong>{item.primary}</strong></div>
+                  <span>{item.secondary}</span>
+                  <span>{item.detail}</span>
+                </div>
+              ))}
             </div>
-            <div className="stability-meter">{[1, 2, 3, 4, 5].map((step) => <span key={step} className={step <= sourceRows.filter((row) => (row.source?.state ?? row.state) === "healthy").length + 1 ? "on" : ""} />)}</div>
+            <div className="stability-meter">{[1, 2, 3, 4, 5].map((step) => <span key={step} className={step <= healthRows.filter((row) => row.tone === "healthy").length + 1 ? "on" : ""} />)}</div>
             <div className="risk-alerts">
-              {riskAlerts.length === 0 ? <span>{localLabel(language, "暂无告警", "No active alerts")}</span> : riskAlerts.map((alert) => (
-                <button key={alert.kind} className={`risk-alert ${alert.level}`} onClick={() => alert.kind === "settlement_stuck" && props.currentRound ? props.onManualSettle(props.currentRound.id, "UP") : undefined}>
-                  {alert.text}
-                </button>
+              {groupedAlerts.length === 0 ? <span>{t("noActiveAlerts")}</span> : groupedAlerts.map((group) => (
+                <div className="risk-alert-group" key={group.key}>
+                  <header><b>{group.label}</b><em>{group.items.length}</em></header>
+                  {group.items.map((alert) => (
+                    <button key={alert.kind} className={`risk-alert ${alert.level}`} onClick={() => alert.kind === "settlement_stuck" && currentRound ? props.onManualSettle(currentRound.id, "UP") : undefined}>
+                      <span>{alert.text}</span>
+                      {alert.detail ? <em>{alert.detail}</em> : null}
+                    </button>
+                  ))}
+                </div>
               ))}
             </div>
           </TerminalSection>
 
-          <TerminalSection title="BTC/USD" meta={`CL ${money(snapshot?.chainlink.referencePrice ?? 0)} · PTB ${money(snapshot?.priceToBeat ?? 0)}`}>
+          <TerminalSection title="BTC/USD" meta={`CL ${money(snapshot?.chainlink.referencePrice ?? 0)} · PTB ${btcMoneyOrDash(snapshot?.priceToBeat)}`}>
             <div className="terminal-order">
               <div className="order-odds">
-                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}>UP <b>{decimal(snapshot?.upPrice ?? 0, 4)}</b></button>
-                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}>DN <b>{decimal(snapshot?.downPrice ?? 0, 4)}</b></button>
+                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{decimal((snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0) * 100, 1)}¢</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
+                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}><span>▼ DOWN</span><b>{decimal((snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0) * 100, 1)}¢</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
               </div>
-              <div className="terminal-segment">
+              <div className="terminal-segment action-segment">
                 {(["buy", "sell"] as OrderAction[]).map((action) => <button key={action} className={props.orderAction === action ? "on" : ""} onClick={() => props.onOrderActionChange(action)}>{action === "buy" ? "BUY / ENTER" : "SELL / EXIT"}</button>)}
               </div>
-              <div className="terminal-segment">
-                {(["market", "limit"] as PaperOrderKind[]).map((kind) => <button key={kind} className={props.orderKind === kind ? "on" : ""} onClick={() => props.onOrderKindChange(kind)}>{kind === "market" ? "MARKET ORDER" : "LIMIT ORDER"}</button>)}
+              <div className="terminal-segment order-kind-segment">
+                <button className={props.orderKind === "market" ? "on kind-market" : "kind-market"} onClick={() => props.onOrderKindChange("market")}><b>MARKET</b>{" "}<small>FOK</small></button>
+                <button className={props.orderKind === "limit" ? "on kind-limit" : "kind-limit"} onClick={() => props.onOrderKindChange("limit")}><b>LIMIT</b>{" "}<small>GTC</small></button>
               </div>
               <div className="amount-grid">
-                {[1, 5, 10, 20, 50].map((amount) => <button key={amount} onClick={() => props.onAmountChange(String(amount))}>${amount}</button>)}
+                {[1, 5, 10, 20, 50].map((amount) => <button key={amount} onClick={() => props.onAmountChange(String(amount))}>{amount} USD</button>)}
                 <button onClick={() => props.onAmountChange(String(Math.max((profile?.availableUsdc ?? 0) / 2, 0).toFixed(0)))}>1/2</button>
                 <button onClick={() => props.onAmountChange(String(Math.max(profile?.availableUsdc ?? 0, 0).toFixed(0)))}>MAX</button>
               </div>
               <label className="terminal-input">
-                <span>{props.orderAction === "buy" ? localLabel(language, "输入金额", "Amount") : localLabel(language, "卖出份额", "Qty")}</span>
+                <span>{props.orderAction === "buy" ? t("amount") : t("qty")}</span>
                 <input value={props.orderAction === "buy" ? props.orderAmount : props.orderQty} onChange={(event) => props.orderAction === "buy" ? props.onAmountChange(event.target.value) : props.onQtyChange(event.target.value)} />
               </label>
               {props.orderKind === "limit" ? (
-                <label className="terminal-input">
-                  <span>{localLabel(language, "指定赔率", "Limit Odds")}</span>
-                  <input value={props.limitPrice} onChange={(event) => props.onLimitPriceChange(event.target.value)} />
+                <label className={`terminal-input ${limitPriceError ? "error" : ""}`}>
+                  <span>{localLabel(language, "限价 (¢)", "Limit (¢)")}</span>
+                  <input
+                    aria-invalid={Boolean(limitPriceError)}
+                    type="number"
+                    min={1}
+                    max={99}
+                    step={1}
+                    value={props.limitPrice}
+                    onChange={(event) => props.onLimitPriceChange(event.target.value)}
+                  />
+                  {limitPriceError ? <em className="terminal-input-error">{limitPriceError}</em> : null}
                 </label>
               ) : null}
+              <div className="terminal-price-note">
+                <span>{localLabel(language, "展示价", "Display")}</span>
+                <b>{tokenPriceText(displayPrice)}</b>
+                <span>{localLabel(language, "价差", "Spread")} {spreadText}</span>
+              </div>
               <div className="order-meta">
-                <span>Fee {money(feeCost * Number(props.orderAmount || 0), 2)}</span>
+                <span>{localLabel(language, "手续费", "Fee")} {estimatedOrderFee}</span>
                 <span>{t("available")}: {money(profile?.availableUsdc ?? 0)}</span>
                 <span>{t("estimatedQty")}: {decimal(estimatedQty, 4)}</span>
               </div>
-              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} onClick={props.onPlaceOrder}>
-                {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `执行 ${selectedSide} 买入` : `执行 ${selectedSide} 卖出`}
+              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} title={tradeBlockReason} onClick={props.onPlaceOrder}>
+                {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `BUY ${selectedSide}` : `SELL ${selectedSide}`}
               </button>
               <div className="quick-row">
-                <button disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onCloseSide}>Exit {selectedSide}</button>
-                <button disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onReverseSide}>Reverse</button>
+                <button disabled={!props.canSell || props.quickBusy || openSidePositions.length === 0} onClick={props.onCloseSide}>{localLabel(language, "平仓", "Exit")} {selectedSide}</button>
+                <button disabled={!props.canSell || props.quickBusy || openSidePositions.length === 0} onClick={props.onReverseSide}>{localLabel(language, "反手", "Reverse")}</button>
               </div>
+              {balanceWarning ? <div className="inline-error-banner compact-feedback">{balanceWarning}</div> : null}
+              {orderBookStale ? (
+                <div className="inline-warning-banner compact-feedback" role="status">
+                  <strong>{t("orderBookStaleTitle")}</strong>
+                  <span>{t("orderBookStaleWarning")} {typeof orderBookAge === "number" ? `${Math.round(orderBookAge)}ms` : ""}</span>
+                </div>
+              ) : null}
               {canManualSettle ? (
                 <div className="manual-settle">
-                  <span>Manual Review</span>
-                  <button onClick={() => props.currentRound && props.onManualSettle(props.currentRound.id, "UP")}>Settle UP</button>
-                  <button onClick={() => props.currentRound && props.onManualSettle(props.currentRound.id, "DOWN")}>Settle DN</button>
+                  <span>{localLabel(language, "人工复核", "Manual Review")}</span>
+                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "UP")}>Settle UP</button>
+                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "DOWN")}>Settle DN</button>
                 </div>
               ) : null}
             </div>
           </TerminalSection>
 
-          <TerminalSection title={localLabel(language, "策略提示", "Strategy Hints")} meta="RULES">
+          <TerminalSection title={t("strategyHints")} meta="RULES">
             <div className="strategy-list">
               {strategy.map((item) => <div key={item.label}><span>{item.label}</span><b>{item.value}</b></div>)}
             </div>
@@ -3139,590 +3543,10 @@ function TradePage(props: {
       </div>
     </section>
   );
-
-  return (
-    <>
-      <section className="market-header">
-        <div className="market-title-block">
-          <p className="eyebrow">{t("market")}</p>
-          <h2>{marketTitle}</h2>
-          <span>{marketSubtitle}</span>
-          <div className="market-link-row">
-            <a className="market-link" href={polymarketUrl} target="_blank" rel="noreferrer">
-              <strong>Polymarket</strong>
-              <span>CLOB</span>
-            </a>
-            <a className="market-link" href={binanceUrl} target="_blank" rel="noreferrer">
-              <strong>Binance</strong>
-              <span>Spot</span>
-            </a>
-          </div>
-        </div>
-        <div className="portfolio-strip">
-          <AppMetric label={t("available")} value={money(profile?.availableUsdc ?? 0)} />
-          <AppMetric
-            label={localLabel(language, "总盈亏", "Total PnL")}
-            value={signedMoney(profile?.realizedPnlToday ?? 0)}
-            tone={(profile?.realizedPnlToday ?? 0) >= 0 ? "positive" : "negative"}
-          />
-          <AppMetric
-            label={t("floatingPnl")}
-            value={signedMoney(profile?.unrealizedPnl ?? 0)}
-            tone={(profile?.unrealizedPnl ?? 0) >= 0 ? "positive" : "negative"}
-          />
-          <AppMetric label={t("positionValue")} value={money(profile?.positionValue ?? 0)} />
-          <AppMetric label={t("lastOrderLatency")} value={props.lastOrderLatencyMs ? `${props.lastOrderLatencyMs} ms` : "--"} />
-        </div>
-      </section>
-
-      <section className="trade-layout">
-        <div className="panel chart-panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("chart")}</p>
-              <h2>{t("binanceKline")}</h2>
-            </div>
-            <div className="interval-tabs">
-              {TRADE_INTERVAL_OPTIONS.map((interval) => (
-                <button
-                  key={interval}
-                  className={selectedInterval === interval ? "active" : ""}
-                  onClick={() => props.onIntervalChange(interval)}
-                >
-                  {interval}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="headline-metrics">
-            <AppMetric label={t("currentPrice")} value={money(snapshot?.binance.spotPrice ?? 0)} />
-            <AppMetric label={t("priceToBeat")} value={money(snapshot?.priceToBeat ?? 0)} />
-            <AppMetric
-              label={t("chainlinkPrice")}
-              value={metricValueForSource(sourceChainlink, snapshot?.chainlink.referencePrice ?? 0)}
-              caption={chainlinkMetricCaption}
-            />
-          </div>
-
-          <div className="chart-shell">
-            <CandlestickChart
-              bars={chartBars}
-              upColor="#3fd07d"
-              downColor="#ff7d6a"
-              emptyText={t("noData")}
-              priceToBeat={snapshot?.priceToBeat}
-              latestPrice={snapshot?.binance.spotPrice}
-              round={props.currentRound}
-            />
-          </div>
-
-          <div className="source-row">
-            <SourceBadge label="Binance" source={sourceBinance} nowMs={nowMs} clientRecvTs={props.lastMarketRecvTs} language={language} t={t} marketStreamState={marketStreamState} />
-            <SourceBadge label="Chainlink" source={sourceChainlink} nowMs={nowMs} clientRecvTs={props.lastMarketRecvTs} language={language} t={t} marketStreamState={marketStreamState} />
-          </div>
-        </div>
-
-        <aside className="panel trade-sidebar">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("orderPanel")}</p>
-              <h2>{t("quickTrade")}</h2>
-            </div>
-            <span className={`status-chip tone-${sourceTone(sourceClob?.state)}`}>
-              CLOB 路 {sourceClob?.state ?? "--"}
-            </span>
-          </div>
-
-          <div className="side-card-grid">
-            {(["UP", "DOWN"] as TradeSide[]).map((side) => (
-              <button
-                key={side}
-                className={`side-card side-${side.toLowerCase()} ${selectedSide === side ? "active" : ""}`}
-                onClick={() => props.onSelectSide(side)}
-              >
-                <span>{side}</span>
-                <strong>{money(side === "UP" ? snapshot?.upPrice ?? 0 : snapshot?.downPrice ?? 0, 3)}</strong>
-                <small>
-                  {t("bestBid")}: {decimal(snapshot?.clob.bestBidAskSummary[side].bestBid ?? 0, 3)}
-                </small>
-              </button>
-            ))}
-          </div>
-
-          <div className="segmented-control">
-            {(["buy", "sell"] as OrderAction[]).map((action) => (
-              <button
-                key={action}
-                className={props.orderAction === action ? "active" : ""}
-                onClick={() => props.onOrderActionChange(action)}
-              >
-                {action === "buy" ? t("buy") : t("sell")}
-              </button>
-            ))}
-          </div>
-
-          <div className="segmented-control">
-            {(["market", "limit"] as PaperOrderKind[]).map((kind) => (
-              <button
-                key={kind}
-                className={props.orderKind === kind ? "active" : ""}
-                onClick={() => props.onOrderKindChange(kind)}
-              >
-                {kind === "market" ? t("marketOrder") : t("limitOrder")}
-              </button>
-            ))}
-          </div>
-
-          <div className="mini-portfolio">
-            <div>
-              <span>{t("currentSideExposure")}</span>
-              <strong>{decimal(selectedExposureQty, 4)}</strong>
-            </div>
-            <div>
-              <span>{t("availableQty")}</span>
-              <strong>{decimal(selectedAvailableQty, 4)}</strong>
-            </div>
-            <div>
-              <span>{t("currentSideValue")}</span>
-              <strong>{money(selectedExposureValue)}</strong>
-            </div>
-          </div>
-
-          {props.orderAction === "buy" ? (
-            <label className="order-input">
-              <span>{t("amount")}</span>
-              <input value={props.orderAmount} onChange={(event) => props.onAmountChange(event.target.value)} />
-            </label>
-          ) : (
-            <label className="order-input">
-              <span>{t("qty")}</span>
-              <input value={props.orderQty} onChange={(event) => props.onQtyChange(event.target.value)} />
-            </label>
-          )}
-
-          {props.orderKind === "limit" ? (
-            <label className="order-input">
-              <span>{t("limitPrice")}</span>
-              <input value={props.limitPrice} onChange={(event) => props.onLimitPriceChange(event.target.value)} />
-            </label>
-          ) : null}
-
-          <div className="trade-summary">
-            <div>
-              <span>{t("referenceOdds")}</span>
-              <strong>{decimal(tradePrice, 3)}</strong>
-            </div>
-            <div>
-              <span>{t("estimatedQty")}</span>
-              <strong>{decimal(estimatedQty, 4)}</strong>
-            </div>
-            <div>
-              <span>{props.orderKind === "limit" && props.orderAction === "buy" ? t("frozenAmount") : t("amount")}</span>
-              <strong>{money(estimatedNotional)}</strong>
-            </div>
-            <div>
-              <span>{t("payoutIfWin")}</span>
-              <strong>{typeof payoutIfWin === "number" ? money(payoutIfWin) : "--"}</strong>
-            </div>
-            <div>
-              <span>{t("slippageHint")}</span>
-              <strong>{legacySpreadText}</strong>
-            </div>
-            <div>
-              <span>{t("backendToFrontend")}</span>
-              <strong>{clobTransportLatency.disabled || typeof clobTransportLatency.backendToFrontendLatencyMs !== "number" ? "--" : `${Math.round(Number(clobTransportLatency.backendToFrontendLatencyMs))} ms`}</strong>
-            </div>
-            <div>
-              <span>{localLabel(language, "市场更新年龄", "Market Update Age")}</span>
-              <strong>{clobTransportLatency.disabled || typeof clobTransportLatency.marketUpdateAgeMs !== "number" ? "--" : `${Math.round(clobTransportLatency.marketUpdateAgeMs)} ms`}</strong>
-            </div>
-            <div className={selectedOrderBookStale ? "tone-warning" : undefined}>
-              <span>{t("orderBookAge")}</span>
-              <strong>{typeof selectedOrderBookAgeMs === "number" ? `${Math.round(Number(selectedOrderBookAgeMs))} ms` : "--"}</strong>
-            </div>
-          </div>
-
-          {selectedOrderBookStale ? (
-            <div className="inline-warning-banner compact-feedback" role="status">
-              <strong>{t("orderBookStaleTitle")}</strong>
-              <span>{t("orderBookStaleWarning")}</span>
-            </div>
-          ) : null}
-
-          <div className="button-stack">
-            {balanceWarning ? <div className="inline-error-banner compact-feedback">{balanceWarning}</div> : null}
-            <button
-              className={`primary-button ${selectedSide === "DOWN" ? "danger-shift" : ""}`}
-              disabled={!canTrade || props.tradeBusy}
-              title={balanceWarning}
-              onClick={props.onPlaceOrder}
-            >
-              {props.orderAction === "buy"
-                ? selectedSide === "UP"
-                  ? t("buyUp")
-                  : t("buyDown")
-                : `${t("sell")} ${selectedSide}`}
-            </button>
-            <div className="button-row">
-              <button className="ghost-button" disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onCloseSide}>
-                {t("closeSide")}
-              </button>
-              <button className="secondary-button" disabled={!canQuickAction || props.quickBusy || selectedOpenPositions.length === 0} onClick={props.onReverseSide}>
-                {t("reverseSide")}
-              </button>
-            </div>
-          </div>
-
-          <SourceBadge label="CLOB" source={sourceClob} nowMs={nowMs} clientRecvTs={props.lastMarketRecvTs} language={language} t={t} marketStreamState={marketStreamState} />
-        </aside>
-      </section>
-
-      <section className="info-grid">
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("orderBook")}</p>
-              <h2>{t("depthAndTrades")}</h2>
-            </div>
-            <div className="section-actions">
-              <div className="metric-inline">
-                <span>{t("clobDelta")}: {decimal(snapshot?.clob.delta ?? 0, 4)}</span>
-                <span>{t("clobVolume")}: {decimal(snapshot?.clob.volume ?? 0, 4)}</span>
-              </div>
-              <button className="ghost-button compact-button" onClick={() => setOrderBookExpanded((value) => !value)}>
-                {orderBookExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {orderBookExpanded ? (
-            <div className="orderbook-columns">
-              {(["UP", "DOWN"] as TradeSide[]).map((side) => {
-                const book = snapshot?.orderBooks[side];
-                return (
-                  <div className="book-column" key={side}>
-                    <div className="book-column-head">
-                      <strong>{side}</strong>
-                      <span>
-                        {t("buyOneSellOne")}: {decimal(book?.bestBid ?? 0, 3)} / {decimal(book?.bestAsk ?? 0, 3)}
-                      </span>
-                    </div>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>{t("bid")}</th>
-                          <th>{t("qty")}</th>
-                          <th>{t("ask")}</th>
-                          <th>{t("qty")}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {Array.from({ length: 5 }).map((_, index) => {
-                          const bid = book?.bids[index];
-                          const ask = book?.asks[index];
-                          return (
-                            <tr key={`${side}-${index}`}>
-                              <td>{bid ? decimal(bid.price, 3) : "--"}</td>
-                              <td>{bid ? decimal(bid.qty, 3) : "--"}</td>
-                              <td>{ask ? decimal(ask.price, 3) : "--"}</td>
-                              <td>{ask ? decimal(ask.qty, 3) : "--"}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
-        </div>
-
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{localLabel(language, "盘口结果", "Market Results")}</p>
-              <h2>{t("recentRounds")}</h2>
-            </div>
-            <button className="ghost-button compact-button" onClick={() => setHistoryExpanded((value) => !value)}>
-              {historyExpanded ? t("collapse") : t("expand")}
-            </button>
-          </div>
-          {historyExpanded ? <div className="stack-panels">
-            <div className="history-grid">
-              {props.history.map((round) => {
-                const openDiff =
-                  isBtcReferencePrice(round.polymarketOpenPrice) && typeof round.binanceOpenPrice === "number"
-                    ? round.polymarketOpenPrice - round.binanceOpenPrice
-                    : undefined;
-                const closeDiff =
-                  isBtcReferencePrice(round.polymarketClosePrice) && typeof round.binanceClosePrice === "number"
-                    ? round.polymarketClosePrice - round.binanceClosePrice
-                    : undefined;
-                const preview = round.settlementPreview;
-                return (
-                  <div className="history-card" key={round.id}>
-                    <strong>{round.id}</strong>
-                    <span className={roundMoveTone(round)}>{roundMoveLabel(round, language)}</span>
-                    <small>{dateTimeText(round.startAt)}</small>
-                    <small>
-                      {localLabel(language, "Polymarket BTC 开/收", "Polymarket BTC O/C")} ({localLabel(language, "来源", "Source")}:{" "}
-                      {round.polymarketOpenPriceSource ?? round.polymarketClosePriceSource ?? "Gamma"}
-                      {round.settlementReceivedAt ? `, Δ ${Math.round((round.settlementReceivedAt - round.endAt) / 1000)}s` : ""}
-                      ):{" "}
-                      {isBtcReferencePrice(round.polymarketOpenPrice) ? money(round.polymarketOpenPrice) : "--"} /{" "}
-                      {isBtcReferencePrice(round.polymarketClosePrice) ? money(round.polymarketClosePrice) : "--"}
-                    </small>
-                    <small>
-                      {localLabel(language, "Binance BTC 开/收", "Binance BTC O/C")}:{" "}
-                      {typeof round.binanceOpenPrice === "number" ? money(round.binanceOpenPrice) : "--"} /{" "}
-                      {typeof round.binanceClosePrice === "number" ? money(round.binanceClosePrice) : "--"}
-                    </small>
-                    <small>
-                      Δ Open / Δ Close: {typeof openDiff === "number" ? signedMoney(openDiff) : "--"} /{" "}
-                      {typeof closeDiff === "number" ? signedMoney(closeDiff) : "--"}
-                    </small>
-                    <small>
-                      {localLabel(language, "状态", "Status")}: {round.status} 路 {round.settlementSource ?? "Gamma"}
-                    </small>
-                    {preview && !round.settledSide ? (
-                      <div className={`settlement-preview-note tone-${settlementPreviewTone(preview)}`}>
-                        <strong>
-                          {settlementPreviewLabel(preview, language)}: {settlementPreviewText(preview, language)}
-                        </strong>
-                        <small>{settlementPreviewHelpText(preview, language)}</small>
-                      </div>
-                    ) : null}
-                    <small>
-                      {t("result")}: {round.settledSide ?? "--"}
-                    </small>
-                    <small className={round.userPnl >= 0 ? "tone-positive" : "tone-negative"}>
-                      {t("historyPnl")}: {signedMoney(round.userPnl)}
-                    </small>
-                  </div>
-                );
-              })}
-            </div>
-          </div> : null}
-        </div>
-      </section>
-
-      <section className="bottom-grid trade-workspace trade-panels-grid">
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("positions")}</p>
-              <h2>{currentRoundPositions.length}</h2>
-              <span className="section-subtitle">{pageSummaryText(language, tradePositionsPageSafe, currentRoundPositions.length)}</span>
-            </div>
-            <div className="section-actions">
-              <button className="ghost-button compact-button" disabled={tradePositionsPageSafe === 0} onClick={() => setTradePositionsPage((page) => Math.max(page - 1, 0))}>
-                {localLabel(language, "上一页", "Previous")}
-              </button>
-              <button className="ghost-button compact-button" disabled={tradePositionsPageSafe >= tradePositionsTotalPages - 1} onClick={() => setTradePositionsPage((page) => Math.min(page + 1, tradePositionsTotalPages - 1))}>
-                {localLabel(language, "下一页", "Next")}
-              </button>
-              <button className="ghost-button compact-button" onClick={() => setTradePositionsExpanded((value) => !value)}>
-                {tradePositionsExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {tradePositionsExpanded ? (
-            <>
-              {sellFeedbackMessage ? <div className="inline-error-banner">{sellFeedbackMessage}</div> : null}
-              <table>
-                <thead>
-                  <tr>
-                    <th>{t("market")}</th>
-                    <th>{t("side")}</th>
-                    <th>{t("qty")}</th>
-                    <th>{t("lockedQty")}</th>
-                    <th>{t("avgPrice")}</th>
-                    <th>{t("currentBook")}</th>
-                    <th>{t("positionValue")}</th>
-                    <th>{t("floatingPnl")}</th>
-                    <th>{t("status")}</th>
-                    <th>{t("action")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayPositions.length === 0 ? (
-                    <tr>
-                      <td colSpan={10}>{t("noData")}</td>
-                    </tr>
-                  ) : (
-                    displayPositions.map((position) => {
-                      const sellBlockedReason = getSellBlockedReason({
-                        language,
-                        position,
-                        currentRound: props.currentRound,
-                        nowMs,
-                        acceptingOrders
-                      });
-                      const canSellPosition = props.canSell && !sellBlockedReason;
-                      const isSelling = props.sellBusyPositionId === position.id;
-                      return (
-                        <tr key={position.id}>
-                          <td>
-                            <div className="field-stack">
-                              <strong>{position.roundId}</strong>
-                            </div>
-                          </td>
-                          <td><FieldChip label={position.side} tone={sideTone(position.side)} /></td>
-                          <td>{decimal(position.qty, 4)}</td>
-                          <td>{decimal(position.lockedQty ?? 0, 4)}</td>
-                          <td>{decimal(position.averageEntry, 4)}</td>
-                          <td>
-                            {position.displayStatus === "open"
-                              ? `${decimal(position.currentBid ?? 0, 3)} / ${decimal(position.currentAsk ?? 0, 3)}`
-                              : "--"}
-                            <small className="cell-note">
-                              CLOB {position.displayStatus === "open" && position.sourceLatencyMs ? `${Math.round(position.sourceLatencyMs)} ms` : "--"}
-                            </small>
-                          </td>
-                          <td>{money(position.currentValue ?? position.qty * position.currentMark)}</td>
-                          <td className={positionDisplayedPnl(position) >= 0 ? "tone-positive" : "tone-negative"}>
-                            {signedMoney(positionDisplayedPnl(position))}
-                          </td>
-                          <td><FieldChip label={positionStatusLabel(position, language)} tone={position.displayStatus === "open" ? "positive" : "neutral"} /></td>
-                          <td>
-                            {position.displayStatus === "open" ? (
-                              <div className="table-action-cell">
-                                <button
-                                  className="ghost-button compact-button"
-                                  disabled={!canSellPosition || isSelling}
-                                  title={sellBlockedReason}
-                                  onClick={() => props.onSell(position.id)}
-                                >
-                                  {isSelling ? "Selling..." : t("sell")}
-                                </button>
-                                {sellBlockedReason ? <small className="cell-note">{sellBlockedReason}</small> : null}
-                              </div>
-                            ) : (
-                              <FieldChip label={positionStatusLabel(position, language)} tone="neutral" />
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </>
-          ) : null}
-        </div>
-
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{localLabel(language, "操作日志", "Operation Log")}</p>
-              <h2>{currentRoundOrders.length}</h2>
-              <span className="section-subtitle">
-                {t("pendingOrders")} {pendingOrders.length} · {pageSummaryText(language, tradeOrdersPageSafe, sortedTradeOrders.length)}
-              </span>
-            </div>
-            <div className="section-actions">
-              <button className="ghost-button compact-button" disabled={tradeOrdersPageSafe === 0} onClick={() => setTradeOrdersPage((page) => Math.max(page - 1, 0))}>
-                {localLabel(language, "上一页", "Previous")}
-              </button>
-              <button className="ghost-button compact-button" disabled={tradeOrdersPageSafe >= tradeOrdersTotalPages - 1} onClick={() => setTradeOrdersPage((page) => Math.min(page + 1, tradeOrdersTotalPages - 1))}>
-                {localLabel(language, "下一页", "Next")}
-              </button>
-              <button className="ghost-button compact-button" onClick={() => setTradeOrdersExpanded((value) => !value)}>
-                {tradeOrdersExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {tradeOrdersExpanded ? (
-            <table>
-              <thead>
-                <tr>
-                  <th>{t("operationTimeUtc")}</th>
-                  <th>{t("type")}</th>
-                  <th>{t("market")}</th>
-                  <th>{t("action")}</th>
-                  <th>{t("side")}</th>
-                  <th>{t("amount")}</th>
-                  <th>{t("qty")}</th>
-                  <th>{t("avgPrice")}</th>
-                  <th>{t("status")}</th>
-                  <th>{t("action")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {displayOrders.length === 0 ? (
-                  <tr>
-                    <td colSpan={10}>{t("noData")}</td>
-                  </tr>
-                ) : (
-                  displayOrders.map((order) => (
-                    <tr key={order.id} className={order.status === "pending" ? "pending-order-row" : ""}>
-                      <td>{dateTimeText(order.createdAt)}</td>
-                      <td>
-                        <div className="field-stack">
-                          <div className="field-chip-row">
-                            <FieldChip label={orderKindLabel(order, language)} tone="info" />
-                            <FieldChip label={order.resultType ?? orderStatusLabel(order, language)} tone={orderStatusTone(order.status)} />
-                          </div>
-                        </div>
-                      </td>
-                      <td>
-                        <div className="field-stack">
-                          <strong>{order.marketSlug ?? order.roundId}</strong>
-                          <small>{order.roundId}</small>
-                        </div>
-                      </td>
-                      <td><FieldChip label={order.action} tone={actionTone(order.action)} /></td>
-                      <td><FieldChip label={order.side} tone={sideTone(order.side)} /></td>
-                      <td>
-                        {money(order.requestedAmountUsdc ?? order.notionalUsdc)}
-                        {order.frozenUsdc && order.frozenUsdc > 0 ? <small className="cell-note">{localLabel(language, "冻结", "Frozen")}: {money(order.frozenUsdc)}</small> : null}
-                      </td>
-                      <td>
-                        {decimal(order.filledQty, 4)}
-                        {order.status === "pending" ? <small className="cell-note">{t("remainingQty")}: {decimal(order.unfilledQty, 4)}</small> : null}
-                        {order.frozenQty && order.frozenQty > 0 ? <small className="cell-note">{t("frozenQty")}: {decimal(order.frozenQty, 4)}</small> : null}
-                      </td>
-                      <td><OrderExecutionCell order={order} language={language} /></td>
-                      <td><FieldChip label={orderStatusLabel(order, language)} tone={orderStatusTone(order.status)} /></td>
-                      <td>
-                        <div className="table-action-cell">
-                          {order.status === "pending" ? (
-                            <button
-                              className="ghost-button compact-button"
-                              disabled={props.cancelBusyOrderId === order.id}
-                              onMouseDown={(event) => {
-                                if (event.button === 0) {
-                                  event.preventDefault();
-                                  void props.onCancel(order.id);
-                                }
-                              }}
-                              onClick={() => props.onCancel(order.id)}
-                            >
-                              {props.cancelBusyOrderId === order.id ? t("loading") : t("cancel")}
-                            </button>
-                          ) : (
-                            <small className="cell-note">{localLabel(language, "撮合", "Match")}: {order.matchLatencyMs} ms</small>
-                          )}
-                          <button className="ghost-button compact-button" onClick={() => props.onTimeline(order.id)}>
-                            {props.timelineBusyOrderId === order.id ? t("loading") : t("timeline")}
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          ) : null}
-        </div>
-      </section>
-    </>
-  );
 }
 
-function ProfilePage(props: {
-  t: (key: string) => string;
+function AnalyticsPage(props: {
+  t: (key: string, options?: Record<string, unknown>) => string;
   token: string;
   language: Language;
   profile?: ProfileOverview;
@@ -3741,495 +3565,272 @@ function ProfilePage(props: {
   roundLogBusyRoundId?: string;
 }) {
   const { t, language } = props;
-  const [equityWindow, setEquityWindow] = useState<OperatedEquityWindow>(30);
-  const equityCurve = buildEquityCurve(props.operatedHistory, props.orders, equityWindow);
-  const roundCalendarItems = buildRoundCalendarItems(props.operatedHistory, props.orders);
-  const curveMin = equityCurve.reduce((min, point) => Math.min(min, point.cumulativeEquity), Number.POSITIVE_INFINITY);
-  const curveMax = equityCurve.reduce((max, point) => Math.max(max, point.cumulativeEquity), Number.NEGATIVE_INFINITY);
-  const padding = Number.isFinite(curveMin) && Number.isFinite(curveMax) ? Math.max((curveMax - curveMin) * 0.12, 20) : 20;
-  const curveDomainMin = Number.isFinite(curveMin) ? curveMin - padding : 0;
-  const curveDomainMax = Number.isFinite(curveMax) ? curveMax + padding : 1;
-  const roundsParticipatedTotal = props.profile?.roundsParticipatedTotal ?? props.operatedHistory.length;
-  const roundsPerPage = 84;
-  const totalCalendarPages = Math.max(Math.ceil(roundCalendarItems.length / roundsPerPage), 1);
-  const [calendarPage, setCalendarPage] = useState(totalCalendarPages - 1);
-  const [profilePositionsExpanded, setProfilePositionsExpanded] = useState(true);
-  const [profileOrdersExpanded, setProfileOrdersExpanded] = useState(true);
-  const [profileLogsExpanded, setProfileLogsExpanded] = useState(true);
-  const [profilePositionsPage, setProfilePositionsPage] = useState(0);
-  const [profileOrdersPage, setProfileOrdersPage] = useState(0);
-  const [profileLogsPage, setProfileLogsPage] = useState(0);
-  const [expandedPositionRounds, setExpandedPositionRounds] = useState<string[]>([]);
-  const [expandedOrderRounds, setExpandedOrderRounds] = useState<string[]>([]);
-  const [passwordForm, setPasswordForm] = useState({ currentPassword: "", password: "", confirmPassword: "" });
-  const [passwordMessage, setPasswordMessage] = useState<string>();
-  const [passwordBusy, setPasswordBusy] = useState(false);
-  const groupedPositions = buildGroupedPositions(props.history, props.positions, props.orders);
-  const groupedOrders = buildGroupedOrders(props.history, props.orders);
-  const sortedProfileLogs = [...props.logs].sort((left, right) => right.serverRecvTs - left.serverRecvTs);
-  const profilePositionsTotalPages = pageCountFor(groupedPositions.length);
-  const profileOrdersTotalPages = pageCountFor(groupedOrders.length);
-  const profileLogsTotalPages = pageCountFor(sortedProfileLogs.length);
-  const profilePositionsPageSafe = clampPage(profilePositionsPage, groupedPositions.length);
-  const profileOrdersPageSafe = clampPage(profileOrdersPage, groupedOrders.length);
-  const profileLogsPageSafe = clampPage(profileLogsPage, sortedProfileLogs.length);
-  const displayProfilePositionGroups = paginateRows(groupedPositions, profilePositionsPageSafe);
-  const displayProfileOrderGroups = paginateRows(groupedOrders, profileOrdersPageSafe);
-  const displayProfileLogs = paginateRows(sortedProfileLogs, profileLogsPageSafe);
-
+  type AnalyticsResultFilter = "ALL" | AnalyticsResult;
+  const [period, setPeriod] = useState<AnalyticsPeriod>("all");
+  const [direction, setDirection] = useState<"ALL" | TradeSide>("ALL");
+  const [resultFilter, setResultFilter] = useState<AnalyticsResultFilter>("ALL");
+  const [visibleTradeLimit, setVisibleTradeLimit] = useState(ANALYTICS_INITIAL_TRADE_LIMIT);
+  const [groupVisibleLimits, setGroupVisibleLimits] = useState<Record<string, number>>({});
   useEffect(() => {
-    setCalendarPage(Math.max(totalCalendarPages - 1, 0));
-  }, [totalCalendarPages]);
-
-  useEffect(() => {
-    setProfilePositionsPage((page) => clampPage(page, groupedPositions.length));
-  }, [groupedPositions.length]);
-
-  useEffect(() => {
-    setProfileOrdersPage((page) => clampPage(page, groupedOrders.length));
-  }, [groupedOrders.length]);
-
-  useEffect(() => {
-    setProfileLogsPage((page) => clampPage(page, sortedProfileLogs.length));
-  }, [sortedProfileLogs.length]);
-
-  const pageStartIndex = calendarPage * roundsPerPage;
-  const visibleRoundCalendarItems = roundCalendarItems.slice(pageStartIndex, pageStartIndex + roundsPerPage);
-  const togglePositionRound = (roundId: string) => {
-    setExpandedPositionRounds((roundIds) =>
-      roundIds.includes(roundId) ? roundIds.filter((value) => value !== roundId) : [...roundIds, roundId]
-    );
-  };
-  const toggleOrderRound = (roundId: string) => {
-    setExpandedOrderRounds((roundIds) =>
-      roundIds.includes(roundId) ? roundIds.filter((value) => value !== roundId) : [...roundIds, roundId]
-    );
-  };
-  const equityWindowOptions: OperatedEquityWindow[] = [10, 30, 60, "all"];
-  const submitPasswordChange = async () => {
-    try {
-      setPasswordBusy(true);
-      setPasswordMessage(undefined);
-      await api.changeMyPassword(props.token, passwordForm);
-      setPasswordForm({ currentPassword: "", password: "", confirmPassword: "" });
-      setPasswordMessage(localLabel(language, "密码已修改。旧密码已失效。", "Password changed. The old password is no longer valid."));
-    } catch (error) {
-      setPasswordMessage(error instanceof Error ? error.message : "Password change failed.");
-    } finally {
-      setPasswordBusy(false);
+    setVisibleTradeLimit(ANALYTICS_INITIAL_TRADE_LIMIT);
+    setGroupVisibleLimits({});
+  }, [direction, period, resultFilter]);
+  const rows = useMemo(
+    () => buildAnalyticsRows(props.history, props.positions, props.orders, language),
+    [props.history, props.positions, props.orders, language]
+  );
+  const periodRows = useMemo(() => filterAnalyticsPeriod(rows, period), [rows, period]);
+  const filteredRows = useMemo(
+    () =>
+      periodRows.filter((row) => {
+        if (direction !== "ALL" && row.side !== direction) {
+          return false;
+        }
+        if (resultFilter !== "ALL" && row.result !== resultFilter) {
+          return false;
+        }
+        return true;
+      }),
+    [direction, periodRows, resultFilter]
+  );
+  const summary = useMemo(() => analyticsSummary(filteredRows), [filteredRows]);
+  const displayedRows = useMemo(
+    () => (period === "trades" ? filteredRows.slice(0, visibleTradeLimit) : filteredRows),
+    [filteredRows, period, visibleTradeLimit]
+  );
+  const groupedRows = useMemo(() => {
+    if (period === "trades") {
+      const groups = [];
+      for (let start = 0; start < displayedRows.length; start += ANALYTICS_GROUP_SIZE) {
+        const groupRows = displayedRows.slice(start, start + ANALYTICS_GROUP_SIZE);
+        const settledRows = groupRows.filter((row) => row.settlementState === "SETTLED");
+        const dayPnl = settledRows.reduce((sum, row) => sum + row.pnl, 0);
+        const from = String(start + 1).padStart(3, "0");
+        const to = String(start + groupRows.length).padStart(3, "0");
+        groups.push({
+          key: `trades:${start}`,
+          label: localLabel(language, `交易 ${from}-${to}`, `Trades ${from}-${to}`),
+          allRows: groupRows,
+          visibleRows: groupRows,
+          hiddenCount: 0,
+          settledCount: settledRows.length,
+          unsettledCount: groupRows.length - settledRows.length,
+          groupPnl: dayPnl
+        });
+      }
+      return groups;
     }
-  };
+    const groups = new Map<string, AnalyticsTradeRow[]>();
+    for (const row of displayedRows) {
+      const key = analyticsTimelineKey(row, period);
+      const next = groups.get(key) ?? [];
+      next.push(row);
+      groups.set(key, next);
+    }
+    return [...groups.entries()].map(([key, groupRows]) => {
+      const limit = groupVisibleLimits[key] ?? ANALYTICS_GROUP_SIZE;
+      const settledRows = groupRows.filter((row) => row.settlementState === "SETTLED");
+      const groupPnl = settledRows.reduce((sum, row) => sum + row.pnl, 0);
+      return {
+        key,
+        label: analyticsTimelineLabel(key, period),
+        allRows: groupRows,
+        visibleRows: groupRows.slice(0, limit),
+        hiddenCount: Math.max(groupRows.length - limit, 0),
+        settledCount: settledRows.length,
+        unsettledCount: groupRows.length - settledRows.length,
+        groupPnl
+      };
+    });
+  }, [displayedRows, groupVisibleLimits, language, period]);
+  const periodOptions = [
+    { id: "all", label: analyticsPeriodLabel("all", language) },
+    { id: "year", label: analyticsPeriodLabel("year", language) },
+    { id: "month", label: analyticsPeriodLabel("month", language) },
+    { id: "week", label: analyticsPeriodLabel("week", language) },
+    { id: "day", label: analyticsPeriodLabel("day", language) },
+    { id: "trades", label: analyticsPeriodLabel("trades", language) }
+  ] as const;
 
   return (
-    <>
-      <section className="profile-stats">
-        <AppMetric label={t("totalEquity")} value={money(props.profile?.totalEquity ?? 0)} />
-        <AppMetric label={t("available")} value={money(props.profile?.availableUsdc ?? 0)} />
-        <AppMetric label={t("positionValue")} value={money(props.profile?.positionValue ?? 0)} />
-        <AppMetric
-          label={t("floatingPnl")}
-          value={signedMoney(props.profile?.unrealizedPnl ?? 0)}
-          tone={(props.profile?.unrealizedPnl ?? 0) >= 0 ? "positive" : "negative"}
-        />
-        <AppMetric
-          label={t("realizedPnl")}
-          value={signedMoney(props.profile?.realizedPnlToday ?? 0)}
-          tone={(props.profile?.realizedPnlToday ?? 0) >= 0 ? "positive" : "negative"}
-        />
-        <AppMetric label={t("winRate")} value={compactPercent(props.profile?.winRate ?? 0)} />
-        <AppMetric label={t("roundsParticipated")} value={String(roundsParticipatedTotal)} />
-      </section>
+    <section className="analytics-terminal-page">
+      <div className="analytics-headband">
+        <div className="analytics-head-copy">
+          <b>{localLabel(language, "交易分析", "Analytics")}</b>
+          <span>{localLabel(language, "按 UTC 展示 BTC 模拟盘交易生命周期", "BTC paper trading lifecycle shown in UTC")}</span>
+        </div>
+        <div className="analytics-head-meta">
+          <span>{filteredRows.length} {localLabel(language, "条记录", "rows")}</span>
+          <span>{summary.trades} {localLabel(language, "已结算", "settled")}</span>
+          <span>{summary.wins}W / {summary.losses}L</span>
+        </div>
+      </div>
 
-      <section className="panel password-panel">
-        <div className="section-header">
-          <div>
-            <p className="eyebrow">{localLabel(language, "账户安全", "Account Security")}</p>
-            <h2>{localLabel(language, "修改密码", "Change Password")}</h2>
+      <div className="analytics-summary">
+        <div className="analytics-card">
+          <span>{localLabel(language, "总盈亏", "Total PnL")}</span>
+          <strong>{signedMoney(summary.totalPnl)}</strong>
+          <small>
+            {localLabel(language, "总资产", "Total equity")} {money(props.profile?.totalEquity ?? 0)}
+            {" · "}
+            {localLabel(language, "可用", "Available")} {money(props.profile?.availableUsdc ?? 0)}
+          </small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "胜率", "Win Rate")}</span>
+          <strong>{summary.trades > 0 ? compactPercent(summary.winRate) : "—"}</strong>
+          <small>{summary.wins}W / {summary.losses}L</small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "交易笔数", "Trades")}</span>
+          <strong>{summary.trades}</strong>
+          <small>{filteredRows.length} {localLabel(language, "条记录", "rows")}</small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "总费用", "Total Fees")}</span>
+          <strong>{money(summary.totalFees, 4)}</strong>
+          <small>{localLabel(language, "统一 UTC", "UTC normalized")}</small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "最佳单笔", "Best Trade")}</span>
+          <strong>{summary.trades > 0 ? signedMoney(summary.bestTrade) : "—"}</strong>
+          <small>{localLabel(language, "最佳已结算结果", "Best settled result")}</small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "最差单笔", "Worst Trade")}</span>
+          <strong>{summary.trades > 0 ? signedMoney(summary.worstTrade) : "—"}</strong>
+          <small>{localLabel(language, "最差已结算结果", "Worst settled result")}</small>
+        </div>
+      </div>
+
+      <div className="analytics-controls">
+        <div className="analytics-period-tabs">
+          {periodOptions.map((option) => (
+            <button key={option.id} className={period === option.id ? "active" : ""} onClick={() => setPeriod(option.id)}>
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <label>
+          <span>{localLabel(language, "标的", "Symbol")}</span>
+          <select value="BTC" disabled>
+            <option value="BTC">BTC</option>
+          </select>
+        </label>
+        <label>
+          <span>{localLabel(language, "方向", "Direction")}</span>
+          <select value={direction} onChange={(event) => setDirection(event.target.value as "ALL" | TradeSide)}>
+            <option value="ALL">{localLabel(language, "全部", "All")}</option>
+            <option value="UP">UP</option>
+            <option value="DOWN">DOWN</option>
+          </select>
+        </label>
+        <label>
+          <span>{localLabel(language, "结果", "Result")}</span>
+          <select value={resultFilter} onChange={(event) => setResultFilter(event.target.value as AnalyticsResultFilter)}>
+            <option value="ALL">{localLabel(language, "全部", "All")}</option>
+            <option value="WIN">{analyticsResultLabel("WIN", language)}</option>
+            <option value="LOSE">{analyticsResultLabel("LOSE", language)}</option>
+            <option value="SOLD">{analyticsResultLabel("SOLD", language)}</option>
+            <option value="OPEN">{analyticsResultLabel("OPEN", language)}</option>
+            <option value="UNFILLED">{analyticsResultLabel("UNFILLED", language)}</option>
+          </select>
+        </label>
+        <span>{localLabel(language, "所有时间均以 UTC 显示", "All times shown in UTC")}</span>
+      </div>
+
+      <div className="analytics-day-list">
+        {groupedRows.length === 0 ? (
+          <div className="analytics-empty">
+            <b>{localLabel(language, "空结果", "Empty")}</b>
+            <div>{localLabel(language, "当前筛选条件下没有可展示的分析记录。", "No analytics rows match the current filters.")}</div>
           </div>
-          <button className="secondary-button" disabled={passwordBusy} onClick={submitPasswordChange}>
-            {passwordBusy ? t("loading") : localLabel(language, "保存密码", "Save Password")}
-          </button>
-        </div>
-        {passwordMessage ? <div className="inline-info-banner">{passwordMessage}</div> : null}
-        <div className="password-grid">
-          <label>
-            {localLabel(language, "当前密码", "Current Password")}
-            <input type="password" value={passwordForm.currentPassword} onChange={(event) => setPasswordForm((form) => ({ ...form, currentPassword: event.target.value }))} />
-          </label>
-          <label>
-            {localLabel(language, "新密码", "New Password")}
-            <input type="password" value={passwordForm.password} onChange={(event) => setPasswordForm((form) => ({ ...form, password: event.target.value }))} />
-          </label>
-          <label>
-            {localLabel(language, "确认新密码", "Confirm Password")}
-            <input type="password" value={passwordForm.confirmPassword} onChange={(event) => setPasswordForm((form) => ({ ...form, confirmPassword: event.target.value }))} />
-          </label>
-        </div>
-      </section>
-
-      <section className="profile-insights">
-        <div className="panel profile-curve-panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("equityCurve")}</p>
-              <h2>{t("cumulativeEquity")}</h2>
-            </div>
-            <div className="section-actions">
-              <div className="segmented-control compact-segmented">
-                {equityWindowOptions.map((option) => (
-                  <button
-                    key={String(option)}
-                    className={equityWindow === option ? "active" : ""}
-                    onClick={() => setEquityWindow(option)}
-                  >
-                    {option === "all" ? localLabel(language, "全部", "All") : localLabel(language, `最近 ${option}`, `Last ${option}`)}
-                  </button>
-                ))}
+        ) : (
+          groupedRows.map(({ key, label, allRows, visibleRows, hiddenCount, unsettledCount, groupPnl, settledCount }) => (
+            <div key={key} className="analytics-day-group">
+              <div className="analytics-day-head">
+                <strong>{label}</strong>
+                <div className="analytics-day-stats">
+                  <span>{allRows.length} {localLabel(language, "条记录", "rows")}</span>
+                  <span>{settledCount} {localLabel(language, "已结算", "settled")}</span>
+                  <span>{unsettledCount} {localLabel(language, "未结算", "unsettled")}</span>
+                </div>
+                <em className={groupPnl >= 0 ? "tone-positive" : "tone-negative"}>{signedMoney(groupPnl)}</em>
               </div>
-            </div>
-          </div>
-          {equityCurve.length === 0 ? (
-            <div className="empty-chart-state">{t("noCurveData")}</div>
-          ) : (
-            <div className="profile-curve-shell">
-              <FastEquityCurve points={equityCurve} minValue={curveDomainMin} maxValue={curveDomainMax} />
-            </div>
-          )}
-        </div>
-        <div className="panel round-calendar-panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("roundCalendar")}</p>
-              <h2>{t("operatedRounds")}</h2>
-              <span className="section-subtitle">
-                {roundCalendarItems.length} {t("roundsParticipated")}
-              </span>
-            </div>
-            <div className="section-actions">
-              <button
-                className="ghost-button compact-button"
-                disabled={calendarPage === 0}
-                onClick={() => setCalendarPage((value) => Math.max(value - 1, 0))}
-              >
-                {t("previousPage")}
-              </button>
-              <button
-                className="ghost-button compact-button"
-                disabled={calendarPage >= totalCalendarPages - 1}
-                onClick={() => setCalendarPage((value) => Math.min(value + 1, totalCalendarPages - 1))}
-              >
-                {t("nextPage")}
-              </button>
-            </div>
-          </div>
-          {visibleRoundCalendarItems.length === 0 ? (
-            <div className="empty-chart-state">{t("noOperatedRounds")}</div>
-          ) : (
-            <div className="round-calendar-grid">
-              {visibleRoundCalendarItems.map((item) => (
-                <button
-                  key={item.roundId}
-                  className={`round-calendar-tile round-calendar-${item.roundPnl > 0 ? "positive" : item.roundPnl < 0 ? "negative" : "neutral"}${props.selectedRoundLogId === item.roundId ? " active" : ""}`}
-                  onClick={() => void props.onOpenRoundLogs(item)}
-                  disabled={props.roundLogBusyRoundId === item.roundId}
-                >
-                  <span className="round-calendar-sequence">
-                    {t("roundSequence")} #{item.sequence}
-                  </span>
-                  <strong>{item.datedLabel}</strong>
-                  <small>{item.marketSlug ?? item.roundId}</small>
-                  <em>{signedMoney(item.roundPnl)}</em>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-
-      </section>
-
-      <section className="bottom-grid profile-panels-grid">
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("positions")}</p>
-              <h2>{groupedPositions.length}</h2>
-              <span className="section-subtitle">
-                {props.positions.length} {t("positions")} · {pageSummaryText(language, profilePositionsPageSafe, groupedPositions.length)}
-              </span>
-            </div>
-            <div className="section-actions">
-              <button className="ghost-button compact-button" disabled={profilePositionsPageSafe === 0} onClick={() => setProfilePositionsPage((page) => Math.max(page - 1, 0))}>
-                {t("previousPage")}
-              </button>
-              <button className="ghost-button compact-button" disabled={profilePositionsPageSafe >= profilePositionsTotalPages - 1} onClick={() => setProfilePositionsPage((page) => Math.min(page + 1, profilePositionsTotalPages - 1))}>
-                {t("nextPage")}
-              </button>
-              <button className="ghost-button compact-button" onClick={() => setProfilePositionsExpanded((value) => !value)}>
-                {profilePositionsExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {profilePositionsExpanded ? (
-            <div className="round-group-list">
-              {displayProfilePositionGroups.length === 0 ? (
-                <div className="empty-round-log-state">{t("noData")}</div>
-              ) : (
-                displayProfilePositionGroups.map((group) => {
-                  const expanded = expandedPositionRounds.includes(group.roundId);
-                  return (
-                    <div className="round-group-card" key={group.roundId}>
-                      <button className="round-group-summary" onClick={() => togglePositionRound(group.roundId)}>
-                        <div className="field-stack">
-                          <strong>{roundDisplayTitle(group, language)}</strong>
-                          <small>{roundSecondaryText(group, language)}</small>
-                        </div>
-                        <div className="round-group-metrics">
-                          <span>{group.positions.length} {t("positions")}</span>
-                          <span>{localLabel(language, "持仓价值", "Value")}: {money(group.positionValue)}</span>
-                          <span className={group.floatingPnl >= 0 ? "tone-positive" : "tone-negative"}>{signedMoney(group.floatingPnl)}</span>
-                          {typeof group.userPnl === "number" ? <span className={group.userPnl >= 0 ? "tone-positive" : "tone-negative"}>{t("historyPnl")}: {signedMoney(group.userPnl)}</span> : null}
-                        </div>
-                        <FieldChip label={expanded ? t("collapse") : t("expand")} tone="info" />
-                      </button>
-                      {expanded ? (
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>{t("side")}</th>
-                              <th>{t("qty")}</th>
-                              <th>{t("lockedQty")}</th>
-                              <th>{t("avgPrice")}</th>
-                              <th>{t("currentBook")}</th>
-                              <th>{t("positionValue")}</th>
-                              <th>{t("floatingPnl")}</th>
-                              <th>{t("status")}</th>
-                              <th>{t("action")}</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {group.positions.map((position) => (
-                              <tr key={position.id}>
-                                <td><FieldChip label={position.side} tone={sideTone(position.side)} /></td>
-                                <td>{decimal(position.qty, 4)}</td>
-                                <td>{decimal(position.lockedQty ?? 0, 4)}</td>
-                                <td>{decimal(position.averageEntry, 4)}</td>
-                                <td>
-                                  {position.displayStatus === "open"
-                                    ? `${decimal(position.currentBid ?? 0, 3)} / ${decimal(position.currentAsk ?? 0, 3)}`
-                                    : "--"}
-                                  <small className="cell-note">CLOB {position.displayStatus === "open" && position.sourceLatencyMs ? `${Math.round(position.sourceLatencyMs)} ms` : "--"}</small>
-                                </td>
-                                <td>{money(position.currentValue ?? position.qty * position.currentMark)}</td>
-                                <td className={positionDisplayedPnl(position) >= 0 ? "tone-positive" : "tone-negative"}>
-                                  {signedMoney(positionDisplayedPnl(position))}
-                                </td>
-                                <td><FieldChip label={positionStatusLabel(position, language)} tone={position.displayStatus === "open" ? "positive" : "neutral"} /></td>
-                                <td>
-                                  {position.displayStatus === "open" ? (
-                                    <button className="ghost-button compact-button" onClick={() => props.onSell(position.id)}>
-                                      {t("sell")}
-                                    </button>
-                                  ) : (
-                                    <FieldChip label={positionStatusLabel(position, language)} tone="neutral" />
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      ) : null}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          ) : null}
-        </div>
-
-        <div className="panel">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("orders")}</p>
-              <h2>{groupedOrders.length}</h2>
-              <span className="section-subtitle">
-                {props.orders.length} {t("orders")} · {pageSummaryText(language, profileOrdersPageSafe, groupedOrders.length)}
-              </span>
-            </div>
-            <div className="section-actions">
-              <button className="ghost-button compact-button" disabled={profileOrdersPageSafe === 0} onClick={() => setProfileOrdersPage((page) => Math.max(page - 1, 0))}>
-                {t("previousPage")}
-              </button>
-              <button className="ghost-button compact-button" disabled={profileOrdersPageSafe >= profileOrdersTotalPages - 1} onClick={() => setProfileOrdersPage((page) => Math.min(page + 1, profileOrdersTotalPages - 1))}>
-                {t("nextPage")}
-              </button>
-              <button className="ghost-button compact-button" onClick={() => setProfileOrdersExpanded((value) => !value)}>
-                {profileOrdersExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {profileOrdersExpanded ? (
-            <div className="round-group-list">
-              {displayProfileOrderGroups.length === 0 ? (
-                <div className="empty-round-log-state">{t("noData")}</div>
-              ) : (
-                displayProfileOrderGroups.map((group) => {
-                  const expanded = expandedOrderRounds.includes(group.roundId);
-                  return (
-                    <div className="round-group-card" key={group.roundId}>
-                      <button className="round-group-summary" onClick={() => toggleOrderRound(group.roundId)}>
-                        <div className="field-stack">
-                          <strong>{roundDisplayTitle(group, language)}</strong>
-                          <small>{roundSecondaryText(group, language)}</small>
-                        </div>
-                        <div className="round-group-metrics">
-                          <span>{group.orders.length} {t("orders")}</span>
-                          <span>{t("pendingOrders")} {group.pendingCount}</span>
-                          <span>{t("amount")}: {money(group.notionalUsdc)}</span>
-                          {typeof group.userPnl === "number" ? <span className={group.userPnl >= 0 ? "tone-positive" : "tone-negative"}>{t("historyPnl")}: {signedMoney(group.userPnl)}</span> : null}
-                        </div>
-                        <FieldChip label={expanded ? t("collapse") : t("expand")} tone="info" />
-                      </button>
-                      {expanded ? (
-                        <table>
-                          <thead>
-                            <tr>
-                              <th>{t("operationTimeUtc")}</th>
-                              <th>{t("type")}</th>
-                              <th>{t("action")}</th>
-                              <th>{t("side")}</th>
-                              <th>{t("amount")}</th>
-                              <th>{t("qty")}</th>
-                              <th>{t("avgPrice")}</th>
-                              <th>{t("status")}</th>
-                              <th>{t("action")}</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {group.orders.map((order) => (
-                              <tr key={order.id} className={order.status === "pending" ? "pending-order-row" : ""}>
-                                <td>{dateTimeText(order.createdAt)}</td>
-                                <td>
-                                  <div className="field-chip-row">
-                                    <FieldChip label={orderKindLabel(order, language)} tone="info" />
-                                    <FieldChip label={order.resultType ?? orderStatusLabel(order, language)} tone={orderStatusTone(order.status)} />
-                                  </div>
-                                </td>
-                                <td><FieldChip label={order.action} tone={actionTone(order.action)} /></td>
-                                <td><FieldChip label={order.side} tone={sideTone(order.side)} /></td>
-                                <td>
-                                  {money(order.requestedAmountUsdc ?? order.notionalUsdc)}
-                                  {order.frozenUsdc && order.frozenUsdc > 0 ? <small className="cell-note">{localLabel(language, "冻结", "Frozen")}: {money(order.frozenUsdc)}</small> : null}
-                                </td>
-                                <td>
-                                  {decimal(order.filledQty, 4)}
-                                  {order.status === "pending" ? <small className="cell-note">{t("remainingQty")}: {decimal(order.unfilledQty, 4)}</small> : null}
-                                  {order.frozenQty && order.frozenQty > 0 ? <small className="cell-note">{t("frozenQty")}: {decimal(order.frozenQty, 4)}</small> : null}
-                                </td>
-                                <td><OrderExecutionCell order={order} language={language} /></td>
-                                <td><FieldChip label={orderStatusLabel(order, language)} tone={orderStatusTone(order.status)} /></td>
-                                <td>
-                                  <div className="table-action-cell">
-                                    {order.status === "pending" ? (
-                                      <button
-                                        className="ghost-button compact-button"
-                                        disabled={props.cancelBusyOrderId === order.id}
-                                        onMouseDown={(event) => {
-                                          if (event.button === 0) {
-                                            event.preventDefault();
-                                            void props.onCancel(order.id);
-                                          }
-                                        }}
-                                        onClick={() => props.onCancel(order.id)}
-                                      >
-                                        {props.cancelBusyOrderId === order.id ? t("loading") : t("cancel")}
-                                      </button>
-                                    ) : (
-                                      <small className="cell-note">{localLabel(language, "撮合", "Match")}: {order.matchLatencyMs} ms</small>
-                                    )}
-                                    <button className="ghost-button compact-button" onClick={() => props.onTimeline(order.id)}>
-                                      {props.timelineBusyOrderId === order.id ? t("loading") : t("timeline")}
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      ) : null}
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          ) : null}
-        </div>
-
-        <div className="panel profile-panel-full">
-          <div className="section-header">
-            <div>
-              <p className="eyebrow">{t("logs")}</p>
-              <h2>{props.logs.length}</h2>
-              <span className="section-subtitle">{pageSummaryText(language, profileLogsPageSafe, sortedProfileLogs.length)}</span>
-            </div>
-            <div className="section-actions">
-              <button className="ghost-button compact-button" disabled={profileLogsPageSafe === 0} onClick={() => setProfileLogsPage((page) => Math.max(page - 1, 0))}>
-                {t("previousPage")}
-              </button>
-              <button className="ghost-button compact-button" disabled={profileLogsPageSafe >= profileLogsTotalPages - 1} onClick={() => setProfileLogsPage((page) => Math.min(page + 1, profileLogsTotalPages - 1))}>
-                {t("nextPage")}
-              </button>
-              <button className="ghost-button compact-button" onClick={() => setProfileLogsExpanded((value) => !value)}>
-                {profileLogsExpanded ? t("collapse") : t("expand")}
-              </button>
-            </div>
-          </div>
-          {profileLogsExpanded ? (
-            <table>
-              <thead>
-                <tr>
-                  <th>{t("time")}</th>
-                  <th>{t("module")}</th>
-                  <th>{t("actionType")}</th>
-                  <th>{t("status")}</th>
-                  <th>{t("message")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {displayProfileLogs.length === 0 ? (
-                  <tr>
-                    <td colSpan={5}>{t("noData")}</td>
-                  </tr>
-                ) : (
-                  displayProfileLogs.map((log) => (
-                    <tr key={log.eventId}>
-                      <td>{dateTimeText(log.serverRecvTs)}</td>
-                      <td>
-                        <div className="field-stack">
-                          <FieldChip label={log.moduleName} tone="info" />
-                          <small>{log.category}</small>
-                        </div>
-                      </td>
-                      <td><FieldChip label={auditActionLabel(log.actionType, language)} tone={actionTone(log.actionType)} /></td>
-                      <td><FieldChip label={log.actionStatus} tone={auditStatusTone(log.actionStatus)} /></td>
-                      <td>
-                        <div className="field-stack">
-                          <strong>{log.resultMessage}</strong>
-                          <small>{log.traceId}</small>
-                        </div>
-                      </td>
+              <div className="analytics-table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{localLabel(language, "时间", "Time")}</th>
+                      <th>{localLabel(language, "轮次", "Round")}</th>
+                      <th>{localLabel(language, "方向", "Direction")}</th>
+                      <th>{localLabel(language, "投入", "Invested")}</th>
+                      <th>{localLabel(language, "入场价", "Entry")}</th>
+                      <th>{localLabel(language, "结算价/退出价", "Settle/Exit")}</th>
+                      <th>{localLabel(language, "份额", "Shares")}</th>
+                      <th>{localLabel(language, "费用", "Fees")}</th>
+                      <th>PnL</th>
+                      <th>{localLabel(language, "状态", "State")}</th>
+                      <th>{localLabel(language, "结果", "Result")}</th>
+                      <th>{localLabel(language, "分析", "Analysis")}</th>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          ) : null}
-        </div>
-      </section>
-    </>
+                  </thead>
+                  <tbody>
+                    {visibleRows.map((row) => (
+                      <tr key={row.id}>
+                        <td>{timeText(row.ts)}</td>
+                        <td>{row.roundLabel}</td>
+                        <td><span className={`analytics-tag ${row.side === "UP" ? "up" : "down"}`}>{row.side}</span></td>
+                        <td>{money(row.invested)}</td>
+                        <td>{tokenPriceText(row.entryPrice)}</td>
+                        <td>{typeof row.settlementPrice === "number" ? tokenPriceText(row.settlementPrice) : "—"}</td>
+                        <td>{decimal(row.shares, 4)}</td>
+                        <td>{money(row.fees, 4)}</td>
+                        <td>{signedMoney(row.pnl)}</td>
+                        <td>
+                          <span className={`analytics-tag state-${row.settlementState.toLowerCase()}`}>
+                            {analyticsSettlementLabel(row.settlementState, language)}
+                          </span>
+                        </td>
+                        <td><span className={`analytics-tag result-${row.result.toLowerCase()}`}>{analyticsResultLabel(row.result, language)}</span></td>
+                        <td><span className={`analytics-row-analysis ${row.analysisTone}`}>{row.analysisText}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {hiddenCount > 0 ? (
+                <button
+                  type="button"
+                  className="analytics-load-more"
+                  onClick={() =>
+                    setGroupVisibleLimits((limits) => ({
+                      ...limits,
+                      [key]: (limits[key] ?? ANALYTICS_GROUP_SIZE) + ANALYTICS_GROUP_SIZE
+                    }))
+                  }
+                >
+                  {localLabel(language, `展开更多 ${Math.min(hiddenCount, ANALYTICS_GROUP_SIZE)} 条`, `Show ${Math.min(hiddenCount, ANALYTICS_GROUP_SIZE)} more`)}
+                </button>
+              ) : null}
+            </div>
+          ))
+        )}
+        {period === "trades" && visibleTradeLimit < filteredRows.length ? (
+          <button
+            type="button"
+            className="analytics-load-more global"
+            onClick={() => setVisibleTradeLimit((limit) => limit + ANALYTICS_TRADE_LIMIT_STEP)}
+          >
+            {localLabel(language, `加载更多 ${Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP)} 条交易`, `Load ${Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP)} more trades`)}
+          </button>
+        ) : null}
+      </div>
+    </section>
   );
 }
 
-function LogSearchPage(props: { t: (key: string) => string; token: string; me: PublicUser; canExport: boolean }) {
+function LogSearchPage(props: { t: (key: string, options?: Record<string, unknown>) => string; token: string; me: PublicUser; canExport: boolean }) {
   const { t, token, me } = props;
   const [filters, setFilters] = useState<Record<string, string>>({ system: "all", limit: "100" });
   const [logs, setLogs] = useState<UnifiedLogRow[]>([]);
@@ -4431,30 +4032,30 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
   const disabledUserIds = new Set(users.filter((user) => !user.isActive).map((user) => user.id));
   const logSystemLabel = (system: UnifiedLogRow["system"]) =>
     system === "audit"
-      ? localLabel(language, "审计", "Audit")
+      ? t("audit")
       : system === "training"
-        ? localLabel(language, "交易", "Trading")
-        : localLabel(language, "撮合", "Matching");
+        ? t("trading")
+        : t("matching");
   const logGroupLabel = (value?: string) => {
-    if (value === "operation") return localLabel(language, "操作审计", "Operation Audit");
-    if (value === "settlement") return localLabel(language, "结算审计", "Settlement Audit");
-    if (value === "market_latency") return localLabel(language, "市场数据延迟", "Market Data Latency");
-    if (value === "system_latency") return localLabel(language, "系统/链路延迟", "System/Link Latency");
-    if (value === "matching_action") return localLabel(language, "交易撮合动作", "Matching Actions");
+    if (value === "operation") return t("operationAudit");
+    if (value === "settlement") return t("settlementAudit");
+    if (value === "market_latency") return t("marketDataLatency");
+    if (value === "system_latency") return t("systemLinkLatency");
+    if (value === "matching_action") return t("matchingActions");
     return value ?? "--";
   };
   const latencySourceLabel = (value?: string) => {
     if (value === "binance") return "Binance";
     if (value === "chainlink") return "Chainlink";
-    if (value === "clob") return localLabel(language, "Polymarket盘口(CLOB)", "Polymarket Book (CLOB)");
-    if (value === "system") return localLabel(language, "系统", "System");
+    if (value === "clob") return t("polymarketBookClob");
+    if (value === "system") return t("system");
     return value ?? "--";
   };
   const matchingKindLabel = (value?: string) =>
     value === "action"
-      ? localLabel(language, "交易撮合动作", "Matching Actions")
+      ? t("matchingActions")
       : value === "engine"
-        ? localLabel(language, "撮合引擎事件", "Matching Engine Events")
+        ? t("matchingEngineEvents")
         : value ?? "--";
   const latencySummary = (log: UnifiedLogRow) => {
     if (!log.latencyPhaseMetrics) {
@@ -4588,7 +4189,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
         </label>
         {canFilterUsers ? (
           <label>
-            {localLabel(language, "用户", "User")}
+            {t("user")}
             <select value={filters.userId ?? ""} onChange={(event) => updateFilters({ userId: event.target.value })}>
               <option value="">{t("all")}</option>
               {visibleUsers.map((user) => (
@@ -4611,14 +4212,14 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
           </select>
         </label>
         <label>
-          <span title={localLabel(language, "订单编号：用户提交或系统生成的订单唯一 ID", "Order ID: unique id for a user/system order")}>
-            {localLabel(language, "订单编号", "Order ID")}
+          <span title={t("orderIdUniqueIdForAUserSystemOrder")}>
+            {t("orderId")}
           </span>
           <input value={filters.orderId ?? ""} onChange={(event) => updateFilters({ orderId: event.target.value })} />
         </label>
         <label>
-          <span title={localLabel(language, "系统追踪号：用于内部排查一次请求或流程链路", "Trace ID: internal request/process trace for debugging")}>
-            {localLabel(language, "系统追踪号", "Trace ID")}
+          <span title={t("traceIdInternalRequestProcessTraceForDebugging")}>
+            {t("traceId")}
           </span>
           <input value={filters.traceId ?? ""} onChange={(event) => updateFilters({ traceId: event.target.value })} />
         </label>
@@ -4657,7 +4258,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
           </select>
           </label>
           <label>
-            {localLabel(language, "日志分组", "Log Group")}
+            {t("logGroup")}
             <select value={filters.logGroup ?? ""} onChange={(event) => updateFilters({ logGroup: event.target.value })} disabled={selectedSystem === "training"}>
               <option value="">{t("all")}</option>
               {(facets.audit.logGroups ?? LOG_GROUP_OPTIONS).map((group) => (
@@ -4668,7 +4269,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             </select>
           </label>
           <label>
-            {localLabel(language, "延迟来源", "Latency Source")}
+            {t("latencySource")}
             <select value={filters.latencySource ?? ""} onChange={(event) => updateFilters({ latencySource: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"}>
               <option value="">{t("all")}</option>
               {(facets.audit.latencySources ?? LATENCY_SOURCE_OPTIONS).map((source) => (
@@ -4679,7 +4280,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             </select>
           </label>
           <label>
-            {localLabel(language, "链路状态", "Connection State")}
+            {t("connectionState")}
             <select value={filters.connectionState ?? ""} onChange={(event) => updateFilters({ connectionState: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"}>
               <option value="">{t("all")}</option>
               {(facets.audit.connectionStates ?? CONNECTION_STATE_OPTIONS).map((state) => (
@@ -4690,7 +4291,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             </select>
           </label>
           <label>
-            {localLabel(language, "延迟阶段", "Latency Phase")}
+            {t("latencyPhase")}
             <select value={filters.latencyPhase ?? ""} onChange={(event) => updateFilters({ latencyPhase: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"}>
               <option value="">{t("all")}</option>
               {(facets.audit.latencyPhases ?? LATENCY_PHASE_OPTIONS).map((phase) => (
@@ -4701,15 +4302,15 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             </select>
           </label>
           <label>
-            {localLabel(language, "最小延迟(ms)", "Min Latency (ms)")}
+            {t("minLatencyMs")}
             <input type="number" value={filters.latencyMinMs ?? ""} onChange={(event) => updateFilters({ latencyMinMs: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"} />
           </label>
           <label>
-            {localLabel(language, "最大延迟(ms)", "Max Latency (ms)")}
+            {t("maxLatencyMs")}
             <input type="number" value={filters.latencyMaxMs ?? ""} onChange={(event) => updateFilters({ latencyMaxMs: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"} />
           </label>
           <label>
-            {localLabel(language, "撮合子类型", "Matching Kind")}
+            {t("matchingKind")}
             <select value={filters.matchingLogKind ?? ""} onChange={(event) => updateFilters({ matchingLogKind: event.target.value })} disabled={selectedSystem === "audit" || selectedSystem === "training"}>
               <option value="">{t("all")}</option>
               {(facets.matching.kinds ?? MATCHING_KIND_OPTIONS).map((kind) => (
@@ -4765,7 +4366,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
             <input value={filters.pageName ?? ""} onChange={(event) => updateFilters({ pageName: event.target.value })} disabled={selectedSystem === "training" || selectedSystem === "matching"} />
           </label>
           <label>
-            {localLabel(language, "精确 actionType", "Exact actionType")}
+            {t("exactActiontype")}
             <input value={filters.actionType ?? ""} onChange={(event) => updateFilters({ actionType: event.target.value })} />
           </label>
           <label>
@@ -4807,16 +4408,16 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
       ) : null}
       <div className="more-filter-actions">
         <button className="ghost-button compact-button" onClick={() => setShowLogInfo((value) => !value)}>
-          {showLogInfo ? localLabel(language, "收起日志说明", "Hide Log Info") : localLabel(language, "日志说明/字段说明", "Log Info / Fields")}
+          {showLogInfo ? t("hideLogInfo") : t("logInfoFields")}
         </button>
         <button className="ghost-button compact-button" onClick={() => setShowMoreFilters((value) => !value)}>
-          {showMoreFilters ? localLabel(language, "收起筛选", "Fewer Filters") : localLabel(language, "更多筛选", "More Filters")}
+          {showMoreFilters ? t("fewerFilters") : t("moreFilters")}
         </button>
       </div>
       {showLogInfo ? (
         <div className="log-info-panel">
           <div>
-            <strong>{selectedSystem === "all" ? localLabel(language, "全部日志", "All Logs") : logSystemLabel(selectedSystem as UnifiedLogRow["system"])}</strong>
+            <strong>{selectedSystem === "all" ? t("allLogs") : logSystemLabel(selectedSystem as UnifiedLogRow["system"])}</strong>
             <p>{logInfoText}</p>
           </div>
           <div className="log-info-grid">
@@ -4829,7 +4430,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
               </div>
             </div>
             <div>
-              <span>{localLabel(language, "主要字段", "Main Fields")}</span>
+              <span>{localLabel(language, "主字段 / Main Fields", "Main Fields")}</span>
               <div className="field-chip-row">
                 {fieldSummary.map((field) => (
                   <FieldChip key={field} label={field} tone="neutral" />
@@ -4843,14 +4444,14 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
         <thead>
           <tr>
             <th>{t("time")}</th>
-            <th>{localLabel(language, "系统", "System")}</th>
+            <th>{t("system")}</th>
             <th>{t("userRole")}</th>
             <th>{t("round")}</th>
-            <th>{localLabel(language, "操作分类", "Action Type")}</th>
+            <th>{t("actionType")}</th>
             <th>{t("status")}</th>
             <th>
-              <span title={localLabel(language, "系统追踪号 / 订单编号", "Trace ID / Order ID")}>
-                {localLabel(language, "追踪 / 订单", "Trace / Order")}
+              <span title={t("traceIdOrderId")}>
+                {t("traceOrder")}
               </span>
             </th>
             <th>{t("message")}</th>
@@ -4881,7 +4482,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
                   <td>
                     <div className="log-user-cell">
                       <span>{log.username ?? log.userId ?? "--"} / {log.role ?? "--"}</span>
-                      {isDisabledUserLog ? <FieldChip label={localLabel(language, "停用", "Disabled")} tone="negative" /> : null}
+                      {isDisabledUserLog ? <FieldChip label={t("disabled")} tone="negative" /> : null}
                     </div>
                   </td>
                   <td>
@@ -4894,8 +4495,8 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
                   <td>{log.actionStatus ?? "--"}</td>
                   <td>
                     <div className="field-stack">
-                      <span title={localLabel(language, "系统追踪号（用于内部排查）", "Trace ID for internal diagnostics")}>{log.traceId ?? "--"}</span>
-                      <small title={localLabel(language, "订单编号 / 持仓编号", "Order ID / Position ID")}>{log.orderId ?? log.positionId ?? "--"}</small>
+                      <span title={t("traceIdForInternalDiagnostics")}>{log.traceId ?? "--"}</span>
+                      <small title={t("orderIdPositionId")}>{log.orderId ?? log.positionId ?? "--"}</small>
                     </div>
                   </td>
                   <td>
@@ -4911,7 +4512,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
       {nextCursor ? (
         <div className="load-more-row">
           <button className="ghost-button compact-button" disabled={busy} onClick={() => search("append")}>
-            {busy ? t("loading") : localLabel(language, "加载更多", "Load More")}
+            {busy ? t("loading") : t("loadMore")}
           </button>
         </div>
       ) : null}
@@ -4934,7 +4535,7 @@ function LogSearchPage(props: { t: (key: string) => string; token: string; me: P
 }
 
 function LogExportDialog(props: {
-  t: (key: string) => string;
+  t: (key: string, options?: Record<string, unknown>) => string;
   token: string;
   me: PublicUser;
   users: PublicUser[];
@@ -4998,10 +4599,10 @@ function LogExportDialog(props: {
 
   const systemLabel = (system: Exclude<LogSystem, "all">) =>
     system === "audit"
-      ? localLabel(language, "审计日志", "Audit Logs")
+      ? t("auditLogs")
       : system === "training"
-        ? localLabel(language, "交易日志", "Trading Logs")
-        : localLabel(language, "撮合事件", "Matching Events");
+        ? t("tradingLogs")
+        : t("matchingEvents");
 
   const updateForm = (key: keyof typeof form, value: string) => {
     setForm((current) => ({ ...current, [key]: value }));
@@ -5077,12 +4678,12 @@ function LogExportDialog(props: {
       const blob = await api.exportLogsZipPost(token, buildExportQuery());
       const result = await saveBlobWithDesktopFallback(blob, exportFileName());
       if (result.canceled) {
-        setMessage(localLabel(language, "已取消保存。", "Save was canceled."));
+        setMessage(t("saveWasCanceled"));
         return;
       }
       setMessage(
         result.filePath
-          ? localLabel(language, `已保存到 ${result.filePath}`, `Saved to ${result.filePath}`)
+          ? t("savedTo", { resultfilePath: result.filePath })
           : localLabel(
               language,
               "导出已开始下载。当前是浏览器模式，浏览器无法直接选择任意本地保存路径，请在浏览器下载设置中选择位置。",
@@ -5103,11 +4704,11 @@ function LogExportDialog(props: {
       <section className="panel export-dialog" onClick={(event) => event.stopPropagation()}>
         <div className="section-header">
           <div>
-            <p className="eyebrow">{localLabel(language, "日志导出", "Log Export")}</p>
-            <h2>{localLabel(language, "导出向导", "Export Wizard")}</h2>
+            <p className="eyebrow">{t("logExport")}</p>
+            <h2>{t("exportWizard")}</h2>
           </div>
           <button className="ghost-button compact-button" onClick={props.onClose}>
-            {t("close")}
+            {localLabel(language, "关闭 Close", "Close")}
           </button>
         </div>
         {message ? <div className="inline-info-banner">{message}</div> : null}
@@ -5125,7 +4726,7 @@ function LogExportDialog(props: {
               )}
         </div>
         <div className="dialog-section">
-          <strong>{localLabel(language, "日志类型", "Log Systems")}</strong>
+          <strong>{t("logSystems")}</strong>
           <div className="choice-grid">
             {LOG_EXPORT_SYSTEMS.map((system) => (
               <label key={system} className="check-choice">
@@ -5137,9 +4738,9 @@ function LogExportDialog(props: {
         </div>
         <div className="dialog-section">
           <div className="section-header compact-header">
-            <strong>{localLabel(language, "人员范围", "User Scope")}</strong>
+            <strong>{t("userScope")}</strong>
             <button className="ghost-button compact-button" onClick={() => setSelectedUserIds([])}>
-              {localLabel(language, "当前权限全部", "All In Scope")}
+              {t("allInScope")}
             </button>
           </div>
           <div className="choice-grid user-choice-grid">
@@ -5188,7 +4789,7 @@ function LogExportDialog(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "日志分组", "Log Group")}
+            {t("logGroup")}
             <select value={form.logGroup} onChange={(event) => updateForm("logGroup", event.target.value)}>
               <option value="">{t("all")}</option>
               {LOG_GROUP_OPTIONS.map((group) => (
@@ -5199,7 +4800,7 @@ function LogExportDialog(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "延迟来源", "Latency Source")}
+            {t("latencySource")}
             <select value={form.latencySource} onChange={(event) => updateForm("latencySource", event.target.value)}>
               <option value="">{t("all")}</option>
               {LATENCY_SOURCE_OPTIONS.map((source) => (
@@ -5210,7 +4811,7 @@ function LogExportDialog(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "链路状态", "Connection State")}
+            {t("connectionState")}
             <select value={form.connectionState} onChange={(event) => updateForm("connectionState", event.target.value)}>
               <option value="">{t("all")}</option>
               {CONNECTION_STATE_OPTIONS.map((state) => (
@@ -5221,7 +4822,7 @@ function LogExportDialog(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "延迟阶段", "Latency Phase")}
+            {t("latencyPhase")}
             <select value={form.latencyPhase} onChange={(event) => updateForm("latencyPhase", event.target.value)}>
               <option value="">{t("all")}</option>
               {LATENCY_PHASE_OPTIONS.map((phase) => (
@@ -5232,15 +4833,15 @@ function LogExportDialog(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "最小延迟(ms)", "Min Latency (ms)")}
+            {t("minLatencyMs")}
             <input type="number" value={form.latencyMinMs} onChange={(event) => updateForm("latencyMinMs", event.target.value)} />
           </label>
           <label>
-            {localLabel(language, "最大延迟(ms)", "Max Latency (ms)")}
+            {t("maxLatencyMs")}
             <input type="number" value={form.latencyMaxMs} onChange={(event) => updateForm("latencyMaxMs", event.target.value)} />
           </label>
           <label>
-            {localLabel(language, "撮合子类型", "Matching Kind")}
+            {t("matchingKind")}
             <select value={form.matchingLogKind} onChange={(event) => updateForm("matchingLogKind", event.target.value)}>
               <option value="">{t("all")}</option>
               {MATCHING_KIND_OPTIONS.map((kind) => (
@@ -5263,8 +4864,8 @@ function LogExportDialog(props: {
             <input value={form.marketSlug} onChange={(event) => updateForm("marketSlug", event.target.value)} />
           </label>
           <label>
-            <span title={localLabel(language, "订单编号：用户提交或系统生成的订单唯一 ID", "Order ID: unique id for a user/system order")}>
-              {localLabel(language, "订单编号", "Order ID")}
+            <span title={t("orderIdUniqueIdForAUserSystemOrder")}>
+              {t("orderId")}
             </span>
             <input value={form.orderId} onChange={(event) => updateForm("orderId", event.target.value)} />
           </label>
@@ -5273,13 +4874,13 @@ function LogExportDialog(props: {
             <input value={form.positionId} onChange={(event) => updateForm("positionId", event.target.value)} />
           </label>
           <label>
-            <span title={localLabel(language, "系统追踪号：用于内部排查一次请求或流程链路", "Trace ID: internal request/process trace for debugging")}>
-              {localLabel(language, "系统追踪号", "Trace ID")}
+            <span title={t("traceIdInternalRequestProcessTraceForDebugging")}>
+              {t("traceId")}
             </span>
             <input value={form.traceId} onChange={(event) => updateForm("traceId", event.target.value)} />
           </label>
           <label>
-            {localLabel(language, "操作分类", "Action Type")}
+            {t("actionType")}
             <input value={form.actionType} onChange={(event) => updateForm("actionType", event.target.value)} />
           </label>
           <label>
@@ -5330,8 +4931,8 @@ function LogExportDialog(props: {
             {props.busy
               ? t("loading")
               : hasNativeSaveDialog
-                ? localLabel(language, "选择保存位置并导出", "Choose Save Location and Export")
-                : localLabel(language, "浏览器下载导出", "Download Export")}
+                ? t("chooseSaveLocationAndExport")
+                : t("downloadExport")}
           </button>
           <button className="ghost-button" disabled={props.busy} onClick={props.onClose}>
             {t("cancel")}
@@ -5343,7 +4944,7 @@ function LogExportDialog(props: {
 }
 
 function BulkUserDialog(props: {
-  t: (key: string) => string;
+  t: (key: string, options?: Record<string, unknown>) => string;
   token: string;
   language: Language;
   users: PublicUser[];
@@ -5376,13 +4977,13 @@ function BulkUserDialog(props: {
         setLocalError(undefined);
       })
       .catch(() => {
-        setLocalError(localLabel(language, "读取文件失败。", "Failed to read the file."));
+        setLocalError(t("failedToReadTheFile"));
       });
   };
 
   const submit = async () => {
     if (hasErrors || parsed.validUsers.length === 0) {
-      setLocalError(localLabel(language, "请先修正导入内容中的错误。", "Fix import errors before creating users."));
+      setLocalError(t("fixImportErrorsBeforeCreatingUsers"));
       return;
     }
     try {
@@ -5408,8 +5009,8 @@ function BulkUserDialog(props: {
       <section className="panel bulk-user-dialog" onClick={(event) => event.stopPropagation()}>
         <div className="section-header">
           <div>
-            <p className="eyebrow">{localLabel(language, "批量注册", "Bulk Registration")}</p>
-            <h2>{localLabel(language, "CSV / TSV 导入账号", "CSV / TSV User Import")}</h2>
+            <p className="eyebrow">{t("bulkRegistration")}</p>
+            <h2>{t("csvTsvUserImport")}</h2>
           </div>
           <button className="ghost-button compact-button" onClick={props.onClose}>
             {t("close")}
@@ -5418,7 +5019,7 @@ function BulkUserDialog(props: {
         <div className="dialog-section">
           <div className="button-row fit-actions">
             <label className="file-import-button">
-              {localLabel(language, "选择 CSV/TSV 文件", "Choose CSV/TSV File")}
+              {t("chooseCsvTsvFile")}
               <input type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values,text/plain" onChange={handleFile} />
             </label>
             <button
@@ -5429,7 +5030,7 @@ function BulkUserDialog(props: {
                 setLocalError(undefined);
               }}
             >
-              {localLabel(language, "填入模板", "Use Template")}
+              {t("useTemplate")}
             </button>
           </div>
           <small className="muted-line">
@@ -5442,7 +5043,7 @@ function BulkUserDialog(props: {
         </div>
         <div className="dialog-form">
           <label>
-            {localLabel(language, "粘贴 CSV/TSV 文本", "Paste CSV/TSV Text")}
+            {t("pasteCsvTsvText")}
             <textarea
               value={sourceText}
               onChange={(event) => {
@@ -5473,12 +5074,12 @@ function BulkUserDialog(props: {
               <tr>
                 <th>#</th>
                 <th>{t("username")}</th>
-                <th>{localLabel(language, "姓名", "Display Name")}</th>
+                <th>{t("displayName")}</th>
                 <th>{t("role")}</th>
                 <th>{t("language")}</th>
-                <th>{localLabel(language, "直属组长", "Senior Tester")}</th>
+                <th>{t("seniorTester")}</th>
                 <th>{t("available")}</th>
-                <th>{localLabel(language, "校验", "Validation")}</th>
+                <th>{t("validation")}</th>
               </tr>
             </thead>
             <tbody>
@@ -5495,12 +5096,12 @@ function BulkUserDialog(props: {
                     <td>{row.role ?? "Tester"}</td>
                     <td>{row.language ?? "zh-CN"}</td>
                     <td>{row.seniorTesterId ?? "--"}</td>
-                    <td>{typeof row.availableUsdc === "number" ? money(row.availableUsdc) : localLabel(language, "默认", "Default")}</td>
+                    <td>{typeof row.availableUsdc === "number" ? money(row.availableUsdc) : t("default")}</td>
                     <td>
                       {row.errors.length ? (
                         <span className="tone-negative">{row.errors.join(" ")}</span>
                       ) : (
-                        <FieldChip label={localLabel(language, "可创建", "Ready")} tone="positive" />
+                        <FieldChip label={t("ready")} tone="positive" />
                       )}
                     </td>
                   </tr>
@@ -5511,7 +5112,7 @@ function BulkUserDialog(props: {
         </div>
         <div className="button-row dialog-actions">
           <button className="secondary-button" disabled={props.busy || hasErrors || parsed.validUsers.length === 0} onClick={submit}>
-            {props.busy ? t("loading") : localLabel(language, `创建 ${parsed.validUsers.length} 个账号`, `Create ${parsed.validUsers.length} Users`)}
+            {props.busy ? t("loading") : t("createUsers", { parsedvalidUsersleng: parsed.validUsers.length })}
           </button>
           <button className="ghost-button" disabled={props.busy} onClick={props.onClose}>
             {t("cancel")}
@@ -5523,7 +5124,7 @@ function BulkUserDialog(props: {
 }
 
 function UserManagementPage(props: {
-  t: (key: string) => string;
+  t: (key: string, options?: Record<string, unknown>) => string;
   token: string;
   me: PublicUser;
   language: Language;
@@ -5606,7 +5207,7 @@ function UserManagementPage(props: {
   };
 
   const disableUser = async (user: PublicUser) => {
-    const ok = window.confirm(localLabel(language, `确认停用账号 ${user.username}？`, `Disable account ${user.username}?`));
+    const ok = window.confirm(t("disableAccount", { userusername: user.username }));
     if (!ok) {
       return;
     }
@@ -5623,7 +5224,7 @@ function UserManagementPage(props: {
   };
 
   const enableUser = async (user: PublicUser) => {
-    const ok = window.confirm(localLabel(language, `确认恢复账号 ${user.username}？`, `Restore account ${user.username}?`));
+    const ok = window.confirm(t("restoreAccount", { userusername: user.username }));
     if (!ok) {
       return;
     }
@@ -5644,7 +5245,7 @@ function UserManagementPage(props: {
       return;
     }
     if (passwordDialog.password !== passwordDialog.confirmPassword) {
-      setError(localLabel(language, "两次输入的新密码不一致。", "The new password confirmation does not match."));
+      setError(t("theNewPasswordConfirmationDoesNotMatch"));
       return;
     }
     try {
@@ -5676,7 +5277,7 @@ function UserManagementPage(props: {
     }
     const amount = Number(balanceDialog.amount);
     if (!Number.isFinite(amount) || amount < 0) {
-      setError(localLabel(language, "请输入有效金额。", "Enter a valid amount."));
+      setError(t("enterAValidAmount"));
       return;
     }
     try {
@@ -5700,7 +5301,7 @@ function UserManagementPage(props: {
     <section className="panel log-search-panel">
       <div className="section-header">
         <div>
-          <p className="eyebrow">{localLabel(language, "用户管理", "Users")}</p>
+          <p className="eyebrow">{t("users")}</p>
           <h2>{users.length}</h2>
         </div>
         <div className="button-row fit-actions">
@@ -5713,7 +5314,7 @@ function UserManagementPage(props: {
                 setBulkDialogOpen(true);
               }}
             >
-              {localLabel(language, "批量注册", "Bulk Register")}
+              {t("bulkRegister")}
             </button>
           ) : null}
           <button
@@ -5724,7 +5325,7 @@ function UserManagementPage(props: {
               setPasswordDialog({ user: me, mode: "self", currentPassword: "", password: "", confirmPassword: "" });
             }}
           >
-            {localLabel(language, "修改个人密码", "Change My Password")}
+            {t("changeMyPassword")}
           </button>
           <button className="secondary-button" onClick={loadUsers} disabled={busy}>
             {busy ? props.t("loading") : props.t("search")}
@@ -5744,7 +5345,7 @@ function UserManagementPage(props: {
             <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
           </label>
           <label>
-            {localLabel(language, "姓名", "Display Name")}
+            {t("displayName")}
             <input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} />
           </label>
           <label>
@@ -5765,7 +5366,7 @@ function UserManagementPage(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "直属组长", "Senior Tester")}
+            {t("seniorTester")}
             <select value={form.seniorTesterId} onChange={(event) => setForm({ ...form, seniorTesterId: event.target.value })} disabled={form.role !== "Tester"}>
               <option value="">{props.t("all")}</option>
               {seniorOptions.map((user) => (
@@ -5780,7 +5381,7 @@ function UserManagementPage(props: {
             <input value={form.availableUsdc} onChange={(event) => setForm({ ...form, availableUsdc: event.target.value })} />
           </label>
           <button className="primary-button user-create-button" disabled={busy} onClick={createUser}>
-            {localLabel(language, "创建账号", "Create")}
+            {t("create")}
           </button>
         </div>
       ) : null}
@@ -5789,10 +5390,10 @@ function UserManagementPage(props: {
         <thead>
           <tr>
             <th>{props.t("username")}</th>
-            <th>{localLabel(language, "姓名", "Display Name")}</th>
+            <th>{t("displayName")}</th>
             <th>{props.t("role")}</th>
             <th>{props.t("status")}</th>
-            <th>{localLabel(language, "直属组长", "Senior Tester")}</th>
+            <th>{t("seniorTester")}</th>
             <th>{props.t("available")}</th>
             <th>{props.t("action")}</th>
           </tr>
@@ -5812,7 +5413,7 @@ function UserManagementPage(props: {
                   <td>{user.role}</td>
                   <td>
                     <FieldChip
-                      label={user.isActive ? localLabel(language, "启用", "Active") : localLabel(language, "停用", "Disabled")}
+                      label={user.isActive ? t("active") : t("disabled")}
                       tone={user.isActive ? "positive" : "negative"}
                     />
                   </td>
@@ -5829,7 +5430,7 @@ function UserManagementPage(props: {
                             setBalanceDialog({ user, amount: String(user.availableUsdc) });
                           }}
                         >
-                          {localLabel(language, "重置余额", "Balance")}
+                          {t("balance")}
                         </button>
                       ) : null}
                       {canManageTarget(user) ? (
@@ -5841,17 +5442,17 @@ function UserManagementPage(props: {
                             setPasswordDialog({ user, mode: "reset", currentPassword: "", password: "", confirmPassword: "" });
                           }}
                         >
-                          {localLabel(language, "重置密码", "Password")}
+                          {t("password")}
                         </button>
                       ) : null}
                       {canManageTarget(user) && user.id !== me.id ? (
                         user.isActive ? (
                           <button className="ghost-button compact-button" disabled={busy} onClick={() => disableUser(user)}>
-                            {localLabel(language, "停用", "Disable")}
+                            {t("disable")}
                           </button>
                         ) : (
                           <button className="ghost-button compact-button" disabled={busy} onClick={() => enableUser(user)}>
-                            {localLabel(language, "恢复", "Restore")}
+                            {t("restore")}
                           </button>
                         )
                       ) : null}
@@ -5868,7 +5469,7 @@ function UserManagementPage(props: {
           <div className="panel user-action-dialog">
             <div className="section-header">
               <div>
-                <p className="eyebrow">{localLabel(language, "重置余额", "Balance")}</p>
+                <p className="eyebrow">{t("balance")}</p>
                 <h2>{balanceDialog.user.username}</h2>
               </div>
               <button className="ghost-button compact-button" onClick={() => setBalanceDialog(undefined)}>
@@ -5886,7 +5487,7 @@ function UserManagementPage(props: {
               </label>
               <div className="button-row">
                 <button className="secondary-button" disabled={busy} onClick={submitBalance}>
-                  {localLabel(language, "确认重置", "Confirm")}
+                  {t("confirm")}
                 </button>
                 <button className="ghost-button" disabled={busy} onClick={() => setBalanceDialog(undefined)}>
                   {props.t("cancel")}
@@ -5901,11 +5502,11 @@ function UserManagementPage(props: {
           <div className="panel user-action-dialog">
             <div className="section-header">
               <div>
-                <p className="eyebrow">{localLabel(language, "身份验证", "Identity Check")}</p>
+                <p className="eyebrow">{t("identityCheck")}</p>
                 <h2>
                   {passwordDialog.mode === "self"
-                    ? localLabel(language, "修改个人密码", "Change My Password")
-                    : localLabel(language, "重置密码", "Reset Password")}{" "}
+                    ? t("changeMyPassword")
+                    : t("resetPassword")}{" "}
                   / {passwordDialog.user.username}
                 </h2>
               </div>
@@ -5916,7 +5517,7 @@ function UserManagementPage(props: {
             {error ? <div className="inline-error-banner">{error}</div> : null}
             <div className="dialog-form">
               <label>
-                {localLabel(language, "当前操作人密码", "Current Operator Password")}
+                {t("currentOperatorPassword")}
                 <input
                   type="password"
                   value={passwordDialog.currentPassword}
@@ -5924,7 +5525,7 @@ function UserManagementPage(props: {
                 />
               </label>
               <label>
-                {localLabel(language, "新密码", "New Password")}
+                {t("newPassword")}
                 <input
                   type="password"
                   value={passwordDialog.password}
@@ -5932,7 +5533,7 @@ function UserManagementPage(props: {
                 />
               </label>
               <label>
-                {localLabel(language, "确认新密码", "Confirm New Password")}
+                {t("confirmNewPassword")}
                 <input
                   type="password"
                   value={passwordDialog.confirmPassword}
@@ -5941,7 +5542,7 @@ function UserManagementPage(props: {
               </label>
               <div className="button-row">
                 <button className="secondary-button" disabled={busy} onClick={submitPasswordReset}>
-                  {localLabel(language, "确认重置", "Confirm")}
+                  {t("confirm")}
                 </button>
                 <button className="ghost-button" disabled={busy} onClick={() => setPasswordDialog(undefined)}>
                   {props.t("cancel")}
@@ -5968,7 +5569,7 @@ function UserManagementPage(props: {
   );
 }
 
-function TimelineDialog(props: { t: (key: string) => string; timeline: TradeTimeline; onClose: () => void }) {
+function TimelineDialog(props: { t: (key: string, options?: Record<string, unknown>) => string; timeline: TradeTimeline; onClose: () => void }) {
   const { t, timeline } = props;
   const rows = [
     ...timeline.auditEvents.map((event) => ({
@@ -6028,7 +5629,7 @@ function TimelineDialog(props: { t: (key: string) => string; timeline: TradeTime
 }
 
 function RoundLogDialog(props: {
-  t: (key: string) => string;
+  t: (key: string, options?: Record<string, unknown>) => string;
   state: RoundLogDialogState;
   onClose: () => void;
 }) {

@@ -327,7 +327,7 @@ async function testRedeemWritesWalletPositionAndAudit() {
     upPrice: 1,
     downPrice: 0,
     serverNow: now,
-    binance: { candlesByInterval: { "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] } },
+    binance: { candlesByInterval: { "30s": [], "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] } },
     clob: {
       upBook: { snapshotId: "up", snapshotTs: now, bestBid: 0.99, bestAsk: 1, midPrice: 1, bids: [], asks: [] },
       downBook: { snapshotId: "down", snapshotTs: now, bestBid: 0, bestAsk: 0.01, midPrice: 0, bids: [], asks: [] },
@@ -352,7 +352,7 @@ async function testRedeemWritesWalletPositionAndAudit() {
       referencePrice: 0,
       settlementReference: 0,
       candles5s: [],
-      candlesByInterval: { "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] }
+      candlesByInterval: { "30s": [], "1m": [], "5m": [], "15m": [], "1h": [], "1d": [] }
     }
   });
   engine.createBehaviorLog = (input: { actionType: string }) => input;
@@ -567,7 +567,7 @@ async function testResolvedEventSchedulesTwoSecondRedeem() {
   assert.equal(round.settlementReceivedAt, now);
   assert.equal(round.redeemScheduledAt, now + 2000);
   assert.equal(round.status, "Redeeming");
-  assert.deepEqual(events, ["settlement:success:Settled", "upsert:Redeeming"]);
+  assert.deepEqual(events, ["settlement:success:Redeeming", "upsert:Redeeming"]);
 }
 
 async function testFrontendLatencyUsesReceiptTimestamp() {
@@ -592,8 +592,8 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(appSource, /scheduleMarketReconnect/);
   assert.match(appSource, /refreshMarketSnapshot/);
   assert.match(appSource, /api\.getCurrentRound\(token\)/);
-  assert.match(appSource, /Polymarket BTC 开\/收/);
-  assert.match(appSource, /Δ Open \/ Δ Close/);
+  assert.match(appSource, /polymarketOpenPrice/);
+  assert.match(appSource, /polymarketClosePrice/);
   assert.match(appSource, /lastMarketRecvTs/);
   assert.match(appSource, /function isBtcReferencePrice\(value\?: number\): value is number/);
   assert.match(appSource, /isBtcReferencePrice\(round\.polymarketOpenPrice\)/);
@@ -605,14 +605,16 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(storeSource, /shouldAcceptMarketPayload/);
   assert.match(storeSource, /transportMeta\.serverPublishTs/);
   const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
-  assert.match(i18nSource, /dataAge: "源数据距今"/);
-  assert.match(i18nSource, /dataAge: "Source Data Age"/);
-  assert.match(i18nSource, /endToEnd: "源数据到前端"/);
-  assert.match(i18nSource, /endToEnd: "Source Data to Frontend"/);
-  assert.match(i18nSource, /latencyOver3s: "延迟超过 3 秒"/);
+  assert.match(i18nSource, /dataAge:/);
+  assert.match(i18nSource, /dataAge: "Data Age"/);
+  assert.match(i18nSource, /endToEnd:/);
+  assert.match(i18nSource, /endToEnd: "Source to Frontend"/);
+  assert.match(i18nSource, /latencyOver3s:/);
   assert.match(i18nSource, /latencyOver3s: "Latency over 3s"/);
   assert.doesNotMatch(i18nSource, /源事件到前端/);
   assert.doesNotMatch(i18nSource, /Source Event/);
+  assert.doesNotMatch(i18nSource, /\uFFFD/);
+  assert.doesNotMatch(i18nSource, /锟|鍒|涓|寰|绛|鐧|瀵|妯|杞/);
 }
 
 async function testChainlinkDisplayUsesStrictRtds() {
@@ -628,7 +630,7 @@ async function testChainlinkDisplayUsesStrictRtds() {
   assert.match(chainlinkSource, /Strict RTDS mode does not fall back to AggregatorV3/);
   assert.doesNotMatch(chainlinkSource, /createPublicClient/);
   assert.doesNotMatch(chainlinkSource, /latestRoundData/);
-  assert.match(appSource, /Chainlink RTDS WebSocket/);
+  assert.match(appSource, /CL RTDS WebSocket/);
 }
 
 async function testProfileUsesOperatedGroupedRoundViews() {
@@ -637,46 +639,54 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   const stylesSource = readFileSync("apps/client/src/styles.css", "utf8");
   const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
-  assert.match(appSource, /type OperatedEquityWindow = 10 \| 30 \| 60 \| "all"/);
-  assert.match(appSource, /function buildOperatedHistory\(history: HistoryRound\[\], orders: OrderRecord\[\]\)/);
-  assert.match(appSource, /function buildGroupedPositions\(history: HistoryRound\[\], positions: PositionRecord\[\], orders: OrderRecord\[\]\)/);
-  assert.match(appSource, /function buildGroupedOrders\(history: HistoryRound\[\], orders: OrderRecord\[\]\)/);
-  assert.match(appSource, /const \[equityWindow, setEquityWindow\] = useState<OperatedEquityWindow>\(30\)/);
+  assert.match(appSource, /type AnalyticsPeriod = "all" \| "year" \| "month" \| "week" \| "day" \| "trades"/);
+  assert.match(appSource, /type AnalyticsResult = "WIN" \| "LOSE" \| "SOLD" \| "OPEN" \| "UNFILLED"/);
+  assert.match(appSource, /interface AnalyticsTradeRow/);
+  assert.match(appSource, /function buildAnalyticsRows\(history: HistoryRound\[\], positions: PositionRecord\[\], orders: OrderRecord\[\], language: Language\)/);
+  assert.match(appSource, /function filterAnalyticsPeriod\(rows: AnalyticsTradeRow\[\], period: AnalyticsPeriod\)/);
+  assert.match(appSource, /function analyticsSummary\(rows: AnalyticsTradeRow\[\]\)/);
+  assert.doesNotMatch(appSource, /function analyticsConclusion/);
+  assert.match(appSource, /function AnalyticsPage/);
+  assert.match(appSource, /<AnalyticsPage/);
   assert.match(appSource, /api\.getOperatedHistory\(token\)/);
-  assert.match(appSource, /function datedRoundTimeRangeText\(round: Pick<RoundRecord, "startAt" \| "endAt">\)/);
-  assert.match(appSource, /const equityCurve = buildEquityCurve\(props\.operatedHistory, props\.orders, equityWindow\)/);
-  assert.match(appSource, /let runningProfit = 0/);
-  assert.match(appSource, /runningProfit \+= round\.userPnl/);
+  assert.match(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt\)/);
+  assert.match(appSource, /analysisText: analysis\.text/);
+  assert.match(appSource, /settlementState: "UNSETTLED"/);
+  assert.match(appSource, /function analyticsTimelineKey\(row: AnalyticsTradeRow, period: AnalyticsPeriod\)/);
+  assert.match(appSource, /ANALYTICS_GROUP_SIZE = 50/);
+  assert.match(appSource, /ANALYTICS_INITIAL_TRADE_LIMIT = 200/);
+  assert.match(appSource, /\{ id: "all", label: analyticsPeriodLabel\("all", language\) \}/);
+  assert.match(appSource, /\{ id: "trades", label: analyticsPeriodLabel\("trades", language\) \}/);
+  assert.match(appSource, /<select value="BTC" disabled>/);
+  assert.match(appSource, /<option value="WIN">\{analyticsResultLabel\("WIN", language\)\}<\/option>/);
+  assert.match(appSource, /<option value="LOSE">\{analyticsResultLabel\("LOSE", language\)\}<\/option>/);
+  assert.match(appSource, /<option value="SOLD">\{analyticsResultLabel\("SOLD", language\)\}<\/option>/);
+  assert.match(appSource, /<option value="OPEN">\{analyticsResultLabel\("OPEN", language\)\}<\/option>/);
+  assert.match(appSource, /<option value="UNFILLED">\{analyticsResultLabel\("UNFILLED", language\)\}<\/option>/);
+  assert.match(appSource, /isClobDepthFailure\(order\)/);
+  assert.match(appSource, /row\.result !== "OPEN" && row\.result !== "UNFILLED"/);
+  assert.doesNotMatch(appSource, /props\.t\("accountSecurity"\)/);
+  assert.match(appSource, /analyticsSettlementLabel\(row\.settlementState, language\)/);
+  assert.match(appSource, /analyticsResultLabel\(row\.result, language\)/);
+  assert.match(appSource, /analytics-row-analysis/);
+  assert.match(appSource, /analytics-table-wrap/);
+  assert.doesNotMatch(appSource, /function ProfilePage/);
+  assert.doesNotMatch(appSource, /const \[equityWindow, setEquityWindow\]/);
+  assert.doesNotMatch(appSource, /<FastEquityCurve/);
   assert.doesNotMatch(appSource, /baselineEquity/);
-  assert.doesNotMatch(appSource, /profile\?\.totalEquity.*cumulativePnl/);
-  assert.match(appSource, /const roundCalendarItems = buildRoundCalendarItems\(props\.operatedHistory, props\.orders\)/);
-  assert.match(appSource, /datedLabel: datedRoundTimeRangeText\(round\)/);
-  assert.match(appSource, /function FastEquityCurve/);
-  assert.match(appSource, /const width = 1080/);
-  assert.match(appSource, /const height = 420/);
-  assert.match(appSource, /<FastEquityCurve points=\{equityCurve\} minValue=\{curveDomainMin\} maxValue=\{curveDomainMax\} \/>/);
-  assert.match(appSource, /handlePointerMove/);
-  assert.match(appSource, /onMouseMove=\{handlePointerMove\}/);
-  assert.match(appSource, /hover-tooltip/);
-  assert.match(appSource, /hoverPoint\.datedLabel/);
-  assert.match(appSource, /<title>/);
-  assert.match(appSource, /first\.datedLabel/);
-  assert.match(appSource, /last\.datedLabel/);
-  assert.match(appSource, /<strong>\{item\.datedLabel\}<\/strong>/);
-  assert.match(appSource, /roundsParticipatedTotal/);
-  assert.match(stylesSource, /--workspace-width: 1920px/);
-  assert.match(stylesSource, /width: var\(--workspace-width\)/);
-  assert.match(stylesSource, /min-width: var\(--workspace-width\)/);
-  assert.match(stylesSource, /grid-template-columns: 1120px 1fr/);
-  assert.match(stylesSource, /height: 420px/);
-  assert.match(stylesSource, /profile-fast-curve \.hover-tooltip/);
+  assert.match(stylesSource, /analytics-terminal-page/);
+  assert.match(stylesSource, /analytics-summary/);
+  assert.match(stylesSource, /analytics-period-tabs/);
+  assert.match(stylesSource, /analytics-table-wrap/);
+  assert.match(stylesSource, /analytics-row-analysis/);
+  assert.match(stylesSource, /analytics-load-more/);
+  assert.doesNotMatch(stylesSource, /analytics-security/);
+  assert.match(stylesSource, /app-shell:not\(\.page-trade\)/);
   assert.doesNotMatch(stylesSource, /@media \(max-width: 1440px\)/);
   assert.doesNotMatch(stylesSource, /@media \(max-width: 920px\)/);
   assert.doesNotMatch(appSource, /from "recharts"/);
   assert.doesNotMatch(appSource, /<ResponsiveContainer/);
   assert.doesNotMatch(appSource, /<LineChart/);
-  assert.match(appSource, /const displayProfilePositionGroups = paginateRows\(groupedPositions, profilePositionsPageSafe\)/);
-  assert.match(appSource, /const displayProfileOrderGroups = paginateRows\(groupedOrders, profileOrdersPageSafe\)/);
   assert.match(appSource, /api\.getRoundActivity\(token, item\.roundId\)/);
   assert.match(appSource, /behaviorLogs: \[\.\.\.activity\.behaviorLogs\]/);
   assert.match(appSource, /state\.behaviorLogs\.map/);
@@ -707,11 +717,40 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(connectorSource, /resolvedMarkets: \[\.\.\.\(this\.state\.resolvedMarkets \?\? \[\]\), resolvedEvent\]\.slice\(-20\)/);
   assert.match(configSource, /export function buildServerConfig\(env: NodeJS\.ProcessEnv = process\.env\)/);
   assert.match(configSource, /pollDelayMs: Number\(env\.POLL_DELAY_MS \?\? 0\)/);
-  assert.match(simulationSource, /const PRELIMINARY_SETTLEMENT_THRESHOLD = 0\.97/);
+  assert.match(simulationSource, /const PRELIMINARY_SETTLEMENT_THRESHOLD = 0\.9/);
   assert.match(simulationSource, /const GAMMA_PREFETCH_START_MS = 180_000/);
-  assert.match(simulationSource, /const GAMMA_PREFETCH_END_MS = 60_000/);
-  assert.match(simulationSource, /const GAMMA_PREFETCH_INTERVAL_MS = 5000/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_FAST_START_MS = 60_000/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_END_MS = 0/);
+  assert.match(simulationSource, /const GAMMA_PREFETCH_INTERVAL_MS = 2000/);
   assert.match(simulationSource, /this\.shouldPrefetchGamma\(round, now\)/);
+  assert.match(simulationSource, /fetchBestGammaSettlementDetail\(round, now\)/);
+  assert.match(simulationSource, /Promise\.allSettled\(tasks\)/);
+  assert.match(simulationSource, /resolveTrustedGammaSettlement\(round, detail, now\)/);
+  assert.match(simulationSource, /confirmGammaSettlement\(round, detail, settlement\.side, settlement\.price, now\)/);
+  assert.match(simulationSource, /confirmExactGammaOutcome\(round\.id, exactOutcomeSide, now\)/);
+  assert.match(simulationSource, /function resolvePairedDisplayPrices/);
+  assert.match(simulationSource, /input\.upBook\.asks\.length > 0 && isPositivePrice\(input\.upBook\.bestAsk\)/);
+  assert.match(simulationSource, /input\.downBook\.asks\.length > 0 && isPositivePrice\(input\.downBook\.bestAsk\)/);
+  assert.match(simulationSource, /if \(!upAskDepthAvailable && !downAskDepthAvailable\)/);
+  assert.match(simulationSource, /UP: \{ value: 0, source: "outcome_price", spread: 0 \}/);
+  assert.match(simulationSource, /DOWN: \{ value: 0\.01, source: "outcome_price", spread: 0 \}/);
+  assert.match(simulationSource, /const upPrice = isPositivePrice\(upBook\.bestAsk\) \? upBook\.bestAsk : 0/);
+  assert.match(appSource, /Binance 对比 CL/);
+  assert.match(appSource, /Binance vs CL/);
+  assert.doesNotMatch(appSource, /CL 对比 PTB/);
+  assert.doesNotMatch(appSource, /CL vs PTB/);
+  assert.match(appSource, /function parseLimitPriceCentsInput\(value: string\)/);
+  assert.match(appSource, /\^\\d\+\$/);
+  assert.match(appSource, /parsed < 1 \|\| parsed > 99/);
+  assert.match(appSource, /limitPriceCents! \/ 100/);
+  assert.match(appSource, /min=\{1\}/);
+  assert.match(appSource, /max=\{99\}/);
+  assert.match(appSource, /commitChartVisibleDraft/);
+  assert.match(appSource, /event\.key === "Enter"/);
+  assert.match(appSource, /parseBarCountInput\(chartVisibleDraft\)/);
+  assert.match(simulationSource, /this\.scheduleRedeem\(round, now\)/);
+  assert.match(simulationSource, /this\.publishSettlementMarketSnapshot\(round, "redeem_completed"\)/);
+  assert.match(simulationSource, /SETTLEMENT_DUPLICATE_SKIPPED/);
   assert.match(simulationSource, /now - round\.lastPollAt < pollIntervalMs/);
   assert.doesNotMatch(simulationSource, /HOT_SETTLEMENT_POLL_MS/);
   assert.doesNotMatch(simulationSource, /HOT_SETTLEMENT_WINDOW_MS/);
@@ -723,6 +762,14 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(apiSource, /settlementPreview\?: SettlementPreview/);
   assert.match(appSource, /settlementPreviewLabel/);
   assert.match(appSource, /settlementPreviewHelpText/);
+  assert.match(appSource, /shouldRejectStaleMarketPayload/);
+  assert.match(appSource, /if \(seq > 0\) \{\s*return false;\s*\}/);
+  assert.match(appSource, /function hasTwoSidedBook/);
+  assert.match(appSource, /function spreadDisplayText/);
+  assert.match(appSource, /SPREAD --/);
+  assert.match(appSource, /title=\{upDisplayTitle\}/);
+  assert.match(appSource, /title=\{downDisplayTitle\}/);
+  assert.match(appSource, /title=\{selectedDisplayTitleSafe\}/);
   assert.match(appSource, /settlement-preview-note/);
   assert.doesNotMatch(appSource, /status-pill tone-\$\{settlementPreviewTone\(settlementPreview\)\}/);
   assert.match(appSource, /Manual Review/);
@@ -742,16 +789,130 @@ async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   assert.doesNotMatch(indexSource, /snapshot: store\.marketSnapshot/);
 }
 
+async function testRealtimeLatencyPacingContracts() {
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+  const typesSource = readFileSync("apps/server/src/domain/types.ts", "utf8");
+  const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
+  const configSource = readFileSync("apps/server/src/config.ts", "utf8");
+
+  assert.match(configSource, /marketWsMinIntervalMs: Number\(env\.MARKET_WS_MIN_INTERVAL_MS \?\? 50\)/);
+  assert.match(configSource, /marketHistoryCacheMaxUsers: Number\(env\.MARKET_HISTORY_CACHE_MAX_USERS \?\? 200\)/);
+  assert.match(configSource, /polymarketBookCalibrationMs: Number\(env\.POLYMARKET_BOOK_CALIBRATION_MS \?\? env\.POLYMARKET_BOOK_POLL_MS \?\? 5000\)/);
+  assert.match(typesSource, /coalescedCount\?: number/);
+  assert.match(apiSource, /serverQueueMs\?: number/);
+  assert.match(indexSource, /const MARKET_WS_MIN_INTERVAL_MS = Math\.max\(serverConfig\.marketWsMinIntervalMs, 0\)/);
+  assert.match(indexSource, /const marketHistoryCache = new Map/);
+  assert.match(indexSource, /store\.getHistoryRevision\(\)/);
+  assert.match(indexSource, /createMarketPayload\(user\.id, coalescedCount, pendingSince\)/);
+  assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
+  assert.match(storeSource, /this\.emitter\.emit\("market:update", snapshot\)/);
+  assert.match(storeSource, /this\.queuedMarketSnapshot = snapshot/);
+  assert.match(storeSource, /void this\.flushMarketSnapshotCache\(\)/);
+  assert.match(storeSource, /await this\.persistMarketSnapshotCache\(snapshot\)/);
+  assert.match(storeSource, /getHistoryRevision\(\)/);
+  assert.match(storeSource, /bumpHistoryRevision\(\)/);
+  assert.match(simulationSource, /scheduleLatencyLogs\(snapshot\)/);
+  assert.match(simulationSource, /setImmediate\(\(\) =>/);
+  assert.match(appSource, /requestAnimationFrame/);
+  assert.match(appSource, /pendingMarketPayloadRef/);
+  assert.match(appSource, /queueMarketPayload\(parsed\.data, receivedAt\)/);
+  assert.match(appSource, /flushPendingMarketPayload\(\)/);
+  assert.match(appSource, /memo\(function TradePage/);
+}
+
+async function testClobWsFirstMarketDataContracts() {
+  const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+
+  assert.match(connectorSource, /custom_feature_enabled: true/);
+  assert.match(connectorSource, /eventType === "best_bid_ask"/);
+  assert.match(connectorSource, /eventType === "price_change"/);
+  assert.match(connectorSource, /function recomputeBookTop/);
+  assert.match(connectorSource, /function applyTopToBook/);
+  assert.match(connectorSource, /function applyPriceChangeToBook/);
+  assert.match(connectorSource, /input\.snapshotTs < book\.snapshotTs/);
+  assert.match(connectorSource, /size=0|input\.qty > 0/);
+  assert.match(connectorSource, /Streaming best bid\/ask/);
+  assert.match(connectorSource, /Streaming price changes/);
+  assert.match(simulationSource, /bookPollMs: config\.polymarketBookCalibrationMs/);
+  assert.match(simulationSource, /polymarketBookCalibrationMs \|\| this\.config\.polymarketBookPollMs/);
+  assert.match(indexSource, /polymarketBookCalibrationMs: serverConfig\.polymarketBookCalibrationMs/);
+}
+
+async function testClobV2FeeMarketInfoAndLatencyContracts() {
+  const typesSource = readFileSync("apps/server/src/domain/types.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
+  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+  const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+
+  assert.match(typesSource, /export interface ClobMarketInfo/);
+  assert.match(typesSource, /minimumTickSize: number/);
+  assert.match(typesSource, /minimumOrderSize: number/);
+  assert.match(typesSource, /makerFeeRate: number/);
+  assert.match(typesSource, /takerFeeRate: number/);
+  assert.match(typesSource, /export interface LatencyBreakdown/);
+  assert.match(typesSource, /sourceEventAge/);
+  assert.match(typesSource, /serverIngressLatency/);
+  assert.match(typesSource, /serverComputeLatency/);
+  assert.match(typesSource, /clientTransportLatency/);
+  assert.match(typesSource, /estimatedFee\?: number/);
+  assert.match(typesSource, /actualFee\?: number/);
+  assert.match(typesSource, /feeCurrency\?: FeeCurrency/);
+  assert.match(connectorSource, /fetchClobMarketInfo/);
+  assert.match(connectorSource, /minimum_tick_size/);
+  assert.match(connectorSource, /minimum_order_size/);
+  assert.match(connectorSource, /input\.fd/);
+  assert.match(connectorSource, /feeSchedule\?\.rate/);
+  assert.match(connectorSource, /Array\.isArray\(input\.t\)/);
+  assert.match(connectorSource, /upBookPayload\.snapshotTs >= existingUpBook\.snapshotTs/);
+  assert.match(simulationSource, /isAlignedToTick/);
+  assert.match(simulationSource, /Order size must be at least CLOB minimum order size/);
+  assert.match(simulationSource, /user\.availableUsdc = roundCurrency\(user\.availableUsdc - totalSpend\)/);
+  assert.match(simulationSource, /user\.availableUsdc = roundCurrency\(user\.availableUsdc \+ estimate\.matchedNotional - \(order\.actualFee \?\? 0\)\)/);
+  assert.match(simulationSource, /sourceEventAge/);
+  assert.match(simulationSource, /serverIngressLatency/);
+  assert.match(storeSource, /estimated_fee DOUBLE PRECISION/);
+  assert.match(storeSource, /actual_fee DOUBLE PRECISION/);
+  assert.match(storeSource, /fee_breakdown JSONB/);
+  assert.match(apiSource, /export interface ClobMarketInfo/);
+  assert.match(apiSource, /latencyBreakdown: LatencyBreakdown/);
+  assert.match(appSource, /USD/);
+  assert.match(appSource, /estimatedOrderFee/);
+  assert.match(appSource, /Latency Split/);
+  assert.match(appSource, /parsedAmount \+ estimatedOrderFee > \(profile\?\.availableUsdc \?\? 0\)/);
+}
+
 async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const referenceSource = readFileSync("apps/server/src/services/connectors/polymarket-reference.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
   assert.doesNotMatch(simulationSource, /getRoundUpMarketPrice/);
   assert.doesNotMatch(simulationSource, /getRoundPolymarketBtcReference/);
+  assert.doesNotMatch(simulationSource, /captureReferencePrice/);
   assert.match(simulationSource, /hydrateRoundPolymarketReferencePrices/);
+  assert.match(simulationSource, /syncPriceToBeatFromPolymarketOpenPrice/);
+  assert.match(simulationSource, /const officialPriceToBeat = roundNumber\(round\.polymarketOpenPrice, 2\)/);
+  assert.match(simulationSource, /round\.priceToBeat = officialPriceToBeat/);
+  assert.match(simulationSource, /round\.priceToBeatSource = round\.polymarketOpenPriceSource \?\? "Gamma"/);
   assert.match(simulationSource, /PolymarketReferenceResolver/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.startAt/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.endAt/);
+  assert.match(simulationSource, /historyCacheMs: isActiveRound \? 2_000 : undefined/);
   assert.match(simulationSource, /isBtcReferencePrice\(existing\?\.polymarketOpenPrice\)/);
   assert.match(simulationSource, /if \(!isBtcReferencePrice\(round\.polymarketOpenPrice\)\)/);
+  assert.doesNotMatch(simulationSource, /capture_price_to_beat/);
+  assert.match(referenceSource, /historyCacheMs\?: number/);
+  assert.match(referenceSource, /getHistoricalSamples\(metadata, input\?\.historyCacheMs\)/);
+  assert.match(appSource, /function btcMoneyOrDash\(value\?: number\)/);
+  assert.match(appSource, /PTB \$\{btcMoneyOrDash\(snapshot\?\.priceToBeat\)\}/);
+  assert.match(appSource, /`PTB: \$\{btcMoneyOrDash\(round\.priceToBeat\)\}`/);
+  assert.doesNotMatch(appSource, /PTB \$\{money\(snapshot\?\.priceToBeat \?\? 0\)\}/);
 
   const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
   assert.match(connectorSource, /function normalizeMarketOutcomes\(payload: DetailedMarketPayload\)/);
@@ -774,8 +935,8 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const binanceSource = readFileSync("apps/server/src/services/connectors/binance.ts", "utf8");
 
-  assert.match(simulationSource, /const upPrice = upBook\.bestAsk \|\| upBook\.midPrice/);
-  assert.match(simulationSource, /const downPrice = downBook\.bestAsk \|\| downBook\.midPrice/);
+  assert.match(simulationSource, /const upPrice = isPositivePrice\(upBook\.bestAsk\) \? upBook\.bestAsk : 0/);
+  assert.match(simulationSource, /const downPrice = isPositivePrice\(downBook\.bestAsk\) \? downBook\.bestAsk : 0/);
   assert.match(binanceSource, /"1m": 180/);
   assert.match(binanceSource, /"5m": 30/);
   assert.match(binanceSource, /"15m": 24/);
@@ -787,12 +948,12 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   assert.match(appSource, /AUDIT_ACTION_LABELS/);
   assert.match(appSource, /auditActionLabel\(actionType, language\)/);
   assert.match(appSource, /api\.getHistory\(token, 200\)/);
-  assert.match(appSource, /const TRADE_INTERVAL_OPTIONS = \["1m", "5m", "15m", "1h"\]/);
+  assert.match(appSource, /const TRADE_INTERVAL_OPTIONS = \["30s", "1m", "5m", "15m", "1h"\]/);
   assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
   assert.match(appSource, /defaultVisibleCountForInterval\(selectedInterval\)/);
   assert.match(simulationSource, /private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars\(\)/);
-  assert.match(appSource, /title=\{localLabel\(language, "系统追踪号/);
-  assert.match(appSource, /title=\{localLabel\(language, "订单编号/);
+  assert.match(appSource, /Trace ID/);
+  assert.match(appSource, /Order ID/);
 }
 
 async function testPolymarketMarketSelectionUsesSlugTime() {
@@ -926,6 +1087,9 @@ async function main() {
   await testProfileUsesOperatedGroupedRoundViews();
   await testSettlementUsesResolvedQueueAndFiveSecondGammaPolling();
   await testBackendTransportStampingKeepsLatencySeparateFromAge();
+  await testRealtimeLatencyPacingContracts();
+  await testClobWsFirstMarketDataContracts();
+  await testClobV2FeeMarketInfoAndLatencyContracts();
   await testPolymarketReferencePricesDoNotUseOutcomeOdds();
   await testRtdsLoginAuditAndBestAskUiRequirements();
   await testPolymarketMarketSelectionUsesSlugTime();

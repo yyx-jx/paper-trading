@@ -21,7 +21,9 @@ export type OrderAction = "buy" | "sell";
 export type OrderStatus = "pending" | "filled" | "partial" | "failed" | "cancelled";
 export type PaperOrderKind = "market" | "limit";
 export type PaperTimeInForce = "FOK" | "GTC";
+export type DisplayPriceSource = "mid" | "last_trade" | "outcome_price";
 export type PaperOrderResult = "pending" | "all_filled" | "all_failed" | "cancelled";
+export type FeeCurrency = "USD";
 export type MatchingOrderDirection = "bid" | "ask";
 export type MatchingOrderType = "market" | "limit";
 export type MatchingTimeInForce = "IOC" | "GTC";
@@ -96,6 +98,48 @@ export interface SourceHealth {
 export interface MarketTransportMeta {
   serverPublishTs: number;
   payloadSeq: number;
+  coalescedCount?: number;
+  serverQueueMs?: number;
+}
+
+export interface ClobMarketInfo {
+  conditionId?: string;
+  minimumTickSize: number;
+  minimumOrderSize: number;
+  makerFeeRate: number;
+  takerFeeRate: number;
+  platformFeeRate?: number;
+  platformFeeExponent?: number;
+  platformFeeTakerOnly?: boolean;
+  feeRateAvailable?: boolean;
+  feeRateBps?: number;
+  feeDetails?: Record<string, unknown>;
+  tokens?: Array<{ tokenId: string; outcome?: string; minimumTickSize?: number; minimumOrderSize?: number }>;
+  rfqEnabled?: boolean;
+  source: "clob" | "gamma" | "conservative";
+  conservative: boolean;
+  updatedAt: number;
+}
+
+export interface FeeBreakdown {
+  role: "maker" | "taker";
+  feeRate: number;
+  formula: "C * feeRate * p * (1 - p)";
+  price: number;
+  quantity: number;
+  notional: number;
+  platformFee?: number;
+  platformFeeExponent?: number;
+  platformFeeTakerOnly?: boolean;
+  totalFee?: number;
+  amount: number;
+}
+
+export interface LatencyBreakdown {
+  sourceEventAge: Record<"binance" | "chainlink" | "clob", number>;
+  serverIngressLatency: Record<"binance" | "chainlink" | "clob", number>;
+  serverComputeLatency: number;
+  clientTransportLatency?: number;
 }
 
 export interface SettlementPreview {
@@ -107,6 +151,12 @@ export interface SettlementPreview {
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
+  tokenSide?: TradeSide;
+  binanceSide?: TradeSide;
+  binancePrice?: number;
+  priceToBeat?: number;
+  confidence?: "aligned" | "token_only" | "binance_only" | "conflict";
+  conflictReason?: string;
   message?: string;
 }
 
@@ -149,7 +199,7 @@ export interface CandlePoint {
   price: number;
 }
 
-export type CandleInterval = "1m" | "5m" | "15m" | "1h" | "1d";
+export type CandleInterval = "30s" | "1m" | "5m" | "15m" | "1h" | "1d";
 
 export interface CandleBar {
   interval: CandleInterval | "5s";
@@ -208,6 +258,10 @@ export interface MarketSnapshot {
   priceToBeat: number;
   upPrice: number;
   downPrice: number;
+  displayPrices: Record<TradeSide, number>;
+  displayPriceSource: Record<TradeSide, DisplayPriceSource>;
+  displayPriceSpread: Record<TradeSide, number>;
+  latencyBreakdown: LatencyBreakdown;
   sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
   orderBooks: Record<TradeSide, OrderBookSnapshot>;
   recentTrades: MarketTrade[];
@@ -229,6 +283,8 @@ export interface MarketSnapshot {
     upBook: OrderBookSnapshot;
     downBook: OrderBookSnapshot;
     recentTrades: MarketTrade[];
+    currentRoundUpPriceSeries: CandlePoint[];
+    marketInfo: ClobMarketInfo;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
   };
   uiMeta: {
@@ -350,6 +406,7 @@ export interface RoundRecord {
   downTokenId?: string;
   title?: string;
   resolutionSource?: string;
+  marketInfo?: ClobMarketInfo;
   startAt: number;
   endAt: number;
   priceToBeat: number;
@@ -404,6 +461,10 @@ export interface OrderRecord {
   frozenUsdc?: number;
   frozenQty?: number;
   fills?: MatchingFill[];
+  estimatedFee?: number;
+  actualFee?: number;
+  feeBreakdown?: FeeBreakdown;
+  feeCurrency?: FeeCurrency;
   sourceLatencyMs?: number;
   marketSlug?: string;
   orderBookSnapshotRef?: string;
@@ -465,6 +526,9 @@ export interface OrderLifecycleRecord {
   matchLatencyMs: number;
   settlementTimeMs?: number;
   settlementDirection?: TradeSide;
+  entryFee?: number;
+  exitFee?: number;
+  feeCurrency?: FeeCurrency;
   createdAt: number;
   updatedAt: number;
 }
@@ -727,6 +791,10 @@ export interface BehaviorActionLog {
   partialFilled?: boolean;
   unfilledQty?: number;
   executionLatencyMs?: number;
+  estimatedFee?: number;
+  actualFee?: number;
+  feeBreakdown?: FeeBreakdown;
+  feeCurrency?: FeeCurrency;
   settlementDirection?: TradeSide;
   settlementTimeMs?: number;
   gammaPollCount?: number;
@@ -774,6 +842,7 @@ export interface PolymarketMarketDetail {
   acceptingOrders: boolean;
   closed: boolean;
   resolutionSource?: string;
+  marketInfo?: ClobMarketInfo;
 }
 
 export interface BinanceConnectorState {

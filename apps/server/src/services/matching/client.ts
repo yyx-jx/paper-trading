@@ -25,8 +25,8 @@ async function requestJson<T>(
         ...(init.headers ?? {})
       }
     });
-    const payload = (await response.json()) as T & { error?: boolean; message?: string };
-    if (!response.ok || payload.error) {
+    const payload = (await response.json()) as T & { message?: string; code?: string };
+    if (!response.ok) {
       throw new Error(payload.message ?? `Matching service request failed with status ${response.status}.`);
     }
     return payload;

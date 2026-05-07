@@ -4,6 +4,7 @@ import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from 
 import type { BinanceConnectorState, CandleBar, CandleInterval, CandlePoint, SourceHealth } from "../../domain/types";
 
 const BAR_LIMITS: Record<CandleInterval, number> = {
+  "30s": 240,
   "1m": 180,
   "5m": 30,
   "15m": 24,
@@ -12,6 +13,7 @@ const BAR_LIMITS: Record<CandleInterval, number> = {
 };
 
 const INTERVAL_MS: Record<CandleInterval, number> = {
+  "30s": 30_000,
   "1m": 60_000,
   "5m": 5 * 60_000,
   "15m": 15 * 60_000,
@@ -55,6 +57,7 @@ function emptyBar(interval: CandleInterval, now: number): CandleBar {
 
 function createEmptyCandles(now: number) {
   return {
+    "30s": [emptyBar("30s", now)],
     "1m": [emptyBar("1m", now)],
     "5m": [emptyBar("5m", now)],
     "15m": [emptyBar("15m", now)],
@@ -127,6 +130,40 @@ function normalizeBars(interval: CandleInterval, bars: CandleBar[]) {
   return [...deduped.values()]
     .sort((left, right) => left.startTs - right.startTs)
     .slice(-BAR_LIMITS[interval]);
+}
+
+function splitOneMinuteBarToThirtySeconds(bar: CandleBar): CandleBar[] {
+  if (!bar.close && !bar.open && !bar.high && !bar.low) {
+    return [];
+  }
+  const firstStart = Math.floor(bar.startTs / INTERVAL_MS["30s"]) * INTERVAL_MS["30s"];
+  const firstEnd = firstStart + INTERVAL_MS["30s"] - 1;
+  const secondStart = firstStart + INTERVAL_MS["30s"];
+  const secondEnd = secondStart + INTERVAL_MS["30s"] - 1;
+  const firstClose = roundNumber((bar.open + bar.close) / 2, 2);
+  const halfVolume = roundNumber((bar.volume ?? 0) / 2, 6);
+  return normalizeBars("30s", [
+    {
+      interval: "30s",
+      startTs: firstStart,
+      endTs: firstEnd,
+      open: bar.open,
+      high: Math.max(bar.high, bar.open, firstClose),
+      low: Math.min(bar.low || bar.open, bar.open, firstClose),
+      close: firstClose,
+      volume: halfVolume
+    },
+    {
+      interval: "30s",
+      startTs: secondStart,
+      endTs: secondEnd,
+      open: firstClose,
+      high: Math.max(bar.high, firstClose, bar.close),
+      low: Math.min(bar.low || firstClose, firstClose, bar.close),
+      close: bar.close,
+      volume: halfVolume
+    }
+  ]);
 }
 
 function hasUsableBars(bars: CandleBar[]) {
@@ -267,10 +304,12 @@ export class BinanceConnector {
       const now = Date.now();
       const normalized1m = normalizeBars("1m", candles1m);
       const normalized1d = normalizeBars("1d", candles1d);
+      const latest30s = normalized1m.flatMap((bar) => splitOneMinuteBarToThirtySeconds(bar));
       this.state = {
         ...this.state,
         price: latestPrice > 0 ? roundNumber(latestPrice, 2) : this.state.price,
         candlesByInterval: {
+          "30s": normalizeBars("30s", latest30s),
           "1m": normalized1m,
           "5m": normalizeBars("5m", candles5m),
           "15m": normalizeBars("15m", candles15m),
@@ -501,16 +540,18 @@ export class BinanceConnector {
     if (price <= 0) {
       return;
     }
-    const nextBar = updateLiveBar("1m", this.state.candlesByInterval["1m"].at(-1), price, qty, ts);
+      const nextBar30s = updateLiveBar("30s", this.state.candlesByInterval["30s"].at(-1), price, qty, ts);
+      const nextBar = updateLiveBar("1m", this.state.candlesByInterval["1m"].at(-1), price, qty, ts);
     this.state.price = roundNumber(price, 2);
     this.state.latestTick = {
       ts,
       price: roundNumber(price, 2)
     };
-    this.state.candlesByInterval = {
-      ...this.state.candlesByInterval,
-      "1m": normalizeBars("1m", [...this.state.candlesByInterval["1m"], nextBar])
-    };
+      this.state.candlesByInterval = {
+        ...this.state.candlesByInterval,
+        "30s": normalizeBars("30s", [...this.state.candlesByInterval["30s"], nextBar30s]),
+        "1m": normalizeBars("1m", [...this.state.candlesByInterval["1m"], nextBar])
+      };
     this.syncDerivedCandles();
   }
 
@@ -527,6 +568,7 @@ export class BinanceConnector {
     const normalized1d = normalizeBars("1d", this.state.candlesByInterval["1d"]);
     this.state.candlesByInterval = {
       ...this.state.candlesByInterval,
+      "30s": normalizeBars("30s", this.state.candlesByInterval["30s"]),
       "1m": normalized1m,
       "5m": normalizeBars(
         "5m",
