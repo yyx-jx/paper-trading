@@ -660,8 +660,6 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.match(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt\)/);
   assert.match(appSource, /analysisText: analysis\.text/);
   assert.match(appSource, /settlementState: "UNSETTLED"/);
-  assert.match(appSource, /function analyticsTimelineKey\(row: AnalyticsTradeRow, period: AnalyticsPeriod\)/);
-  assert.match(appSource, /ANALYTICS_GROUP_SIZE = 50/);
   assert.match(appSource, /ANALYTICS_INITIAL_TRADE_LIMIT = 200/);
   assert.match(appSource, /\{ id: "all", label: analyticsPeriodLabel\("all", language\) \}/);
   assert.match(appSource, /\{ id: "trades", label: analyticsPeriodLabel\("trades", language\) \}/);
@@ -677,6 +675,12 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.match(appSource, /analyticsSettlementLabel\(row\.settlementState, language\)/);
   assert.match(appSource, /analyticsResultLabel\(row\.result, language\)/);
   assert.match(appSource, /analytics-row-analysis/);
+  assert.match(appSource, /function isManualSettlementPermissionError\(message: string\)/);
+  assert.match(appSource, /if \(!isManualSettlementPermissionError\(message\)\) \{\s*setError\(message\);/s);
+  assert.doesNotMatch(appSource, /analyticsTimelineKey/);
+  assert.doesNotMatch(appSource, /analyticsTimelineLabel/);
+  assert.doesNotMatch(appSource, /groupVisibleLimits/);
+  assert.match(appSource, /analytics-table-panel/);
   assert.match(appSource, /analytics-table-wrap/);
   assert.doesNotMatch(appSource, /function ProfilePage/);
   assert.doesNotMatch(appSource, /const \[equityWindow, setEquityWindow\]/);
@@ -685,9 +689,12 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.match(stylesSource, /analytics-terminal-page/);
   assert.match(stylesSource, /analytics-summary/);
   assert.match(stylesSource, /analytics-period-tabs/);
+  assert.match(stylesSource, /analytics-table-panel/);
   assert.match(stylesSource, /analytics-table-wrap/);
   assert.match(stylesSource, /analytics-row-analysis/);
   assert.match(stylesSource, /analytics-load-more/);
+  assert.doesNotMatch(stylesSource, /analytics-day-group/);
+  assert.doesNotMatch(stylesSource, /analytics-day-head/);
   assert.doesNotMatch(stylesSource, /analytics-security/);
   assert.match(stylesSource, /app-shell:not\(\.page-trade\)/);
   assert.doesNotMatch(stylesSource, /@media \(max-width: 1440px\)/);
@@ -918,7 +925,8 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(referenceSource, /historyCacheMs\?: number/);
   assert.match(referenceSource, /getHistoricalSamples\(metadata, input\?\.historyCacheMs\)/);
   assert.match(appSource, /function btcMoneyOrDash\(value\?: number\)/);
-  assert.match(appSource, /PTB \$\{btcMoneyOrDash\(snapshot\?\.priceToBeat\)\}/);
+  assert.match(appSource, /const displayPriceToBeat = isBtcReferencePrice\(snapshot\?\.displayPriceToBeat\) \? snapshot\.displayPriceToBeat : undefined;/);
+  assert.match(appSource, /PTB \(Binance open\)/);
   assert.match(appSource, /`PTB: \$\{btcMoneyOrDash\(round\.priceToBeat\)\}`/);
   assert.doesNotMatch(appSource, /PTB \$\{money\(snapshot\?\.priceToBeat \?\? 0\)\}/);
 
@@ -926,11 +934,11 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(connectorSource, /function normalizeMarketOutcomes\(payload: DetailedMarketPayload\)/);
   assert.match(connectorSource, /function outcomeSide\(value\?: string\): TradeSide \| undefined/);
   assert.match(connectorSource, /const normalizedOutcomes = normalizeMarketOutcomes\(payload\)/);
-  assert.match(connectorSource, /isBtcPrice\(value: number\)/);
-  assert.match(connectorSource, /value > 1000/);
+  assert.match(connectorSource, /const parsedEventStartAt = Date\.parse\(payload\.eventStartTime \?\? ""\)/);
+  assert.match(connectorSource, /resolutionSource: payload\.resolutionSource/);
   assert.match(connectorSource, /outcomePrices:\s*\[normalizedOutcomes\.upPrice, normalizedOutcomes\.downPrice\]/);
-  assert.match(connectorSource, /referenceOpenPrice/);
-  assert.match(connectorSource, /referenceClosePrice/);
+  assert.match(connectorSource, /referenceOpenPrice: round\.polymarketOpenPrice/);
+  assert.match(connectorSource, /referenceClosePrice: round\.polymarketClosePrice/);
 
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   assert.match(storeSource, /sanitizePolymarketBtcReference/);
@@ -978,7 +986,8 @@ async function testPolymarketMarketSelectionUsesSlugTime() {
     conditionId: `condition-${startAt}`,
     slug: `${slugPrefix}-${Math.floor(startAt / 1000)}`,
     question: "Bitcoin Up or Down - 5 Minute",
-    endDate: new Date(startAt + 60 * 60_000).toISOString(),
+    eventStartTime: new Date(startAt).toISOString(),
+    endDate: new Date(startAt + 5 * 60_000).toISOString(),
     resolutionSource: "https://data.chain.link/streams/btc-usd",
     acceptingOrders: true,
     closed: false,

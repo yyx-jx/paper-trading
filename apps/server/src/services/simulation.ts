@@ -2675,7 +2675,7 @@ export class SimulationEngine {
       }
 
       if (!round.binanceOpenPrice && round.startAt <= now && this.binanceState.price > 0) {
-        round.binanceOpenPrice = roundNumber(round.priceToBeat || this.binanceState.price, 2);
+        round.binanceOpenPrice = roundNumber(this.binanceState.price, 2);
       }
 
       if (!round.binanceClosePrice && now >= round.endAt && this.binanceState.price > 0) {
@@ -2927,6 +2927,15 @@ export class SimulationEngine {
         serverComputeLatency: Math.max(Date.now() - now, 0)
       };
 
+    const officialPriceToBeat =
+      currentRound && isBtcReferencePrice(currentRound.priceToBeat) && isOfficialPtbSource(currentRound.priceToBeatSource)
+        ? roundNumber(currentRound.priceToBeat, 2)
+        : undefined;
+    const fallbackDisplayPriceToBeat =
+      !officialPriceToBeat && currentRound && isBtcReferencePrice(currentRound.binanceOpenPrice)
+        ? roundNumber(currentRound.binanceOpenPrice, 2)
+        : undefined;
+
     return {
       symbol: this.config.symbol,
       marketId: currentRound?.marketId ?? matchedMarket?.id ?? this.config.marketId,
@@ -2939,10 +2948,13 @@ export class SimulationEngine {
       binancePrice,
       chainlinkPrice,
       currentPrice: binancePrice || chainlinkPrice,
-      priceToBeat:
-        currentRound && isBtcReferencePrice(currentRound.priceToBeat) && isOfficialPtbSource(currentRound.priceToBeatSource)
-          ? currentRound.priceToBeat
-          : 0,
+      priceToBeat: officialPriceToBeat ?? 0,
+      displayPriceToBeat: officialPriceToBeat ?? fallbackDisplayPriceToBeat,
+      displayPriceToBeatSource: officialPriceToBeat
+        ? "official"
+        : fallbackDisplayPriceToBeat
+          ? "binance_open_fallback"
+          : undefined,
       upPrice: roundNumber(upPrice, 4),
       downPrice: roundNumber(downPrice, 4),
       displayPrices: {

@@ -286,6 +286,8 @@ export interface MarketSnapshot {
   chainlinkPrice: number;
   currentPrice: number;
   priceToBeat: number;
+  displayPriceToBeat?: number;
+  displayPriceToBeatSource?: "official" | "binance_open_fallback";
   upPrice: number;
   downPrice: number;
   displayPrices: Record<TradeSide, number>;

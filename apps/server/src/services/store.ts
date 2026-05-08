@@ -623,6 +623,8 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     chainlinkPrice: 0,
     currentPrice: 0,
     priceToBeat: 0,
+    displayPriceToBeat: undefined,
+    displayPriceToBeatSource: undefined,
     upPrice: 0,
     downPrice: 0,
     displayPrices: {

@@ -578,6 +578,29 @@ function orderBookExecutionPrice(order: OrderRecord) {
   return price > 0 ? price : order.midPrice;
 }
 
+function orderDisplayPrice(order: OrderRecord) {
+  return order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0;
+}
+
+function orderTradeLabel(order: OrderRecord, language: Language) {
+  const actionLabel = localLabel(language, order.action === "buy" ? "买入" : "卖出", order.action === "buy" ? "Buy" : "Sell");
+  const sideLabel = order.side === "UP" ? "UP" : "DOWN";
+  return `${actionLabel} ${sideLabel}`;
+}
+
+function orderPriceQualifier(order: OrderRecord, language: Language) {
+  if (order.status === "filled") {
+    return localLabel(language, "成交价 · 不含 fee", "Fill · excl. fee");
+  }
+  if (order.orderKind === "limit" && order.status === "pending") {
+    return localLabel(language, "挂单价", "Limit price");
+  }
+  if (typeof order.limitPrice === "number" && order.limitPrice > 0) {
+    return localLabel(language, "限价", "Limit");
+  }
+  return localLabel(language, "参考价", "Reference");
+}
+
 function OrderExecutionCell({ order, language }: { order: OrderRecord; language: Language }) {
   const bookPrice = orderBookExecutionPrice(order);
   return (
@@ -738,7 +761,6 @@ function buildRiskAlerts(input: {
   oddsChange: number;
   sources: Array<SourceHealth | undefined>;
   clobLatencyMs: number;
-  positions: PositionRecord[];
   nowMs: number;
 }) {
   // ACK state is intentionally retained in the alert model even when the current UI does not expose a separate button.
@@ -808,15 +830,6 @@ function buildRiskAlerts(input: {
       group: "system",
       level: "warn",
       text: localLabel(input.language, `CLOB 行情过旧 ${Math.round(input.clobLatencyMs)}ms`, `CLOB market stale ${Math.round(input.clobLatencyMs)}ms`)
-    });
-  }
-  if (input.positions.some((position) => position.displayStatus === "pending_settlement" && input.nowMs - position.openedAt > 8 * 60_000)) {
-    alerts.push({
-      kind: "settlement_stuck",
-      group: "settlement",
-      level: "danger",
-      text: localLabel(input.language, "结算卡住：需要人工处理", "Settlement stalled: manual review required"),
-      detail: localLabel(input.language, "存在等待结算超过 8 分钟的持仓。", "Some positions have been pending settlement for over 8 minutes.")
     });
   }
   return alerts;
@@ -1366,6 +1379,13 @@ function isOfficialPtbSource(source?: string) {
 
 function btcMoneyOrDash(value?: number) {
   return isBtcReferencePrice(value) ? money(value) : "--";
+}
+
+function ptbDisplayLabel(language: Language, source?: MarketSnapshot["displayPriceToBeatSource"]) {
+  if (source === "binance_open_fallback") {
+    return localLabel(language, "PTB (币安开盘)", "PTB (Binance open)");
+  }
+  return "PTB";
 }
 
 function metricValueForSource(source: SourceHealth | undefined, value: number, digits = 2) {
@@ -2448,7 +2468,10 @@ function App() {
         logs: nextLogs
       });
     } catch (manualError) {
-      setError(manualError instanceof Error ? manualError.message : "Manual settlement failed.");
+      const message = manualError instanceof Error ? manualError.message : "Manual settlement failed.";
+      if (!isManualSettlementPermissionError(message)) {
+        setError(message);
+      }
     }
   };
 
@@ -2645,7 +2668,6 @@ type AnalyticsPeriod = "all" | "year" | "month" | "week" | "day" | "trades";
 type AnalyticsResult = "WIN" | "LOSE" | "SOLD" | "OPEN" | "UNFILLED";
 type AnalyticsTone = "positive" | "negative" | "neutral" | "warning";
 type AnalyticsSettlementState = "SETTLED" | "UNSETTLED";
-const ANALYTICS_GROUP_SIZE = 50;
 const ANALYTICS_INITIAL_TRADE_LIMIT = 200;
 const ANALYTICS_TRADE_LIMIT_STEP = 200;
 interface AnalyticsTradeRow {
@@ -2697,7 +2719,7 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
       result,
       roundId: position.roundId,
       roundCloseAt: round?.endAt,
-      roundLabel: analyticsRoundLabel(round?.endAt),
+      roundLabel: analyticsRoundLabel(round?.endAt, position.closedAt ?? position.openedAt),
       side: position.side,
       invested: position.notionalSpent,
       entryPrice: position.averageEntry,
@@ -2722,7 +2744,7 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
       result: "UNFILLED",
       roundId: order.roundId,
       roundCloseAt: round?.endAt,
-      roundLabel: analyticsRoundLabel(round?.endAt),
+      roundLabel: analyticsRoundLabel(round?.endAt, order.createdAt),
       side: order.side,
       invested: order.notionalUsdc,
       entryPrice: order.limitPrice ?? order.bestAsk ?? order.midPrice ?? 0,
@@ -2779,8 +2801,9 @@ function analyticsSummary(rows: AnalyticsTradeRow[]) {
   };
 }
 
-function analyticsRoundLabel(endAt?: number) {
-  return endAt ? `B5-${chartTimeText(endAt)} UTC` : "B5--";
+function analyticsRoundLabel(endAt?: number, fallbackTs?: number) {
+  const resolvedTs = endAt ?? fallbackTs;
+  return resolvedTs ? `B5-${chartTimeText(resolvedTs)} UTC` : "B5--";
 }
 
 function analyticsPeriodLabel(period: AnalyticsPeriod, language: Language) {
@@ -2843,25 +2866,8 @@ function analyticsRowAnalysis(result: AnalyticsResult, language: Language): { te
   };
 }
 
-function analyticsTimelineKey(row: AnalyticsTradeRow, period: AnalyticsPeriod) {
-  const parts = utcParts(row.ts);
-  if (period === "all" || period === "year") {
-    return `${parts.year}-${parts.month}`;
-  }
-  if (period === "day") {
-    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:00`;
-  }
-  return `${parts.year}-${parts.month}-${parts.day}`;
-}
-
-function analyticsTimelineLabel(key: string, period: AnalyticsPeriod) {
-  if (period === "all" || period === "year") {
-    return `${key} UTC`;
-  }
-  if (period === "day") {
-    return `${key} UTC`;
-  }
-  return `${key} UTC`;
+function isManualSettlementPermissionError(message: string) {
+  return /manual settlement/i.test(message) && /(tester|cannot|forbidden|not allow|not permitted|unauthorized)/i.test(message);
 }
 
 function isClobDepthFailure(order: OrderRecord) {
@@ -3029,14 +3035,28 @@ function TradePageRestored(props: {
   const recentOrders = [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
     .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
     .slice(0, 16);
+  const openPositionsBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord[]>>(
+    (accumulator, side) => {
+      accumulator[side] = currentRoundPositions.filter(
+        (position) =>
+          position.side === side &&
+          position.status === "open" &&
+          position.displayStatus !== "settled" &&
+          position.displayStatus !== "sold"
+      );
+      return accumulator;
+    },
+    { UP: [], DOWN: [] }
+  );
+  const sellablePositionBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord | undefined>>(
+    (accumulator, side) => {
+      accumulator[side] = openPositionsBySide[side].find((position) => position.displayStatus === "open");
+      return accumulator;
+    },
+    { UP: undefined, DOWN: undefined }
+  );
   const positionCards = (["UP", "DOWN"] as TradeSide[]).map((side) => {
-    const sidePositions = currentRoundPositions.filter(
-      (position) =>
-        position.side === side &&
-        position.status === "open" &&
-        position.displayStatus !== "settled" &&
-        position.displayStatus !== "sold"
-    );
+    const sidePositions = openPositionsBySide[side];
     const qty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
     const value = sidePositions.reduce(
       (sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark),
@@ -3046,7 +3066,7 @@ function TradePageRestored(props: {
     const entryQty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
     const pnlSummary = summarizePositionPnl(sidePositions);
     const pnl = pnlSummary.markPnlUsdc;
-    const sellablePosition = sidePositions.find((position) => position.displayStatus === "open");
+    const sellablePosition = sellablePositionBySide[side];
     return {
       side,
       qty,
@@ -3105,7 +3125,6 @@ function TradePageRestored(props: {
     oddsChange,
     sources: [sourceBinance, sourceChainlink, sourceClob],
     clobLatencyMs: clobLatency.dataAgeMs,
-    positions,
     nowMs
   });
   const groupedAlerts = [
@@ -3152,14 +3171,13 @@ function TradePageRestored(props: {
   const canManualSettle =
     props.canManualSettle &&
     props.currentRound &&
-    (props.currentRound.status === "Manual" || riskAlerts.some((alert) => alert.kind === "settlement_stuck"));
-  const trustedPriceToBeat =
-    currentRound && isBtcReferencePrice(snapshot?.priceToBeat) && isOfficialPtbSource(currentRound.priceToBeatSource)
-      ? snapshot?.priceToBeat
-      : undefined;
+    props.currentRound.status === "Manual";
+  const displayPriceToBeat = isBtcReferencePrice(snapshot?.displayPriceToBeat) ? snapshot.displayPriceToBeat : undefined;
   const btcUsdMeta = [
     `CL ${money(snapshot?.chainlink.referencePrice ?? 0)}`,
-    trustedPriceToBeat ? `PTB ${btcMoneyOrDash(trustedPriceToBeat)}` : undefined
+    displayPriceToBeat
+      ? `${ptbDisplayLabel(language, snapshot?.displayPriceToBeatSource)} ${btcMoneyOrDash(displayPriceToBeat)}`
+      : undefined
   ].filter(Boolean).join(" · ");
 
   return (
@@ -3242,7 +3260,7 @@ function TradePageRestored(props: {
                   </div>
                   <strong>{money(card.value)}</strong>
                   <em className="position-token-meta">
-                    <span>{localLabel(language, "均价", "Entry")} {tokenPriceText(card.averageEntry)}</span>
+                    <span>{localLabel(language, "持仓均价(含买入费)", "Avg position cost (incl. entry fee)")} {tokenPriceText(card.averageEntry)}</span>
                     <span className={card.pnl >= 0 ? "terminal-green" : "terminal-red"}>
                       {localLabel(language, card.pnl >= 0 ? "浮盈" : "浮亏", card.pnl >= 0 ? "PnL +" : "PnL -")} {signedMoney(card.pnl)}
                     </span>
@@ -3277,7 +3295,7 @@ function TradePageRestored(props: {
                 <>
                   <div className="terminal-trade-head">
                     <span>Time</span>
-                    <span>Side</span>
+                    <span>{localLabel(language, "交易", "Trade")}</span>
                     <span>USD</span>
                     <span>Price</span>
                     <span>Status</span>
@@ -3285,24 +3303,43 @@ function TradePageRestored(props: {
                   </div>
                   {recentOrders.map((order) => {
                     const canCancelOrder = order.orderKind === "limit" && order.status === "pending";
+                    const sellablePosition = sellablePositionBySide[order.side];
+                    const canSellPosition = order.action === "buy" && order.status === "filled" && Boolean(sellablePosition);
                     const cancelBusy = props.cancelBusyOrderId === order.id;
+                    const sellBusy = Boolean(sellablePosition && props.sellBusyPositionId === sellablePosition.id);
                     return (
                       <div className="terminal-trade-row" key={order.id}>
                         <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
-                        <b>{order.side === "UP" ? "▲UP" : "▼DN"}</b>
+                        <span className={`terminal-trade-side terminal-trade-side-${order.action}`}>
+                          <b>{orderTradeLabel(order, language)}</b>
+                          <small>{order.side === "UP" ? "▲UP" : "▼DN"}</small>
+                        </span>
                         <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
-                        <span className="terminal-trade-price">@{tokenPriceText(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0)}</span>
+                        <span className="terminal-trade-price-block">
+                          <strong className="terminal-trade-price">@{tokenPriceText(orderDisplayPrice(order))}</strong>
+                          <small>{orderPriceQualifier(order, language)}</small>
+                        </span>
                         <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
                         <span className="terminal-trade-action">
                           {canCancelOrder ? (
                             <button
                               type="button"
-                              className="terminal-cancel-order-button"
+                              className="terminal-order-action-button terminal-cancel-order-button"
                               disabled={cancelBusy}
                               onClick={() => props.onCancel(order.id)}
                               title={t("cancel")}
                             >
                               {cancelBusy ? t("loading") : t("cancel")}
+                            </button>
+                          ) : canSellPosition && sellablePosition ? (
+                            <button
+                              type="button"
+                              className="terminal-order-action-button terminal-sell-position-button"
+                              disabled={sellBusy}
+                              onClick={() => props.onSell(sellablePosition.id)}
+                              title={localLabel(language, "卖出该方向持仓", "Sell the current position for this side")}
+                            >
+                              {sellBusy ? t("loading") : localLabel(language, "卖出持仓", "Sell position")}
                             </button>
                           ) : null}
                         </span>
@@ -3385,7 +3422,7 @@ function TradePageRestored(props: {
               upColor="#00f0c0"
               downColor="#f03060"
               emptyText={t("noData")}
-              priceToBeat={trustedPriceToBeat}
+              priceToBeat={displayPriceToBeat}
               latestPrice={snapshot?.binance.spotPrice}
               round={currentRound}
               visibleCount={props.chartVisibleCount}
@@ -3490,7 +3527,7 @@ function TradePageRestored(props: {
                 <div className="risk-alert-group" key={group.key}>
                   <header><b>{group.label}</b><em>{group.items.length}</em></header>
                   {group.items.map((alert) => (
-                    <button key={alert.kind} className={`risk-alert ${alert.level}`} onClick={() => alert.kind === "settlement_stuck" && currentRound ? props.onManualSettle(currentRound.id, "UP") : undefined}>
+                    <button key={alert.kind} className={`risk-alert ${alert.level}`}>
                       <span>{alert.text}</span>
                       {alert.detail ? <em>{alert.detail}</em> : null}
                     </button>
@@ -3605,10 +3642,8 @@ function AnalyticsPage(props: {
   const [direction, setDirection] = useState<"ALL" | TradeSide>("ALL");
   const [resultFilter, setResultFilter] = useState<AnalyticsResultFilter>("ALL");
   const [visibleTradeLimit, setVisibleTradeLimit] = useState(ANALYTICS_INITIAL_TRADE_LIMIT);
-  const [groupVisibleLimits, setGroupVisibleLimits] = useState<Record<string, number>>({});
   useEffect(() => {
     setVisibleTradeLimit(ANALYTICS_INITIAL_TRADE_LIMIT);
-    setGroupVisibleLimits({});
   }, [direction, period, resultFilter]);
   const rows = useMemo(
     () => buildAnalyticsRows(props.history, props.positions, props.orders, language),
@@ -3633,51 +3668,6 @@ function AnalyticsPage(props: {
     () => (period === "trades" ? filteredRows.slice(0, visibleTradeLimit) : filteredRows),
     [filteredRows, period, visibleTradeLimit]
   );
-  const groupedRows = useMemo(() => {
-    if (period === "trades") {
-      const groups = [];
-      for (let start = 0; start < displayedRows.length; start += ANALYTICS_GROUP_SIZE) {
-        const groupRows = displayedRows.slice(start, start + ANALYTICS_GROUP_SIZE);
-        const settledRows = groupRows.filter((row) => row.settlementState === "SETTLED");
-        const dayPnl = settledRows.reduce((sum, row) => sum + row.pnl, 0);
-        const from = String(start + 1).padStart(3, "0");
-        const to = String(start + groupRows.length).padStart(3, "0");
-        groups.push({
-          key: `trades:${start}`,
-          label: localLabel(language, `交易 ${from}-${to}`, `Trades ${from}-${to}`),
-          allRows: groupRows,
-          visibleRows: groupRows,
-          hiddenCount: 0,
-          settledCount: settledRows.length,
-          unsettledCount: groupRows.length - settledRows.length,
-          groupPnl: dayPnl
-        });
-      }
-      return groups;
-    }
-    const groups = new Map<string, AnalyticsTradeRow[]>();
-    for (const row of displayedRows) {
-      const key = analyticsTimelineKey(row, period);
-      const next = groups.get(key) ?? [];
-      next.push(row);
-      groups.set(key, next);
-    }
-    return [...groups.entries()].map(([key, groupRows]) => {
-      const limit = groupVisibleLimits[key] ?? ANALYTICS_GROUP_SIZE;
-      const settledRows = groupRows.filter((row) => row.settlementState === "SETTLED");
-      const groupPnl = settledRows.reduce((sum, row) => sum + row.pnl, 0);
-      return {
-        key,
-        label: analyticsTimelineLabel(key, period),
-        allRows: groupRows,
-        visibleRows: groupRows.slice(0, limit),
-        hiddenCount: Math.max(groupRows.length - limit, 0),
-        settledCount: settledRows.length,
-        unsettledCount: groupRows.length - settledRows.length,
-        groupPnl
-      };
-    });
-  }, [displayedRows, groupVisibleLimits, language, period]);
   const openPnlSummary = useMemo(
     () => summarizePositionPnl(props.positions.filter((position) => position.status === "open")),
     [props.positions]
@@ -3790,82 +3780,55 @@ function AnalyticsPage(props: {
         <span>{localLabel(language, "所有时间均以 UTC 显示", "All times shown in UTC")}</span>
       </div>
 
-      <div className="analytics-day-list">
-        {groupedRows.length === 0 ? (
+      <div className="analytics-table-panel">
+        {displayedRows.length === 0 ? (
           <div className="analytics-empty">
             <b>{localLabel(language, "空结果", "Empty")}</b>
             <div>{localLabel(language, "当前筛选条件下没有可展示的分析记录。", "No analytics rows match the current filters.")}</div>
           </div>
         ) : (
-          groupedRows.map(({ key, label, allRows, visibleRows, hiddenCount, unsettledCount, groupPnl, settledCount }) => (
-            <div key={key} className="analytics-day-group">
-              <div className="analytics-day-head">
-                <strong>{label}</strong>
-                <div className="analytics-day-stats">
-                  <span>{allRows.length} {localLabel(language, "条记录", "rows")}</span>
-                  <span>{settledCount} {localLabel(language, "已结算", "settled")}</span>
-                  <span>{unsettledCount} {localLabel(language, "未结算", "unsettled")}</span>
-                </div>
-                <em className={groupPnl >= 0 ? "tone-positive" : "tone-negative"}>{signedMoney(groupPnl)}</em>
-              </div>
-              <div className="analytics-table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>{localLabel(language, "时间", "Time")}</th>
-                      <th>{localLabel(language, "轮次", "Round")}</th>
-                      <th>{localLabel(language, "方向", "Direction")}</th>
-                      <th>{localLabel(language, "投入", "Invested")}</th>
-                      <th>{localLabel(language, "入场价", "Entry")}</th>
-                      <th>{localLabel(language, "结算价/退出价", "Settle/Exit")}</th>
-                      <th>{localLabel(language, "份额", "Shares")}</th>
-                      <th>{localLabel(language, "费用", "Fees")}</th>
-                      <th>PnL</th>
-                      <th>{localLabel(language, "状态", "State")}</th>
-                      <th>{localLabel(language, "结果", "Result")}</th>
-                      <th>{localLabel(language, "分析", "Analysis")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleRows.map((row) => (
-                      <tr key={row.id}>
-                        <td>{timeText(row.ts)}</td>
-                        <td>{row.roundLabel}</td>
-                        <td><span className={`analytics-tag ${row.side === "UP" ? "up" : "down"}`}>{row.side}</span></td>
-                        <td>{money(row.invested)}</td>
-                        <td>{tokenPriceText(row.entryPrice)}</td>
-                        <td>{typeof row.settlementPrice === "number" ? tokenPriceText(row.settlementPrice) : "—"}</td>
-                        <td>{decimal(row.shares, 4)}</td>
-                        <td>{money(row.fees, 4)}</td>
-                        <td>{signedMoney(row.pnl)}</td>
-                        <td>
-                          <span className={`analytics-tag state-${row.settlementState.toLowerCase()}`}>
-                            {analyticsSettlementLabel(row.settlementState, language)}
-                          </span>
-                        </td>
-                        <td><span className={`analytics-tag result-${row.result.toLowerCase()}`}>{analyticsResultLabel(row.result, language)}</span></td>
-                        <td><span className={`analytics-row-analysis ${row.analysisTone}`}>{row.analysisText}</span></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {hiddenCount > 0 ? (
-                <button
-                  type="button"
-                  className="analytics-load-more"
-                  onClick={() =>
-                    setGroupVisibleLimits((limits) => ({
-                      ...limits,
-                      [key]: (limits[key] ?? ANALYTICS_GROUP_SIZE) + ANALYTICS_GROUP_SIZE
-                    }))
-                  }
-                >
-                  {localLabel(language, `展开更多 ${Math.min(hiddenCount, ANALYTICS_GROUP_SIZE)} 条`, `Show ${Math.min(hiddenCount, ANALYTICS_GROUP_SIZE)} more`)}
-                </button>
-              ) : null}
-            </div>
-          ))
+          <div className="analytics-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>{localLabel(language, "时间", "Time")}</th>
+                  <th>{localLabel(language, "轮次", "Round")}</th>
+                  <th>{localLabel(language, "方向", "Direction")}</th>
+                  <th>{localLabel(language, "投入", "Invested")}</th>
+                  <th>{localLabel(language, "入场价", "Entry")}</th>
+                  <th>{localLabel(language, "结算价/退出价", "Settle/Exit")}</th>
+                  <th>{localLabel(language, "份额", "Shares")}</th>
+                  <th>{localLabel(language, "费用", "Fees")}</th>
+                  <th>PnL</th>
+                  <th>{localLabel(language, "状态", "State")}</th>
+                  <th>{localLabel(language, "结果", "Result")}</th>
+                  <th>{localLabel(language, "分析", "Analysis")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {displayedRows.map((row) => (
+                  <tr key={row.id}>
+                    <td>{timeText(row.ts)}</td>
+                    <td>{row.roundLabel}</td>
+                    <td><span className={`analytics-tag ${row.side === "UP" ? "up" : "down"}`}>{row.side}</span></td>
+                    <td>{money(row.invested)}</td>
+                    <td>{tokenPriceText(row.entryPrice)}</td>
+                    <td>{typeof row.settlementPrice === "number" ? tokenPriceText(row.settlementPrice) : "—"}</td>
+                    <td>{decimal(row.shares, 4)}</td>
+                    <td>{money(row.fees, 4)}</td>
+                    <td>{signedMoney(row.pnl)}</td>
+                    <td>
+                      <span className={`analytics-tag state-${row.settlementState.toLowerCase()}`}>
+                        {analyticsSettlementLabel(row.settlementState, language)}
+                      </span>
+                    </td>
+                    <td><span className={`analytics-tag result-${row.result.toLowerCase()}`}>{analyticsResultLabel(row.result, language)}</span></td>
+                    <td><span className={`analytics-row-analysis ${row.analysisTone}`}>{row.analysisText}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
         {period === "trades" && visibleTradeLimit < filteredRows.length ? (
           <button
