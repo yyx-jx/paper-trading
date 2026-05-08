@@ -1,21 +1,22 @@
 import { EventEmitter } from "node:events";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import v8 from "node:v8";
 import {
-  appendFileSync,
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
   readSync,
-  statSync,
-  writeFileSync
+  statSync
 } from "node:fs";
 import path from "node:path";
-import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
-import { Pool } from "pg";
+import { Pool, type PoolClient, type QueryResult } from "pg";
 import { createClient } from "redis";
+import { ROLE_PERMISSIONS, normalizeRolePermissions } from "../auth/permissions";
+import { hashPassword, isBcryptHash, verifyPassword } from "../auth/password";
+import { AsyncJsonlWriter } from "./log-writer";
 import type {
   AuditEvent,
   AuditLogQuery,
@@ -32,6 +33,7 @@ import type {
   OrderBookSnapshot,
   OrderRecord,
   PermissionCode,
+  PermissionLevel,
   PositionRecord,
   ProfileOverview,
   PublicUser,
@@ -50,10 +52,10 @@ const STARTUP_CONNECT_RETRY_DELAY_MS = 2000;
 const FIVE_MINUTE_ROUND_MS = 5 * 60_000;
 const QTY_EPSILON = 0.0000001;
 const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
-const BCRYPT_COST = 10;
 const LOG_FILE_TAIL_BYTES = 512 * 1024;
 const MEMORY_GUARD_INTERVAL_MS = 15_000;
 const PERSISTENCE_FAILURE_THRESHOLD = 3;
+const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
 
@@ -75,21 +77,6 @@ function sleep(ms: number) {
 }
 
 const roundNumber = (value: number, digits = 8) => Number(value.toFixed(digits));
-
-function isBcryptHash(value: string) {
-  return /^\$2[aby]\$\d{2}\$/.test(value);
-}
-
-function hashPassword(password: string) {
-  return bcrypt.hashSync(password, BCRYPT_COST);
-}
-
-function verifyPassword(password: string, stored: string) {
-  if (isBcryptHash(stored)) {
-    return bcrypt.compareSync(password, stored);
-  }
-  return password === stored;
-}
 
 function isFiveMinuteRound(round: RoundRecord) {
   return round.endAt > round.startAt && round.endAt - round.startAt === FIVE_MINUTE_ROUND_MS;
@@ -173,48 +160,6 @@ function readJsonlTail<T>(filePath: string, maxBytes: number, guard: (value: unk
     .filter(guard);
 }
 
-const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
-  Tester: ["trade:view", "trade:order", "trade:cancel", "trade:sell", "profile:view"],
-  "Senior Tester": [
-    "trade:view",
-    "trade:order",
-    "trade:cancel",
-    "trade:sell",
-    "profile:view",
-    "users:list",
-    "users:disable",
-    "users:reset-password",
-    "users:balance:set",
-    "logs:view:team"
-  ],
-  "Test Engineer": [
-    "trade:view",
-    "trade:order",
-    "trade:cancel",
-    "trade:sell",
-    "profile:view",
-    "system:status:view",
-    "users:list",
-    "logs:view:team"
-  ],
-  Admin: [
-    "trade:view",
-    "trade:order",
-    "trade:cancel",
-    "trade:sell",
-    "profile:view",
-    "system:status:view",
-    "audit:view",
-    "users:list",
-    "users:create",
-    "users:bulk-create",
-    "users:disable",
-    "users:reset-password",
-    "users:balance:set",
-    "logs:view:all"
-  ]
-};
-
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
@@ -229,6 +174,14 @@ CREATE TABLE IF NOT EXISTS users (
   senior_tester_id TEXT,
   disabled_at BIGINT,
   disabled_by TEXT,
+  manager_user_id TEXT,
+  permission_level TEXT NOT NULL DEFAULT 'Standard',
+  failed_login_count INTEGER NOT NULL DEFAULT 0,
+  locked_until BIGINT,
+  password_changed_at BIGINT,
+  last_login_at BIGINT,
+  must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+  data_version INTEGER NOT NULL DEFAULT 1,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL
 );
@@ -336,6 +289,7 @@ CREATE TABLE IF NOT EXISTS orders (
   persist_latency_ms DOUBLE PRECISION,
   total_order_latency_ms DOUBLE PRECISION,
   failure_reason TEXT,
+  client_order_id TEXT,
   client_send_ts BIGINT,
   server_recv_ts BIGINT NOT NULL,
   server_publish_ts BIGINT NOT NULL,
@@ -397,6 +351,13 @@ CREATE TABLE IF NOT EXISTS positions (
   source_latency_ms DOUBLE PRECISION,
   unrealized_pnl DOUBLE PRECISION NOT NULL,
   realized_pnl DOUBLE PRECISION NOT NULL,
+  entry_fee_usdc DOUBLE PRECISION,
+  exit_fee_usdc DOUBLE PRECISION,
+  total_fee_usdc DOUBLE PRECISION,
+  cost_basis_usdc DOUBLE PRECISION,
+  mark_pnl_usdc DOUBLE PRECISION,
+  executable_pnl_usdc DOUBLE PRECISION,
+  data_version INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL,
   opened_at BIGINT NOT NULL,
   closed_at BIGINT,
@@ -477,9 +438,38 @@ CREATE TABLE IF NOT EXISTS behavior_action_logs (
   context_json JSONB
 );
 
+CREATE TABLE IF NOT EXISTS export_audit_logs (
+  export_id TEXT PRIMARY KEY,
+  actor_user_id TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  export_type TEXT NOT NULL,
+  format TEXT NOT NULL,
+  scope JSONB NOT NULL,
+  record_count INTEGER NOT NULL,
+  filtered_d_grade_count INTEGER NOT NULL,
+  missing_quality_count INTEGER NOT NULL,
+  file_sha256 TEXT NOT NULL,
+  created_at_ms BIGINT NOT NULL,
+  details JSONB
+);
+
+CREATE TABLE IF NOT EXISTS redeem_ledger (
+  id TEXT PRIMARY KEY,
+  round_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  position_id TEXT NOT NULL,
+  redeem_amount_usdc DOUBLE PRECISION NOT NULL,
+  realized_pnl_usdc DOUBLE PRECISION NOT NULL,
+  settlement_result TEXT NOT NULL,
+  created_at_ms BIGINT NOT NULL,
+  details JSONB,
+  UNIQUE (round_id, user_id, position_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_rounds_start_at ON rounds(start_at DESC);
 CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_ts ON order_book_snapshots(snapshot_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_client_order_id ON orders(user_id, client_order_id) WHERE client_order_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_order_lifecycle_user_time ON order_lifecycle_logs(user_id, order_timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_order_lifecycle_round ON order_lifecycle_logs(round_id, direction, order_timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_user_opened ON positions(user_id, opened_at DESC);
@@ -506,9 +496,20 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TR
 ALTER TABLE users ADD COLUMN IF NOT EXISTS senior_tester_id TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at BIGINT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_by TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_user_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_level TEXT NOT NULL DEFAULT 'Standard';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT;
 UPDATE users SET updated_at = created_at WHERE updated_at IS NULL;
+UPDATE users SET manager_user_id = senior_tester_id WHERE manager_user_id IS NULL AND senior_tester_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_users_senior_tester ON users(senior_tester_id);
+CREATE INDEX IF NOT EXISTS idx_users_manager_user ON users(manager_user_id);
+ALTER TABLE rounds ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_source TEXT;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_price DOUBLE PRECISION;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_status TEXT;
@@ -547,20 +548,40 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_acquire_latency_ms DOUBLE PRECI
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS local_match_latency_ms DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS persist_latency_ms DOUBLE PRECISION;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_order_latency_ms DOUBLE PRECISION;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS locked_qty DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_bid DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_ask DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_mid DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_value DOUBLE PRECISION;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_fee_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_fee_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS total_fee_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS cost_basis_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS mark_pnl_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS executable_pnl_usdc DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS entry_fee DOUBLE PRECISION;
 ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS exit_fee DOUBLE PRECISION;
 ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS fee_currency TEXT;
+ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE behavior_action_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_export_audit_logs_actor_created ON export_audit_logs(actor_user_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_redeem_ledger_round_user ON redeem_ledger(round_id, user_id);
 `;
 
 const LOG_DIR = path.resolve(process.cwd(), "data/logs");
 const LOG_FILE = path.join(LOG_DIR, "audit-events.jsonl");
 const BEHAVIOR_LOG_FILE = path.join(LOG_DIR, "behavior-action-logs.jsonl");
+const JSONL_WRITER_OPTIONS = {
+  batchSize: 100,
+  flushIntervalMs: 500,
+  maxFileBytes: 50 * 1024 * 1024,
+  maxQueueDepth: 10_000
+};
 
 function createEmptyCandleBar(interval: CandleInterval, now: number): CandleBar {
   return {
@@ -749,6 +770,16 @@ function normalizePermissionCodes(value: unknown): PermissionCode[] {
   return [];
 }
 
+export type TradeMutationMemorySnapshot = {
+  users: Array<[string, UserRecord]>;
+  orders: OrderRecord[];
+  positions: PositionRecord[];
+  orderLifecycleLogs: OrderLifecycleRecord[];
+  orderBookSnapshots: Array<[string, OrderBookSnapshotRecord]>;
+  logs: AuditEvent[];
+  behaviorLogs: BehaviorActionLog[];
+};
+
 export class AppStore {
   public readonly emitter = new EventEmitter();
   public readonly users = new Map<string, UserRecord>();
@@ -776,6 +807,7 @@ export class AppStore {
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
   private readonly pendingUserPayloadIds = new Set<string>();
+  private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
   private memoryProtectionState: MemoryProtectionState = "normal";
   private postgresReconnectTask?: Promise<void>;
@@ -784,6 +816,8 @@ export class AppStore {
     postgres: PersistenceHealth;
     redis: PersistenceHealth;
   };
+  private readonly auditLogWriter = new AsyncJsonlWriter<AuditEvent>(LOG_FILE, JSONL_WRITER_OPTIONS);
+  private readonly behaviorLogWriter = new AsyncJsonlWriter<BehaviorActionLog>(BEHAVIOR_LOG_FILE, JSONL_WRITER_OPTIONS);
   private readonly config: {
     initialBalance: number;
     logRetentionMs: number;
@@ -794,6 +828,9 @@ export class AppStore {
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
     strictPersistence: boolean;
+    requireSchemaMigrations?: boolean;
+    allowDevSchemaBootstrap?: boolean;
+    expectedSchemaMigrationId?: string;
     pgConnectionTimeoutMs: number;
     pgIdleTimeoutMs: number;
     pgMaxConnections: number;
@@ -822,6 +859,9 @@ export class AppStore {
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
     strictPersistence: boolean;
+    requireSchemaMigrations: boolean;
+    allowDevSchemaBootstrap: boolean;
+    expectedSchemaMigrationId: string;
     pgConnectionTimeoutMs: number;
     pgIdleTimeoutMs: number;
     pgMaxConnections: number;
@@ -839,7 +879,12 @@ export class AppStore {
     serverHeapWarnMb: number;
     serverHeapProtectMb: number;
   }) {
-    this.config = config;
+    this.config = {
+      ...config,
+      requireSchemaMigrations: config.requireSchemaMigrations ?? false,
+      allowDevSchemaBootstrap: config.allowDevSchemaBootstrap ?? true,
+      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000004"
+    };
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
     this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.chainlinkEnabled);
@@ -885,6 +930,7 @@ export class AppStore {
     }
     await this.closePostgresPool();
     await this.postgresReconnectTask?.catch(() => undefined);
+    await Promise.all([this.auditLogWriter.close(), this.behaviorLogWriter.close()]);
   }
 
   sanitizeUser(user: UserRecord): PublicUser {
@@ -898,6 +944,12 @@ export class AppStore {
       availableUsdc: user.availableUsdc,
       isActive: user.isActive,
       seniorTesterId: user.seniorTesterId,
+      managerUserId: user.managerUserId ?? user.seniorTesterId,
+      permissionLevel: user.permissionLevel ?? "Standard",
+      lockedUntil: user.lockedUntil,
+      passwordChangedAt: user.passwordChangedAt,
+      lastLoginAt: user.lastLoginAt,
+      mustChangePassword: user.mustChangePassword,
       disabledAt: user.disabledAt,
       disabledBy: user.disabledBy,
       createdAt: user.createdAt,
@@ -907,9 +959,13 @@ export class AppStore {
 
   findUserByCredentials(username: string, password: string) {
     for (const user of this.users.values()) {
+      if (user.username === username && this.isUserLocked(user)) {
+        return undefined;
+      }
       if (user.username === username && verifyPassword(password, user.password) && user.isActive) {
         if (!isBcryptHash(user.password)) {
           user.password = hashPassword(password);
+          user.passwordChangedAt = Date.now();
           user.updatedAt = Date.now();
           void this.persistUser(user);
         }
@@ -917,6 +973,27 @@ export class AppStore {
       }
     }
     return undefined;
+  }
+
+  isUserLocked(user: UserRecord, now = Date.now()) {
+    return typeof user.lockedUntil === "number" && user.lockedUntil > now;
+  }
+
+  async recordFailedLogin(user: UserRecord) {
+    user.failedLoginCount = (user.failedLoginCount ?? 0) + 1;
+    if (user.failedLoginCount >= 3) {
+      user.lockedUntil = Date.now() + 10 * 60_000;
+    }
+    user.updatedAt = Date.now();
+    await this.persistUser(user);
+  }
+
+  async recordSuccessfulLogin(user: UserRecord) {
+    user.failedLoginCount = 0;
+    user.lockedUntil = undefined;
+    user.lastLoginAt = Date.now();
+    user.updatedAt = user.lastLoginAt;
+    await this.persistUser(user);
   }
 
   findUserByUsername(username: string) {
@@ -935,6 +1012,10 @@ export class AppStore {
     return [...this.users.values()]
       .sort((left, right) => left.createdAt - right.createdAt)
       .map((user) => this.sanitizeUser(user));
+  }
+
+  listUserRecords() {
+    return [...this.users.values()].sort((left, right) => left.createdAt - right.createdAt);
   }
 
   getPersistenceStatus() {
@@ -957,6 +1038,64 @@ export class AppStore {
     };
   }
 
+  getJsonlStats() {
+    return {
+      audit: this.auditLogWriter.getStats(),
+      behavior: this.behaviorLogWriter.getStats()
+    };
+  }
+
+  captureTradeMutationSnapshot(): TradeMutationMemorySnapshot {
+    return {
+      users: [...this.users.entries()].map(([id, user]) => [id, { ...user }]),
+      orders: this.orders.map((order) => ({ ...order })),
+      positions: this.positions.map((position) => ({ ...position })),
+      orderLifecycleLogs: this.orderLifecycleLogs.map((log) => ({ ...log })),
+      orderBookSnapshots: [...this.orderBookSnapshots.entries()].map(([ref, record]) => [
+        ref,
+        {
+          ...record,
+          snapshot: {
+            ...record.snapshot,
+            bids: record.snapshot.bids.map((level) => ({ ...level })),
+            asks: record.snapshot.asks.map((level) => ({ ...level }))
+          }
+        }
+      ]),
+      logs: this.logs.map((log) => ({ ...log })),
+      behaviorLogs: this.behaviorLogs.map((log) => ({ ...log }))
+    };
+  }
+
+  restoreTradeMutationSnapshot(snapshot: TradeMutationMemorySnapshot) {
+    this.users.clear();
+    for (const [id, user] of snapshot.users) {
+      this.users.set(id, { ...user });
+    }
+    this.orders.splice(0, this.orders.length, ...snapshot.orders.map((order) => ({ ...order })));
+    this.positions.splice(0, this.positions.length, ...snapshot.positions.map((position) => ({ ...position })));
+    this.orderLifecycleLogs.splice(
+      0,
+      this.orderLifecycleLogs.length,
+      ...snapshot.orderLifecycleLogs.map((log) => ({ ...log }))
+    );
+    this.orderBookSnapshots.clear();
+    for (const [ref, record] of snapshot.orderBookSnapshots) {
+      this.orderBookSnapshots.set(ref, {
+        ...record,
+        snapshot: {
+          ...record.snapshot,
+          bids: record.snapshot.bids.map((level) => ({ ...level })),
+          asks: record.snapshot.asks.map((level) => ({ ...level }))
+        }
+      });
+    }
+    this.logs.splice(0, this.logs.length, ...snapshot.logs.map((log) => ({ ...log })));
+    this.behaviorLogs.splice(0, this.behaviorLogs.length, ...snapshot.behaviorLogs.map((log) => ({ ...log })));
+    this.rebuildHotIndexes();
+    this.bumpHistoryRevision();
+  }
+
   assertWritablePersistence(context: string) {
     if (
       this.config.persistenceMode === "external" &&
@@ -966,6 +1105,77 @@ export class AppStore {
       void this.schedulePostgresReconnect(`${context} blocked`);
       throw new Error(this.persistenceUnavailableMessage(context));
     }
+  }
+
+  async withTransaction<T>(handler: () => Promise<T>) {
+    const activeClient = txStorage.getStore();
+    if (activeClient) {
+      return handler();
+    }
+    if (!this.postgresEnabled || !this.pool) {
+      if (this.config.persistenceMode === "external" && this.config.strictPersistence) {
+        void this.schedulePostgresReconnect("transaction requested while unavailable");
+        throw new Error(this.persistenceUnavailableMessage("Transaction"));
+      }
+      return handler();
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await txStorage.run(client, handler);
+      await client.query("COMMIT");
+      this.notePersistenceSuccess("postgres");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      await this.handlePostgresFailure(error, "transaction");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimRedeemLedger(input: {
+    roundId: string;
+    userId: string;
+    positionId: string;
+    redeemAmountUsdc: number;
+    realizedPnlUsdc: number;
+    settlementResult: "win" | "loss";
+    createdAtMs: number;
+    details?: Record<string, unknown>;
+  }) {
+    const key = `${input.roundId}:${input.userId}:${input.positionId}`;
+    if (!this.postgresEnabled || !this.pool) {
+      if (this.memoryRedeemLedgerKeys.has(key)) {
+        return false;
+      }
+      this.memoryRedeemLedgerKeys.add(key);
+      return true;
+    }
+
+    const result = await this.queryDb(
+      `
+      INSERT INTO redeem_ledger (
+        id, round_id, user_id, position_id, redeem_amount_usdc, realized_pnl_usdc,
+        settlement_result, created_at_ms, details
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT (round_id, user_id, position_id) DO NOTHING
+      `,
+      [
+        `redeem_${createHash("sha256").update(key).digest("hex").slice(0, 24)}`,
+        input.roundId,
+        input.userId,
+        input.positionId,
+        input.redeemAmountUsdc,
+        input.realizedPnlUsdc,
+        input.settlementResult,
+        input.createdAtMs,
+        JSON.stringify(input.details ?? {})
+      ]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   isPersistenceUnavailableError(error: unknown) {
@@ -1108,15 +1318,19 @@ export class AppStore {
 
   async persistUser(user: UserRecord) {
     user.permissionCodes = ROLE_PERMISSIONS[user.role];
+    user.managerUserId = user.managerUserId ?? user.seniorTesterId;
+    user.permissionLevel = user.permissionLevel ?? "Standard";
     user.updatedAt = user.updatedAt || Date.now();
     this.users.set(user.id, user);
     await this.runDb(
       `
       INSERT INTO users (
         id, username, password, display_name, role, language, permission_codes, available_usdc,
-        is_active, senior_tester_id, disabled_at, disabled_by, created_at, updated_at
+        is_active, senior_tester_id, disabled_at, disabled_by, manager_user_id, permission_level,
+        failed_login_count, locked_until, password_changed_at, last_login_at, must_change_password,
+        created_at, updated_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       ON CONFLICT (id) DO UPDATE SET
         username = EXCLUDED.username,
         password = EXCLUDED.password,
@@ -1129,6 +1343,13 @@ export class AppStore {
         senior_tester_id = EXCLUDED.senior_tester_id,
         disabled_at = EXCLUDED.disabled_at,
         disabled_by = EXCLUDED.disabled_by,
+        manager_user_id = EXCLUDED.manager_user_id,
+        permission_level = EXCLUDED.permission_level,
+        failed_login_count = EXCLUDED.failed_login_count,
+        locked_until = EXCLUDED.locked_until,
+        password_changed_at = EXCLUDED.password_changed_at,
+        last_login_at = EXCLUDED.last_login_at,
+        must_change_password = EXCLUDED.must_change_password,
         updated_at = EXCLUDED.updated_at
       `,
       [
@@ -1144,6 +1365,13 @@ export class AppStore {
         user.seniorTesterId ?? null,
         user.disabledAt ?? null,
         user.disabledBy ?? null,
+        user.managerUserId ?? null,
+        user.permissionLevel ?? "Standard",
+        user.failedLoginCount ?? 0,
+        user.lockedUntil ?? null,
+        user.passwordChangedAt ?? null,
+        user.lastLoginAt ?? null,
+        user.mustChangePassword ?? false,
         user.createdAt,
         user.updatedAt
       ]
@@ -1157,6 +1385,9 @@ export class AppStore {
     role: Role;
     language: Language;
     seniorTesterId?: string;
+    managerUserId?: string;
+    permissionLevel?: PermissionLevel;
+    mustChangePassword?: boolean;
     availableUsdc: number;
   }) {
     if (this.findUserByUsername(input.username)) {
@@ -1174,10 +1405,64 @@ export class AppStore {
       availableUsdc: input.availableUsdc,
       isActive: true,
       seniorTesterId: input.seniorTesterId,
+      managerUserId: input.managerUserId ?? input.seniorTesterId,
+      permissionLevel: input.permissionLevel ?? "Standard",
+      failedLoginCount: 0,
+      passwordChangedAt: now,
+      mustChangePassword: input.mustChangePassword ?? false,
       createdAt: now,
       updatedAt: now
     };
     await this.persistUser(user);
+    return user;
+  }
+
+  async updateUserProfile(
+    userId: string,
+    input: {
+      displayName?: string;
+      role?: Role;
+      language?: Language;
+      seniorTesterId?: string;
+      managerUserId?: string;
+      permissionLevel?: PermissionLevel;
+      availableUsdc?: number;
+      isActive?: boolean;
+      disabledBy?: string;
+    }
+  ) {
+    const user = this.users.get(userId);
+    if (!user) {
+      throw new Error("User was not found.");
+    }
+    if (typeof input.displayName === "string") {
+      user.displayName = input.displayName;
+    }
+    if (input.role) {
+      user.role = input.role;
+    }
+    if (input.language) {
+      user.language = input.language;
+    }
+    if (Object.prototype.hasOwnProperty.call(input, "seniorTesterId") || Object.prototype.hasOwnProperty.call(input, "managerUserId")) {
+      const managerUserId = input.managerUserId ?? input.seniorTesterId;
+      user.seniorTesterId = user.role === "Tester" ? managerUserId : undefined;
+      user.managerUserId = user.role === "Tester" ? managerUserId : undefined;
+    }
+    if (input.permissionLevel) {
+      user.permissionLevel = input.permissionLevel;
+    }
+    if (typeof input.availableUsdc === "number") {
+      user.availableUsdc = Number(input.availableUsdc.toFixed(2));
+    }
+    if (typeof input.isActive === "boolean") {
+      user.isActive = input.isActive;
+      user.disabledAt = input.isActive ? undefined : Date.now();
+      user.disabledBy = input.isActive ? undefined : input.disabledBy;
+    }
+    user.updatedAt = Date.now();
+    await this.persistUser(user);
+    this.emitUserPayload(user.id);
     return user;
   }
 
@@ -1216,6 +1501,10 @@ export class AppStore {
       throw new Error("User was not found.");
     }
     user.password = hashPassword(password);
+    user.passwordChangedAt = Date.now();
+    user.failedLoginCount = 0;
+    user.lockedUntil = undefined;
+    user.mustChangePassword = false;
     user.updatedAt = Date.now();
     await this.persistUser(user);
     return user;
@@ -1412,6 +1701,32 @@ export class AppStore {
   getOrderById(orderId: string) {
     const index = this.orderIndexById?.get(orderId);
     return typeof index === "number" ? this.orders[index] : this.orders.find((order) => order.id === orderId);
+  }
+
+  async findOrderByClientOrderId(userId: string, clientOrderId?: string) {
+    const normalizedClientOrderId = clientOrderId?.trim();
+    if (!normalizedClientOrderId) {
+      return undefined;
+    }
+    const memoryOrder = this.orders.find((order) => order.userId === userId && order.clientOrderId === normalizedClientOrderId);
+    if (memoryOrder) {
+      return memoryOrder;
+    }
+    if (!this.postgresEnabled || !this.pool) {
+      return undefined;
+    }
+    const result = await this.queryDb(
+      "SELECT * FROM orders WHERE user_id = $1 AND client_order_id = $2 ORDER BY created_at DESC LIMIT 1",
+      [userId, normalizedClientOrderId]
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return undefined;
+    }
+    const order = this.rowToOrder(row);
+    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    this.pruneMemoryCaches();
+    return order;
   }
 
   sanitizeOrder(order: OrderRecord): OrderRecord {
@@ -1896,11 +2211,25 @@ export class AppStore {
   private decoratePosition(position: PositionRecord) {
     const round = this.getRoundById(position.roundId);
     const displayStatus = this.getPositionDisplayStatus(position, round);
+    const entryFeeUsdc = position.entryFeeUsdc ?? 0;
+    const exitFeeUsdc = position.exitFeeUsdc ?? 0;
+    const costBasisUsdc = position.costBasisUsdc ?? position.notionalSpent;
+    const markValue = position.currentValue ?? position.qty * position.currentMark;
+    const executableValue = typeof position.currentBid === "number" ? position.qty * position.currentBid : markValue;
+    const feeFields = {
+      entryFeeUsdc,
+      exitFeeUsdc,
+      totalFeeUsdc: position.totalFeeUsdc ?? roundNumber(entryFeeUsdc + exitFeeUsdc, 8),
+      costBasisUsdc,
+      markPnlUsdc: position.markPnlUsdc ?? roundNumber(markValue - costBasisUsdc, 2),
+      executablePnlUsdc: position.executablePnlUsdc ?? roundNumber(executableValue - costBasisUsdc, 2)
+    };
     const sanitized =
       displayStatus === "open"
-        ? position
+        ? { ...position, ...feeFields }
         : {
             ...position,
+            ...feeFields,
             currentBid: undefined,
             currentAsk: undefined,
             currentMid: undefined,
@@ -2535,14 +2864,14 @@ export class AppStore {
         expected_qty, filled_qty, unfilled_qty, avg_fill_price, best_bid, best_ask, mid_price,
         book_snapshot_ts, partial_filled, slippage_bps, match_latency_ms,
         book_acquire_latency_ms, local_match_latency_ms, persist_latency_ms, total_order_latency_ms, failure_reason,
-        client_send_ts, server_recv_ts, server_publish_ts, created_at
+        client_order_id, client_send_ts, server_recv_ts, server_publish_ts, created_at
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
         $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
         $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
         $41,$42,$43,$44,$45,$46,$47,$48,$49,$50,
-        $51
+        $51,$52
       )
       ON CONFLICT (id) DO UPDATE SET
         lifecycle_status = EXCLUDED.lifecycle_status,
@@ -2568,6 +2897,7 @@ export class AppStore {
         fee_currency = EXCLUDED.fee_currency,
         order_book_snapshot_ref = EXCLUDED.order_book_snapshot_ref,
         failure_reason = EXCLUDED.failure_reason,
+        client_order_id = EXCLUDED.client_order_id,
         server_publish_ts = EXCLUDED.server_publish_ts
       `,
       [
@@ -2618,6 +2948,7 @@ export class AppStore {
         order.persistLatencyMs ?? null,
         order.totalOrderLatencyMs ?? null,
         order.failureReason ?? null,
+        order.clientOrderId ?? null,
         order.clientSendTs ?? null,
         order.serverRecvTs,
         order.serverPublishTs,
@@ -2636,10 +2967,12 @@ export class AppStore {
       INSERT INTO positions (
         id, user_id, round_id, side, qty, locked_qty, average_entry, notional_spent, current_mark,
         current_bid, current_ask, current_mid, current_value, source_latency_ms,
-        unrealized_pnl, realized_pnl, status, opened_at, closed_at, settlement_result
+        unrealized_pnl, realized_pnl, entry_fee_usdc, exit_fee_usdc, total_fee_usdc,
+        cost_basis_usdc, mark_pnl_usdc, executable_pnl_usdc, status, opened_at, closed_at, settlement_result
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+        $21,$22,$23,$24,$25,$26
       )
       ON CONFLICT (id) DO UPDATE SET
         qty = EXCLUDED.qty,
@@ -2654,6 +2987,12 @@ export class AppStore {
         source_latency_ms = EXCLUDED.source_latency_ms,
         unrealized_pnl = EXCLUDED.unrealized_pnl,
         realized_pnl = EXCLUDED.realized_pnl,
+        entry_fee_usdc = EXCLUDED.entry_fee_usdc,
+        exit_fee_usdc = EXCLUDED.exit_fee_usdc,
+        total_fee_usdc = EXCLUDED.total_fee_usdc,
+        cost_basis_usdc = EXCLUDED.cost_basis_usdc,
+        mark_pnl_usdc = EXCLUDED.mark_pnl_usdc,
+        executable_pnl_usdc = EXCLUDED.executable_pnl_usdc,
         status = EXCLUDED.status,
         closed_at = EXCLUDED.closed_at,
         settlement_result = EXCLUDED.settlement_result
@@ -2675,6 +3014,12 @@ export class AppStore {
         position.sourceLatencyMs ?? null,
         position.unrealizedPnl,
         position.realizedPnl,
+        position.entryFeeUsdc ?? 0,
+        position.exitFeeUsdc ?? 0,
+        position.totalFeeUsdc ?? roundNumber((position.entryFeeUsdc ?? 0) + (position.exitFeeUsdc ?? 0), 8),
+        position.costBasisUsdc ?? position.notionalSpent,
+        position.markPnlUsdc ?? roundNumber((position.currentValue ?? position.qty * position.currentMark) - (position.costBasisUsdc ?? position.notionalSpent), 2),
+        position.executablePnlUsdc ?? roundNumber(((position.currentBid ?? position.currentMark) * position.qty) - (position.costBasisUsdc ?? position.notionalSpent), 2),
         position.status,
         position.openedAt,
         position.closedAt ?? null,
@@ -2686,8 +3031,8 @@ export class AppStore {
   async recordLog(event: AuditEvent) {
     this.logs.unshift(event);
     this.pruneMemoryCaches(event.serverRecvTs);
-    appendFileSync(LOG_FILE, `${JSON.stringify(event)}\n`, "utf-8");
-    void this.runDb(
+    this.auditLogWriter.write(event);
+    await this.runDb(
       `
       INSERT INTO audit_events (
         event_id, trace_id, category, action_type, action_status, user_id, role,
@@ -2725,12 +3070,8 @@ export class AppStore {
         event.frontendLatencyMs ?? null,
         JSON.stringify(event.details ?? {})
       ]
-    ).catch((error) => {
-      if (!this.isPersistenceUnavailableError(error)) {
-        console.warn("[store] audit event persistence failed:", error);
-      }
-    });
-    void this.cleanupRetentionIfDue(event.serverRecvTs);
+    );
+    await this.cleanupRetentionIfDue(event.serverRecvTs);
     if (event.userId) {
       this.emitUserPayload(event.userId);
     }
@@ -2739,8 +3080,8 @@ export class AppStore {
   async recordBehaviorLog(log: BehaviorActionLog) {
     this.behaviorLogs.unshift(log);
     this.pruneMemoryCaches(log.timestampMs);
-    appendFileSync(BEHAVIOR_LOG_FILE, `${JSON.stringify(log)}\n`, "utf-8");
-    void this.runDb(
+    this.behaviorLogWriter.write(log);
+    await this.runDb(
       `
       INSERT INTO behavior_action_logs (
         log_id, timestamp_ms, asset_class, action_type, action_status, round_id, direction,
@@ -2816,11 +3157,46 @@ export class AppStore {
         log.qualityGrade ?? null,
         JSON.stringify(log.contextJson ?? {})
       ]
-    ).catch((error) => {
-      if (!this.isPersistenceUnavailableError(error)) {
-        console.warn("[store] behavior log persistence failed:", error);
-      }
-    });
+    );
+  }
+
+  async recordExportAudit(input: {
+    exportId: string;
+    actorUserId: string;
+    actorRole: Role;
+    exportType: string;
+    format: string;
+    scope: Record<string, unknown>;
+    recordCount: number;
+    filteredDGradeCount: number;
+    missingQualityCount: number;
+    fileSha256: string;
+    createdAtMs: number;
+    details?: Record<string, unknown>;
+  }) {
+    await this.runDb(
+      `
+      INSERT INTO export_audit_logs (
+        export_id, actor_user_id, actor_role, export_type, format, scope, record_count,
+        filtered_d_grade_count, missing_quality_count, file_sha256, created_at_ms, details
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (export_id) DO NOTHING
+      `,
+      [
+        input.exportId,
+        input.actorUserId,
+        input.actorRole,
+        input.exportType,
+        input.format,
+        JSON.stringify(input.scope),
+        input.recordCount,
+        input.filteredDGradeCount,
+        input.missingQualityCount,
+        input.fileSha256,
+        input.createdAtMs,
+        JSON.stringify(input.details ?? {})
+      ]
+    );
   }
 
   anonymizeUserId(userId: string) {
@@ -2946,7 +3322,10 @@ export class AppStore {
         await this.closePostgresPool();
         const pool = this.createPostgresPool();
         await pool.query("SELECT 1");
-        await pool.query(SCHEMA_SQL);
+        if (this.config.allowDevSchemaBootstrap) {
+          await pool.query(SCHEMA_SQL);
+        }
+        await this.assertSchemaMigrations(pool);
         this.pool = pool;
         this.postgresEnabled = true;
         this.notePersistenceSuccess("postgres");
@@ -2982,7 +3361,10 @@ export class AppStore {
       try {
         this.pool = this.createPostgresPool();
         await this.pool.query("SELECT 1");
-        await this.pool.query(SCHEMA_SQL);
+        if (this.config.allowDevSchemaBootstrap) {
+          await this.pool.query(SCHEMA_SQL);
+        }
+        await this.assertSchemaMigrations(this.pool);
         this.postgresEnabled = true;
         this.notePersistenceSuccess("postgres");
         return;
@@ -3008,6 +3390,28 @@ export class AppStore {
       );
     }
     console.warn("[store] PostgreSQL is unavailable, using in-memory persistence only:", lastError);
+  }
+
+  private async assertSchemaMigrations(pool: Pool) {
+    if (!this.config.requireSchemaMigrations) {
+      return;
+    }
+    const tableResult = await pool.query<{ exists: boolean }>(
+      "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'schema_migrations') AS exists"
+    );
+    if (!tableResult.rows[0]?.exists) {
+      throw new Error(
+        "[store] SERVER_REQUIRE_MIGRATIONS=true but schema_migrations is missing. Run npm run db:migrate first."
+      );
+    }
+    const migrationResult = await pool.query("SELECT 1 FROM schema_migrations WHERE id = $1", [
+      this.config.expectedSchemaMigrationId
+    ]);
+    if (migrationResult.rowCount === 0) {
+      throw new Error(
+        `[store] Required migration ${this.config.expectedSchemaMigrationId} is not applied. Run npm run db:migrate first.`
+      );
+    }
   }
 
   private async connectRedis() {
@@ -3151,10 +3555,21 @@ export class AppStore {
           displayName: row.display_name,
           role,
           language: row.language,
-          permissionCodes: [...new Set([...normalizePermissionCodes(row.permission_codes), ...ROLE_PERMISSIONS[role]])],
+          permissionCodes: normalizeRolePermissions(role, normalizePermissionCodes(row.permission_codes)),
           availableUsdc: Number(row.available_usdc),
           isActive: row.is_active === null || typeof row.is_active === "undefined" ? true : Boolean(row.is_active),
           seniorTesterId: row.senior_tester_id ? String(row.senior_tester_id) : undefined,
+          managerUserId: row.manager_user_id
+            ? String(row.manager_user_id)
+            : row.senior_tester_id
+              ? String(row.senior_tester_id)
+              : undefined,
+          permissionLevel: row.permission_level === "Initial" ? "Initial" : "Standard",
+          failedLoginCount: Number(row.failed_login_count ?? 0),
+          lockedUntil: row.locked_until ? Number(row.locked_until) : undefined,
+          passwordChangedAt: row.password_changed_at ? Number(row.password_changed_at) : undefined,
+          lastLoginAt: row.last_login_at ? Number(row.last_login_at) : undefined,
+          mustChangePassword: Boolean(row.must_change_password),
           disabledAt: row.disabled_at ? Number(row.disabled_at) : undefined,
           disabledBy: row.disabled_by ? String(row.disabled_by) : undefined,
           createdAt,
@@ -3214,10 +3629,10 @@ export class AppStore {
       .sort((left, right) => right.serverRecvTs - left.serverRecvTs);
     this.logs.splice(0, this.logs.length, ...retained);
     await this.runDb("DELETE FROM audit_events WHERE server_recv_ts < $1", [threshold]);
-    this.pruneLogFile(threshold);
+    await this.pruneLogFile(threshold);
   }
 
-  private pruneLogFile(threshold: number) {
+  private async pruneLogFile(threshold: number) {
     if (!existsSync(LOG_FILE)) {
       return;
     }
@@ -3232,11 +3647,7 @@ export class AppStore {
             typeof (event as AuditEvent).serverRecvTs === "number"
         )
     ).filter((event) => event.serverRecvTs >= threshold);
-    writeFileSync(
-      LOG_FILE,
-      filtered.map((event) => JSON.stringify(event)).join("\n") + (filtered.length ? "\n" : ""),
-      "utf-8"
-    );
+    await this.auditLogWriter.rewrite(filtered);
   }
 
   private rowToRound(row: Record<string, unknown>): RoundRecord {
@@ -3429,6 +3840,7 @@ export class AppStore {
       persistLatencyMs: numberOrUndefined(row.persist_latency_ms),
       totalOrderLatencyMs: numberOrUndefined(row.total_order_latency_ms),
       failureReason: row.failure_reason ? String(row.failure_reason) : undefined,
+      clientOrderId: row.client_order_id ? String(row.client_order_id) : undefined,
       clientSendTs: row.client_send_ts ? Number(row.client_send_ts) : undefined,
       serverRecvTs: Number(row.server_recv_ts),
       serverPublishTs: Number(row.server_publish_ts),
@@ -3455,6 +3867,12 @@ export class AppStore {
       sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
       unrealizedPnl: Number(row.unrealized_pnl),
       realizedPnl: Number(row.realized_pnl),
+      entryFeeUsdc: numberOrUndefined(row.entry_fee_usdc),
+      exitFeeUsdc: numberOrUndefined(row.exit_fee_usdc),
+      totalFeeUsdc: numberOrUndefined(row.total_fee_usdc),
+      costBasisUsdc: numberOrUndefined(row.cost_basis_usdc) ?? Number(row.notional_spent),
+      markPnlUsdc: numberOrUndefined(row.mark_pnl_usdc),
+      executablePnlUsdc: numberOrUndefined(row.executable_pnl_usdc),
       status: row.status as PositionRecord["status"],
       openedAt: Number(row.opened_at),
       closedAt: row.closed_at ? Number(row.closed_at) : undefined,
@@ -3566,22 +3984,31 @@ export class AppStore {
     };
   }
 
-  private async runDb(query: string, params: unknown[]) {
+  private async queryDb(query: string, params: unknown[]): Promise<QueryResult> {
     if (!this.postgresEnabled || !this.pool) {
       if (this.config.persistenceMode === "external" && this.config.strictPersistence) {
         void this.schedulePostgresReconnect("write requested while unavailable");
         throw new Error(this.persistenceUnavailableMessage("Write"));
       }
-      return;
+      return { rows: [], rowCount: 0, command: "", oid: 0, fields: [] };
     }
     try {
-      await this.pool.query(query, params as never[]);
+      const txClient = txStorage.getStore();
+      const result = txClient
+        ? await txClient.query(query, params as never[])
+        : await this.pool.query(query, params as never[]);
       this.notePersistenceSuccess("postgres");
+      return result;
     } catch (error) {
       await this.handlePostgresFailure(error, "write");
       if (this.config.strictPersistence) {
         throw new Error(this.persistenceUnavailableMessage("Write"));
       }
+      return { rows: [], rowCount: 0, command: "", oid: 0, fields: [] };
     }
+  }
+
+  private async runDb(query: string, params: unknown[]) {
+    await this.queryDb(query, params);
   }
 }

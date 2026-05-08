@@ -33,10 +33,20 @@ function persistenceModeEnv(value: string | undefined): PersistenceMode {
 
 export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
   const jwtSecret = env.JWT_SECRET ?? "btc-paper-trading-secret";
-  if ((env.NODE_ENV === "production" || env.DEPLOY_ENV === "production") && jwtSecret === "btc-paper-trading-secret") {
+  const isProduction = env.NODE_ENV === "production" || env.DEPLOY_ENV === "production";
+  if (isProduction && jwtSecret === "btc-paper-trading-secret") {
     throw new Error("JWT_SECRET must be set to a non-default value in production.");
   }
+  const corsOrigins = csvEnv(env.CORS_ORIGINS);
+  if (isProduction && corsOrigins.length === 0) {
+    throw new Error("CORS_ORIGINS must be set in production.");
+  }
+  const exportAnonymizationSecret = textEnv(env.EXPORT_ANONYMIZATION_SECRET, jwtSecret);
+  if (isProduction && exportAnonymizationSecret === jwtSecret) {
+    throw new Error("EXPORT_ANONYMIZATION_SECRET must be set to a dedicated value in production.");
+  }
   return {
+    isProduction,
     port: Number(env.PORT ?? 8787),
     matchingServicePort: Number(env.MATCHING_SERVICE_PORT ?? 8788),
     matchingServiceUrl: textEnv(env.MATCHING_SERVICE_URL, "http://127.0.0.1:8788"),
@@ -44,6 +54,14 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     embeddedMatchingService: env.EMBEDDED_MATCHING_SERVICE !== "false",
     chainlinkEnabled: env.CHAINLINK_ENABLED !== "false",
     upstreamProxyUrl: optionalTextEnv(env.UPSTREAM_PROXY_URL),
+    publicDomain: optionalTextEnv(env.PUBLIC_DOMAIN),
+    corsOrigins,
+    trustProxy: env.TRUST_PROXY === "true",
+    requestTimeoutMs: Number(env.REQUEST_TIMEOUT_MS ?? 30000),
+    metricsEnabled: env.METRICS_ENABLED !== "false",
+    metricsBasicAuthUser: optionalTextEnv(env.METRICS_BASIC_AUTH_USER),
+    metricsBasicAuthPassword: optionalTextEnv(env.METRICS_BASIC_AUTH_PASSWORD),
+    exportAnonymizationSecret,
     jwtSecret,
     symbol: textEnv(env.SYMBOL, "BTC"),
     marketId: textEnv(env.MARKET_ID, "btc-5m-live"),
@@ -53,6 +71,15 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     marketWsMinIntervalMs: Number(env.MARKET_WS_MIN_INTERVAL_MS ?? 50),
     marketHistoryCacheMaxUsers: Number(env.MARKET_HISTORY_CACHE_MAX_USERS ?? 200),
     strictPersistence: env.SERVER_STRICT_PERSISTENCE !== "false",
+    requireSchemaMigrations: isProduction ? env.SERVER_REQUIRE_MIGRATIONS !== "false" : env.SERVER_REQUIRE_MIGRATIONS === "true",
+    allowDevSchemaBootstrap: !isProduction && env.SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP !== "false",
+    expectedSchemaMigrationId: textEnv(env.EXPECTED_SCHEMA_MIGRATION_ID, "000004"),
+    loginRateLimitWindowMs: Number(env.LOGIN_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    loginRateLimitMax: Number(env.LOGIN_RATE_LIMIT_MAX ?? 30),
+    writeRateLimitWindowMs: Number(env.WRITE_RATE_LIMIT_WINDOW_MS ?? 60_000),
+    orderRateLimitMax: Number(env.ORDER_RATE_LIMIT_MAX ?? 120),
+    exportRateLimitMax: Number(env.EXPORT_RATE_LIMIT_MAX ?? 20),
+    bulkImportRateLimitMax: Number(env.BULK_IMPORT_RATE_LIMIT_MAX ?? 20),
     pgConnectionTimeoutMs: Number(env.PG_CONNECTION_TIMEOUT_MS ?? 8000),
     pgIdleTimeoutMs: Number(env.PG_IDLE_TIMEOUT_MS ?? 30000),
     pgMaxConnections: Number(env.PG_MAX_CONNECTIONS ?? 10),

@@ -5,7 +5,7 @@ const fsSync = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 
-const API_BASE_URL = "http://127.0.0.1:8787";
+const LOCAL_API_BASE_URL = "http://127.0.0.1:8787";
 let backendProcess;
 let backendLogStream;
 
@@ -26,7 +26,7 @@ function rendererEntryPath() {
 
 function checkBackendHealth() {
   return new Promise((resolve) => {
-    const request = http.get(`${API_BASE_URL}/health`, (response) => {
+    const request = http.get(`${LOCAL_API_BASE_URL}/health`, (response) => {
       response.resume();
       resolve(Boolean(response.statusCode && response.statusCode < 500));
     });
@@ -50,6 +50,17 @@ async function waitForBackend(timeoutMs = 30000) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   throw new Error("Backend did not become ready in time.");
+}
+
+function shouldEmbedBackend() {
+  const override = String(process.env.ELECTRON_EMBED_BACKEND ?? "").trim().toLowerCase();
+  if (override === "true" || override === "1" || override === "yes") {
+    return true;
+  }
+  if (override === "false" || override === "0" || override === "no") {
+    return false;
+  }
+  return app.isPackaged && app.getName().toLowerCase().includes("test");
 }
 
 async function startPackagedBackend() {
@@ -182,7 +193,7 @@ app.whenReady().then(async () => {
     };
   });
 
-  if (app.isPackaged) {
+  if (shouldEmbedBackend()) {
     await startPackagedBackend();
   }
 

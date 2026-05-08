@@ -19,7 +19,7 @@ import type {
 interface AppState {
   token?: string;
   me?: PublicUser;
-  currentPage: "trade" | "profile" | "logs" | "replay" | "users";
+  currentPage: "trade" | "home" | "profile" | "logs";
   currentRound?: RoundRecord;
   history: HistoryRound[];
   operatedHistory: HistoryRound[];
@@ -37,7 +37,7 @@ interface AppState {
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
   clearAuth: () => void;
-  setCurrentPage: (page: "trade" | "profile" | "logs" | "replay" | "users") => void;
+  setCurrentPage: (page: "trade" | "home" | "profile" | "logs") => void;
   setBootstrap: (data: BootstrapPayload) => void;
   setMarketPayload: (data: MarketPayload, clientRecvTs?: number) => boolean;
   setUserPayload: (data: UserPayload) => void;

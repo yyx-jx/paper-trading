@@ -13,3 +13,4 @@ data/logs/*.jsonl
 data/logs/*.tmp
 .tmp-*
 tmp-*
+.codex-artifacts/

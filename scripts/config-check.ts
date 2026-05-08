@@ -10,6 +10,8 @@ const blankRpcConfig = buildServerConfig({
 assert.equal(blankRpcConfig.chainlinkEnabled, true);
 assert.equal(blankRpcConfig.chainlinkRpcUrl, DEFAULT_CHAINLINK_RPC_URL);
 assert.deepEqual(blankRpcConfig.chainlinkFallbackRpcUrls, ["https://rpc.example/a", "https://rpc.example/b"]);
+assert.equal(blankRpcConfig.requireSchemaMigrations, false);
+assert.equal(blankRpcConfig.expectedSchemaMigrationId, "000004");
 
 const disabledConfig = buildServerConfig({
   CHAINLINK_ENABLED: "false",
@@ -21,5 +23,13 @@ assert.equal(disabledConfig.chainlinkEnabled, false);
 assert.equal(disabledConfig.chainlinkRpcUrl, DEFAULT_CHAINLINK_RPC_URL);
 assert.deepEqual(disabledConfig.chainlinkFallbackRpcUrls, DEFAULT_CHAINLINK_FALLBACK_RPC_URLS);
 assert.equal(disabledConfig.upstreamProxyUrl, undefined);
+
+const migrationGuardConfig = buildServerConfig({
+  SERVER_REQUIRE_MIGRATIONS: "true",
+  EXPECTED_SCHEMA_MIGRATION_ID: "000123"
+});
+
+assert.equal(migrationGuardConfig.requireSchemaMigrations, true);
+assert.equal(migrationGuardConfig.expectedSchemaMigrationId, "000123");
 
 console.log("config-check ok");

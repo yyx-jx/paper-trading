@@ -1,5 +1,6 @@
 export type Language = "zh-CN" | "en-US";
 export type Role = "Tester" | "Senior Tester" | "Test Engineer" | "Admin";
+export type PermissionLevel = "Initial" | "Standard";
 export type TradeSide = "UP" | "DOWN";
 export type OrderAction = "buy" | "sell";
 export type PaperOrderKind = "market" | "limit";
@@ -35,6 +36,8 @@ export interface PublicUser {
   availableUsdc: number;
   isActive: boolean;
   seniorTesterId?: string;
+  managerUserId?: string;
+  permissionLevel?: PermissionLevel;
   disabledAt?: number;
   disabledBy?: string;
   createdAt: number;
@@ -317,6 +320,12 @@ export interface PositionRecord {
   sourceLatencyMs?: number;
   unrealizedPnl: number;
   realizedPnl: number;
+  entryFeeUsdc?: number;
+  exitFeeUsdc?: number;
+  totalFeeUsdc?: number;
+  costBasisUsdc?: number;
+  markPnlUsdc?: number;
+  executablePnlUsdc?: number;
   status: "open" | "closed";
   displayStatus?: "open" | "pending_settlement" | "settled" | "sold";
   openedAt: number;
@@ -372,6 +381,7 @@ export interface OrderRecord {
   persistLatencyMs?: number;
   totalOrderLatencyMs?: number;
   failureReason?: string;
+  clientOrderId?: string;
   clientSendTs?: number;
   serverRecvTs: number;
   serverPublishTs: number;
@@ -609,7 +619,20 @@ export interface CreateUserInput {
   role: Role;
   language?: Language;
   seniorTesterId?: string;
+  managerUserId?: string;
+  permissionLevel?: PermissionLevel;
   availableUsdc?: number;
+}
+
+export interface UpdateUserInput {
+  displayName?: string;
+  role?: Role;
+  language?: Language;
+  seniorTesterId?: string | null;
+  managerUserId?: string | null;
+  permissionLevel?: PermissionLevel;
+  availableUsdc?: number;
+  isActive?: boolean;
 }
 
 export interface BulkCreateUserInput {
@@ -749,6 +772,8 @@ type LoginWireResponse = {
   available_usdc: number;
   is_active: boolean;
   senior_tester_id?: string;
+  manager_user_id?: string;
+  permission_level?: PermissionLevel;
   created_at: number;
   updated_at: number;
 };
@@ -765,6 +790,8 @@ function mapLoginResponse(input: LoginWireResponse): LoginResponse {
     availableUsdc: input.available_usdc,
     isActive: input.is_active,
     seniorTesterId: input.senior_tester_id,
+    managerUserId: input.manager_user_id ?? input.senior_tester_id,
+    permissionLevel: input.permission_level ?? "Standard",
     createdAt: input.created_at,
     updatedAt: input.updated_at
   };
@@ -775,6 +802,16 @@ export const api = {
   createWsUrl(path: string, token: string) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
     return `${base}${path}?token=${token}`;
+  },
+  createWsTicketUrl(path: string, ticket: string) {
+    const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+    return `${base}${path}?ticket=${ticket}`;
+  },
+  createWsTicket(token: string, channel: "market" | "user") {
+    return request<{ ticket: string; expiresAt: number }>("/api/ws/tickets", token, {
+      method: "POST",
+      body: JSON.stringify({ channel })
+    });
   },
   async login(username: string, password: string) {
     const data = await request<LoginWireResponse>("/api/auth/login", undefined, {
@@ -793,6 +830,12 @@ export const api = {
     return request<PublicUser>("/api/me/language", token, {
       method: "POST",
       body: JSON.stringify({ language })
+    });
+  },
+  updateMe(token: string, input: { displayName?: string; language?: Language }) {
+    return request<PublicUser>("/api/me", token, {
+      method: "PATCH",
+      body: JSON.stringify(input)
     });
   },
   changeMyPassword(token: string, input: { currentPassword: string; password: string; confirmPassword: string }) {
@@ -884,6 +927,12 @@ export const api = {
       body: JSON.stringify(input)
     });
   },
+  updateUser(token: string, userId: string, input: UpdateUserInput) {
+    return request<PublicUser>(`/api/users/${userId}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    });
+  },
   bulkCreateUsers(token: string, users: BulkCreateUserInput[]) {
     return request<BulkCreateUsersResult>("/api/users/bulk", token, {
       method: "POST",
@@ -921,12 +970,19 @@ export const api = {
       amount?: number;
       qty?: number;
       limitPrice?: number;
+      clientOrderId?: string;
     }
   ) {
+    const clientOrderId =
+      input.clientOrderId ??
+      (globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `client_${Date.now()}_${Math.random().toString(36).slice(2)}`);
     return request<{ order: OrderRecord }>("/api/orders", token, {
       method: "POST",
       body: JSON.stringify({
         ...input,
+        clientOrderId,
         clientSendTs: Date.now()
       })
     });

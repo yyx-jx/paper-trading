@@ -1,11 +1,16 @@
 import cors from "@fastify/cors";
+import { createHash } from "node:crypto";
 import websocket from "@fastify/websocket";
 import Fastify from "fastify";
 import jwt from "jsonwebtoken";
+import { nanoid } from "nanoid";
 import { WebSocket as WsWebSocket } from "ws";
 import { z } from "zod";
 import { serverConfig } from "./config";
-import { sendApiError } from "./http-errors";
+import { ApiError, sendApiError } from "./http-errors";
+import { assertCan, assertCanManageUser } from "./auth/authz";
+import { hasPermission } from "./auth/permissions";
+import { canExportUser, getVisibleUserIdsForActor } from "./auth/scope";
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
@@ -17,13 +22,15 @@ import type {
   MarketSnapshot,
   MarketTransportMeta,
   MatchingEventRecord,
+  PermissionLevel,
   Role,
   RoundRecord,
   SettlementPreview,
   SourceHealth,
   TradeSide,
   UnifiedLogRow,
-  UserRecord
+  UserRecord,
+  DatasetExportRequest
 } from "./domain/types";
 import { createMatchingServiceApp } from "./services/matching/app";
 import { MatchingServiceClient } from "./services/matching/client";
@@ -40,13 +47,48 @@ import {
   type ExportUser,
   type UserExportData
 } from "./services/csv-zip-export";
-import { validateBulkCreateUsers } from "./services/bulk-users";
+import { CSV_BULK_USER_TEMPLATE, parseBulkUsersCsv, validateBulkCreateUsers } from "./services/bulk-users";
 import { LOG_FACETS } from "./services/log-facets";
+import { buildDatasetExport, previewDatasetExport } from "./services/dataset-export";
+import { appMetrics } from "./services/metrics";
 
-const app = Fastify({ logger: false });
+const app = Fastify({
+  logger: false,
+  trustProxy: serverConfig.trustProxy,
+  requestTimeout: serverConfig.requestTimeoutMs
+});
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+let shuttingDown = false;
+const wsConnectionCounts = {
+  market: 0,
+  user: 0
+};
+const wsTickets = new Map<string, { userId: string; channel: "market" | "user"; expiresAt: number }>();
+const WS_TICKET_TTL_MS = 60_000;
+const WS_HEARTBEAT_MS = 25_000;
+const httpStartTimes = new WeakMap<object, number>();
+const heartbeatTimeoutSockets = new WeakSet<WsWebSocket>();
 
 function logStartupStage(stage: string) {
   console.log(`[startup] ${new Date().toISOString()} ${stage}`);
+}
+
+function clientKey(request: { ip?: string; headers: Record<string, string | string[] | undefined> }, suffix: string) {
+  const forwarded = typeof request.headers["x-forwarded-for"] === "string" ? request.headers["x-forwarded-for"].split(",")[0]?.trim() : undefined;
+  return `${forwarded || request.ip || "unknown"}:${suffix}`;
+}
+
+function enforceRateLimit(key: string, max: number, windowMs: number) {
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return;
+  }
+  bucket.count += 1;
+  if (bucket.count > max) {
+    throw new ApiError(429, "Too many requests. Please retry later.", "RATE_LIMITED");
+  }
 }
 
 const store = new AppStore({
@@ -59,6 +101,9 @@ const store = new AppStore({
   persistenceMode: serverConfig.persistenceMode,
   chainlinkEnabled: serverConfig.chainlinkEnabled,
   strictPersistence: serverConfig.strictPersistence,
+  requireSchemaMigrations: serverConfig.requireSchemaMigrations,
+  allowDevSchemaBootstrap: serverConfig.allowDevSchemaBootstrap,
+  expectedSchemaMigrationId: serverConfig.expectedSchemaMigrationId,
   pgConnectionTimeoutMs: serverConfig.pgConnectionTimeoutMs,
   pgIdleTimeoutMs: serverConfig.pgIdleTimeoutMs,
   pgMaxConnections: serverConfig.pgMaxConnections,
@@ -136,6 +181,10 @@ const loginSchema = z.object({
   password: z.string().min(1)
 });
 
+const wsTicketSchema = z.object({
+  channel: z.enum(["market", "user"])
+});
+
 const orderSchema = z.object({
   action: z.enum(["buy", "sell"]).optional(),
   side: z.enum(["UP", "DOWN"]),
@@ -143,11 +192,17 @@ const orderSchema = z.object({
   amount: z.number().positive().optional(),
   qty: z.number().positive().optional(),
   limitPrice: z.number().positive().optional(),
+  clientOrderId: z.string().trim().min(1).max(128).optional(),
   clientSendTs: z.number().optional()
 });
 
 const languageSchema = z.object({
   language: z.enum(["zh-CN", "en-US"])
+});
+
+const selfProfileSchema = z.object({
+  displayName: z.string().trim().min(1).optional(),
+  language: z.enum(["zh-CN", "en-US"]).optional()
 });
 
 const roleSchema = z.enum(["Tester", "Senior Tester", "Test Engineer", "Admin"]);
@@ -159,7 +214,20 @@ const createUserSchema = z.object({
   role: roleSchema,
   language: z.enum(["zh-CN", "en-US"]).optional(),
   seniorTesterId: z.string().optional(),
+  managerUserId: z.string().optional(),
+  permissionLevel: z.enum(["Initial", "Standard"]).optional(),
   availableUsdc: z.number().nonnegative().optional()
+});
+
+const updateUserSchema = z.object({
+  displayName: z.string().trim().min(1).optional(),
+  role: roleSchema.optional(),
+  language: z.enum(["zh-CN", "en-US"]).optional(),
+  seniorTesterId: z.string().nullable().optional(),
+  managerUserId: z.string().nullable().optional(),
+  permissionLevel: z.enum(["Initial", "Standard"]).optional(),
+  availableUsdc: z.number().nonnegative().optional(),
+  isActive: z.boolean().optional()
 });
 
 const bulkCreateUserItemSchema = z.object({
@@ -169,11 +237,26 @@ const bulkCreateUserItemSchema = z.object({
   role: roleSchema.optional(),
   language: z.enum(["zh-CN", "en-US"]).optional(),
   seniorTesterId: z.string().optional(),
+  managerUserId: z.string().optional(),
+  permissionLevel: z.enum(["Initial", "Standard"]).optional(),
+  mustChangePassword: z.boolean().optional(),
   availableUsdc: z.number().nonnegative().optional()
 });
 
 const bulkCreateUsersSchema = z.object({
   users: z.array(bulkCreateUserItemSchema).min(1).max(500)
+});
+
+const bulkUsersCsvSchema = z.object({
+  csv: z.string().min(1)
+});
+
+const datasetExportSchema = z.object({
+  from: z.number().optional(),
+  to: z.number().optional(),
+  userIds: z.array(z.string()).optional(),
+  includeDGrade: z.boolean().optional(),
+  format: z.enum(["zip", "parquet"]).optional()
 });
 
 const resetPasswordSchema = z.object({
@@ -330,28 +413,116 @@ function getUserFromRequest(request: { headers: Record<string, string | string[]
   return user;
 }
 
-function requirePermission(user: UserRecord, code: string) {
-  if (!user.permissionCodes.includes(code as never)) {
-    throw new Error(`Missing permission: ${code}`);
+function createWsTicket(user: UserRecord, channel: "market" | "user") {
+  const ticket = `wst_${nanoid(32)}`;
+  wsTickets.set(ticket, {
+    userId: user.id,
+    channel,
+    expiresAt: Date.now() + WS_TICKET_TTL_MS
+  });
+  return {
+    ticket,
+    expiresAt: Date.now() + WS_TICKET_TTL_MS
+  };
+}
+
+function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user") {
+  if (!rawTicket) {
+    return undefined;
   }
+  const ticket = wsTickets.get(rawTicket);
+  wsTickets.delete(rawTicket);
+  if (!ticket || ticket.channel !== channel || ticket.expiresAt < Date.now()) {
+    return undefined;
+  }
+  return store.getUserById(ticket.userId);
+}
+
+function getWsUser(query: { token?: string; ticket?: string }, channel: "market" | "user") {
+  const ticketUser = consumeWsTicket(query.ticket, channel);
+  if (ticketUser) {
+    return ticketUser;
+  }
+  const token = readToken(query.token);
+  if (!token) {
+    return undefined;
+  }
+  const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
+  return store.getUserById(payload.userId);
+}
+
+function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
+  let alive = true;
+  socket.on("pong", () => {
+    alive = true;
+  });
+  const timer = setInterval(() => {
+    if (socket.readyState !== WsWebSocket.OPEN) {
+      clearInterval(timer);
+      return;
+    }
+    if (!alive) {
+      heartbeatTimeoutSockets.add(socket);
+      appMetrics.recordWsDisconnect(channel, "heartbeat_timeout");
+      socket.close();
+      clearInterval(timer);
+      return;
+    }
+    alive = false;
+    socket.ping();
+  }, WS_HEARTBEAT_MS);
+  socket.on("close", () => clearInterval(timer));
+}
+
+function consumeHeartbeatTimeout(socket: WsWebSocket) {
+  if (!heartbeatTimeoutSockets.has(socket)) {
+    return false;
+  }
+  heartbeatTimeoutSockets.delete(socket);
+  return true;
+}
+
+function updateRuntimeMetrics() {
+  const persistence = store.getPersistenceStatus();
+  const sources = store.getSourceStatus();
+  appMetrics.setRuntime({
+    persistence: {
+      postgres: persistence.postgres,
+      redis: persistence.redis
+    },
+    sources
+  });
+  appMetrics.setWsConnections("market", wsConnectionCounts.market);
+  appMetrics.setWsConnections("user", wsConnectionCounts.user);
+  appMetrics.setJsonlStats(store.getJsonlStats());
+}
+
+function metricsAuthorized(authHeader: string | string[] | undefined) {
+  if (!serverConfig.metricsBasicAuthUser || !serverConfig.metricsBasicAuthPassword) {
+    return true;
+  }
+  const header = typeof authHeader === "string" ? authHeader : undefined;
+  if (!header?.startsWith("Basic ")) {
+    return false;
+  }
+  const decoded = Buffer.from(header.slice("Basic ".length), "base64").toString("utf8");
+  return decoded === `${serverConfig.metricsBasicAuthUser}:${serverConfig.metricsBasicAuthPassword}`;
+}
+
+function requirePermission(user: UserRecord, code: string) {
+  assertCan(user, code as never);
 }
 
 function canViewAllLogs(user: UserRecord) {
-  return user.role === "Admin";
+  return hasPermission(user, "logs:view:all");
 }
 
 function canViewTeamLogs(user: UserRecord) {
-  return user.role === "Senior Tester" || user.role === "Test Engineer" || user.permissionCodes.includes("logs:view:team" as never);
+  return hasPermission(user, "logs:view:managed") || hasPermission(user, "logs:view:team");
 }
 
 function teamVisibleUserIds(user: UserRecord) {
-  return [
-    user.id,
-    ...store
-      .listUsers()
-      .filter((candidate) => candidate.role === "Tester" && candidate.seniorTesterId === user.id)
-      .map((candidate) => candidate.id)
-  ];
+  return getVisibleUserIdsForActor(user, store.listUserRecords());
 }
 
 function resolveAuditLogFilters(user: UserRecord, parsed: AuditLogQuery): AuditLogQuery {
@@ -444,7 +615,7 @@ function scopedUserIdsForActor(actor: UserRecord) {
 
 function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): LogSearchQuery {
   const scopedIds = scopedUserIdsForActor(actor);
-  const allUsers = store.listUsers();
+  const allUsers = store.listUsers() as unknown as UserRecord[];
   const requestedUser = parsed.userId ? store.getUserById(parsed.userId) : undefined;
   if (parsed.userId && !requestedUser) {
     throw new Error("Target user was not found.");
@@ -721,18 +892,12 @@ async function searchUnifiedLogs(actor: UserRecord, parsed: LogSearchQuery): Pro
 }
 
 function canListUsers(user: UserRecord) {
-  return user.permissionCodes.includes("users:list" as never);
+  return hasPermission(user, "users:list");
 }
 
 function listUsersForActor(actor: UserRecord) {
-  if (actor.role === "Admin") {
-    return store.listUsers();
-  }
-  if (actor.role === "Senior Tester" || actor.role === "Test Engineer") {
-    const visibleIds = new Set(teamVisibleUserIds(actor));
-    return store.listUsers().filter((user) => visibleIds.has(user.id));
-  }
-  return [];
+  const visibleIds = new Set(getVisibleUserIdsForActor(actor, store.listUserRecords()));
+  return store.listUsers().filter((user) => visibleIds.has(user.id));
 }
 
 function getTargetUserForManagement(actor: UserRecord, targetUserId: string) {
@@ -740,13 +905,8 @@ function getTargetUserForManagement(actor: UserRecord, targetUserId: string) {
   if (!target) {
     throw new Error("Target user was not found.");
   }
-  if (actor.role === "Admin") {
-    return target;
-  }
-  if (actor.role === "Senior Tester" && target.role === "Tester" && target.seniorTesterId === actor.id) {
-    return target;
-  }
-  throw new Error("Target user is outside your management scope.");
+  assertCanManageUser(actor, target, store.listUserRecords());
+  return target;
 }
 
 function getTargetUserForBalance(actor: UserRecord, targetUserId: string) {
@@ -756,18 +916,18 @@ function getTargetUserForBalance(actor: UserRecord, targetUserId: string) {
   return getTargetUserForManagement(actor, targetUserId);
 }
 
-function normalizeSeniorTesterId(role: Role, seniorTesterId?: string) {
+function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
   if (role !== "Tester") {
     return undefined;
   }
-  if (!seniorTesterId) {
+  if (!managerUserId) {
     return undefined;
   }
-  const senior = store.getUserById(seniorTesterId);
+  const senior = store.getUserById(managerUserId);
   if (!senior || senior.role !== "Senior Tester") {
-    throw new Error("seniorTesterId must point to a Senior Tester.");
+    throw new Error("managerUserId must point to a Senior Tester.");
   }
-  return seniorTesterId;
+  return managerUserId;
 }
 
 function stampSourceForTransport(source: SourceHealth, serverPublishTs: number): SourceHealth {
@@ -912,6 +1072,7 @@ async function recordUserManagementAudit(input: {
   actionType:
     | "user.create"
     | "user.bulkCreate"
+    | "user.update"
     | "user.disable"
     | "user.enable"
     | "user.resetPassword"
@@ -1128,6 +1289,35 @@ async function buildLogsExportZip(actor: UserRecord, query: ExportQuery) {
   );
 }
 
+async function loadDatasetExportLogs(actor: UserRecord, request: DatasetExportRequest) {
+  if (!hasPermission(actor, "data:export:all") && !hasPermission(actor, "data:export:managed")) {
+    throw new ApiError(403, "Missing permission: data export.", "PERMISSION_DENIED");
+  }
+  if (request.includeDGrade && !hasPermission(actor, "data:export:include-d")) {
+    throw new ApiError(403, "Only Admin can include D grade rows.", "PERMISSION_DENIED");
+  }
+  const allUsers = store.listUsers() as unknown as UserRecord[];
+  const visibleUserIds = getVisibleUserIdsForActor(actor, allUsers);
+  const requestedUserIds = request.userIds?.length ? request.userIds : visibleUserIds;
+  const userIds = requestedUserIds.filter((userId) => {
+    const target = store.getUserById(userId);
+    return target ? canExportUser(actor, target.id, allUsers) : false;
+  });
+  if (userIds.length !== requestedUserIds.length) {
+    throw new ApiError(403, "Dataset export includes users outside your scope.", "PERMISSION_DENIED");
+  }
+  const logs = await store.searchBehaviorLogs(
+    {
+      from: request.from,
+      to: request.to,
+      userIds,
+      limit: LOG_EXPORT_MAX_ROWS_PER_FILE
+    },
+    { limit: LOG_EXPORT_MAX_ROWS_PER_FILE }
+  );
+  return { userIds, logs };
+}
+
 async function safeRoute<T>(handler: () => Promise<T>) {
   return handler();
 }
@@ -1155,7 +1345,6 @@ function warnForLocalMisconfiguration() {
   }
 }
 
-let shuttingDown = false;
 let matchingRuntime: Awaited<ReturnType<typeof createMatchingServiceApp>> | undefined;
 
 const shutdown = async () => {
@@ -1209,10 +1398,33 @@ async function bootstrap() {
   logStartupStage("store.init done");
 
   await app.register(cors, {
-    origin: true,
+    origin: (origin, callback) => {
+      if (!origin || serverConfig.corsOrigins.length === 0 || serverConfig.corsOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("CORS origin is not allowed."), false);
+    },
     credentials: true
   });
   await app.register(websocket);
+  app.addHook("onRequest", async (request, reply) => {
+    httpStartTimes.set(request, Date.now());
+    const requestId =
+      typeof request.headers["x-request-id"] === "string" && request.headers["x-request-id"].trim()
+        ? request.headers["x-request-id"].trim()
+        : `req_${nanoid(12)}`;
+    request.headers["x-request-id"] = requestId;
+    reply.header("x-request-id", requestId);
+    if (shuttingDown && request.url.startsWith("/api/") && !request.url.startsWith("/api/health/live")) {
+      throw new ApiError(503, "Server is shutting down.", "SERVER_SHUTTING_DOWN");
+    }
+  });
+  app.addHook("onResponse", async (request, reply) => {
+    const startedAt = httpStartTimes.get(request) ?? Date.now();
+    const route = request.routeOptions.url ?? request.url.split("?")[0] ?? "unknown";
+    appMetrics.recordHttp(request.method, route, reply.statusCode, Math.max(Date.now() - startedAt, 0));
+  });
   app.setErrorHandler((error, _request, reply) => sendApiError(reply, error));
 
   app.get("/health", async () => {
@@ -1247,6 +1459,96 @@ async function bootstrap() {
     };
   });
 
+  app.get("/api/health/live", async () => ({
+    ok: true,
+    shuttingDown,
+    serverNow: Date.now(),
+    uptimeSec: Math.round(process.uptime())
+  }));
+
+  app.get("/api/health/ready", async (request, reply) => {
+    const persistence = store.getPersistenceStatus();
+    const matching = await engine.getMatchingHealth().catch(() => undefined);
+    const ready =
+      !shuttingDown &&
+      persistence.postgres &&
+      (!serverConfig.strictPersistence || persistence.state.postgres.state === "healthy") &&
+      (!serverConfig.embeddedMatchingService || Boolean(matching?.ok));
+    if (!ready) {
+      reply.code(503);
+    }
+    return {
+      ok: ready,
+      shuttingDown,
+      persistence,
+      matchingService: matching ?? { ok: false },
+      schemaMigration: serverConfig.expectedSchemaMigrationId,
+      sources: store.getSourceStatus(),
+      serverNow: Date.now()
+    };
+  });
+
+  app.get("/api/metrics", async () => {
+    updateRuntimeMetrics();
+    const memory = store.getMemoryStatus();
+    const profileCount = store.listUsers().length;
+    const jsonlStats = store.getJsonlStats();
+    const persistence = store.getPersistenceStatus();
+    const sources = store.getSourceStatus();
+    const orderLatencies = store
+      .getRecentLogs("")
+      .filter((log) => log.actionType === "place_order" && typeof log.backendLatencyMs === "number")
+      .map((log) => log.backendLatencyMs as number)
+      .sort((a, b) => a - b);
+    const p95Index = orderLatencies.length > 0 ? Math.min(orderLatencies.length - 1, Math.ceil(orderLatencies.length * 0.95) - 1) : -1;
+    return {
+      uptimeSec: Math.round(process.uptime()),
+      memoryMb: memory.heapUsedMb,
+      heapLimitMb: memory.heapLimitMb,
+      memoryProtectionState: memory.memoryProtectionState,
+      wsClients: wsConnectionCounts.market + wsConnectionCounts.user,
+      wsClientsByChannel: { ...wsConnectionCounts },
+      users: profileCount,
+      orderLatencyP95Ms: p95Index >= 0 ? orderLatencies[p95Index] : 0,
+      eventLoopLagMs: appMetrics.getEventLoopLagMs(),
+      http: {
+        metricsEnabled: serverConfig.metricsEnabled
+      },
+      ws: {
+        connections: wsConnectionCounts.market + wsConnectionCounts.user,
+        byChannel: { ...wsConnectionCounts }
+      },
+      orders: {
+        latencyP95Ms: p95Index >= 0 ? orderLatencies[p95Index] : 0,
+        sampleCount: orderLatencies.length
+      },
+      jsonl: jsonlStats,
+      persistence,
+      externalSources: sources.map((source) => ({
+        source: source.source,
+        state: source.state,
+        sourceEventAgeMs: Math.max(Date.now() - source.sourceEventTs, 0)
+      })),
+      exports: appMetrics.getExportOverview(),
+      sourceHealth: Object.fromEntries(sources.map((source) => [source.source.toLowerCase(), source.state]))
+    };
+  });
+
+  app.get("/metrics", async (request, reply) => {
+    if (!serverConfig.metricsEnabled) {
+      reply.code(404);
+      return "metrics disabled";
+    }
+    if (!metricsAuthorized(request.headers.authorization)) {
+      reply.header("www-authenticate", 'Basic realm="metrics"');
+      reply.code(401);
+      return "unauthorized";
+    }
+    updateRuntimeMetrics();
+    reply.header("content-type", appMetrics.contentType());
+    return appMetrics.text();
+  });
+
   app.post("/api/auth/login", async (request, reply) => {
     const serverRecvTs = Date.now();
     const parsed = loginSchema.safeParse(request.body);
@@ -1262,9 +1564,23 @@ async function bootstrap() {
       return { message: "Invalid login payload.", code: "VALIDATION_FAILED" };
     }
     const candidate = store.findUserByUsername(parsed.data.username);
+    if (candidate && store.isUserLocked(candidate)) {
+      await recordLoginAudit({
+        username: parsed.data.username,
+        user: candidate,
+        success: false,
+        serverRecvTs,
+        resultMessage: "User account is temporarily locked."
+      });
+      reply.code(423);
+      return { message: "User account is temporarily locked.", code: "ACCOUNT_LOCKED" };
+    }
     const user = store.findUserByCredentials(parsed.data.username, parsed.data.password);
     if (!user) {
       const disabledMatch = candidate && store.verifyUserPassword(candidate, parsed.data.password) && !candidate.isActive;
+      if (candidate && !disabledMatch) {
+        await store.recordFailedLogin(candidate);
+      }
       await recordLoginAudit({
         username: parsed.data.username,
         user: disabledMatch ? candidate : undefined,
@@ -1280,6 +1596,7 @@ async function bootstrap() {
     }
 
     const token = signToken(user);
+    await store.recordSuccessfulLogin(user);
     await recordLoginAudit({
       user,
       success: true,
@@ -1297,10 +1614,20 @@ async function bootstrap() {
       available_usdc: user.availableUsdc,
       is_active: user.isActive,
       senior_tester_id: user.seniorTesterId,
+      manager_user_id: user.managerUserId ?? user.seniorTesterId,
+      permission_level: user.permissionLevel ?? "Standard",
       created_at: user.createdAt,
       updated_at: user.updatedAt
     };
   });
+
+  app.post("/api/ws/tickets", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      const parsed = wsTicketSchema.parse(request.body);
+      return createWsTicket(user, parsed.channel);
+    })
+  );
 
   app.get("/api/me", async (request) =>
     safeRoute(async () => {
@@ -1325,6 +1652,32 @@ async function bootstrap() {
       await engine.updateLanguage(user, parsed.language as Language);
       store.emitUserPayload(user.id);
       return store.sanitizeUser(user);
+    })
+  );
+
+  app.patch("/api/me", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      const serverRecvTs = Date.now();
+      const parsed = selfProfileSchema.parse(request.body);
+      const updated = await store.updateUserProfile(user.id, {
+        displayName: parsed.displayName,
+        language: parsed.language as Language | undefined
+      });
+      await recordUserManagementAudit({
+        actor: user,
+        actionType: "user.update",
+        success: true,
+        serverRecvTs,
+        targetUserId: updated.id,
+        resultMessage: "User profile was updated.",
+        details: {
+          username: updated.username,
+          role: updated.role,
+          selfService: true
+        }
+      });
+      return store.sanitizeUser(updated);
     })
   );
 
@@ -1373,14 +1726,16 @@ async function bootstrap() {
       requirePermission(actor, "users:create");
       const serverRecvTs = Date.now();
       const parsed = createUserSchema.parse(request.body);
-      const seniorTesterId = normalizeSeniorTesterId(parsed.role as Role, parsed.seniorTesterId);
+      const managerUserId = normalizeManagerUserId(parsed.role as Role, parsed.managerUserId ?? parsed.seniorTesterId);
       const created = await store.createUser({
         username: parsed.username,
         password: parsed.password,
         displayName: parsed.displayName,
         role: parsed.role as Role,
         language: (parsed.language ?? "zh-CN") as Language,
-        seniorTesterId,
+        seniorTesterId: managerUserId,
+        managerUserId,
+        permissionLevel: (parsed.permissionLevel ?? "Standard") as PermissionLevel,
         availableUsdc: parsed.availableUsdc ?? serverConfig.initialBalance
       });
       await recordUserManagementAudit({
@@ -1393,11 +1748,178 @@ async function bootstrap() {
         details: {
           username: created.username,
           role: created.role,
-          seniorTesterId: created.seniorTesterId,
+          managerUserId: created.managerUserId ?? created.seniorTesterId,
           availableUsdc: created.availableUsdc
         }
       });
       return store.sanitizeUser(created);
+    })
+  );
+
+  app.patch("/api/users/:id", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:update");
+      const serverRecvTs = Date.now();
+      const params = request.params as { id: string };
+      if (params.id === actor.id) {
+        throw new Error("Use the profile controls to update your own account.");
+      }
+      const target = getTargetUserForManagement(actor, params.id);
+      const parsed = updateUserSchema.parse(request.body);
+      const nextRole = (parsed.role ?? target.role) as Role;
+      if (actor.role !== "Admin" && parsed.role && parsed.role !== target.role) {
+        throw new Error("Only Admin can change user roles.");
+      }
+      if (actor.role !== "Admin" && typeof parsed.isActive === "boolean") {
+        throw new Error("Use enable/disable actions for account status changes.");
+      }
+      const managerUserId = normalizeManagerUserId(
+        nextRole,
+        parsed.managerUserId === null || parsed.seniorTesterId === null
+          ? undefined
+          : parsed.managerUserId ?? parsed.seniorTesterId ?? target.managerUserId ?? target.seniorTesterId
+      );
+      const updated = await store.updateUserProfile(target.id, {
+        displayName: parsed.displayName,
+        role: nextRole,
+        language: parsed.language as Language | undefined,
+        seniorTesterId: managerUserId,
+        managerUserId,
+        permissionLevel: parsed.permissionLevel as PermissionLevel | undefined,
+        availableUsdc: parsed.availableUsdc,
+        isActive: parsed.isActive,
+        disabledBy: parsed.isActive === false ? actor.id : undefined
+      });
+      await recordUserManagementAudit({
+        actor,
+        actionType: "user.update",
+        success: true,
+        serverRecvTs,
+        targetUserId: updated.id,
+        resultMessage: "User profile was updated.",
+        details: {
+          username: updated.username,
+          role: updated.role,
+          managerUserId: updated.managerUserId ?? updated.seniorTesterId,
+          permissionLevel: updated.permissionLevel ?? "Standard",
+          availableUsdc: updated.availableUsdc,
+          isActive: updated.isActive
+        }
+      });
+      return store.sanitizeUser(updated);
+    })
+  );
+
+  app.get("/api/users/bulk/template.csv", async (_request, reply) => {
+    reply.header("content-type", "text/csv; charset=utf-8");
+    reply.header("content-disposition", 'attachment; filename="bulk-users-template.csv"');
+    return CSV_BULK_USER_TEMPLATE;
+  });
+
+  app.post("/api/users/bulk/csv/preview", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:bulk-create");
+      enforceRateLimit(clientKey(request, "bulk-users"), serverConfig.bulkImportRateLimitMax, serverConfig.writeRateLimitWindowMs);
+      const parsed = bulkUsersCsvSchema.parse(request.body);
+      const csv = parseBulkUsersCsv(parsed.csv, {
+        findManagerByUsername: (username) => {
+          const user = store.findUserByUsername(username);
+          return user ? store.sanitizeUser(user) : undefined;
+        }
+      });
+      const validation = validateBulkCreateUsers(csv.users, {
+        initialBalance: serverConfig.initialBalance,
+        usernameExists: (username) => Boolean(store.findUserByUsername(username)),
+        seniorTesterExists: (userId) => {
+          const senior = store.getUserById(userId);
+          return Boolean(senior && (senior.role === "Senior Tester" || senior.role === "Test Engineer"));
+        }
+      });
+      const failed = [...csv.failed, ...validation.failed];
+      appMetrics.recordBulkImport("csv_preview", failed.length > 0 ? "failed" : "success");
+      return {
+        total: csv.total,
+        valid: failed.length === 0 ? validation.normalized : [],
+        failed
+      };
+    })
+  );
+
+  app.post("/api/users/bulk/csv", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:bulk-create");
+      enforceRateLimit(clientKey(request, "bulk-users"), serverConfig.bulkImportRateLimitMax, serverConfig.writeRateLimitWindowMs);
+      const serverRecvTs = Date.now();
+      const parsed = bulkUsersCsvSchema.parse(request.body);
+      const csv = parseBulkUsersCsv(parsed.csv, {
+        findManagerByUsername: (username) => {
+          const user = store.findUserByUsername(username);
+          return user ? store.sanitizeUser(user) : undefined;
+        }
+      });
+      const validation = validateBulkCreateUsers(csv.users, {
+        initialBalance: serverConfig.initialBalance,
+        usernameExists: (username) => Boolean(store.findUserByUsername(username)),
+        seniorTesterExists: (userId) => {
+          const senior = store.getUserById(userId);
+          return Boolean(senior && (senior.role === "Senior Tester" || senior.role === "Test Engineer"));
+        }
+      });
+      const failed = [...csv.failed, ...validation.failed];
+      if (failed.length > 0) {
+        appMetrics.recordBulkImport("csv", "failed");
+        await recordUserManagementAudit({
+          actor,
+          actionType: "user.bulkCreate",
+          success: false,
+          serverRecvTs,
+          resultMessage: "CSV user import validation failed.",
+          details: {
+            requestedCount: csv.total,
+            source: "csv",
+            failed
+          }
+        });
+        return { created: [], failed, total: csv.total };
+      }
+
+      const created = [];
+      for (const item of validation.normalized) {
+        const user = await store.createUser({
+          username: item.username,
+          password: item.password,
+          displayName: item.displayName,
+          role: item.role,
+          language: item.language,
+          seniorTesterId: item.seniorTesterId,
+          managerUserId: item.managerUserId,
+          permissionLevel: item.permissionLevel,
+          mustChangePassword: item.mustChangePassword,
+          availableUsdc: item.availableUsdc
+        });
+        created.push({
+          rowNumber: item.rowNumber,
+          user: store.sanitizeUser(user)
+        });
+      }
+      await recordUserManagementAudit({
+        actor,
+        actionType: "user.bulkCreate",
+        success: true,
+        serverRecvTs,
+        resultMessage: "CSV user import completed.",
+        details: {
+          requestedCount: csv.total,
+          source: "csv",
+          createdCount: created.length,
+          usernames: created.map((item) => item.user.username)
+        }
+      });
+      appMetrics.recordBulkImport("csv", "success");
+      return { created, failed: [], total: csv.total };
     })
   );
 
@@ -1416,6 +1938,7 @@ async function bootstrap() {
         }
       });
       if (validation.failed.length > 0) {
+        appMetrics.recordBulkImport("legacy", "failed");
         await recordUserManagementAudit({
           actor,
           actionType: "user.bulkCreate",
@@ -1443,6 +1966,9 @@ async function bootstrap() {
           role: item.role,
           language: item.language,
           seniorTesterId: item.seniorTesterId,
+          managerUserId: item.managerUserId,
+          permissionLevel: item.permissionLevel,
+          mustChangePassword: item.mustChangePassword,
           availableUsdc: item.availableUsdc
         });
         created.push({
@@ -1462,6 +1988,7 @@ async function bootstrap() {
           usernames: created.map((item) => item.user.username)
         }
       });
+      appMetrics.recordBulkImport("legacy", "success");
       return {
         created,
         failed: [],
@@ -1605,12 +2132,14 @@ async function bootstrap() {
       const params = request.params as { id: string };
       const parsed = manualSettlementSchema.parse(request.body);
       return decorateRoundWithSettlementPreview(
-        await engine.manualSettleRound(user, {
-          roundId: params.id,
-          side: parsed.side,
-          price: parsed.price,
-          reason: parsed.reason
-        })
+        await store.withTransaction(() =>
+          engine.manualSettleRound(user, {
+            roundId: params.id,
+            side: parsed.side,
+            price: parsed.price,
+            reason: parsed.reason
+          })
+        )
       );
     })
   );
@@ -1654,19 +2183,27 @@ async function bootstrap() {
       requirePermission(user, "trade:order");
       store.assertWritablePersistence("Order placement");
       const parsed = orderSchema.parse(request.body);
-      const result = await engine.placeOrder(
-        user,
-        parsed as {
-          action?: "buy" | "sell";
-          side: TradeSide;
-          orderKind?: "market" | "limit";
-          amount?: number;
-          qty?: number;
-          limitPrice?: number;
-          clientSendTs?: number;
-        }
-      );
-      return { order: store.sanitizeOrder(result.order) };
+      const startedAt = Date.now();
+      try {
+        const result = await engine.placeOrder(
+          user,
+          parsed as {
+            action?: "buy" | "sell";
+            side: TradeSide;
+            orderKind?: "market" | "limit";
+            amount?: number;
+            qty?: number;
+            limitPrice?: number;
+            clientOrderId?: string;
+            clientSendTs?: number;
+          }
+        );
+        appMetrics.recordOrder(result.order.status, Date.now() - startedAt);
+        return { order: store.sanitizeOrder(result.order) };
+      } catch (error) {
+        appMetrics.recordOrder("failed", Date.now() - startedAt);
+        throw error;
+      }
     })
   );
 
@@ -1676,7 +2213,9 @@ async function bootstrap() {
       requirePermission(user, "trade:cancel");
       store.assertWritablePersistence("Order cancellation");
       const params = request.params as { id: string };
-      return store.sanitizeOrder(await engine.cancelOrder(user, params.id));
+      const cancelled = store.sanitizeOrder(await engine.cancelOrder(user, params.id));
+      appMetrics.recordOrder("cancelled", 0);
+      return cancelled;
     })
   );
 
@@ -1686,7 +2225,14 @@ async function bootstrap() {
       requirePermission(user, "trade:sell");
       store.assertWritablePersistence("Position sell");
       const params = request.params as { id: string };
-      return store.sanitizeOrder(await engine.sellPosition(user, params.id));
+      try {
+        const sold = store.sanitizeOrder(await store.withTransaction(() => engine.sellPosition(user, params.id)));
+        appMetrics.recordPositionClose("success");
+        return sold;
+      } catch (error) {
+        appMetrics.recordPositionClose("failed");
+        throw error;
+      }
     })
   );
 
@@ -1696,7 +2242,16 @@ async function bootstrap() {
       requirePermission(user, "trade:sell");
       store.assertWritablePersistence("Close side");
       const parsed = quickSideSchema.parse(request.body);
-      return await engine.closeSide(user, parsed as { side: TradeSide; clientSendTs?: number });
+      try {
+        const result = await store.withTransaction(() =>
+          engine.closeSide(user, parsed as { side: TradeSide; clientSendTs?: number })
+        );
+        appMetrics.recordPositionClose("success");
+        return result;
+      } catch (error) {
+        appMetrics.recordPositionClose("failed");
+        throw error;
+      }
     })
   );
 
@@ -1707,11 +2262,19 @@ async function bootstrap() {
       requirePermission(user, "trade:order");
       store.assertWritablePersistence("Reverse side");
       const parsed = quickSideSchema.parse(request.body);
-      const result = await engine.reverseSide(user, parsed as { side: TradeSide; clientSendTs?: number });
-      return {
-        ...result,
-        reverseOrder: store.sanitizeOrder(result.reverseOrder)
-      };
+      try {
+        const result = await store.withTransaction(() =>
+          engine.reverseSide(user, parsed as { side: TradeSide; clientSendTs?: number })
+        );
+        appMetrics.recordPositionClose("success");
+        return {
+          ...result,
+          reverseOrder: store.sanitizeOrder(result.reverseOrder)
+        };
+      } catch (error) {
+        appMetrics.recordPositionClose("failed");
+        throw error;
+      }
     })
   );
 
@@ -1746,11 +2309,75 @@ async function bootstrap() {
     })
   );
 
+  app.post("/api/datasets/export/preview", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      enforceRateLimit(clientKey(request, "dataset-export"), serverConfig.exportRateLimitMax, serverConfig.writeRateLimitWindowMs);
+      const parsed = datasetExportSchema.parse(request.body) as DatasetExportRequest;
+      if (parsed.format === "parquet") {
+        throw new ApiError(501, "Parquet dataset export is not available yet.", "NOT_IMPLEMENTED");
+      }
+      const { userIds, logs } = await loadDatasetExportLogs(actor, parsed);
+      return {
+        ...previewDatasetExport(logs, parsed.includeDGrade),
+        userCount: userIds.length
+      };
+    })
+  );
+
+  app.post("/api/datasets/export", async (request, reply) => {
+    try {
+      const actor = getUserFromRequest(request);
+      enforceRateLimit(clientKey(request, "dataset-export"), serverConfig.exportRateLimitMax, serverConfig.writeRateLimitWindowMs);
+      const parsed = datasetExportSchema.parse(request.body) as DatasetExportRequest;
+      if (parsed.format === "parquet") {
+        throw new ApiError(501, "Parquet dataset export is not available yet.", "NOT_IMPLEMENTED");
+      }
+      const { userIds, logs } = await loadDatasetExportLogs(actor, parsed);
+      const exportId = store.newId("dataset_export");
+      const generated = buildDatasetExport({
+        exportId,
+        actor: { id: actor.id, role: actor.role },
+        request: parsed,
+        userIds,
+        logs,
+        anonymizationSecret: serverConfig.exportAnonymizationSecret
+      });
+      await store.recordExportAudit({
+        exportId,
+        actorUserId: actor.id,
+        actorRole: actor.role,
+        exportType: "customer_dataset",
+        format: "zip",
+        scope: generated.manifest.scope,
+        recordCount: generated.preview.recordCount,
+        filteredDGradeCount: generated.preview.filteredDGradeCount,
+        missingQualityCount: generated.preview.missingQualityCount,
+        fileSha256: generated.sha256,
+        createdAtMs: generated.manifest.generatedAt,
+        details: {
+          formats: generated.manifest.formats,
+          userCount: userIds.length
+        }
+      });
+      appMetrics.recordExport("customer_dataset", "success", generated.preview.recordCount);
+      reply.header("content-type", "application/zip");
+      reply.header("content-disposition", `attachment; filename="customer-dataset-${exportId}.zip"`);
+      reply.header("x-export-id", exportId);
+      reply.header("x-export-sha256", generated.sha256);
+      return reply.send(generated.archive);
+    } catch (error) {
+      appMetrics.recordExport("customer_dataset", "failed");
+      return sendApiError(reply, error, "Dataset export failed.");
+    }
+  });
+
   app.get("/api/logs/export", async (request, reply) => {
     try {
       const user = getUserFromRequest(request);
       const parsed = exportLogQuerySchema.parse(request.query) as ExportQuery;
       const body = await buildLogsExportZip(user, parsed);
+      appMetrics.recordExport("internal_logs", "success");
       reply
         .header("Content-Type", "application/zip")
         .header("Content-Length", body.length)
@@ -1760,6 +2387,7 @@ async function bootstrap() {
         );
       return reply.send(body);
     } catch (error) {
+      appMetrics.recordExport("internal_logs", "failed");
       return sendApiError(reply, error, "Log export failed.");
     }
   });
@@ -1769,6 +2397,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       const parsed = logExportBodySchema.parse(request.body) as ExportQuery;
       const body = await buildLogsExportZip(user, parsed);
+      appMetrics.recordExport("internal_logs", "success");
       reply
         .header("Content-Type", "application/zip")
         .header("Content-Length", body.length)
@@ -1778,6 +2407,7 @@ async function bootstrap() {
         );
       return reply.send(body);
     } catch (error) {
+      appMetrics.recordExport("internal_logs", "failed");
       return sendApiError(reply, error, "Log export failed.");
     }
   });
@@ -1929,18 +2559,15 @@ async function bootstrap() {
 
   app.get("/ws/market", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string };
-      const token = readToken(query.token);
-      if (!token) {
-        socket.close();
-        return;
-      }
-      const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-      const user = store.getUserById(payload.userId);
+      const query = request.query as { token?: string; ticket?: string };
+      const user = getWsUser(query, "market");
       if (!user || !user.isActive) {
         socket.close();
         return;
       }
+      attachHeartbeat(socket, "market");
+      wsConnectionCounts.market += 1;
+      appMetrics.setWsConnections("market", wsConnectionCounts.market);
 
       let lastSentSeq = 0;
       let lastSentAt = 0;
@@ -2000,8 +2627,11 @@ async function bootstrap() {
           return;
         }
         sending = true;
-        socket.send(JSON.stringify({ type: "market", data }), (error?: Error) => {
+        const outbound = JSON.stringify({ type: "market", data });
+        const sendStartedAt = Date.now();
+        socket.send(outbound, (error?: Error) => {
           sending = false;
+          appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
           if (!error) {
             lastSentSeq = Math.max(lastSentSeq, seq);
             lastSentAt = Date.now();
@@ -2023,6 +2653,11 @@ async function bootstrap() {
       store.emitter.on("market:update", listener);
       socket.on("close", () => {
         closed = true;
+        wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
+        appMetrics.setWsConnections("market", wsConnectionCounts.market);
+        if (!consumeHeartbeatTimeout(socket)) {
+          appMetrics.recordWsDisconnect("market", "close");
+        }
         if (retryTimer) {
           clearTimeout(retryTimer);
         }
@@ -2035,18 +2670,15 @@ async function bootstrap() {
 
   app.get("/ws/user", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string };
-      const token = readToken(query.token);
-      if (!token) {
-        socket.close();
-        return;
-      }
-      const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-      const user = store.getUserById(payload.userId);
+      const query = request.query as { token?: string; ticket?: string };
+      const user = getWsUser(query, "user");
       if (!user || !user.isActive) {
         socket.close();
         return;
       }
+      attachHeartbeat(socket, "user");
+      wsConnectionCounts.user += 1;
+      appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
       const eventName = `user:${user.id}`;
       const sendPayload = () => {
@@ -2055,24 +2687,31 @@ async function bootstrap() {
           socket.close();
           return;
         }
-        socket.send(
-          JSON.stringify({
-            type: "user",
-            data: {
-              profile: store.getProfile(user.id),
-              operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-              positions: store.getPositions(user.id),
-              orders: store.getOrders(user.id),
-              logs: store.getRecentLogs(user.id)
-            }
-          })
-        );
+        const outbound = JSON.stringify({
+          type: "user",
+          data: {
+            profile: store.getProfile(user.id),
+            operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
+            positions: store.getPositions(user.id),
+            orders: store.getOrders(user.id),
+            logs: store.getRecentLogs(user.id)
+          }
+        });
+        const sendStartedAt = Date.now();
+        socket.send(outbound, (error?: Error) => {
+          appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
+        });
       };
 
       const listener = () => sendPayload();
       sendPayload();
       store.emitter.on(eventName, listener);
       socket.on("close", () => {
+        wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
+        appMetrics.setWsConnections("user", wsConnectionCounts.user);
+        if (!consumeHeartbeatTimeout(socket)) {
+          appMetrics.recordWsDisconnect("user", "close");
+        }
         store.emitter.off(eventName, listener);
       });
     } catch {

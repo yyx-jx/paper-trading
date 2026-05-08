@@ -1,15 +1,32 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file:
+      - ${APP_ENV_FILE:-.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app-server:
+        condition: service_healthy
+
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: paper_trading
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-paper_trading}
+      POSTGRES_USER: ${POSTGRES_USER:-paper_trading}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
+      - backups:/backups
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d paper_trading"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-paper_trading} -d ${POSTGRES_DB:-paper_trading}"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -19,7 +36,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redis_data:/data
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -35,17 +52,18 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/paper_trading
+      DATABASE_URL: postgresql://${POSTGRES_USER:-paper_trading}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-paper_trading}
       REDIS_URL: redis://redis:6379
+      NODE_ENV: production
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "8788:8788"
+    expose:
+      - "8788"
     volumes:
-      - app_logs:/app/data/logs
+      - logs:/app/data/logs
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8788/health"]
       interval: 10s
@@ -61,10 +79,14 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/paper_trading
+      DATABASE_URL: postgresql://${POSTGRES_USER:-paper_trading}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-paper_trading}
       REDIS_URL: redis://redis:6379
       MATCHING_SERVICE_URL: http://matching-service:8788
       EMBEDDED_MATCHING_SERVICE: "false"
+      NODE_ENV: production
+      SERVER_REQUIRE_MIGRATIONS: "true"
+      SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP: "false"
+      TRUST_PROXY: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,17 +94,58 @@ services:
         condition: service_healthy
       matching-service:
         condition: service_healthy
-    ports:
-      - "8787:8787"
+    expose:
+      - "8787"
     volumes:
-      - app_logs:/app/data/logs
+      - logs:/app/data/logs
+      - backups:/app/backups
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/health/ready"]
       interval: 10s
       timeout: 5s
       retries: 12
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      app-server:
+        condition: service_healthy
+    expose:
+      - "9090"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-grafana-password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    expose:
+      - "3000"
+
 volumes:
-  postgres_data:
-  redis_data:
-  app_logs:
+  pgdata:
+  redisdata:
+  logs:
+  backups:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  grafana_data:

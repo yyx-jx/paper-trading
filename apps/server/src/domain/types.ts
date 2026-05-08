@@ -1,21 +1,38 @@
 export type Language = "zh-CN" | "en-US";
 export type Role = "Tester" | "Senior Tester" | "Test Engineer" | "Admin";
+export type PermissionLevel = "Initial" | "Standard";
 export type PermissionCode =
   | "trade:view"
   | "trade:order"
   | "trade:cancel"
   | "trade:sell"
   | "profile:view"
+  | "profile:update"
+  | "profile:password:change"
   | "system:status:view"
   | "audit:view"
+  | "audit:export"
   | "users:list"
   | "users:create"
   | "users:bulk-create"
+  | "users:update"
   | "users:disable"
+  | "users:enable"
   | "users:reset-password"
   | "users:balance:set"
+  | "users:manager:update"
+  | "users:permission-level:update"
   | "logs:view:all"
-  | "logs:view:team";
+  | "logs:view:team"
+  | "logs:view:self"
+  | "logs:view:managed"
+  | "data:export:self"
+  | "data:export:managed"
+  | "data:export:all"
+  | "data:export:include-d"
+  | "quality:review"
+  | "strategy:config"
+  | "market:config";
 export type TradeSide = "UP" | "DOWN";
 export type OrderAction = "buy" | "sell";
 export type OrderStatus = "pending" | "filled" | "partial" | "failed" | "cancelled";
@@ -58,6 +75,13 @@ export interface UserRecord {
   availableUsdc: number;
   isActive: boolean;
   seniorTesterId?: string;
+  managerUserId?: string;
+  permissionLevel?: PermissionLevel;
+  failedLoginCount?: number;
+  lockedUntil?: number;
+  passwordChangedAt?: number;
+  lastLoginAt?: number;
+  mustChangePassword?: boolean;
   disabledAt?: number;
   disabledBy?: string;
   createdAt: number;
@@ -74,6 +98,12 @@ export interface PublicUser {
   availableUsdc: number;
   isActive: boolean;
   seniorTesterId?: string;
+  managerUserId?: string;
+  permissionLevel?: PermissionLevel;
+  lockedUntil?: number;
+  passwordChangedAt?: number;
+  lastLoginAt?: number;
+  mustChangePassword?: boolean;
   disabledAt?: number;
   disabledBy?: string;
   createdAt: number;
@@ -486,6 +516,7 @@ export interface OrderRecord {
   persistLatencyMs?: number;
   totalOrderLatencyMs?: number;
   failureReason?: string;
+  clientOrderId?: string;
   clientSendTs?: number;
   serverRecvTs: number;
   serverPublishTs: number;
@@ -550,6 +581,12 @@ export interface PositionRecord {
   sourceLatencyMs?: number;
   unrealizedPnl: number;
   realizedPnl: number;
+  entryFeeUsdc?: number;
+  exitFeeUsdc?: number;
+  totalFeeUsdc?: number;
+  costBasisUsdc?: number;
+  markPnlUsdc?: number;
+  executablePnlUsdc?: number;
   status: "open" | "closed";
   displayStatus?: "open" | "pending_settlement" | "settled" | "sold";
   openedAt: number;
@@ -703,6 +740,53 @@ export interface UnifiedLogRow {
   latencyPhaseMetrics?: Partial<Record<LatencyPhase, number>>;
   matchingLogKind?: MatchingLogKind;
   payload?: Record<string, unknown>;
+}
+
+export interface DatasetExportRequest {
+  from?: number;
+  to?: number;
+  userIds?: string[];
+  includeDGrade?: boolean;
+  format?: "zip" | "parquet";
+}
+
+export interface DatasetExportPreview {
+  recordCount: number;
+  filteredDGradeCount: number;
+  missingQualityCount: number;
+  userCount: number;
+  formats: Array<"csv" | "jsonl">;
+}
+
+export interface DatasetExportManifest {
+  exportId: string;
+  generatedAt: number;
+  generatedAtIso: string;
+  formats: Array<"csv" | "jsonl">;
+  recordCount: number;
+  filteredDGradeCount: number;
+  missingQualityCount: number;
+  userCount: number;
+  scope: {
+    userIds: string[];
+    includeDGrade: boolean;
+    from?: number;
+    to?: number;
+  };
+  files: Array<{ path: string; sha256: string; rowCount?: number }>;
+}
+
+export interface DatasetExportAuditEvent {
+  exportId: string;
+  actorUserId: string;
+  actorRole: Role;
+  scope: DatasetExportManifest["scope"];
+  formats: Array<"csv" | "jsonl">;
+  recordCount: number;
+  filteredDGradeCount: number;
+  missingQualityCount: number;
+  sha256: string;
+  createdAtMs: number;
 }
 
 export interface LogSearchResult {

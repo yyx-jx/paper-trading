@@ -29,6 +29,7 @@ interface DetailedMarketPayload {
   slug: string;
   question: string;
   endDate: string;
+  eventStartTime?: string;
   resolutionSource?: string;
   bestBid?: number;
   bestAsk?: number;
@@ -404,67 +405,6 @@ function normalizeMarketOutcomes(payload: DetailedMarketPayload) {
     upPrice: toFloat(up.price),
     downPrice: toFloat(down.price)
   };
-}
-
-function isBtcPrice(value: number) {
-  return Number.isFinite(value) && value > 1000 && value < 1_000_000;
-}
-
-function collectBtcPriceCandidates(value: unknown, path: string[] = []): Array<{ price: number; source: string }> {
-  if (typeof value === "number" || typeof value === "string") {
-    const price = Number(value);
-    const source = path.join(".");
-    const normalized = source.toLowerCase();
-    const excluded =
-      normalized.includes("outcomeprices") ||
-      normalized.includes("outcome_prices") ||
-      normalized.includes("bestbid") ||
-      normalized.includes("bestask") ||
-      normalized.includes("lasttrade") ||
-      normalized.includes("timestamp") ||
-      normalized.includes("time") ||
-      normalized.includes("date") ||
-      normalized.includes("token") ||
-      normalized.includes("id");
-    const priceLike =
-      normalized.includes("price") ||
-      normalized.includes("reference") ||
-      normalized.includes("target") ||
-      normalized.includes("beat") ||
-      normalized.includes("resolution") ||
-      normalized.includes("settle") ||
-      normalized.includes("close") ||
-      normalized.includes("open");
-    return isBtcPrice(price) && priceLike && !excluded ? [{ price, source }] : [];
-  }
-
-  if (Array.isArray(value)) {
-    return value.flatMap((item, index) => collectBtcPriceCandidates(item, [...path, String(index)]));
-  }
-
-  if (value && typeof value === "object") {
-    return Object.entries(value as Record<string, unknown>).flatMap(([key, nested]) =>
-      collectBtcPriceCandidates(nested, [...path, key])
-    );
-  }
-
-  return [];
-}
-
-function pickBtcPriceCandidate(
-  candidates: Array<{ price: number; source: string }>,
-  mode: "open" | "close" | "reference"
-) {
-  const preferred =
-    mode === "open"
-      ? ["pricetobeat", "price_to_beat", "open", "start", "initial", "reference"]
-      : mode === "close"
-        ? ["close", "final", "settlement", "settle", "resolution", "resolved"]
-        : ["pricetobeat", "price_to_beat", "reference", "target", "resolution", "open"];
-  return (
-    candidates.find((candidate) => preferred.some((token) => candidate.source.toLowerCase().includes(token))) ??
-    (mode === "reference" ? candidates[0] : undefined)
-  );
 }
 
 function normalizeText(value?: string) {
@@ -1490,15 +1430,12 @@ export class PolymarketConnector {
     const normalizedOutcomes = normalizeMarketOutcomes(payload);
     const event = payload.events?.[0];
     const slugStartAt = parseBtcFiveMinuteSlugStart(payload.slug) ?? parseBtcFiveMinuteSlugStart(event?.slug);
+    const parsedEventStartAt = Date.parse(payload.eventStartTime ?? "");
     const parsedStartAt = Date.parse(event?.startTime ?? event?.startDate ?? payload.endDate);
     const parsedEndAt = Date.parse(payload.endDate);
-    const startAt = slugStartAt ?? parsedStartAt;
-    const endAt = slugStartAt ? slugStartAt + FIVE_MINUTE_MS : parsedEndAt;
+    const startAt = Number.isFinite(parsedEventStartAt) ? parsedEventStartAt : slugStartAt ?? parsedStartAt;
+    const endAt = Number.isFinite(parsedEndAt) ? parsedEndAt : startAt + FIVE_MINUTE_MS;
     const raw = payload as unknown as Record<string, unknown>;
-    const btcPriceCandidates = collectBtcPriceCandidates(raw);
-    const referencePrice = pickBtcPriceCandidate(btcPriceCandidates, "reference");
-    const referenceOpenPrice = pickBtcPriceCandidate(btcPriceCandidates, "open");
-    const referenceClosePrice = pickBtcPriceCandidate(btcPriceCandidates, "close");
     const winningOutcome = String(
       payload.winningOutcome ?? payload.winner ?? payload.resolutionOutcome ?? raw.resolvedOutcome ?? ""
     );
@@ -1522,12 +1459,6 @@ export class PolymarketConnector {
       upOutcome: normalizedOutcomes.upOutcome,
       downOutcome: normalizedOutcomes.downOutcome,
       outcomePrices: [normalizedOutcomes.upPrice, normalizedOutcomes.downPrice],
-      referencePrice: referencePrice?.price,
-      referencePriceSource: referencePrice?.source,
-      referenceOpenPrice: referenceOpenPrice?.price,
-      referenceOpenPriceSource: referenceOpenPrice?.source,
-      referenceClosePrice: referenceClosePrice?.price,
-      referenceClosePriceSource: referenceClosePrice?.source,
       winningTokenId: winningTokenId || undefined,
       winningOutcome: winningOutcome || undefined,
       settlementPrice: payload.closed ? Math.max(normalizedOutcomes.upPrice, normalizedOutcomes.downPrice) : undefined,

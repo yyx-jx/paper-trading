@@ -298,12 +298,18 @@ async function testRedeemWritesWalletPositionAndAudit() {
   const behaviorLogs: Array<{ actionType: string }> = [];
   const persistedUsers: string[] = [];
   const persistedPositions: string[] = [];
+  const claimedRedeems: string[] = [];
   const settledLifecycles: Array<{ userId: string; roundId: string; side: string; settlementResult: string }> = [];
   const emittedUsers: string[] = [];
 
   const engine = createEngineStub();
   engine.store = {
     positions: [position],
+    withTransaction: async (handler: () => Promise<unknown>) => handler(),
+    claimRedeemLedger: async (input: { roundId: string; userId: string; positionId: string }) => {
+      claimedRedeems.push(`${input.roundId}:${input.userId}:${input.positionId}`);
+      return true;
+    },
     getUserById: (userId: string) => (userId === user.id ? user : undefined),
     persistUser: async (nextUser: { id: string }) => persistedUsers.push(nextUser.id),
     persistPosition: async (nextPosition: { id: string }) => persistedPositions.push(nextPosition.id),
@@ -314,6 +320,7 @@ async function testRedeemWritesWalletPositionAndAudit() {
         side: input.side,
         settlementResult: input.settlementResult
       }),
+    upsertRound: async () => undefined,
     emitUserPayload: (userId: string) => emittedUsers.push(userId),
     newId: (prefix: string) => `${prefix}-1`,
     newTraceId: () => "trace-1"
@@ -380,6 +387,7 @@ async function testRedeemWritesWalletPositionAndAudit() {
   assert.ok(round.redeemFinishTs);
   assert.ok(auditEvents.some((event) => event.actionType === "redeem_position" && event.userId === user.id));
   assert.ok(behaviorLogs.some((log) => log.actionType === "redeem_position"));
+  assert.deepEqual(claimedRedeems, ["round-1:u1:pos-1"]);
   assert.deepEqual(persistedUsers, [user.id]);
   assert.deepEqual(persistedPositions, [position.id]);
   assert.deepEqual(emittedUsers, [user.id]);

@@ -1,0 +1,98 @@
+groups:
+  - name: btc-paper-trading
+    rules:
+      - alert: AppDown
+        expr: up{job="app-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: app-server scrape is down
+
+      - alert: ReadinessFailed
+        expr: up{job="app-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: app-server readiness or metrics scrape failed
+
+      - alert: HighEventLoopLag
+        expr: nodejs_event_loop_lag_seconds > 0.2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Event loop lag p95 is above 200ms
+
+      - alert: HighHeapUsage
+        expr: nodejs_heap_size_used_bytes / nodejs_heap_size_total_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Node heap usage is above 80 percent
+
+      - alert: PostgresUnavailable
+        expr: persistence_state{target="postgres"} < 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: PostgreSQL is unhealthy
+
+      - alert: RedisUnavailable
+        expr: persistence_state{target="redis"} < 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Redis is unhealthy
+
+      - alert: ExternalSourceStale
+        expr: source_stale_age_seconds{source=~"clob|binance|chainlink"} > 60
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: External market source is stale
+
+      - alert: HighOrderFailureRate
+        expr: sum(rate(order_status_total{status=~"failed|rejected"}[5m])) / clamp_min(sum(rate(order_status_total[5m])), 1) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Order failure rate is above 10 percent
+
+      - alert: JsonlQueueBacklog
+        expr: jsonl_queue_depth > 5000 or jsonl_backlog_state > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: JSONL writer queue backlog is high
+
+      - alert: JsonlDroppedRecords
+        expr: increase(jsonl_dropped_records_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: JSONL writer dropped records
+
+      - alert: WsBackpressure
+        expr: sum(rate(ws_send_duration_seconds_count{status="failed"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: WebSocket send failures are increasing
+
+      - alert: ExportFailures
+        expr: sum(rate(export_requests_total{status="failed"}[5m])) / clamp_min(sum(rate(export_requests_total[5m])), 1) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Export failure rate is above 20 percent

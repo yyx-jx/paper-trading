@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import path from "node:path";
 import { nanoid } from "nanoid";
 import { Pool } from "pg";
@@ -10,6 +10,7 @@ import type {
   MatchingReplayResult,
   MatchingReplayStep
 } from "../../domain/types";
+import { AsyncJsonlWriter } from "../log-writer";
 
 const STARTUP_CONNECT_RETRY_ATTEMPTS = 10;
 const STARTUP_CONNECT_RETRY_DELAY_MS = 2000;
@@ -110,6 +111,12 @@ CREATE INDEX IF NOT EXISTS idx_matching_events_payload_user_id
 const LOG_DIR = path.resolve(process.cwd(), "data/logs");
 const EVENT_LOG_FILE = path.join(LOG_DIR, "matching-events.jsonl");
 const SNAPSHOT_LOG_FILE = path.join(LOG_DIR, "matching-snapshots.jsonl");
+const JSONL_WRITER_OPTIONS = {
+  batchSize: 100,
+  flushIntervalMs: 500,
+  maxFileBytes: 50 * 1024 * 1024,
+  maxQueueDepth: 10_000
+};
 
 interface StoredSnapshotLine {
   bookKey: string;
@@ -125,6 +132,11 @@ export class MatchingStore {
   private closed = false;
   private readonly books = new Map<string, MatchingBookState>();
   private readonly events: MatchingEventRecord[] = [];
+  private readonly eventLogWriter = new AsyncJsonlWriter<MatchingEventRecord>(EVENT_LOG_FILE, JSONL_WRITER_OPTIONS);
+  private readonly snapshotLogWriter = new AsyncJsonlWriter<{ bookKey: string; state: MatchingBookState }>(
+    SNAPSHOT_LOG_FILE,
+    JSONL_WRITER_OPTIONS
+  );
   private readonly persistenceHealth: {
     postgres: PersistenceHealth;
     redis: PersistenceHealth;
@@ -182,6 +194,8 @@ export class MatchingStore {
     if (this.redis?.isOpen) {
       await this.redis.quit().catch(() => undefined);
     }
+    await this.eventLogWriter.close();
+    await this.snapshotLogWriter.close();
     await this.closePostgresPool();
     await this.postgresReconnectTask?.catch(() => undefined);
   }
@@ -362,15 +376,11 @@ export class MatchingStore {
     this.events.push({ ...event, payload: { ...event.payload } });
     this.pruneMemory(event.createdAt);
 
-    appendFileSync(EVENT_LOG_FILE, `${JSON.stringify(event)}\n`, "utf-8");
-    appendFileSync(
-      SNAPSHOT_LOG_FILE,
-      `${JSON.stringify({
-        bookKey: state.bookKey,
-        state: stateCopy
-      })}\n`,
-      "utf-8"
-    );
+    this.eventLogWriter.write(event);
+    this.snapshotLogWriter.write({
+      bookKey: state.bookKey,
+      state: stateCopy
+    });
 
     await Promise.all([
       this.runDb(

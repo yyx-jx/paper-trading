@@ -28,6 +28,7 @@ import {
   type OrderAction,
   type OrderRecord,
   type PaperOrderKind,
+  type PermissionLevel,
   type PositionRecord,
   type ProfileOverview,
   type PublicUser,
@@ -38,6 +39,7 @@ import {
   type TradeSide,
   type TradeTimeline,
   type UnifiedLogRow,
+  type UpdateUserInput,
   type UserPayload
 } from "./utils/api";
 import {
@@ -45,7 +47,12 @@ import {
   orderBookAgeMs
 } from "./utils/displayMetrics";
 import { layoutChartPriceLabels, nextChartVisibleCount, nextChartYZoom } from "./utils/chartWheel";
+import { FieldChip } from "./components/FieldChip";
+import { PersonalHomePage } from "./features/profile/PersonalHomePage";
+import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
+import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
 import { useAppStore } from "./store/useAppStore";
+import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, utcParts } from "./utils/format";
 
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
 
@@ -60,49 +67,6 @@ declare global {
     };
   }
 }
-
-const money = (value = 0, digits = 2) =>
-  new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits
-  }).format(value);
-
-const decimal = (value = 0, digits = 2) => value.toFixed(digits);
-const signedMoney = (value = 0) => `${value >= 0 ? "+" : "-"}${money(Math.abs(value))}`;
-
-function pad2(value: number) {
-  return String(value).padStart(2, "0");
-}
-
-function utcParts(value: number) {
-  const date = new Date(value);
-  return {
-    year: date.getUTCFullYear(),
-    month: pad2(date.getUTCMonth() + 1),
-    day: pad2(date.getUTCDate()),
-    hour: pad2(date.getUTCHours()),
-    minute: pad2(date.getUTCMinutes()),
-    second: pad2(date.getUTCSeconds())
-  };
-}
-
-const timeText = (value?: number) => {
-  if (!value) {
-    return "--";
-  }
-  const { hour, minute, second } = utcParts(value);
-  return `${hour}:${minute}:${second} UTC`;
-};
-
-const dateTimeText = (value?: number) => {
-  if (!value) {
-    return "--";
-  }
-  const { year, month, day, hour, minute, second } = utcParts(value);
-  return `${year}-${month}-${day} ${hour}:${minute}:${second} UTC`;
-};
 
 const compactPercent = (value = 0) => `${(value * 100).toFixed(1)}%`;
 const jsonPreview = (value: unknown) => JSON.stringify(value ?? {}, null, 2);
@@ -568,18 +532,6 @@ function countdownTone(countdownMs: number) {
   return "live";
 }
 
-function tokenCents(value?: number, digits = 1) {
-  return `${decimal((value ?? 0) * 100, digits)}¢`;
-}
-
-function tokenPriceText(value?: number, digits = 1) {
-  return tokenCents(value, digits);
-}
-
-function positionDisplayedPnl(position: PositionRecord) {
-  return position.displayStatus === "open" ? position.unrealizedPnl : position.realizedPnl;
-}
-
 function isCurrentRoundOrder(order: OrderRecord, currentRound?: RoundRecord) {
   if (!currentRound) {
     return false;
@@ -764,10 +716,6 @@ function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: numb
           : 0,
     disabled: false
   };
-}
-
-function localLabel(language: Language, zh: string, en: string) {
-  return language === "zh-CN" ? zh : en;
 }
 
 function TerminalSection(props: { title: string; meta?: string; children: ReactNode }) {
@@ -1022,7 +970,12 @@ function roundHasEnded(round: Pick<RoundRecord, "endAt">, nowMs: number) {
 
 function preliminarySideFromRound(round: RoundRecord) {
   const price = round.closingSpotPrice ?? round.binanceClosePrice ?? round.polymarketClosePrice;
-  if (typeof price !== "number" || !Number.isFinite(price) || !isBtcReferencePrice(round.priceToBeat)) {
+  if (
+    typeof price !== "number" ||
+    !Number.isFinite(price) ||
+    !isBtcReferencePrice(round.priceToBeat) ||
+    !isOfficialPtbSource(round.priceToBeatSource)
+  ) {
     return undefined;
   }
   return price >= round.priceToBeat ? "UP" : "DOWN";
@@ -1406,6 +1359,11 @@ function isBtcReferencePrice(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 1000;
 }
 
+function isOfficialPtbSource(source?: string) {
+  const normalized = source?.toLowerCase() ?? "";
+  return normalized.includes("chainlink data streams") || normalized.includes("data.chain.link");
+}
+
 function btcMoneyOrDash(value?: number) {
   return isBtcReferencePrice(value) ? money(value) : "--";
 }
@@ -1430,10 +1388,6 @@ function AppMetric(props: {
       {props.caption ? <small>{props.caption}</small> : null}
     </div>
   );
-}
-
-function FieldChip(props: { label: string; tone?: "positive" | "negative" | "neutral" | "warning" | "info" }) {
-  return <span className={`field-chip tone-${props.tone ?? "neutral"}`}>{props.label}</span>;
 }
 
 function CandlestickChart(props: {
@@ -1995,7 +1949,7 @@ function App() {
       : currentRound?.endAt;
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
-  const canOpenUserManagement = me?.role === "Admin" || me?.role === "Senior Tester";
+  const canOpenUserManagement = Boolean(me?.permissionCodes.includes("users:list"));
 
   useEffect(() => {
     setChartVisibleCount(defaultVisibleCountForInterval(selectedInterval));
@@ -2098,7 +2052,7 @@ function App() {
       }
       marketReconnectTimer = window.setTimeout(() => {
         marketReconnectTimer = undefined;
-        connectMarketSocket();
+        void connectMarketSocket();
       }, reconnectDelayMs);
     };
 
@@ -2108,16 +2062,26 @@ function App() {
       }
       userReconnectTimer = window.setTimeout(() => {
         userReconnectTimer = undefined;
-        connectUserSocket();
+        void connectUserSocket();
       }, reconnectDelayMs);
     };
 
-    const connectMarketSocket = () => {
+    const connectMarketSocket = async () => {
       if (disposed) {
         return;
       }
       marketSocket?.close();
-      const socket = new WebSocket(api.createWsUrl("/ws/market", token));
+      let wsUrl = api.createWsUrl("/ws/market", token);
+      try {
+        const ticket = await api.createWsTicket(token, "market");
+        wsUrl = api.createWsTicketUrl("/ws/market", ticket.ticket);
+      } catch {
+        wsUrl = api.createWsUrl("/ws/market", token);
+      }
+      if (disposed) {
+        return;
+      }
+      const socket = new WebSocket(wsUrl);
       marketSocket = socket;
       socket.onopen = () => {
         markMarketActivity();
@@ -2153,12 +2117,22 @@ function App() {
       };
     };
 
-    const connectUserSocket = () => {
+    const connectUserSocket = async () => {
       if (disposed) {
         return;
       }
       userSocket?.close();
-      const socket = new WebSocket(api.createWsUrl("/ws/user", token));
+      let wsUrl = api.createWsUrl("/ws/user", token);
+      try {
+        const ticket = await api.createWsTicket(token, "user");
+        wsUrl = api.createWsTicketUrl("/ws/user", ticket.ticket);
+      } catch {
+        wsUrl = api.createWsUrl("/ws/user", token);
+      }
+      if (disposed) {
+        return;
+      }
+      const socket = new WebSocket(wsUrl);
       userSocket = socket;
       socket.onmessage = (event) => {
         const parsed = JSON.parse(event.data) as {
@@ -2202,8 +2176,8 @@ function App() {
       }
     };
 
-    connectMarketSocket();
-    connectUserSocket();
+    void connectMarketSocket();
+    void connectUserSocket();
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleForegroundRecovery);
     window.addEventListener("pageshow", handleForegroundRecovery);
@@ -2518,17 +2492,15 @@ function App() {
             <button className={currentPage === "trade" ? "active" : ""} onClick={() => setCurrentPage("trade")}>
               {t("trade")}
             </button>
+            <button className={currentPage === "home" ? "active" : ""} onClick={() => setCurrentPage("home")}>
+              {t("home")}
+            </button>
             <button className={currentPage === "profile" ? "active" : ""} onClick={() => setCurrentPage("profile")}>
               {t("profile")}
             </button>
             <button className={currentPage === "logs" ? "active" : ""} onClick={() => setCurrentPage("logs")}>
               {t("auditSearch")}
             </button>
-            {canOpenUserManagement ? (
-              <button className={currentPage === "users" ? "active" : ""} onClick={() => setCurrentPage("users")}>
-                {localLabel((i18n.language as Language) ?? "zh-CN", "用户管理", "Users")}
-              </button>
-            ) : null}
           </nav>
           <select value={i18n.language} onChange={(event) => handleLanguageChange(event.target.value as Language)}>
             <option value="zh-CN">简体中文</option>
@@ -2558,7 +2530,6 @@ function App() {
             currentRound={currentRound}
             settlementPreview={settlementPreview}
             currentPage={currentPage}
-            canOpenUserManagement={canOpenUserManagement}
             history={history}
             snapshot={snapshot}
             profile={profile}
@@ -2604,6 +2575,37 @@ function App() {
             timelineBusyOrderId={timelineBusyOrderId}
             cancelBusyOrderId={cancelBusyOrderId}
           />
+        ) : currentPage === "home" ? (
+          <PersonalHomePage
+            t={t}
+            token={token}
+            me={me}
+            language={(i18n.language as Language) ?? "zh-CN"}
+            profile={profile}
+            positions={positions}
+            logs={logs}
+            canOpenUserManagement={canOpenUserManagement}
+            userManagementSlot={
+              canOpenUserManagement ? (
+                <UserManagementPage
+                  t={t}
+                  token={token}
+                  me={me}
+                  language={(i18n.language as Language) ?? "zh-CN"}
+                  embedded
+                  onProfileRefresh={async () => {
+                    const nextMe = await api.getMe(token);
+                    setUser(nextMe);
+                  }}
+                />
+              ) : undefined
+            }
+            onProfileRefresh={async () => {
+              const nextMe = await api.getMe(token);
+              setUser(nextMe);
+            }}
+            onUserUpdated={setUser}
+          />
         ) : currentPage === "profile" ? (
           <AnalyticsPage
             t={t}
@@ -2616,31 +2618,18 @@ function App() {
             orders={orders}
             logs={logs}
             onSell={handleSell}
-            onCancel={handleCancelOrder}
             onTimeline={handleOpenTimeline}
             onOpenRoundLogs={handleOpenRoundLogs}
             timelineBusyOrderId={timelineBusyOrderId}
-            cancelBusyOrderId={cancelBusyOrderId}
             selectedRoundLogId={roundLogDialog?.item.roundId}
             roundLogBusyRoundId={roundLogBusyRoundId}
           />
-        ) : currentPage === "logs" ? (
+        ) : (
           <LogSearchPage
             t={t}
             token={token}
             me={me}
             canExport={me.permissionCodes.includes("profile:view") || me.role === "Admin"}
-          />
-        ) : (
-          <UserManagementPage
-            t={t}
-            token={token}
-            me={me}
-            language={(i18n.language as Language) ?? "zh-CN"}
-            onProfileRefresh={async () => {
-              const nextMe = await api.getMe(token);
-              setUser(nextMe);
-            }}
           />
         )}
       </main>
@@ -2715,7 +2704,7 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
       settlementPrice: settlementState === "SETTLED" ? position.currentMark : undefined,
       shares: position.qty,
       fees,
-      pnl: position.status === "closed" ? position.realizedPnl : position.unrealizedPnl,
+      pnl: positionDisplayedPnl(position),
       analysisText: analysis.text,
       analysisTone: analysis.tone,
       settlementState
@@ -2939,8 +2928,7 @@ function TradePageRestored(props: {
   nowMs: number;
   currentRound?: RoundRecord;
   settlementPreview?: SettlementPreview;
-  currentPage: "trade" | "profile" | "logs" | "replay" | "users";
-  canOpenUserManagement: boolean;
+  currentPage: "trade" | "home" | "profile" | "logs";
   history: HistoryRound[];
   snapshot?: MarketSnapshot;
   profile?: ProfileOverview;
@@ -2979,7 +2967,7 @@ function TradePageRestored(props: {
   onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
   onManualSettle: (roundId: string, side: TradeSide) => Promise<void>;
-  onNavigate: (page: "trade" | "profile" | "logs" | "users") => void;
+  onNavigate: (page: "trade" | "home" | "profile" | "logs") => void;
   onLanguageChange: (language: Language) => Promise<void>;
   onLogout: () => void;
   timelineBusyOrderId?: string;
@@ -3056,7 +3044,8 @@ function TradePageRestored(props: {
     );
     const entryNotional = sidePositions.reduce((sum, position) => sum + position.notionalSpent, 0);
     const entryQty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
-    const pnl = sidePositions.reduce((sum, position) => sum + positionDisplayedPnl(position), 0);
+    const pnlSummary = summarizePositionPnl(sidePositions);
+    const pnl = pnlSummary.markPnlUsdc;
     const sellablePosition = sidePositions.find((position) => position.displayStatus === "open");
     return {
       side,
@@ -3064,6 +3053,7 @@ function TradePageRestored(props: {
       value,
       averageEntry: entryQty > 0 ? entryNotional / entryQty : 0,
       pnl,
+      pnlSummary,
       sellablePosition
     };
   });
@@ -3163,6 +3153,14 @@ function TradePageRestored(props: {
     props.canManualSettle &&
     props.currentRound &&
     (props.currentRound.status === "Manual" || riskAlerts.some((alert) => alert.kind === "settlement_stuck"));
+  const trustedPriceToBeat =
+    currentRound && isBtcReferencePrice(snapshot?.priceToBeat) && isOfficialPtbSource(currentRound.priceToBeatSource)
+      ? snapshot?.priceToBeat
+      : undefined;
+  const btcUsdMeta = [
+    `CL ${money(snapshot?.chainlink.referencePrice ?? 0)}`,
+    trustedPriceToBeat ? `PTB ${btcMoneyOrDash(trustedPriceToBeat)}` : undefined
+  ].filter(Boolean).join(" · ");
 
   return (
     <section className="terminal-page">
@@ -3172,9 +3170,9 @@ function TradePageRestored(props: {
         </div>
         <div className="terminal-top-nav">
           <button className={props.currentPage === "trade" ? "active" : ""} onClick={() => props.onNavigate("trade")}>{localLabel(language, "交易", "Trade")}</button>
+          <button className={props.currentPage === "home" ? "active" : ""} onClick={() => props.onNavigate("home")}>{localLabel(language, "主页", "Home")}</button>
           <button className={props.currentPage === "profile" ? "active" : ""} onClick={() => props.onNavigate("profile")}>{localLabel(language, "分析", "Analytics")}</button>
           <button className={props.currentPage === "logs" ? "active" : ""} onClick={() => props.onNavigate("logs")}>{localLabel(language, "日志", "Logs")}</button>
-          {props.canOpenUserManagement ? <button className={props.currentPage === "users" ? "active" : ""} onClick={() => props.onNavigate("users")}>{localLabel(language, "用户", "Users")}</button> : null}
         </div>
         <div className="terminal-top-mid">
           <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
@@ -3249,6 +3247,14 @@ function TradePageRestored(props: {
                       {localLabel(language, card.pnl >= 0 ? "浮盈" : "浮亏", card.pnl >= 0 ? "PnL +" : "PnL -")} {signedMoney(card.pnl)}
                     </span>
                   </em>
+                  <PositionPnlBreakdown
+                    language={language}
+                    markPnlUsdc={card.pnlSummary.markPnlUsdc}
+                    executablePnlUsdc={card.pnlSummary.executablePnlUsdc}
+                    entryFeeUsdc={card.pnlSummary.entryFeeUsdc}
+                    exitFeeUsdc={card.pnlSummary.exitFeeUsdc}
+                    totalFeeUsdc={card.pnlSummary.totalFeeUsdc}
+                  />
                   {card.sellablePosition ? (
                     <button
                       type="button"
@@ -3265,15 +3271,46 @@ function TradePageRestored(props: {
 
           <TerminalSection title={t("thisRound")} meta={String(recentOrders.length)}>
             <div className="terminal-trades">
-              {recentOrders.length === 0 ? <div className="terminal-empty">{t("noData")}</div> : recentOrders.map((order) => (
-                <div className="terminal-trade-row" key={order.id}>
-                  <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
-                  <b>{order.side === "UP" ? "▲UP" : "▼DN"}</b>
-                  <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
-                  <span>@{tokenPriceText(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0)}</span>
-                  <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
-                </div>
-              ))}
+              {recentOrders.length === 0 ? (
+                <div className="terminal-empty">{t("noData")}</div>
+              ) : (
+                <>
+                  <div className="terminal-trade-head">
+                    <span>Time</span>
+                    <span>Side</span>
+                    <span>USD</span>
+                    <span>Price</span>
+                    <span>Status</span>
+                    <span>Action</span>
+                  </div>
+                  {recentOrders.map((order) => {
+                    const canCancelOrder = order.orderKind === "limit" && order.status === "pending";
+                    const cancelBusy = props.cancelBusyOrderId === order.id;
+                    return (
+                      <div className="terminal-trade-row" key={order.id}>
+                        <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
+                        <b>{order.side === "UP" ? "▲UP" : "▼DN"}</b>
+                        <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
+                        <span className="terminal-trade-price">@{tokenPriceText(order.avgFillPrice ?? order.limitPrice ?? orderBookExecutionPrice(order) ?? 0)}</span>
+                        <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
+                        <span className="terminal-trade-action">
+                          {canCancelOrder ? (
+                            <button
+                              type="button"
+                              className="terminal-cancel-order-button"
+                              disabled={cancelBusy}
+                              onClick={() => props.onCancel(order.id)}
+                              title={t("cancel")}
+                            >
+                              {cancelBusy ? t("loading") : t("cancel")}
+                            </button>
+                          ) : null}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
             </div>
           </TerminalSection>
 
@@ -3293,7 +3330,7 @@ function TradePageRestored(props: {
                   `${localLabel(language, "状态", "Status")}: ${round.status}`,
                   `${localLabel(language, "结果", "Result")}: ${round.settledSide ?? (preview?.state === "preliminary" && preview.side ? `PRE-${preview.side}` : preview?.side) ?? "--"}`,
                   `${localLabel(language, "收盘时间", "Close Time")}: ${dateTimeText(round.endAt)}`,
-                  `PTB: ${btcMoneyOrDash(round.priceToBeat)}`,
+                  isOfficialPtbSource(round.priceToBeatSource) ? `PTB: ${btcMoneyOrDash(round.priceToBeat)}` : undefined,
                   `Gamma: ${round.settlementSource ?? (preview?.state === "preliminary" ? "pending" : "Gamma")}`,
                   preview?.tokenSide ? `Token: ${preview.tokenSide} (${tokenPriceText(preview.tokenSide === "UP" ? preview.upPrice : preview.downPrice)})` : undefined,
                   preview?.binanceSide ? `Binance pre: ${preview.binanceSide}` : undefined,
@@ -3348,7 +3385,7 @@ function TradePageRestored(props: {
               upColor="#00f0c0"
               downColor="#f03060"
               emptyText={t("noData")}
-              priceToBeat={snapshot?.priceToBeat}
+              priceToBeat={trustedPriceToBeat}
               latestPrice={snapshot?.binance.spotPrice}
               round={currentRound}
               visibleCount={props.chartVisibleCount}
@@ -3463,7 +3500,7 @@ function TradePageRestored(props: {
             </div>
           </TerminalSection>
 
-          <TerminalSection title="BTC/USD" meta={`CL ${money(snapshot?.chainlink.referencePrice ?? 0)} · PTB ${btcMoneyOrDash(snapshot?.priceToBeat)}`}>
+          <TerminalSection title="BTC/USD" meta={btcUsdMeta}>
             <div className="terminal-order">
               <div className="order-odds">
                 <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{decimal((snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0) * 100, 1)}¢</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
@@ -3556,11 +3593,9 @@ function AnalyticsPage(props: {
   orders: OrderRecord[];
   logs: AuditEvent[];
   onSell: (positionId: string) => Promise<void>;
-  onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
   onOpenRoundLogs: (item: RoundCalendarItem) => Promise<void>;
   timelineBusyOrderId?: string;
-  cancelBusyOrderId?: string;
   selectedRoundLogId?: string;
   roundLogBusyRoundId?: string;
 }) {
@@ -3643,6 +3678,10 @@ function AnalyticsPage(props: {
       };
     });
   }, [displayedRows, groupVisibleLimits, language, period]);
+  const openPnlSummary = useMemo(
+    () => summarizePositionPnl(props.positions.filter((position) => position.status === "open")),
+    [props.positions]
+  );
   const periodOptions = [
     { id: "all", label: analyticsPeriodLabel("all", language) },
     { id: "year", label: analyticsPeriodLabel("year", language) },
@@ -3689,7 +3728,19 @@ function AnalyticsPage(props: {
         <div className="analytics-card">
           <span>{localLabel(language, "总费用", "Total Fees")}</span>
           <strong>{money(summary.totalFees, 4)}</strong>
-          <small>{localLabel(language, "统一 UTC", "UTC normalized")}</small>
+          <small>
+            {localLabel(language, "持仓费用", "Position fees")} {money(openPnlSummary.totalFeeUsdc, 4)}
+          </small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "Mark PnL", "Mark PnL")}</span>
+          <strong>{signedMoney(openPnlSummary.markPnlUsdc)}</strong>
+          <small>{localLabel(language, "mid mark，优先使用含成本/手续费字段", "mid mark, fee-adjusted when available")}</small>
+        </div>
+        <div className="analytics-card">
+          <span>{localLabel(language, "可成交 PnL", "Executable PnL")}</span>
+          <strong>{signedMoney(openPnlSummary.executablePnlUsdc)}</strong>
+          <small>{localLabel(language, "best bid 可退出口径", "best bid executable view")}</small>
         </div>
         <div className="analytics-card">
           <span>{localLabel(language, "最佳单笔", "Best Trade")}</span>
@@ -5128,6 +5179,7 @@ function UserManagementPage(props: {
   token: string;
   me: PublicUser;
   language: Language;
+  embedded?: boolean;
   onProfileRefresh: () => Promise<void>;
 }) {
   const { token, me, language } = props;
@@ -5143,6 +5195,18 @@ function UserManagementPage(props: {
     confirmPassword: string;
   }>();
   const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [roleFilter, setRoleFilter] = useState<"ALL" | Role>("ALL");
+  const [editDialog, setEditDialog] = useState<{
+    user: PublicUser;
+    displayName: string;
+    role: Role;
+    language: Language;
+    managerUserId: string;
+    permissionLevel: PermissionLevel;
+    availableUsdc: string;
+    isActive: boolean;
+  }>();
   const [form, setForm] = useState({
     username: "",
     password: "",
@@ -5154,6 +5218,7 @@ function UserManagementPage(props: {
   });
   const isAdmin = me.role === "Admin";
   const canBulkCreate = me.permissionCodes.includes("users:bulk-create");
+  const canUpdateUsers = me.permissionCodes.includes("users:update");
 
   const loadUsers = async () => {
     try {
@@ -5173,8 +5238,22 @@ function UserManagementPage(props: {
 
   const seniorOptions = users.filter((user) => user.role === "Senior Tester" && user.isActive);
   const canManageTarget = (user: PublicUser) =>
-    isAdmin || (me.role === "Senior Tester" && user.role === "Tester" && user.seniorTesterId === me.id);
+    isAdmin || (me.role === "Senior Tester" && user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === me.id);
   const canSetBalance = (user: PublicUser) => canManageTarget(user) || (me.role === "Senior Tester" && user.id === me.id);
+  const visibleUsers = users.filter((user) => {
+    const query = searchText.trim().toLowerCase();
+    if (roleFilter !== "ALL" && user.role !== roleFilter) return false;
+    if (!query) return true;
+    return [user.username, user.displayName, user.role, user.permissionLevel ?? "Standard"].some((value) =>
+      value.toLowerCase().includes(query)
+    );
+  });
+  const activeCount = users.filter((user) => user.isActive).length;
+  const managedCount = users.filter((user) => canManageTarget(user)).length;
+  const roleCounts = users.reduce<Record<Role, number>>(
+    (counts, user) => ({ ...counts, [user.role]: counts[user.role] + 1 }),
+    { Tester: 0, "Senior Tester": 0, "Test Engineer": 0, Admin: 0 }
+  );
 
   const createUser = async () => {
     try {
@@ -5297,11 +5376,55 @@ function UserManagementPage(props: {
     }
   };
 
+  const openEditDialog = (user: PublicUser) => {
+    setError(undefined);
+    setEditDialog({
+      user,
+      displayName: user.displayName,
+      role: user.role,
+      language: user.language,
+      managerUserId: user.managerUserId ?? user.seniorTesterId ?? "",
+      permissionLevel: user.permissionLevel ?? "Standard",
+      availableUsdc: String(user.availableUsdc),
+      isActive: user.isActive
+    });
+  };
+
+  const submitEdit = async () => {
+    if (!editDialog) return;
+    const amount = Number(editDialog.availableUsdc);
+    if (!Number.isFinite(amount) || amount < 0) {
+      setError(t("enterAValidAmount"));
+      return;
+    }
+    const payload: UpdateUserInput = {
+      displayName: editDialog.displayName,
+      role: editDialog.role,
+      language: editDialog.language,
+      managerUserId: editDialog.role === "Tester" ? editDialog.managerUserId || null : null,
+      seniorTesterId: editDialog.role === "Tester" ? editDialog.managerUserId || null : null,
+      permissionLevel: editDialog.permissionLevel,
+      availableUsdc: amount,
+      isActive: editDialog.isActive
+    };
+    try {
+      setBusy(true);
+      setError(undefined);
+      await api.updateUser(token, editDialog.user.id, payload);
+      setEditDialog(undefined);
+      await loadUsers();
+    } catch (editError) {
+      setError(editError instanceof Error ? editError.message : "Update user failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <section className="panel log-search-panel">
+    <section className={props.embedded ? "user-home-panel" : "panel log-search-panel"}>
       <div className="section-header">
         <div>
-          <p className="eyebrow">{t("users")}</p>
+          <p className="eyebrow">{localLabel(language, "用户范围", "User Scope")}</p>
           <h2>{users.length}</h2>
         </div>
         <div className="button-row fit-actions">
@@ -5333,6 +5456,13 @@ function UserManagementPage(props: {
         </div>
       </div>
       {error ? <div className="inline-error-banner">{error}</div> : null}
+
+      <div className="user-overview-grid">
+        <div className="analytics-card"><span>{localLabel(language, "可见用户", "Visible Users")}</span><strong>{users.length}</strong><small>{managedCount} {localLabel(language, "可管理", "manageable")}</small></div>
+        <div className="analytics-card"><span>{localLabel(language, "活跃账号", "Active")}</span><strong>{activeCount}</strong><small>{users.length - activeCount} {localLabel(language, "停用", "disabled")}</small></div>
+        <div className="analytics-card"><span>{localLabel(language, "Tester", "Tester")}</span><strong>{roleCounts.Tester}</strong><small>{roleCounts["Senior Tester"]} Senior</small></div>
+        <div className="analytics-card"><span>{localLabel(language, "工程/管理", "Engineer/Admin")}</span><strong>{roleCounts["Test Engineer"] + roleCounts.Admin}</strong><small>{roleCounts.Admin} Admin</small></div>
+      </div>
 
       {isAdmin ? (
         <div className="filter-grid user-create-grid">
@@ -5386,6 +5516,26 @@ function UserManagementPage(props: {
         </div>
       ) : null}
 
+      <div className="user-scope-toolbar">
+        <label>
+          {localLabel(language, "搜索", "Search")}
+          <input
+            value={searchText}
+            placeholder={localLabel(language, "用户名 / 昵称 / 角色", "Username / display name / role")}
+            onChange={(event) => setSearchText(event.target.value)}
+          />
+        </label>
+        <label>
+          {props.t("role")}
+          <select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value as "ALL" | Role)}>
+            <option value="ALL">{props.t("all")}</option>
+            {(["Tester", "Senior Tester", "Test Engineer", "Admin"] as Role[]).map((role) => (
+              <option key={role} value={role}>{role}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       <table>
         <thead>
           <tr>
@@ -5394,18 +5544,19 @@ function UserManagementPage(props: {
             <th>{props.t("role")}</th>
             <th>{props.t("status")}</th>
             <th>{t("seniorTester")}</th>
+            <th>{localLabel(language, "权限等级", "Permission")}</th>
             <th>{props.t("available")}</th>
             <th>{props.t("action")}</th>
           </tr>
         </thead>
         <tbody>
-          {users.length === 0 ? (
+          {visibleUsers.length === 0 ? (
             <tr>
-              <td colSpan={7}>{props.t("noData")}</td>
+              <td colSpan={8}>{props.t("noData")}</td>
             </tr>
           ) : (
-            users.map((user) => {
-              const senior = users.find((candidate) => candidate.id === user.seniorTesterId);
+            visibleUsers.map((user) => {
+              const senior = users.find((candidate) => candidate.id === (user.managerUserId ?? user.seniorTesterId));
               return (
                 <tr key={user.id}>
                   <td>{user.username}</td>
@@ -5418,9 +5569,15 @@ function UserManagementPage(props: {
                     />
                   </td>
                   <td>{senior?.username ?? "--"}</td>
+                  <td>{user.permissionLevel ?? "Standard"}</td>
                   <td>{money(user.availableUsdc)}</td>
                   <td>
                     <div className="table-action-cell">
+                      {canUpdateUsers && canManageTarget(user) && user.id !== me.id ? (
+                        <button className="ghost-button compact-button" disabled={busy} onClick={() => openEditDialog(user)}>
+                          {localLabel(language, "资料", "Edit")}
+                        </button>
+                      ) : null}
                       {canSetBalance(user) ? (
                         <button
                           className="ghost-button compact-button"
@@ -5464,6 +5621,77 @@ function UserManagementPage(props: {
           )}
         </tbody>
       </table>
+      {editDialog ? (
+        <div className="modal-backdrop">
+          <div className="panel user-action-dialog user-profile-dialog">
+            <div className="section-header">
+              <div>
+                <p className="eyebrow">{localLabel(language, "用户资料", "User Profile")}</p>
+                <h2>{editDialog.user.username}</h2>
+              </div>
+              <button className="ghost-button compact-button" onClick={() => setEditDialog(undefined)}>
+                {props.t("close")}
+              </button>
+            </div>
+            {error ? <div className="inline-error-banner">{error}</div> : null}
+            <div className="dialog-form">
+              <label>
+                {t("displayName")}
+                <input value={editDialog.displayName} onChange={(event) => setEditDialog({ ...editDialog, displayName: event.target.value })} />
+              </label>
+              <label>
+                {props.t("role")}
+                <select value={editDialog.role} disabled={!isAdmin} onChange={(event) => setEditDialog({ ...editDialog, role: event.target.value as Role })}>
+                  {(["Tester", "Senior Tester", "Test Engineer", "Admin"] as Role[]).map((role) => (
+                    <option key={role} value={role}>{role}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                {props.t("language")}
+                <select value={editDialog.language} onChange={(event) => setEditDialog({ ...editDialog, language: event.target.value as Language })}>
+                  <option value="zh-CN">简体中文</option>
+                  <option value="en-US">English</option>
+                </select>
+              </label>
+              <label>
+                {t("seniorTester")}
+                <select
+                  value={editDialog.managerUserId}
+                  disabled={editDialog.role !== "Tester"}
+                  onChange={(event) => setEditDialog({ ...editDialog, managerUserId: event.target.value })}
+                >
+                  <option value="">{props.t("all")}</option>
+                  {seniorOptions.map((user) => (
+                    <option key={user.id} value={user.id}>{user.username}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                {localLabel(language, "权限等级", "Permission Level")}
+                <select value={editDialog.permissionLevel} onChange={(event) => setEditDialog({ ...editDialog, permissionLevel: event.target.value as PermissionLevel })}>
+                  <option value="Initial">Initial</option>
+                  <option value="Standard">Standard</option>
+                </select>
+              </label>
+              <label>
+                {props.t("available")}
+                <input value={editDialog.availableUsdc} onChange={(event) => setEditDialog({ ...editDialog, availableUsdc: event.target.value })} />
+              </label>
+              {isAdmin ? (
+                <label className="check-choice">
+                  <input type="checkbox" checked={editDialog.isActive} onChange={(event) => setEditDialog({ ...editDialog, isActive: event.target.checked })} />
+                  {editDialog.isActive ? t("active") : t("disabled")}
+                </label>
+              ) : null}
+              <div className="button-row">
+                <button className="secondary-button" disabled={busy} onClick={submitEdit}>{t("confirm")}</button>
+                <button className="ghost-button" disabled={busy} onClick={() => setEditDialog(undefined)}>{props.t("cancel")}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {balanceDialog ? (
         <div className="modal-backdrop">
           <div className="panel user-action-dialog">

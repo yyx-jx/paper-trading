@@ -73,6 +73,20 @@ const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], numbe
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+function isClientOrderConflict(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: unknown; constraint?: unknown; detail?: unknown; message?: unknown };
+  if (candidate.code !== "23505") {
+    return false;
+  }
+  return [candidate.constraint, candidate.detail, candidate.message]
+    .filter(Boolean)
+    .some((value) => String(value).includes("idx_orders_user_client_order_id"));
+}
+
 const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
   "30s": 30_000,
   "1m": 60_000,
@@ -214,6 +228,11 @@ function isMarketResolved(detail: PolymarketMarketDetail): boolean {
 
 function isBtcReferencePrice(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 1000;
+}
+
+function isOfficialPtbSource(source?: string) {
+  const normalized = source?.toLowerCase() ?? "";
+  return normalized.includes("chainlink data streams") || normalized.includes("data.chain.link");
 }
 
 const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
@@ -615,6 +634,23 @@ export class SimulationEngine {
     return this.preliminarySettlements;
   }
 
+  private async runTradeWriteTransaction<T>(handler: () => Promise<T>) {
+    if (
+      typeof this.store.withTransaction !== "function" ||
+      typeof this.store.captureTradeMutationSnapshot !== "function" ||
+      typeof this.store.restoreTradeMutationSnapshot !== "function"
+    ) {
+      return handler();
+    }
+    const memorySnapshot = this.store.captureTradeMutationSnapshot();
+    try {
+      return await this.store.withTransaction(handler);
+    } catch (error) {
+      this.store.restoreTradeMutationSnapshot(memorySnapshot);
+      throw error;
+    }
+  }
+
   async placeOrder(
     user: UserRecord,
     payload: {
@@ -624,6 +660,7 @@ export class SimulationEngine {
       qty?: number;
       orderKind?: PaperOrderKind;
       limitPrice?: number;
+      clientOrderId?: string;
       clientSendTs?: number;
       positionIds?: string[];
       exitType?: Exclude<OrderLifecycleExitType, "settlement" | "mixed">;
@@ -635,7 +672,15 @@ export class SimulationEngine {
     const currentRound = this.getActiveRound(now);
     const action = payload.action ?? "buy";
     const orderKind = payload.orderKind ?? "market";
+    const clientOrderId = payload.clientOrderId?.trim();
     try {
+      const existingOrder =
+        typeof this.store.findOrderByClientOrderId === "function"
+          ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
+          : undefined;
+      if (existingOrder) {
+        return { order: existingOrder };
+      }
       this.assertCanCreateNewOrder(currentRound, now);
       if (orderKind === "limit" && (!payload.limitPrice || payload.limitPrice <= 0)) {
         throw new Error("Limit orders require a positive limit price.");
@@ -767,160 +812,177 @@ export class SimulationEngine {
         bookAcquireLatencyMs,
         localMatchLatencyMs,
         failureReason: status === "failed" ? estimate.failureReason : undefined,
+        clientOrderId,
         clientSendTs: payload.clientSendTs,
         serverRecvTs,
         serverPublishTs: Date.now(),
         createdAt: Date.now()
       };
 
-      const persistStartTs = Date.now();
-      if (status === "pending") {
-        if (action === "buy") {
-          const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
-          user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
-          order.frozenUsdc = frozen;
-        } else {
-          const frozenQty = roundNumber(payload.qty ?? 0, 4);
-          await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
-          order.frozenQty = frozenQty;
-        }
-        await Promise.all([
-          this.store.persistOrder(order),
-          ...(action === "buy" ? [this.store.persistUser(user)] : [])
-        ]);
-      } else if (status === "filled" && estimate.avgPrice) {
-        await this.applyFilledOrder(
-          user,
-          currentRound,
-          order,
-          estimate,
-          payload.positionIds,
-          payload.exitType ?? "manual_sell",
-          false
-        );
-        if (order.action === "buy") {
-          await this.recordBuyLifecycle(user, currentRound, order, snapshot);
-        }
-      } else {
-        await this.store.persistOrder(order);
-      }
-      order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
-      order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
-
-      const auditLogPromise = this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId,
-        category: "matching",
-        actionType: "place_order",
-        actionStatus: status === "failed" ? "failed" : "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "order.panel",
-        symbol: this.config.symbol,
-        roundId: currentRound.id,
-        clientSendTs: payload.clientSendTs,
-        serverRecvTs,
-        engineStartTs,
-        engineFinishTs,
-        serverPublishTs: order.serverPublishTs,
-        backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
-        resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
-        resultMessage:
-          status === "failed"
-            ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
-            : status === "pending"
-              ? "Limit order is pending against future Polymarket CLOB depth."
-              : "Order fully matched against the current Polymarket CLOB snapshot.",
-        details: {
-          traceId,
-          roundId: currentRound.id,
-          marketId,
-          marketSlug: currentRound.marketSlug,
-          orderId: order.id,
-          positionId: payload.positionIds?.[0],
-          bookKey,
-          bookHash: book.snapshotId,
-          bookSnapshotId: book.snapshotId,
-          matchingSequence: undefined,
-          tokenId,
-          action,
-          side: payload.side,
-          orderKind,
-          timeInForce: order.timeInForce,
-          limitPrice: payload.limitPrice,
-          notionalUsdc: payload.amount,
-          requestedQty: payload.qty,
-          filledQty: order.filledQty,
-          unfilledQty: order.unfilledQty,
-          avgFillPrice: order.avgFillPrice,
-          bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-          localMatchLatencyMs: order.localMatchLatencyMs,
-          persistLatencyMs: order.persistLatencyMs,
-          totalOrderLatencyMs: order.totalOrderLatencyMs,
-          executionBookSource: executionBook.source,
-          executionBookAgeMs: executionBook.ageMs,
-          executionBookFallbackReason: executionBook.fallbackReason,
-          sourceLatencyMs,
-          slippageBps: order.slippageBps,
-          estimatedFee: order.estimatedFee,
-          actualFee: order.actualFee,
-          feeBreakdown: order.feeBreakdown,
-          feeCurrency: order.feeCurrency,
-          marketInfo,
-          failureReason: order.failureReason
-        }
-      });
-
-      const behaviorLogPromise = this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "place_order",
-          actionStatus: status === "failed" ? "failed" : "success",
-          traceId,
-          orderId: order.id,
-          round: currentRound,
-          snapshot,
-          direction: payload.side,
-          entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-          positionNotional: order.notionalUsdc,
-          bookSnapshot: book,
-          order,
-          actualFillPrice: order.avgFillPrice,
-          slippageBps: order.slippageBps,
-          partialFilled: order.partialFilled,
-          unfilledQty: order.unfilledQty,
-          executionLatencyMs: order.matchLatencyMs,
-          estimatedFee: order.estimatedFee,
-          actualFee: order.actualFee,
-          feeBreakdown: order.feeBreakdown,
-          feeCurrency: order.feeCurrency,
-          failureReason: order.failureReason,
-          contextJson: {
-            roundStatus: currentRound.status,
-            acceptingOrders: currentRound.acceptingOrders,
-            requestAction: action,
-            requestSide: payload.side,
-            requestAmount: payload.amount,
-            requestQty: payload.qty,
-            orderType: orderKind,
-            isAccepted: status !== "failed",
-            bookSnapshotId: book.snapshotId,
-            bookKey,
-            bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-            localMatchLatencyMs: order.localMatchLatencyMs,
-            persistLatencyMs: order.persistLatencyMs,
-            totalOrderLatencyMs: order.totalOrderLatencyMs,
-            executionBookSource: executionBook.source,
-            executionBookAgeMs: executionBook.ageMs,
-            executionBookFallbackReason: executionBook.fallbackReason,
-            marketInfo
+      try {
+        await this.runTradeWriteTransaction(async () => {
+        const persistStartTs = Date.now();
+        if (status === "pending") {
+          if (action === "buy") {
+            const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
+            user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
+            order.frozenUsdc = frozen;
+          } else {
+            const frozenQty = roundNumber(payload.qty ?? 0, 4);
+            await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
+            order.frozenQty = frozenQty;
           }
-        })
-      );
+          await Promise.all([
+            this.store.persistOrder(order),
+            ...(action === "buy" ? [this.store.persistUser(user)] : [])
+          ]);
+        } else if (status === "filled" && estimate.avgPrice) {
+          await this.applyFilledOrder(
+            user,
+            currentRound,
+            order,
+            estimate,
+            payload.positionIds,
+            payload.exitType ?? "manual_sell",
+            false
+          );
+          if (order.action === "buy") {
+            await this.recordBuyLifecycle(user, currentRound, order, snapshot);
+          }
+        } else {
+          await this.store.persistOrder(order);
+        }
+        order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
+        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
 
-      await Promise.all([auditLogPromise, behaviorLogPromise]);
-      order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
+        await Promise.all([
+          this.writeAuditLog({
+            eventId: this.store.newId("evt"),
+            traceId,
+            category: "matching",
+            actionType: "place_order",
+            actionStatus: status === "failed" ? "failed" : "success",
+            userId: user.id,
+            role: user.role,
+            pageName: "trade.main",
+            moduleName: "order.panel",
+            symbol: this.config.symbol,
+            roundId: currentRound.id,
+            clientSendTs: payload.clientSendTs,
+            serverRecvTs,
+            engineStartTs,
+            engineFinishTs,
+            serverPublishTs: order.serverPublishTs,
+            backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
+            resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
+            resultMessage:
+              status === "failed"
+                ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
+                : status === "pending"
+                  ? "Limit order is pending against future Polymarket CLOB depth."
+                  : "Order fully matched against the current Polymarket CLOB snapshot.",
+            details: {
+              traceId,
+              roundId: currentRound.id,
+              marketId,
+              marketSlug: currentRound.marketSlug,
+              orderId: order.id,
+              clientOrderId,
+              positionId: payload.positionIds?.[0],
+              bookKey,
+              bookHash: book.snapshotId,
+              bookSnapshotId: book.snapshotId,
+              matchingSequence: undefined,
+              tokenId,
+              action,
+              side: payload.side,
+              orderKind,
+              timeInForce: order.timeInForce,
+              limitPrice: payload.limitPrice,
+              notionalUsdc: payload.amount,
+              requestedQty: payload.qty,
+              filledQty: order.filledQty,
+              unfilledQty: order.unfilledQty,
+              avgFillPrice: order.avgFillPrice,
+              bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+              localMatchLatencyMs: order.localMatchLatencyMs,
+              persistLatencyMs: order.persistLatencyMs,
+              totalOrderLatencyMs: order.totalOrderLatencyMs,
+              executionBookSource: executionBook.source,
+              executionBookAgeMs: executionBook.ageMs,
+              executionBookFallbackReason: executionBook.fallbackReason,
+              sourceLatencyMs,
+              slippageBps: order.slippageBps,
+              estimatedFee: order.estimatedFee,
+              actualFee: order.actualFee,
+              feeBreakdown: order.feeBreakdown,
+              feeCurrency: order.feeCurrency,
+              marketInfo,
+              failureReason: order.failureReason
+            }
+          }),
+          this.writeBehaviorLog(
+            this.createBehaviorLog({
+              user,
+              actionType: "place_order",
+              actionStatus: status === "failed" ? "failed" : "success",
+              traceId,
+              orderId: order.id,
+              round: currentRound,
+              snapshot,
+              direction: payload.side,
+              entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+              positionNotional: order.notionalUsdc,
+              bookSnapshot: book,
+              order,
+              actualFillPrice: order.avgFillPrice,
+              slippageBps: order.slippageBps,
+              partialFilled: order.partialFilled,
+              unfilledQty: order.unfilledQty,
+              executionLatencyMs: order.matchLatencyMs,
+              estimatedFee: order.estimatedFee,
+              actualFee: order.actualFee,
+              feeBreakdown: order.feeBreakdown,
+              feeCurrency: order.feeCurrency,
+              failureReason: order.failureReason,
+              contextJson: {
+                roundStatus: currentRound.status,
+                acceptingOrders: currentRound.acceptingOrders,
+                requestAction: action,
+                requestSide: payload.side,
+                requestAmount: payload.amount,
+                requestQty: payload.qty,
+                clientOrderId,
+                orderType: orderKind,
+                isAccepted: status !== "failed",
+                bookSnapshotId: book.snapshotId,
+                bookKey,
+                bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+                localMatchLatencyMs: order.localMatchLatencyMs,
+                persistLatencyMs: order.persistLatencyMs,
+                totalOrderLatencyMs: order.totalOrderLatencyMs,
+                executionBookSource: executionBook.source,
+                executionBookAgeMs: executionBook.ageMs,
+                executionBookFallbackReason: executionBook.fallbackReason,
+                marketInfo
+              }
+            })
+          )
+        ]);
+        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
+        });
+      } catch (writeError) {
+        if (clientOrderId && isClientOrderConflict(writeError)) {
+          const existingOrderAfterConflict =
+            typeof this.store.findOrderByClientOrderId === "function"
+              ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
+              : undefined;
+          if (existingOrderAfterConflict) {
+            return { order: existingOrderAfterConflict };
+          }
+        }
+        throw writeError;
+      }
       this.store.emitUserPayload(user.id);
       return { order };
     } catch (error) {
@@ -952,6 +1014,7 @@ export class SimulationEngine {
           action,
           side: payload.side,
           orderKind: payload.orderKind ?? "market",
+          clientOrderId,
           limitPrice: payload.limitPrice,
           notionalUsdc: payload.amount,
           requestedQty: payload.qty,
@@ -975,6 +1038,7 @@ export class SimulationEngine {
             requestSide: payload.side,
             requestAmount: payload.amount,
             requestQty: payload.qty,
+            clientOrderId,
             orderType: payload.orderKind ?? "market",
             limitPrice: payload.limitPrice,
             failureReason: message
@@ -999,78 +1063,82 @@ export class SimulationEngine {
 
       const releasedFrozenUsdc = order.frozenUsdc ?? 0;
       const releasedFrozenQty = order.frozenQty ?? 0;
-      order.status = "cancelled";
-      order.lifecycleStatus = "cancelled";
-      order.resultType = "cancelled";
-      if (order.frozenUsdc && order.frozenUsdc > 0) {
-        user.availableUsdc = roundNumber(user.availableUsdc + order.frozenUsdc, 2);
-        order.frozenUsdc = 0;
-        await this.store.persistUser(user);
-      }
-      if (order.frozenQty && order.frozenQty > 0) {
-        await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
-        order.frozenQty = 0;
-      }
-      order.serverPublishTs = Date.now();
-      await this.store.persistOrder(order);
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId: order.traceId,
-        category: "operation",
-        actionType: "cancel_order",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "order.panel",
-        symbol: order.symbol,
-        roundId: order.roundId,
-        serverRecvTs: Date.now(),
-        serverPublishTs: Date.now(),
-        backendLatencyMs: 1,
-        resultCode: "ORDER_CANCELLED",
-        resultMessage: "Pending paper limit order was cancelled and frozen assets were released.",
-        details: {
-          traceId: order.traceId,
-          roundId: order.roundId,
-          marketId: order.marketId,
-          marketSlug: order.marketSlug,
-          orderId,
-          orderKind: order.orderKind,
-          releasedFrozenUsdc,
-          releasedFrozenQty,
-          bookKey: order.bookKey,
-          bookSnapshotId: order.bookHash
+      await this.runTradeWriteTransaction(async () => {
+        order.status = "cancelled";
+        order.lifecycleStatus = "cancelled";
+        order.resultType = "cancelled";
+        if (order.frozenUsdc && order.frozenUsdc > 0) {
+          user.availableUsdc = roundNumber(user.availableUsdc + order.frozenUsdc, 2);
+          order.frozenUsdc = 0;
+          await this.store.persistUser(user);
         }
+        if (order.frozenQty && order.frozenQty > 0) {
+          await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
+          order.frozenQty = 0;
+        }
+        order.serverPublishTs = Date.now();
+        await this.store.persistOrder(order);
+        await Promise.all([
+          this.writeAuditLog({
+            eventId: this.store.newId("evt"),
+            traceId: order.traceId,
+            category: "operation",
+            actionType: "cancel_order",
+            actionStatus: "success",
+            userId: user.id,
+            role: user.role,
+            pageName: "trade.main",
+            moduleName: "order.panel",
+            symbol: order.symbol,
+            roundId: order.roundId,
+            serverRecvTs: Date.now(),
+            serverPublishTs: Date.now(),
+            backendLatencyMs: 1,
+            resultCode: "ORDER_CANCELLED",
+            resultMessage: "Pending paper limit order was cancelled and frozen assets were released.",
+            details: {
+              traceId: order.traceId,
+              roundId: order.roundId,
+              marketId: order.marketId,
+              marketSlug: order.marketSlug,
+              orderId,
+              orderKind: order.orderKind,
+              releasedFrozenUsdc,
+              releasedFrozenQty,
+              bookKey: order.bookKey,
+              bookSnapshotId: order.bookHash
+            }
+          }),
+          this.writeBehaviorLog(
+            this.createBehaviorLog({
+              user,
+              actionType: "cancel_order",
+              actionStatus: "success",
+              traceId: order.traceId,
+              orderId: order.id,
+              round: this.store.getRoundById(order.roundId),
+              snapshot,
+              direction: order.side,
+              entryOdds: snapshot[order.side === "UP" ? "upPrice" : "downPrice"],
+              positionNotional: order.notionalUsdc,
+              bookSnapshot: snapshot.orderBooks[order.side],
+              order,
+              frozenAssetRelease: {
+                releasedFrozenUsdc,
+                releasedFrozenQty
+              },
+              partialFilled: order.partialFilled,
+              unfilledQty: order.unfilledQty,
+              contextJson: {
+                cancelledRemainingQty: order.unfilledQty,
+                bookKey: order.bookKey,
+                bookSnapshotId: order.bookHash,
+                marketSlug: order.marketSlug
+              }
+            })
+          )
+        ]);
       });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "cancel_order",
-          actionStatus: "success",
-          traceId: order.traceId,
-          orderId: order.id,
-          round: this.store.getRoundById(order.roundId),
-          snapshot,
-          direction: order.side,
-          entryOdds: snapshot[order.side === "UP" ? "upPrice" : "downPrice"],
-          positionNotional: order.notionalUsdc,
-          bookSnapshot: snapshot.orderBooks[order.side],
-          order,
-          frozenAssetRelease: {
-            releasedFrozenUsdc,
-            releasedFrozenQty
-          },
-          partialFilled: order.partialFilled,
-          unfilledQty: order.unfilledQty,
-          contextJson: {
-            cancelledRemainingQty: order.unfilledQty,
-            bookKey: order.bookKey,
-            bookSnapshotId: order.bookHash,
-            marketSlug: order.marketSlug
-          }
-        })
-      );
       this.store.emitUserPayload(user.id);
       return order;
     } catch (error) {
@@ -2091,7 +2159,8 @@ export class SimulationEngine {
         order.side,
         order.filledQty,
         roundCurrency(estimate.matchedNotional + (order.actualFee ?? 0)),
-        order.midPrice || order.avgFillPrice || 0
+        order.midPrice || order.avgFillPrice || 0,
+        order.actualFee ?? 0
       );
       await Promise.all([
         this.store.persistPosition(position),
@@ -2125,16 +2194,22 @@ export class SimulationEngine {
       const proceeds = roundNumber(grossProceeds - allocatedFee, 8);
       const releasedCost = roundNumber(position.averageEntry * take, 8);
       const realizedPnl = proceeds - releasedCost;
+      position.exitFeeUsdc = roundNumber((position.exitFeeUsdc ?? 0) + allocatedFee, 8);
+      position.totalFeeUsdc = roundNumber((position.entryFeeUsdc ?? 0) + (position.exitFeeUsdc ?? 0), 8);
       position.qty = roundNumber(Math.max(position.qty - take, 0), 4);
       position.lockedQty = roundNumber(Math.max((position.lockedQty ?? 0) - take, 0), 4);
       position.notionalSpent = roundNumber(Math.max(position.notionalSpent - releasedCost, 0), 4);
+      position.costBasisUsdc = position.notionalSpent;
       position.realizedPnl = roundNumber(position.realizedPnl + realizedPnl, 2);
       position.currentMark = roundNumber(order.midPrice || order.avgFillPrice || 0, 4);
       position.unrealizedPnl = roundNumber(position.qty * position.currentMark - position.notionalSpent, 2);
+      position.markPnlUsdc = position.unrealizedPnl;
+      position.executablePnlUsdc = roundNumber(((position.currentBid ?? position.currentMark) * position.qty) - position.notionalSpent, 2);
       if (position.qty <= QTY_EPSILON) {
         position.qty = 0;
         position.lockedQty = 0;
         position.notionalSpent = 0;
+        position.costBasisUsdc = 0;
         position.status = "closed";
         position.closedAt = Date.now();
         position.currentMark = roundNumber(order.avgFillPrice ?? 0, 4);
@@ -2144,6 +2219,8 @@ export class SimulationEngine {
         position.currentValue = 0;
         position.sourceLatencyMs = undefined;
         position.unrealizedPnl = 0;
+        position.markPnlUsdc = 0;
+        position.executablePnlUsdc = 0;
         position.settlementResult = "sold";
       }
       remainingQty = roundNumber(Math.max(remainingQty - take, 0), 4);
@@ -2273,70 +2350,75 @@ export class SimulationEngine {
         marketInfo
       );
 
-      order.bookHash = book.snapshotId;
-      order.bestBid = book.bestBid;
-      order.bestAsk = book.bestAsk;
-      order.midPrice = book.midPrice;
-      order.bookSnapshotTs = book.snapshotTs;
-      order.sourceLatencyMs = Math.max(Date.now() - book.snapshotTs, 0);
-      order.matchLatencyMs = Math.max(Date.now() - order.createdAt, 1);
-      const actionSnapshot = this.captureActionSnapshot();
-      await this.applyFilledOrder(user, round, order, estimate, undefined, "manual_sell");
-      if (order.action === "buy") {
-        await this.recordBuyLifecycle(user, round, order, actionSnapshot);
-      }
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId: order.traceId,
-        category: "matching",
-        actionType: "limit_order_triggered",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "pending.orders",
-        symbol: order.symbol,
-        roundId: order.roundId,
-        serverRecvTs: Date.now(),
-        serverPublishTs: Date.now(),
-        backendLatencyMs: order.matchLatencyMs,
-        resultCode: "LIMIT_ORDER_FILLED",
-        resultMessage: "Pending paper limit order triggered by live odds.",
-        details: {
-          traceId: order.traceId,
-          roundId: order.roundId,
-          marketId: order.marketId,
-          marketSlug: order.marketSlug,
-          orderId: order.id,
-          bookKey: order.bookKey,
-          bookHash: order.bookHash,
-          bookSnapshotId: order.bookHash,
-          sourceLatencyMs: order.sourceLatencyMs,
-          avgFillPrice: order.avgFillPrice,
-          filledQty: order.filledQty,
-          slippageBps: order.slippageBps
+      await this.runTradeWriteTransaction(async () => {
+        order.bookHash = book.snapshotId;
+        order.bestBid = book.bestBid;
+        order.bestAsk = book.bestAsk;
+        order.midPrice = book.midPrice;
+        order.bookSnapshotTs = book.snapshotTs;
+        order.sourceLatencyMs = Math.max(Date.now() - book.snapshotTs, 0);
+        order.matchLatencyMs = Math.max(Date.now() - order.createdAt, 1);
+        const actionSnapshot = this.captureActionSnapshot();
+        await this.applyFilledOrder(user, round, order, estimate, undefined, "manual_sell", false);
+        if (order.action === "buy") {
+          await this.recordBuyLifecycle(user, round, order, actionSnapshot);
         }
+        await Promise.all([
+          this.writeAuditLog({
+            eventId: this.store.newId("evt"),
+            traceId: order.traceId,
+            category: "matching",
+            actionType: "limit_order_triggered",
+            actionStatus: "success",
+            userId: user.id,
+            role: user.role,
+            pageName: "trade.main",
+            moduleName: "pending.orders",
+            symbol: order.symbol,
+            roundId: order.roundId,
+            serverRecvTs: Date.now(),
+            serverPublishTs: Date.now(),
+            backendLatencyMs: order.matchLatencyMs,
+            resultCode: "LIMIT_ORDER_FILLED",
+            resultMessage: "Pending paper limit order triggered by live odds.",
+            details: {
+              traceId: order.traceId,
+              roundId: order.roundId,
+              marketId: order.marketId,
+              marketSlug: order.marketSlug,
+              orderId: order.id,
+              bookKey: order.bookKey,
+              bookHash: order.bookHash,
+              bookSnapshotId: order.bookHash,
+              sourceLatencyMs: order.sourceLatencyMs,
+              avgFillPrice: order.avgFillPrice,
+              filledQty: order.filledQty,
+              slippageBps: order.slippageBps
+            }
+          }),
+          this.writeBehaviorLog(
+            this.createBehaviorLog({
+              user,
+              actionType: "limit_order_triggered",
+              actionStatus: "success",
+              traceId: order.traceId,
+              orderId: order.id,
+              round,
+              snapshot: actionSnapshot,
+              direction: order.side,
+              positionNotional: order.notionalUsdc,
+              bookSnapshot: book,
+              order,
+              actualFillPrice: order.avgFillPrice,
+              slippageBps: order.slippageBps,
+              partialFilled: order.partialFilled,
+              unfilledQty: order.unfilledQty,
+              executionLatencyMs: order.matchLatencyMs
+            })
+          )
+        ]);
       });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "limit_order_triggered",
-          actionStatus: "success",
-          traceId: order.traceId,
-          orderId: order.id,
-          round,
-          snapshot: actionSnapshot,
-          direction: order.side,
-          positionNotional: order.notionalUsdc,
-          bookSnapshot: book,
-          order,
-          actualFillPrice: order.avgFillPrice,
-          slippageBps: order.slippageBps,
-          partialFilled: order.partialFilled,
-          unfilledQty: order.unfilledQty,
-          executionLatencyMs: order.matchLatencyMs
-        })
-      );
+      this.store.emitUserPayload(user.id);
     }
   }
 
@@ -2385,78 +2467,82 @@ export class SimulationEngine {
   }
 
   private async failPendingOrder(user: UserRecord, order: OrderRecord, reason: string) {
-    const releasedFrozenUsdc = order.frozenUsdc ?? 0;
-    const releasedFrozenQty = order.frozenQty ?? 0;
-    if (order.frozenUsdc && order.frozenUsdc > 0) {
-      user.availableUsdc = roundNumber(user.availableUsdc + order.frozenUsdc, 2);
-      order.frozenUsdc = 0;
-      await this.store.persistUser(user);
-    }
-    if (order.frozenQty && order.frozenQty > 0) {
-      await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
-      order.frozenQty = 0;
-    }
-    order.status = "failed";
-    order.lifecycleStatus = "failed";
-    order.resultType = "all_failed";
-    order.failureReason = reason;
-    order.serverPublishTs = Date.now();
-    await this.store.persistOrder(order);
-    const now = Date.now();
-    const snapshot = this.captureActionSnapshot();
-    const round = this.store.getRoundById(order.roundId);
-    await this.writeAuditLog({
-      eventId: this.store.newId("evt"),
-      traceId: order.traceId,
-      category: "matching",
-      actionType: "limit_order_failed",
-      actionStatus: "failed",
-      userId: user.id,
-      role: user.role,
-      pageName: "trade.main",
-      moduleName: "pending.orders",
-      symbol: order.symbol,
-      roundId: order.roundId,
-      serverRecvTs: now,
-      serverPublishTs: now,
-      backendLatencyMs: order.matchLatencyMs,
-      resultCode: "LIMIT_ORDER_FAILED",
-      resultMessage: reason,
-      details: {
-        traceId: order.traceId,
-        roundId: order.roundId,
-        marketId: order.marketId,
-        marketSlug: order.marketSlug,
-        orderId: order.id,
-        bookKey: order.bookKey,
-        bookSnapshotId: order.bookHash,
-        releasedFrozenUsdc,
-        releasedFrozenQty,
-        failureReason: reason
+    await this.runTradeWriteTransaction(async () => {
+      const releasedFrozenUsdc = order.frozenUsdc ?? 0;
+      const releasedFrozenQty = order.frozenQty ?? 0;
+      if (order.frozenUsdc && order.frozenUsdc > 0) {
+        user.availableUsdc = roundNumber(user.availableUsdc + order.frozenUsdc, 2);
+        order.frozenUsdc = 0;
+        await this.store.persistUser(user);
       }
+      if (order.frozenQty && order.frozenQty > 0) {
+        await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
+        order.frozenQty = 0;
+      }
+      order.status = "failed";
+      order.lifecycleStatus = "failed";
+      order.resultType = "all_failed";
+      order.failureReason = reason;
+      order.serverPublishTs = Date.now();
+      await this.store.persistOrder(order);
+      const now = Date.now();
+      const snapshot = this.captureActionSnapshot();
+      const round = this.store.getRoundById(order.roundId);
+      await Promise.all([
+        this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId: order.traceId,
+          category: "matching",
+          actionType: "limit_order_failed",
+          actionStatus: "failed",
+          userId: user.id,
+          role: user.role,
+          pageName: "trade.main",
+          moduleName: "pending.orders",
+          symbol: order.symbol,
+          roundId: order.roundId,
+          serverRecvTs: now,
+          serverPublishTs: now,
+          backendLatencyMs: order.matchLatencyMs,
+          resultCode: "LIMIT_ORDER_FAILED",
+          resultMessage: reason,
+          details: {
+            traceId: order.traceId,
+            roundId: order.roundId,
+            marketId: order.marketId,
+            marketSlug: order.marketSlug,
+            orderId: order.id,
+            bookKey: order.bookKey,
+            bookSnapshotId: order.bookHash,
+            releasedFrozenUsdc,
+            releasedFrozenQty,
+            failureReason: reason
+          }
+        }),
+        this.writeBehaviorLog(
+          this.createBehaviorLog({
+            user,
+            actionType: "limit_order_failed",
+            actionStatus: "failed",
+            traceId: order.traceId,
+            orderId: order.id,
+            round,
+            snapshot,
+            direction: order.side,
+            positionNotional: order.notionalUsdc,
+            bookSnapshot: snapshot.orderBooks[order.side],
+            order,
+            partialFilled: order.partialFilled,
+            unfilledQty: order.unfilledQty,
+            failureReason: reason,
+            frozenAssetRelease: {
+              releasedFrozenUsdc,
+              releasedFrozenQty
+            }
+          })
+        )
+      ]);
     });
-    await this.writeBehaviorLog(
-      this.createBehaviorLog({
-        user,
-        actionType: "limit_order_failed",
-        actionStatus: "failed",
-        traceId: order.traceId,
-        orderId: order.id,
-        round,
-        snapshot,
-        direction: order.side,
-        positionNotional: order.notionalUsdc,
-        bookSnapshot: snapshot.orderBooks[order.side],
-        order,
-        partialFilled: order.partialFilled,
-        unfilledQty: order.unfilledQty,
-        failureReason: reason,
-        frozenAssetRelease: {
-          releasedFrozenUsdc,
-          releasedFrozenQty
-        }
-      })
-    );
     this.store.emitUserPayload(user.id);
   }
 
@@ -2853,7 +2939,10 @@ export class SimulationEngine {
       binancePrice,
       chainlinkPrice,
       currentPrice: binancePrice || chainlinkPrice,
-      priceToBeat: currentRound?.priceToBeat ?? 0,
+      priceToBeat:
+        currentRound && isBtcReferencePrice(currentRound.priceToBeat) && isOfficialPtbSource(currentRound.priceToBeatSource)
+          ? currentRound.priceToBeat
+          : 0,
       upPrice: roundNumber(upPrice, 4),
       downPrice: roundNumber(downPrice, 4),
       displayPrices: {
@@ -2969,12 +3058,14 @@ export class SimulationEngine {
       const unrealizedPnl = roundNumber(position.qty * mark - position.notionalSpent, 2);
       const book = snapshot.orderBooks[position.side];
       const currentValue = roundNumber(position.qty * mark, 2);
+      const executablePnl = roundNumber(((book.bestBid || mark) * position.qty) - position.notionalSpent, 2);
       if (
         position.currentMark !== mark ||
         position.unrealizedPnl !== unrealizedPnl ||
         position.currentValue !== currentValue ||
         position.currentBid !== book.bestBid ||
-        position.currentAsk !== book.bestAsk
+        position.currentAsk !== book.bestAsk ||
+        position.executablePnlUsdc !== executablePnl
       ) {
         position.currentMark = mark;
         position.currentBid = book.bestBid;
@@ -2983,6 +3074,9 @@ export class SimulationEngine {
         position.currentValue = currentValue;
         position.sourceLatencyMs = Math.max(snapshot.serverNow - book.snapshotTs, 0);
         position.unrealizedPnl = unrealizedPnl;
+        position.costBasisUsdc = position.notionalSpent;
+        position.markPnlUsdc = unrealizedPnl;
+        position.executablePnlUsdc = executablePnl;
         changedUsers.add(position.userId);
       }
     }
@@ -3247,137 +3341,187 @@ export class SimulationEngine {
     if (!round.settledSide || round.redeemFinishTs || this.redeemLocks.has(round.id)) {
       return;
     }
+    const settledSide = round.settledSide;
     this.redeemLocks.add(round.id);
+    const originalRound = { ...round };
+    const originalPositions = new Map<string, PositionRecord>();
+    const originalUsers = new Map<string, UserRecord>();
     try {
-    const closedAt = Date.now();
-    const userIds = new Set<string>();
-    const positions = this.store.positions.filter(
-      (position) => position.roundId === round.id && position.status === "open"
-    );
+      const closedAt = Date.now();
+      const userIds = new Set<string>();
+      let redeemedPositionCount = 0;
+      const positions = this.store.positions.filter(
+        (position) => position.roundId === round.id && position.status === "open"
+      );
 
-    for (const position of positions) {
-      const user = this.store.getUserById(position.userId);
-      if (!user) {
-        continue;
-      }
-      const snapshot = this.captureActionSnapshot();
-      const isWinner = position.side === round.settledSide;
-      const redeemAmount = isWinner ? position.qty : 0;
-      const realizedPnl = redeemAmount - position.notionalSpent;
-      user.availableUsdc = roundNumber(user.availableUsdc + redeemAmount, 2);
-      position.realizedPnl = roundNumber(position.realizedPnl + realizedPnl, 2);
-      position.unrealizedPnl = 0;
-      position.status = "closed";
-      position.closedAt = closedAt;
-      position.currentMark = isWinner ? 1 : 0;
-      position.currentBid = undefined;
-      position.currentAsk = undefined;
-      position.currentMid = undefined;
-      position.sourceLatencyMs = undefined;
-      position.lockedQty = 0;
-      position.currentValue = redeemAmount;
-      position.settlementResult = isWinner ? "win" : "loss";
-      await this.store.persistUser(user);
-      await this.store.persistPosition(position);
-      await this.store.settleOpenOrderLifecycles({
-        userId: user.id,
-        roundId: round.id,
-        side: position.side,
-        settlementResult: position.settlementResult,
-        settlementDirection: round.settledSide,
-        settlementTimeMs: round.settlementTs ?? closedAt,
-        exitTokenPrice: isWinner ? 1 : 0
-      });
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId: this.store.newTraceId(),
-        category: "settlement",
-        actionType: "redeem_position",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "profile.main",
-        moduleName: "position.table",
-        symbol: round.symbol,
-        roundId: round.id,
-        serverRecvTs: closedAt,
-        serverPublishTs: closedAt,
-        backendLatencyMs: 0,
-        resultCode: "POSITION_SETTLED",
-        resultMessage: `Position ${position.id} settled as ${position.settlementResult}.`,
-        details: {
-          roundId: round.id,
-          marketId: round.marketId,
-          marketSlug: round.marketSlug,
-          positionId: position.id,
-          side: position.side,
-          settlementResult: position.settlementResult,
-          redeemAmount,
-          realizedPnl: position.realizedPnl
-        }
-      });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "redeem_position",
-          actionStatus: "success",
-          traceId: this.store.newTraceId(),
-          round,
-          snapshot,
-          direction: position.side,
-          entryOdds: position.averageEntry,
-          positionNotional: position.notionalSpent,
-          exitType: "settlement",
-          exitOdds: position.currentMark,
-          settlementResult: position.settlementResult,
-          settlementDirection: round.settledSide,
-          settlementTimeMs: round.settlementTs ?? closedAt,
-          gammaPollCount: round.pollCount,
-          redeemFinishTimeMs: closedAt,
-          contextJson: {
+      await this.store.withTransaction(async () => {
+        for (const position of positions) {
+          const user = this.store.getUserById(position.userId);
+          if (!user) {
+            continue;
+          }
+          originalPositions.set(position.id, { ...position });
+          originalUsers.set(user.id, { ...user });
+          const snapshot = this.captureActionSnapshot();
+          const isWinner = position.side === settledSide;
+          const redeemAmount = isWinner ? position.qty : 0;
+          const realizedPnl = redeemAmount - position.notionalSpent;
+          const settlementResult = isWinner ? "win" : "loss";
+          const claimed = await this.store.claimRedeemLedger({
+            roundId: round.id,
+            userId: user.id,
             positionId: position.id,
+            redeemAmountUsdc: redeemAmount,
+            realizedPnlUsdc: roundNumber(realizedPnl, 2),
+            settlementResult,
+            createdAtMs: closedAt,
+            details: {
+              side: position.side,
+              settledSide,
+              marketId: round.marketId,
+              marketSlug: round.marketSlug
+            }
+          });
+          if (!claimed) {
+            continue;
+          }
+
+          user.availableUsdc = roundNumber(user.availableUsdc + redeemAmount, 2);
+          position.realizedPnl = roundNumber(position.realizedPnl + realizedPnl, 2);
+          position.unrealizedPnl = 0;
+          position.costBasisUsdc = 0;
+          position.markPnlUsdc = 0;
+          position.executablePnlUsdc = 0;
+          position.status = "closed";
+          position.closedAt = closedAt;
+          position.currentMark = isWinner ? 1 : 0;
+          position.currentBid = undefined;
+          position.currentAsk = undefined;
+          position.currentMid = undefined;
+          position.sourceLatencyMs = undefined;
+          position.lockedQty = 0;
+          position.currentValue = redeemAmount;
+          position.settlementResult = settlementResult;
+          await this.store.persistUser(user);
+          await this.store.persistPosition(position);
+          await this.store.settleOpenOrderLifecycles({
+            userId: user.id,
+            roundId: round.id,
+            side: position.side,
+            settlementResult: position.settlementResult,
+            settlementDirection: settledSide,
+            settlementTimeMs: round.settlementTs ?? closedAt,
+            exitTokenPrice: isWinner ? 1 : 0
+          });
+          await this.writeAuditLog({
+            eventId: this.store.newId("evt"),
+            traceId: this.store.newTraceId(),
+            category: "settlement",
+            actionType: "redeem_position",
+            actionStatus: "success",
+            userId: user.id,
+            role: user.role,
+            pageName: "profile.main",
+            moduleName: "position.table",
+            symbol: round.symbol,
+            roundId: round.id,
+            serverRecvTs: closedAt,
+            serverPublishTs: closedAt,
+            backendLatencyMs: 0,
+            resultCode: "POSITION_SETTLED",
+            resultMessage: `Position ${position.id} settled as ${position.settlementResult}.`,
+            details: {
+              roundId: round.id,
+              marketId: round.marketId,
+              marketSlug: round.marketSlug,
+              positionId: position.id,
+              side: position.side,
+              settlementResult: position.settlementResult,
+              redeemAmount,
+              realizedPnl: position.realizedPnl
+            }
+          });
+          await this.writeBehaviorLog(
+            this.createBehaviorLog({
+              user,
+              actionType: "redeem_position",
+              actionStatus: "success",
+              traceId: this.store.newTraceId(),
+              round,
+              snapshot,
+              direction: position.side,
+              entryOdds: position.averageEntry,
+              positionNotional: position.notionalSpent,
+              exitType: "settlement",
+              exitOdds: position.currentMark,
+              settlementResult: position.settlementResult,
+              settlementDirection: settledSide,
+              settlementTimeMs: round.settlementTs ?? closedAt,
+              gammaPollCount: round.pollCount,
+              redeemFinishTimeMs: closedAt,
+              contextJson: {
+                positionId: position.id,
+                roundId: round.id,
+                marketId: round.marketId,
+                marketSlug: round.marketSlug,
+                redeemAmount
+              }
+            })
+          );
+          redeemedPositionCount += 1;
+          userIds.add(user.id);
+        }
+
+        round.redeemFinishTs = closedAt;
+        round.redeemScheduledAt = round.redeemScheduledAt ?? closedAt;
+        round.status = "Closed";
+        await this.store.upsertRound(round);
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId: this.store.newTraceId(),
+          category: "settlement",
+          actionType: "round_closed",
+          actionStatus: "success",
+          pageName: "trade.main",
+          moduleName: "settlement.engine",
+          symbol: round.symbol,
+          roundId: round.id,
+          serverRecvTs: closedAt,
+          serverPublishTs: closedAt,
+          backendLatencyMs: 0,
+          resultCode: "ROUND_CLOSED",
+          resultMessage: "Round was closed after redeem processing completed.",
+          details: {
             roundId: round.id,
             marketId: round.marketId,
             marketSlug: round.marketSlug,
-            redeemAmount
+            settledSide,
+            settlementPrice: round.settlementPrice,
+            redeemFinishTs: round.redeemFinishTs,
+            redeemedPositionCount
           }
-        })
-      );
-      userIds.add(user.id);
-    }
+        });
+      });
 
-    round.redeemFinishTs = closedAt;
-    round.redeemScheduledAt = round.redeemScheduledAt ?? closedAt;
-    round.status = "Closed";
-    await this.writeAuditLog({
-      eventId: this.store.newId("evt"),
-      traceId: this.store.newTraceId(),
-      category: "settlement",
-      actionType: "round_closed",
-      actionStatus: "success",
-      pageName: "trade.main",
-      moduleName: "settlement.engine",
-      symbol: round.symbol,
-      roundId: round.id,
-      serverRecvTs: closedAt,
-      serverPublishTs: closedAt,
-      backendLatencyMs: 0,
-      resultCode: "ROUND_CLOSED",
-      resultMessage: "Round was closed after redeem processing completed.",
-      details: {
-        roundId: round.id,
-        marketId: round.marketId,
-        marketSlug: round.marketSlug,
-        settledSide: round.settledSide,
-        settlementPrice: round.settlementPrice,
-        redeemFinishTs: round.redeemFinishTs,
-        redeemedPositionCount: positions.length
+      for (const userId of userIds) {
+        this.store.emitUserPayload(userId);
       }
-    });
-    for (const userId of userIds) {
-      this.store.emitUserPayload(userId);
-    }
-    await this.publishSettlementMarketSnapshot(round, "redeem_completed");
+      await this.publishSettlementMarketSnapshot(round, "redeem_completed");
+    } catch (error) {
+      Object.assign(round, originalRound);
+      for (const [positionId, original] of originalPositions) {
+        const position = this.store.positions.find((item) => item.id === positionId);
+        if (position) {
+          Object.assign(position, original);
+        }
+      }
+      for (const [userId, original] of originalUsers) {
+        const user = this.store.getUserById(userId);
+        if (user) {
+          Object.assign(user, original);
+        }
+      }
+      throw error;
     } finally {
       this.redeemLocks.delete(round.id);
     }
@@ -3389,7 +3533,8 @@ export class SimulationEngine {
     side: TradeSide,
     filledQty: number,
     spent: number,
-    mark: number
+    mark: number,
+    entryFee = 0
   ) {
     let position = this.store.positions.find(
       (item) => item.userId === userId && item.roundId === roundId && item.side === side && item.status === "open"
@@ -3407,6 +3552,12 @@ export class SimulationEngine {
         currentMark: mark,
         unrealizedPnl: 0,
         realizedPnl: 0,
+        entryFeeUsdc: 0,
+        exitFeeUsdc: 0,
+        totalFeeUsdc: 0,
+        costBasisUsdc: 0,
+        markPnlUsdc: 0,
+        executablePnlUsdc: 0,
         status: "open",
         openedAt: Date.now()
       };
@@ -3417,9 +3568,14 @@ export class SimulationEngine {
     position.averageEntry = roundNumber(totalCost / Math.max(totalQty, QTY_EPSILON), 4);
     position.qty = roundNumber(totalQty, 4);
     position.notionalSpent = roundNumber(totalCost, 4);
+    position.entryFeeUsdc = roundNumber((position.entryFeeUsdc ?? 0) + entryFee, 8);
+    position.totalFeeUsdc = roundNumber((position.entryFeeUsdc ?? 0) + (position.exitFeeUsdc ?? 0), 8);
+    position.costBasisUsdc = position.notionalSpent;
     position.currentMark = roundNumber(mark, 4);
     position.currentValue = roundNumber(position.qty * position.currentMark, 2);
     position.unrealizedPnl = roundNumber(position.qty * position.currentMark - position.notionalSpent, 2);
+    position.markPnlUsdc = position.unrealizedPnl;
+    position.executablePnlUsdc = roundNumber(((position.currentBid ?? position.currentMark) * position.qty) - position.notionalSpent, 2);
     return position;
   }
 
@@ -3703,7 +3859,12 @@ export class SimulationEngine {
   }
 
   private syncPriceToBeatFromPolymarketOpenPrice(round: RoundRecord, now: number) {
-    if (!isBtcReferencePrice(round.polymarketOpenPrice)) {
+    if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isOfficialPtbSource(round.polymarketOpenPriceSource)) {
+      if (round.priceToBeat || round.priceToBeatSource || round.priceToBeatCapturedAt) {
+        round.priceToBeat = 0;
+        round.priceToBeatSource = undefined;
+        round.priceToBeatCapturedAt = undefined;
+      }
       return;
     }
     const officialPriceToBeat = roundNumber(round.polymarketOpenPrice, 2);
@@ -3718,32 +3879,16 @@ export class SimulationEngine {
   }
 
   private async hydrateRoundPolymarketReferencePrices(round: RoundRecord, now: number) {
-    if (!isBtcReferencePrice(round.polymarketOpenPrice)) {
+    if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isOfficialPtbSource(round.polymarketOpenPriceSource)) {
       round.polymarketOpenPrice = undefined;
       round.polymarketOpenPriceSource = undefined;
     }
-    if (!isBtcReferencePrice(round.polymarketClosePrice)) {
+    if (!isBtcReferencePrice(round.polymarketClosePrice) || !isOfficialPtbSource(round.polymarketClosePriceSource)) {
       round.polymarketClosePrice = undefined;
       round.polymarketClosePriceSource = undefined;
     }
-    // Use Gamma API reference prices from the live market detail (extracted from Polymarket metadata).
     const liveDetail =
       this.polymarketState.currentMarket?.slug === round.marketSlug ? this.polymarketState.currentMarket : undefined;
-    if (isBtcReferencePrice(liveDetail?.referenceOpenPrice) && round.startAt <= now) {
-      const liveOpenPrice = roundNumber(liveDetail.referenceOpenPrice, 2);
-      const shouldUseLiveOpenPrice =
-        !isBtcReferencePrice(round.polymarketOpenPrice) ||
-        Math.abs(round.polymarketOpenPrice - liveOpenPrice) >= 0.005 ||
-        !round.polymarketOpenPriceSource;
-      if (shouldUseLiveOpenPrice) {
-        round.polymarketOpenPrice = liveOpenPrice;
-        round.polymarketOpenPriceSource = liveDetail.referenceOpenPriceSource ?? "Gamma";
-      }
-    }
-    if (!round.polymarketClosePrice && liveDetail?.referenceClosePrice && now >= round.endAt) {
-      round.polymarketClosePrice = roundNumber(liveDetail.referenceClosePrice, 2);
-      round.polymarketClosePriceSource = liveDetail.referenceClosePriceSource ?? "Gamma";
-    }
     const resolutionSource = liveDetail?.resolutionSource ?? round.resolutionSource;
     const isActiveRound = round.startAt <= now && round.endAt > now;
     if (!round.polymarketOpenPrice && round.startAt <= now) {

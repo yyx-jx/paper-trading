@@ -137,7 +137,8 @@ async function main() {
   const tester = await create("log-tester", "Tester", senior.id);
   const other = await create("log-other", "Tester");
   const engineer = await create("log-engineer", "Test Engineer");
-  assert.equal(engineer.permissionCodes.includes("logs:view:all"), true);
+  assert.equal(engineer.permissionCodes.includes("logs:view:all"), false);
+  assert.equal(engineer.permissionCodes.includes("logs:view:team"), true);
 
   store.logs.unshift(
     audit({
@@ -199,7 +200,18 @@ async function main() {
   const matching = new MatchingStore({
     databaseUrl: "",
     redisUrl: "",
-    redisSnapshotSeconds: 60
+    persistenceMode: "memory",
+    redisSnapshotSeconds: 60,
+    strictPersistence: false,
+    pgConnectionTimeoutMs: 100,
+    pgIdleTimeoutMs: 100,
+    pgMaxConnections: 1,
+    pgKeepAlive: false,
+    pgReconnectIntervalMs: 100,
+    pgReconnectMaxIntervalMs: 100,
+    eventsMemoryMax: 100,
+    eventsMemoryMaxAgeMs: 60_000,
+    booksMemoryMax: 10
   });
   const userEvent: MatchingEventRecord = {
     eventId: "mevt-user",
