@@ -1,4 +1,4 @@
-import type { Language, PermissionLevel, Role, PublicUser } from "../domain/types";
+﻿import type { Language, PermissionLevel, Role, PublicUser } from "../domain/types";
 
 export interface BulkCreateUserInput {
   username: string;
@@ -40,7 +40,10 @@ export interface BulkUserValidationContext {
 }
 
 export const CSV_BULK_USER_TEMPLATE =
-  "username 用户名,password 密码,displayName 显示名,role 角色,language 语言,managerUsername 管理者用户名,availableUsdc 可用USDC,permissionLevel 权限等级,mustChangePassword 首次登录改密\n" +
+  "username,password,displayName,role,language,managerUsername,availableUsdc,permissionLevel,mustChangePassword\n" +
+  "# username: required unique login name; password: required initial password; displayName: optional display name\n" +
+  "# role: Tester/Senior Tester/Test Engineer/Admin; language: zh-CN/en-US; managerUsername: required only when a Tester belongs to a Senior Tester or Test Engineer\n" +
+  "# availableUsdc: optional non-negative number; permissionLevel: Initial/Standard; mustChangePassword: true/false\n" +
   "alice,ChangeMe123,Alice Tester,Tester,zh-CN,senior01,10000,Standard,true\n";
 
 const ROLES = new Set<Role>(["Tester", "Senior Tester", "Test Engineer", "Admin"]);
@@ -48,6 +51,7 @@ const LANGUAGES = new Set<Language>(["zh-CN", "en-US"]);
 const PERMISSION_LEVELS = new Set<PermissionLevel>(["Initial", "Standard"]);
 
 function parseCsvRows(text: string) {
+  const delimiter = text.split("\t").length > text.split(",").length ? "\t" : ",";
   const rows: string[][] = [];
   let row: string[] = [];
   let cell = "";
@@ -68,7 +72,7 @@ function parseCsvRows(text: string) {
     }
     if (char === '"') {
       quoted = true;
-    } else if (char === ",") {
+    } else if (char === delimiter) {
       row.push(cell);
       cell = "";
     } else if (char === "\n") {
@@ -95,10 +99,16 @@ function parseBoolean(value: string | undefined) {
   return undefined;
 }
 
-function looksLikeTemplateDescription(row: string[]) {
-  const first = row[0]?.toLowerCase() ?? "";
-  return first.includes("username") && row.join(",").includes("用户名");
+function looksLikeHeaderRow(row: string[]) {
+  const normalized = row.map((cell) => cell.trim().toLowerCase());
+  return normalized[0] === "username" && normalized[1] === "password";
 }
+
+function looksLikeTemplateDescription(row: string[]) {
+  const first = row[0]?.trim().toLowerCase() ?? "";
+  return first.startsWith("#") || first.startsWith("//");
+}
+
 
 export function parseBulkUsersCsv(
   text: string,
@@ -107,8 +117,8 @@ export function parseBulkUsersCsv(
   }
 ) {
   const failed: BulkUserValidationFailure[] = [];
-  const rawRows = parseCsvRows(text).filter((row) => row.some((cell) => cell.trim()));
-  const rows = looksLikeTemplateDescription(rawRows[0] ?? []) ? rawRows.slice(1) : rawRows;
+  const rawRows = parseCsvRows(text.replace(/^\uFEFF/, "")).filter((row) => row.some((cell) => cell.trim()));
+  const rows = rawRows.filter((row) => !looksLikeHeaderRow(row) && !looksLikeTemplateDescription(row));
   if (rows.length > 100) {
     failed.push({ rowNumber: 0, error: "CSV import supports at most 100 users." });
   }

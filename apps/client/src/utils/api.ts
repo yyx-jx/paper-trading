@@ -646,7 +646,20 @@ export interface BulkCreateUserInput {
   role?: Role;
   language?: Language;
   seniorTesterId?: string;
+  managerUserId?: string;
+  permissionLevel?: PermissionLevel;
+  mustChangePassword?: boolean;
   availableUsdc?: number;
+}
+
+export interface BulkCreateUserPreviewRow extends BulkCreateUserInput {
+  rowNumber: number;
+  displayName: string;
+  role: Role;
+  language: Language;
+  permissionLevel: PermissionLevel;
+  mustChangePassword: boolean;
+  availableUsdc: number;
 }
 
 export interface BulkCreateUsersResult {
@@ -658,8 +671,14 @@ export interface BulkCreateUsersResult {
   failed: Array<{
     rowNumber: number;
     username?: string;
-    error: string;
+      error: string;
   }>;
+}
+
+export interface BulkCreateUsersPreviewResult {
+  total: number;
+  valid: BulkCreateUserPreviewRow[];
+  failed: BulkCreateUsersResult["failed"];
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8787";
@@ -944,6 +963,21 @@ export const api = {
     return request<BulkCreateUsersResult>("/api/users/bulk", token, {
       method: "POST",
       body: JSON.stringify({ users })
+    });
+  },
+  downloadBulkUsersTemplate(token: string) {
+    return requestText("/api/users/bulk/template.csv", token);
+  },
+  previewBulkUsersCsv(token: string, csv: string) {
+    return request<BulkCreateUsersPreviewResult>("/api/users/bulk/csv/preview", token, {
+      method: "POST",
+      body: JSON.stringify({ csv })
+    });
+  },
+  bulkCreateUsersCsv(token: string, csv: string) {
+    return request<BulkCreateUsersResult>("/api/users/bulk/csv", token, {
+      method: "POST",
+      body: JSON.stringify({ csv })
     });
   },
   disableUser(token: string, userId: string) {

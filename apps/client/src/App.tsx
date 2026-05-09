@@ -15,6 +15,7 @@ import {
   type CandlePoint,
   type BulkCreateUserInput,
   type BulkCreateUsersResult,
+  type BulkCreateUsersPreviewResult,
   type CandleBar,
   type CandleInterval,
   type HistoryRound,
@@ -4970,13 +4971,67 @@ function BulkUserDialog(props: {
 }) {
   const { t, token, language } = props;
   const template =
-    "username,password,displayName,role,language,seniorTesterId,availableUsdc\n" +
-    "tester_new_01,ChangeMe123,Tester New 01,Tester,zh-CN,,10000";
-  const [sourceText, setSourceText] = useState(template);
+    "username,password,displayName,role,language,managerUsername,availableUsdc,permissionLevel,mustChangePassword\n" +
+    "tester_new_01,ChangeMe123,Tester New 01,Tester,zh-CN,,10000,Standard,true";
+  const [sourceText, setSourceText] = useState("");
   const [localError, setLocalError] = useState<string>();
+  const [preview, setPreview] = useState<BulkCreateUsersPreviewResult>();
   const [result, setResult] = useState<BulkCreateUsersResult>();
-  const parsed = useMemo(() => parseBulkUserText(sourceText, props.users, language), [sourceText, props.users, language]);
-  const hasErrors = parsed.errors.length > 0 || parsed.rows.some((row) => row.errors.length > 0);
+  const previewRows = preview?.valid ?? [];
+  const previewFailed = preview?.failed ?? [];
+
+  const downloadCsv = (text: string) => {
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = localLabel(language, "批量用户模板.csv", "bulk-users-template.csv");
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const previewCsv = async (text = sourceText) => {
+    if (!text.trim()) {
+      setLocalError(t("importOrPasteCsvTsvContentFirst"));
+      setPreview(undefined);
+      return;
+    }
+    try {
+      props.setBusy(true);
+      props.onError(undefined);
+      setLocalError(undefined);
+      setResult(undefined);
+      setPreview(await api.previewBulkUsersCsv(token, text));
+    } catch (previewError) {
+      const message = previewError instanceof Error ? previewError.message : "CSV preview failed.";
+      setPreview(undefined);
+      setLocalError(message);
+      props.onError(message);
+    } finally {
+      props.setBusy(false);
+    }
+  };
+
+  const downloadTemplate = async () => {
+    try {
+      props.setBusy(true);
+      props.onError(undefined);
+      setLocalError(undefined);
+      const text = await api.downloadBulkUsersTemplate(token);
+      downloadCsv(text);
+      setSourceText(text.replace(/^\uFEFF/, ""));
+      setPreview(undefined);
+      setResult(undefined);
+    } catch (downloadError) {
+      const message = downloadError instanceof Error ? downloadError.message : "Template download failed.";
+      setLocalError(message);
+      props.onError(message);
+    } finally {
+      props.setBusy(false);
+    }
+  };
 
   const handleFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
@@ -4989,6 +5044,7 @@ function BulkUserDialog(props: {
         setSourceText(text);
         setResult(undefined);
         setLocalError(undefined);
+        void previewCsv(text);
       })
       .catch(() => {
         setLocalError(t("failedToReadTheFile"));
@@ -4996,7 +5052,15 @@ function BulkUserDialog(props: {
   };
 
   const submit = async () => {
-    if (hasErrors || parsed.validUsers.length === 0) {
+    if (!sourceText.trim()) {
+      setLocalError(t("importOrPasteCsvTsvContentFirst"));
+      return;
+    }
+    if (!preview) {
+      await previewCsv();
+      return;
+    }
+    if (previewFailed.length > 0 || previewRows.length === 0) {
       setLocalError(t("fixImportErrorsBeforeCreatingUsers"));
       return;
     }
@@ -5004,10 +5068,11 @@ function BulkUserDialog(props: {
       props.setBusy(true);
       props.onError(undefined);
       setLocalError(undefined);
-      const nextResult = await api.bulkCreateUsers(token, parsed.validUsers);
+      const nextResult = await api.bulkCreateUsersCsv(token, sourceText);
       setResult(nextResult);
       if (nextResult.failed.length === 0) {
         await props.onCreated();
+        setPreview(undefined);
       }
     } catch (bulkError) {
       const message = bulkError instanceof Error ? bulkError.message : "Bulk create failed.";
@@ -5032,14 +5097,26 @@ function BulkUserDialog(props: {
         </div>
         <div className="dialog-section">
           <div className="button-row fit-actions">
+            <button className="secondary-button compact-button" disabled={props.busy} onClick={downloadTemplate}>
+              {localLabel(language, "下载模板", "Download Template")}
+            </button>
             <label className="file-import-button">
               {t("chooseCsvTsvFile")}
               <input type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values,text/plain" onChange={handleFile} />
             </label>
             <button
               className="ghost-button compact-button"
+              disabled={props.busy}
+              onClick={() => void previewCsv()}
+            >
+              {localLabel(language, "预览校验", "Preview")}
+            </button>
+            <button
+              className="ghost-button compact-button"
+              disabled={props.busy}
               onClick={() => {
                 setSourceText(template);
+                setPreview(undefined);
                 setResult(undefined);
                 setLocalError(undefined);
               }}
@@ -5050,8 +5127,8 @@ function BulkUserDialog(props: {
           <small className="muted-line">
             {localLabel(
               language,
-              "必填表头：username,password；可选：displayName,role,language,seniorTesterId,availableUsdc。",
-              "Required headers: username,password; optional: displayName,role,language,seniorTesterId,availableUsdc."
+              "请先下载模板填写；上传或粘贴后点击预览校验，通过后再创建用户。",
+              "Download the template first; upload or paste it, preview validation, then create users."
             )}
           </small>
         </div>
@@ -5062,6 +5139,7 @@ function BulkUserDialog(props: {
               value={sourceText}
               onChange={(event) => {
                 setSourceText(event.target.value);
+                setPreview(undefined);
                 setResult(undefined);
                 setLocalError(undefined);
               }}
@@ -5069,8 +5147,17 @@ function BulkUserDialog(props: {
           </label>
         </div>
         {localError ? <div className="inline-error-banner">{redactNetworkAddresses(localError)}</div> : null}
-        {parsed.errors.length > 0 ? (
-          <div className="inline-error-banner">{parsed.errors.join(" ")}</div>
+        {preview ? (
+          <div className={previewFailed.length ? "inline-error-banner" : "inline-info-banner"}>
+            {localLabel(
+              language,
+              `预览 ${preview.total} 行，可创建 ${previewRows.length} 行，失败 ${previewFailed.length} 行。`,
+              `Previewed ${preview.total} rows, ${previewRows.length} creatable, ${previewFailed.length} failed.`
+            )}
+            {previewFailed.length
+              ? ` ${previewFailed.map((item) => `#${item.rowNumber}: ${redactNetworkAddresses(item.error)}`).join("; ")}`
+              : ""}
+          </div>
         ) : null}
         {result ? (
           <div className={result.failed.length ? "inline-error-banner" : "inline-info-banner"}>
@@ -5099,23 +5186,41 @@ function BulkUserDialog(props: {
               </tr>
             </thead>
             <tbody>
-              {parsed.rows.length === 0 ? (
+              {!preview || (previewRows.length === 0 && previewFailed.length === 0) ? (
                 <tr>
                   <td colSpan={8}>{t("noData")}</td>
                 </tr>
               ) : (
-                parsed.rows.map((row) => (
+                [
+                  ...previewRows.map((row) => ({
+                    ...row,
+                    status: "ready" as const,
+                    error: ""
+                  })),
+                  ...previewFailed.map((row) => ({
+                    rowNumber: row.rowNumber,
+                    username: row.username ?? "",
+                    displayName: "",
+                    role: "Tester" as Role,
+                    language: "zh-CN" as Language,
+                    seniorTesterId: undefined,
+                    managerUserId: undefined,
+                    availableUsdc: undefined,
+                    status: "failed" as const,
+                    error: row.error
+                  }))
+                ].map((row) => (
                   <tr key={row.rowNumber}>
                     <td>{row.rowNumber}</td>
                     <td>{row.username || "--"}</td>
                     <td>{row.displayName || "--"}</td>
                     <td>{row.role ?? "Tester"}</td>
                     <td>{row.language ?? "zh-CN"}</td>
-                    <td>{row.seniorTesterId ?? "--"}</td>
+                    <td>{row.managerUserId ?? row.seniorTesterId ?? "--"}</td>
                     <td>{typeof row.availableUsdc === "number" ? money(row.availableUsdc) : t("default")}</td>
                     <td>
-                      {row.errors.length ? (
-                        <span className="tone-negative">{row.errors.join(" ")}</span>
+                      {row.status === "failed" ? (
+                        <span className="tone-negative">{redactNetworkAddresses(row.error)}</span>
                       ) : (
                         <FieldChip label={t("ready")} tone="positive" />
                       )}
@@ -5127,8 +5232,8 @@ function BulkUserDialog(props: {
           </table>
         </div>
         <div className="button-row dialog-actions">
-          <button className="secondary-button" disabled={props.busy || hasErrors || parsed.validUsers.length === 0} onClick={submit}>
-            {props.busy ? t("loading") : t("createUsers", { parsedvalidUsersleng: parsed.validUsers.length })}
+          <button className="secondary-button" disabled={props.busy || previewFailed.length > 0 || previewRows.length === 0} onClick={submit}>
+            {props.busy ? t("loading") : t("createUsers", { value: previewRows.length })}
           </button>
           <button className="ghost-button" disabled={props.busy} onClick={props.onClose}>
             {t("cancel")}

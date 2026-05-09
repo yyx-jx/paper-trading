@@ -1475,9 +1475,12 @@ async function bootstrap() {
   app.get("/api/health/ready", async (request, reply) => {
     const persistence = store.getPersistenceStatus();
     const matching = await engine.getMatchingHealth().catch(() => undefined);
+    const persistenceReady =
+      persistence.postgres ||
+      (!serverConfig.isProduction && serverConfig.persistenceMode === "memory" && !serverConfig.strictPersistence);
     const ready =
       !shuttingDown &&
-      persistence.postgres &&
+      persistenceReady &&
       (!serverConfig.strictPersistence || persistence.state.postgres.state === "healthy") &&
       (!serverConfig.embeddedMatchingService || Boolean(matching?.ok));
     if (!ready) {
@@ -1817,11 +1820,18 @@ async function bootstrap() {
     })
   );
 
-  app.get("/api/users/bulk/template.csv", async (_request, reply) => {
-    reply.header("content-type", "text/csv; charset=utf-8");
-    reply.header("content-disposition", 'attachment; filename="bulk-users-template.csv"');
-    return CSV_BULK_USER_TEMPLATE;
-  });
+  app.get("/api/users/bulk/template.csv", async (request, reply) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:bulk-create");
+      reply.header("content-type", "text/csv; charset=utf-8");
+      reply.header(
+        "content-disposition",
+        "attachment; filename=\"bulk-users-template.csv\"; filename*=UTF-8''%E6%89%B9%E9%87%8F%E7%94%A8%E6%88%B7%E6%A8%A1%E6%9D%BF.csv"
+      );
+      return `\uFEFF${CSV_BULK_USER_TEMPLATE}`;
+    })
+  );
 
   app.post("/api/users/bulk/csv/preview", async (request) =>
     safeRoute(async () => {

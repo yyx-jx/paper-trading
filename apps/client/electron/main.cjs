@@ -180,10 +180,10 @@ function lockRendererZoom(win) {
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1600,
-    height: 980,
+    width: 1440,
+    height: 900,
     minWidth: 1280,
-    minHeight: 840,
+    minHeight: 760,
     backgroundColor: "#0b1020",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),

@@ -400,6 +400,13 @@ async function main() {
   `);
   await assertZoomLocked(window, "after login");
   await assertNoNetworkAddressesVisible(window, "after login");
+  const tradeCompact = await evaluateTradeLayout(window, 1400, 820);
+  if (!tradeCompact.hasTradePage || !tradeCompact.overflowFree || !tradeCompact.allModulesPresent || !tradeCompact.monitorCellsFit) {
+    throw new Error(`Trade page compact 1400x820 check failed: ${JSON.stringify(tradeCompact)}`);
+  }
+  if (["30s", "1m", "5m", "15m", "1h"].some((label) => !tradeCompact.intervalButtons.includes(label))) {
+    throw new Error(`Missing trade interval buttons at compact 1400x820: ${JSON.stringify(tradeCompact.intervalButtons)}`);
+  }
   const trade1440 = await evaluateTradeLayout(window, 1440, 900);
   if (!trade1440.hasTradePage || !trade1440.overflowFree || !trade1440.allModulesPresent || !trade1440.monitorCellsFit) {
     throw new Error(`Trade page 1440x900 check failed: ${JSON.stringify(trade1440)}`);
@@ -906,6 +913,9 @@ async function main() {
       }
       if (!document.body.textContent.includes("CSV / TSV")) {
         throw new Error("Bulk registration dialog did not open.");
+      }
+      if (!document.body.textContent.includes("Download Template") || !document.body.textContent.includes("Preview")) {
+        throw new Error("Bulk registration template controls are missing.");
       }
       return {
         title: document.title,
