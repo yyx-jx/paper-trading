@@ -101,6 +101,7 @@ const store = new AppStore({
   persistenceMode: serverConfig.persistenceMode,
   chainlinkEnabled: serverConfig.chainlinkEnabled,
   strictPersistence: serverConfig.strictPersistence,
+  seedDefaultUsers: serverConfig.seedDefaultUsers,
   requireSchemaMigrations: serverConfig.requireSchemaMigrations,
   allowDevSchemaBootstrap: serverConfig.allowDevSchemaBootstrap,
   expectedSchemaMigrationId: serverConfig.expectedSchemaMigrationId,
@@ -453,8 +454,10 @@ function getWsUser(query: { token?: string; ticket?: string }, channel: "market"
 
 function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
   let alive = true;
+  let missedPongs = 0;
   socket.on("pong", () => {
     alive = true;
+    missedPongs = 0;
   });
   const timer = setInterval(() => {
     if (socket.readyState !== WsWebSocket.OPEN) {
@@ -462,11 +465,14 @@ function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
       return;
     }
     if (!alive) {
-      heartbeatTimeoutSockets.add(socket);
-      appMetrics.recordWsDisconnect(channel, "heartbeat_timeout");
-      socket.close();
-      clearInterval(timer);
-      return;
+      missedPongs += 1;
+      if (missedPongs >= 3) {
+        heartbeatTimeoutSockets.add(socket);
+        appMetrics.recordWsDisconnect(channel, "heartbeat_timeout");
+        socket.close();
+        clearInterval(timer);
+        return;
+      }
     }
     alive = false;
     socket.ping();

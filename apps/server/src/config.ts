@@ -103,6 +103,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     logRetentionMs: Number(env.LOG_RETENTION_MS ?? 300000),
     snapshotRetentionSeconds: Number(env.REDIS_SNAPSHOT_TTL_SECONDS ?? 300),
     persistenceMode: persistenceModeEnv(env.PERSISTENCE_MODE),
+    seedDefaultUsers: isProduction ? env.SEED_DEFAULT_USERS === "true" : env.SEED_DEFAULT_USERS !== "false",
     databaseUrl: textEnv(env.DATABASE_URL, "postgresql://postgres:postgres@127.0.0.1:5432/paper_trading"),
     redisUrl: textEnv(env.REDIS_URL, "redis://127.0.0.1:6379"),
     binanceRestUrl: textEnv(env.BINANCE_REST_URL, "https://api.binance.com"),

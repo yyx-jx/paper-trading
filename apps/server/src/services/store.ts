@@ -830,6 +830,7 @@ export class AppStore {
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
     strictPersistence: boolean;
+    seedDefaultUsers?: boolean;
     requireSchemaMigrations?: boolean;
     allowDevSchemaBootstrap?: boolean;
     expectedSchemaMigrationId?: string;
@@ -861,6 +862,7 @@ export class AppStore {
     persistenceMode: "external" | "memory";
     chainlinkEnabled: boolean;
     strictPersistence: boolean;
+    seedDefaultUsers: boolean;
     requireSchemaMigrations: boolean;
     allowDevSchemaBootstrap: boolean;
     expectedSchemaMigrationId: string;
@@ -883,6 +885,7 @@ export class AppStore {
   }) {
     this.config = {
       ...config,
+      seedDefaultUsers: config.seedDefaultUsers ?? true,
       requireSchemaMigrations: config.requireSchemaMigrations ?? false,
       allowDevSchemaBootstrap: config.allowDevSchemaBootstrap ?? true,
       expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000004"
@@ -917,8 +920,12 @@ export class AppStore {
     console.log("[store] init start");
     await this.connectPostgres();
     console.log(`[store] connectPostgres done enabled=${this.postgresEnabled}`);
-    await this.seedUsers();
-    console.log("[store] seedUsers done");
+    if (this.config.seedDefaultUsers) {
+      await this.seedUsers();
+      console.log("[store] seedUsers done");
+    } else {
+      console.log("[store] seedUsers skipped");
+    }
     await this.connectRedis();
     console.log(`[store] connectRedis done enabled=${this.redisEnabled}`);
     await this.loadStateFromPersistence();
@@ -3255,7 +3262,10 @@ export class AppStore {
       if (this.closed) {
         return;
       }
-      void this.handlePostgresFailure(error, "pool error");
+      // `pg` emits this for idle clients; the pool has already removed the
+      // broken client, so keep the pool available and let active query failures
+      // drive strict persistence reconnects.
+      console.warn("[store] PostgreSQL idle client error:", error);
     });
     return pool;
   }

@@ -9,6 +9,46 @@ const LOCAL_API_BASE_URL = "http://127.0.0.1:8787";
 let backendProcess;
 let backendLogStream;
 
+function packagedMetadata() {
+  try {
+    return require(path.resolve(__dirname, "../../../package.json"));
+  } catch {
+    return {};
+  }
+}
+
+function productionApiBaseUrl() {
+  const metadata = packagedMetadata();
+  return String(metadata.productionApiBaseUrl || process.env.VITE_API_BASE_URL || "").trim();
+}
+
+function configureProxyBypass() {
+  const apiBaseUrl = productionApiBaseUrl();
+  if (!apiBaseUrl) {
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(apiBaseUrl);
+  } catch {
+    return;
+  }
+
+  const bypassRules = new Set(["localhost", "127.0.0.1", "<local>", parsed.hostname]);
+  if (parsed.port) {
+    bypassRules.add(`${parsed.hostname}:${parsed.port}`);
+  }
+
+  app.commandLine.appendSwitch("proxy-bypass-list", Array.from(bypassRules).join(";"));
+}
+
+function redactNetworkAddresses(value) {
+  return String(value ?? "")
+    .replace(/\b(?:https?|wss?):\/\/[^\s<>"'`]+/gi, "[service address]")
+    .replace(/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b/g, "[service address]");
+}
+
 function asarUnpackedPath(filePath) {
   if (!app.isPackaged) {
     return filePath;
@@ -206,10 +246,12 @@ app.whenReady().then(async () => {
 }).catch((error) => {
   dialog.showErrorBox(
     "BTC Paper Trading Test failed to start",
-    error instanceof Error ? error.message : String(error)
+    redactNetworkAddresses(error instanceof Error ? error.message : String(error))
   );
   app.quit();
 });
+
+configureProxyBypass();
 
 app.on("before-quit", () => {
   stopBackend();

@@ -1,129 +1,43 @@
 # Production Deployment
 
-This deployment target is a single-machine Docker Compose stack behind Caddy.
-Only Caddy publishes public ports. PostgreSQL, Redis, matching-service, and
-app-server stay on the Docker network.
+This target is a temporary HTTP rollout for external desktop clients. Users receive only the Electron client; they do not need a browser URL. The client talks to the server through:
+
+```text
+API: http://103.147.13.98:10001
+WS:  ws://103.147.13.98:10001
+```
+
+Only Caddy publishes the public business port. PostgreSQL, Redis, matching-service, and app-server stay on the Docker network.
 
 ## Required Environment
 
-Create a production env file and pass it with `APP_ENV_FILE=.env.production`.
+Create `.env.production` from `.env.production.example` and pass it with `APP_ENV_FILE=.env.production`.
 
 Required values:
 
 ```text
-PUBLIC_DOMAIN=trade.example.com
-CORS_ORIGINS=https://trade.example.com
+PUBLIC_DOMAIN=103.147.13.98
+PUBLIC_BASE_URL=http://103.147.13.98:10001
+CORS_ORIGINS=http://103.147.13.98:10001
 JWT_SECRET=<strong non-default secret>
 EXPORT_ANONYMIZATION_SECRET=<dedicated export anonymization secret>
 POSTGRES_PASSWORD=<strong database password>
+SERVER_STRICT_PERSISTENCE=true
 SERVER_REQUIRE_MIGRATIONS=true
 SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP=false
 EXPECTED_SCHEMA_MIGRATION_ID=000004
+SEED_DEFAULT_USERS=false
 NODE_ENV=production
+DEPLOY_ENV=production
 ```
-
-## Upgrade Flow
-
-1. Stop new trading writes or enter a maintenance window.
-2. Run `npm run db:backup`.
-3. Run `npm run db:migrate`.
-4. Run `npm run db:status` and confirm `000004` is applied.
-5. Build and start: `APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml up -d --build`.
-6. Check readiness: `curl -fsS https://$PUBLIC_DOMAIN/api/health/ready`.
-7. Verify login, market data, order placement, logs, and export.
-
-## Migration Smoke Test
-
-Before touching production, run the migration smoke test against a disposable
-PostgreSQL database. The script resets the target schema, so never point it at
-production or at `DATABASE_URL`. `pg_dump` and `pg_restore` must be available
-on `PATH` because the smoke test verifies backup recovery.
-
-```bash
-MIGRATION_SMOKE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/btc_paper_smoke npm run test:migrations
-```
-
-For a separate restore target, provide:
-
-```bash
-MIGRATION_SMOKE_RESTORE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/btc_paper_smoke_restore
-```
-
-The smoke test covers fresh migration, old schema upgrade to `000004`,
-schema-version fail-fast behavior, and `pg_dump`/`pg_restore` recovery.
-
-## Readiness And Fault Gates
-
-Run these checks before a production rollout:
-
-```bash
-npm run test:deployment
-npm run test:deployment-readiness
-npm run test:fault-tolerance
-npm run test:metrics
-```
-
-They verify production fail-fast config, Docker/Caddy exposure boundaries,
-health/ready fields, metrics observability, schema guard behavior, and strict
-PG write blocking. These checks do not connect to the production database.
-
-## JSONL Logs
-
-App and matching JSONL audit backups are written under the Docker `logs` volume
-at `/app/data/logs`. Files rotate by date and size, for example:
-
-```text
-audit-events-2026-05-07.jsonl
-audit-events-2026-05-07-0001.jsonl
-behavior-action-logs-2026-05-07.jsonl
-matching-events-2026-05-07.jsonl
-matching-snapshots-2026-05-07.jsonl
-```
-
-PostgreSQL remains the authoritative store. JSONL is an append-only backup and
-audit trail. Monitor `jsonl_queue_depth`, `jsonl_backlog_state`,
-`jsonl_dropped_records_total`, and `jsonl_write_failures_total`; any dropped
-record means the service protected the event loop under pressure and needs
-operator review.
-
-## Production Electron Client
-
-Build the production C/S client only after the HTTPS/WSS server is ready:
-
-```bash
-VITE_API_BASE_URL=https://$PUBLIC_DOMAIN npm run package:win:prod
-```
-
-The production client is a UI terminal only. It does not start a local memory
-backend by default. The Windows test installer remains separate and can still
-start the embedded memory backend:
-
-```bash
-npm run package:win:test
-```
-
-Use `ELECTRON_EMBED_BACKEND=true` only for local diagnostics or test packages.
-Do not enable it for production users.
-
-## Rollback And Restore
-
-The rollback source of truth is PostgreSQL backup restore:
-
-```bash
-BACKUP_FILE=backups/<backup>.dump npm run db:restore
-```
-
-After restore, restart the stack and verify `/api/health/ready`. Redis can be
-recreated from PostgreSQL-backed state and does not need to be restored for a
-normal rollback.
 
 ## Public Ports
 
 Expected public exposure:
 
 ```text
-80/tcp  -> Caddy HTTP challenge/redirect
-443/tcp -> Caddy HTTPS/WSS
+22/tcp    -> SSH management
+10001/tcp -> Caddy HTTP API and WebSocket reverse proxy
 ```
 
 These must not be public:
@@ -133,4 +47,69 @@ These must not be public:
 8788 matching-service
 5432 PostgreSQL
 6379 Redis
+9090 Prometheus
+3000 Grafana
 ```
+
+## First Deploy Flow
+
+```bash
+cd /srv/p-t/app
+cp .env.production.example .env.production
+# Fill POSTGRES_PASSWORD, JWT_SECRET, EXPORT_ANONYMIZATION_SECRET before continuing.
+
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production config
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production up -d postgres redis
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production run --rm app-server npm run db:migrate
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production run --rm app-server npm run db:status
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production run --rm app-server npx tsx scripts/create-admin.ts
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production up -d --build
+```
+
+## HTTP Production Client
+
+Build the temporary HTTP production client only after accepting the plaintext transport risk:
+
+```bash
+ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001 npm run package:win:prod
+```
+
+The production client does not start a local backend. WebSocket URLs are derived from the API URL and use `ws://` for this temporary HTTP origin.
+
+## Migration Smoke Test
+
+Before touching production, run the migration smoke test against a disposable PostgreSQL database. The script resets the target schema, so never point it at production or at `DATABASE_URL`.
+
+```bash
+npm run test:migration-safety
+MIGRATION_SMOKE_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/btc_paper_smoke npm run test:migrations
+```
+
+## Readiness And Fault Gates
+
+Run these checks before rollout:
+
+```bash
+npm run test:deployment
+npm run test:deployment-readiness
+npm run test:fault-tolerance
+npm run test:metrics
+```
+
+They verify production fail-fast config, Docker/Caddy exposure boundaries, health/ready fields, metrics observability, schema guard behavior, and strict PostgreSQL write blocking. These checks do not connect to the production database.
+
+## Backup, Rollback, And Restore
+
+Run a database backup before every upgrade:
+
+```bash
+APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production run --rm app-server npm run db:backup
+```
+
+Keep rollback copies under `/srv/p-t/rollback/<timestamp>`. Prefer code rollback first. If a schema change is incompatible with old code, restore the pre-upgrade database backup:
+
+```bash
+BACKUP_FILE=/app/backups/<backup>.dump npm run db:restore
+```
+
+Never run `docker compose down -v` on production unless intentionally deleting all persisted data.

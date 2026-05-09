@@ -1,3 +1,5 @@
+import { redactNetworkAddresses } from "./redaction";
+
 export type Language = "zh-CN" | "en-US";
 export type Role = "Tester" | "Senior Tester" | "Test Engineer" | "Admin";
 export type PermissionLevel = "Initial" | "Standard";
@@ -679,11 +681,11 @@ async function request<T>(path: string, token?: string, init?: RequestInit): Pro
     try {
       data = JSON.parse(text) as T & { message?: string; code?: string };
     } catch {
-      throw new Error(text || "Request failed.");
+      throw new Error(redactNetworkAddresses(text || "Request failed."));
     }
   }
   if (!response.ok) {
-    const error = new Error(data?.message ?? "Request failed.") as Error & { code?: string };
+    const error = new Error(redactNetworkAddresses(data?.message ?? "Request failed.")) as Error & { code?: string };
     if (data?.code) {
       error.code = data.code;
     }
@@ -702,9 +704,9 @@ async function requestText(path: string, token?: string): Promise<string> {
   if (!response.ok) {
     try {
       const parsed = JSON.parse(text) as { message?: string };
-      throw new Error(parsed.message ?? "Request failed.");
+      throw new Error(redactNetworkAddresses(parsed.message ?? "Request failed."));
     } catch {
-      throw new Error(text || "Request failed.");
+      throw new Error(redactNetworkAddresses(text || "Request failed."));
     }
   }
   return text;
@@ -725,7 +727,7 @@ async function requestBlob(path: string, token?: string): Promise<Blob> {
     } catch {
       // Keep the plain response body as the error message.
     }
-    throw new Error(message);
+    throw new Error(redactNetworkAddresses(message));
   }
   return response.blob();
 }
@@ -748,7 +750,7 @@ async function requestBlobPost(path: string, token: string, body: unknown): Prom
     } catch {
       // Keep the plain response body as the error message.
     }
-    throw new Error(message);
+    throw new Error(redactNetworkAddresses(message));
   }
   return response.blob();
 }
@@ -800,7 +802,10 @@ function mapLoginResponse(input: LoginWireResponse): LoginResponse {
 }
 
 export const api = {
-  baseUrl: API_BASE_URL,
+  async checkHealth() {
+    const response = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    return response.ok;
+  },
   createWsUrl(path: string, token: string) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
     return `${base}${path}?token=${token}`;

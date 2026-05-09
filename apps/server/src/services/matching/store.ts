@@ -251,7 +251,10 @@ export class MatchingStore {
       if (this.closed) {
         return;
       }
-      void this.handlePostgresFailure(error, "pool error");
+      // `pg` emits this for idle clients; the pool has already removed the
+      // broken client, so keep the pool available and let active query failures
+      // drive strict persistence reconnects.
+      console.warn("[matching] PostgreSQL idle client error:", error);
     });
     return pool;
   }

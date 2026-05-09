@@ -14,8 +14,7 @@ export function assertProductionDeploymentBaseline() {
   const deploymentDoc = readText("docs/deployment-production.md");
 
   assert.match(compose, /caddy:/);
-  assert.match(compose, /"80:80"/);
-  assert.match(compose, /"443:443"/);
+  assert.match(compose, /"10001:10001"/);
   assert.doesNotMatch(compose, /"8787:8787"/);
   assert.doesNotMatch(compose, /"8788:8788"/);
   assert.doesNotMatch(compose, /"5432:5432"/);
@@ -26,11 +25,12 @@ export function assertProductionDeploymentBaseline() {
   assert.match(compose, /healthcheck:/);
   assert.match(compose, /http:\/\/127\.0\.0\.1:8787\/api\/health\/ready/);
   assert.doesNotMatch(dockerfile, /COPY data \.\/data/);
+  assert.match(caddy, /:10001/);
   assert.match(caddy, /reverse_proxy app-server:8787/);
   assert.match(caddy, /respond @metrics 404/);
   assert.match(packageJson, /"package:win:prod": "node scripts\/package-win-prod\.cjs"/);
   assert.match(packageJson, /"test:electron-config": "tsx scripts\/electron-config-check\.ts"/);
-  assert.match(deploymentDoc, /VITE_API_BASE_URL=https:\/\/\$PUBLIC_DOMAIN npm run package:win:prod/);
+  assert.match(deploymentDoc, /ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http:\/\/103\.147\.13\.98:10001 npm run package:win:prod/);
 
   assert.throws(() =>
     buildServerConfig({
@@ -66,4 +66,5 @@ export function assertProductionDeploymentBaseline() {
   assert.equal(production.allowDevSchemaBootstrap, false);
   assert.equal(production.strictPersistence, true);
   assert.equal(production.persistenceMode, "external");
+  assert.equal(production.seedDefaultUsers, false);
 }

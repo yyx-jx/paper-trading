@@ -53,6 +53,7 @@ import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
 import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
 import { useAppStore } from "./store/useAppStore";
 import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, utcParts } from "./utils/format";
+import { redactNetworkAddresses } from "./utils/redaction";
 
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
 
@@ -69,7 +70,7 @@ declare global {
 }
 
 const compactPercent = (value = 0) => `${(value * 100).toFixed(1)}%`;
-const jsonPreview = (value: unknown) => JSON.stringify(value ?? {}, null, 2);
+const jsonPreview = (value: unknown) => redactNetworkAddresses(JSON.stringify(value ?? {}, null, 2));
 const exportFileName = () => `paper-trading-export-${new Date().toISOString().slice(0, 10)}.zip`;
 const LOG_EXPORT_SYSTEMS: Array<Exclude<LogSystem, "all">> = ["audit", "training", "matching"];
 const ROLE_OPTIONS: Role[] = ["Tester", "Senior Tester", "Test Engineer", "Admin"];
@@ -820,7 +821,7 @@ function buildRiskAlerts(input: {
         group: "market",
         level: "danger",
         text: localLabel(input.language, `${source.source} 数据中断`, `${source.source} data interrupted`),
-        detail: source.message
+        detail: redactNetworkAddresses(source.message)
       });
     }
   }
@@ -1804,8 +1805,8 @@ function LoginScreen(props: {
     let cancelled = false;
     const ping = async () => {
       try {
-        const response = await fetch(`${api.baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
-        if (!cancelled) setServerOnline(response.ok);
+        const healthy = await api.checkHealth();
+        if (!cancelled) setServerOnline(healthy);
       } catch {
         if (!cancelled) setServerOnline(false);
       }
@@ -1850,7 +1851,7 @@ function LoginScreen(props: {
         </div>
 
         <div className="terminal-login-card">
-          {props.error ? <div className="terminal-login-error">{props.error}</div> : null}
+          {props.error ? <div className="terminal-login-error">{redactNetworkAddresses(props.error)}</div> : null}
           <label>
             <span>{t("username")}</span>
             <div className="terminal-user-wrap">
@@ -1908,7 +1909,6 @@ function LoginScreen(props: {
       <div className="terminal-login-status">
         <span className={serverOnline ? "login-status-dot" : "login-status-dot off"} />
         <span>{serverOnline ? t("serverConnected") : t("backendOffline")}</span>
-        <span>{api.baseUrl}</span>
         <span className="login-clock">{clock}</span>
       </div>
     </div>
@@ -2541,7 +2541,7 @@ function App() {
         </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {error ? <div className="error-banner">{redactNetworkAddresses(error)}</div> : null}
       {bootstrapping ? <div className="loading-banner">{t("bootstrapping")}</div> : null}
 
       <main className="page-grid">
@@ -4073,7 +4073,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
         : value ?? "--";
   const latencySummary = (log: UnifiedLogRow) => {
     if (!log.latencyPhaseMetrics) {
-      return log.resultMessage ?? log.resultCode ?? "--";
+      return redactNetworkAddresses(log.resultMessage ?? log.resultCode ?? "--");
     }
     const metrics = log.latencyPhaseMetrics;
     const parts = [
@@ -4141,7 +4141,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
           ) : null}
         </div>
       </div>
-      {error ? <div className="inline-error-banner">{error}</div> : null}
+      {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
       <div className="log-system-tabs">
         {(["all", "audit", "training", "matching"] as LogSystem[]).map((system) => (
           <button
@@ -4514,7 +4514,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
                     </div>
                   </td>
                   <td>
-                    {log.logGroup === "market_latency" || log.logGroup === "system_latency" ? latencySummary(log) : log.resultMessage ?? log.resultCode ?? "--"}
+                    {log.logGroup === "market_latency" || log.logGroup === "system_latency" ? latencySummary(log) : redactNetworkAddresses(log.resultMessage ?? log.resultCode ?? "--")}
                     {expandedId === rowId ? <pre className="json-block">{jsonPreview(log.payload ?? log)}</pre> : null}
                   </td>
                 </tr>
@@ -5068,7 +5068,7 @@ function BulkUserDialog(props: {
             />
           </label>
         </div>
-        {localError ? <div className="inline-error-banner">{localError}</div> : null}
+        {localError ? <div className="inline-error-banner">{redactNetworkAddresses(localError)}</div> : null}
         {parsed.errors.length > 0 ? (
           <div className="inline-error-banner">{parsed.errors.join(" ")}</div>
         ) : null}
@@ -5079,7 +5079,9 @@ function BulkUserDialog(props: {
               `创建 ${result.created.length} 个，失败 ${result.failed.length} 个。`,
               `Created ${result.created.length}, failed ${result.failed.length}.`
             )}
-            {result.failed.length ? ` ${result.failed.map((item) => `#${item.rowNumber}: ${item.error}`).join("; ")}` : ""}
+            {result.failed.length
+              ? ` ${result.failed.map((item) => `#${item.rowNumber}: ${redactNetworkAddresses(item.error)}`).join("; ")}`
+              : ""}
           </div>
         ) : null}
         <div className="dialog-table-shell">
@@ -5418,7 +5420,7 @@ function UserManagementPage(props: {
           </button>
         </div>
       </div>
-      {error ? <div className="inline-error-banner">{error}</div> : null}
+      {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
 
       <div className="user-overview-grid">
         <div className="analytics-card"><span>{localLabel(language, "可见用户", "Visible Users")}</span><strong>{users.length}</strong><small>{managedCount} {localLabel(language, "可管理", "manageable")}</small></div>
@@ -5596,7 +5598,7 @@ function UserManagementPage(props: {
                 {props.t("close")}
               </button>
             </div>
-            {error ? <div className="inline-error-banner">{error}</div> : null}
+            {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
             <div className="dialog-form">
               <label>
                 {t("displayName")}
@@ -5667,7 +5669,7 @@ function UserManagementPage(props: {
                 {props.t("close")}
               </button>
             </div>
-            {error ? <div className="inline-error-banner">{error}</div> : null}
+            {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
             <div className="dialog-form">
               <label>
                 {props.t("available")}
@@ -5705,7 +5707,7 @@ function UserManagementPage(props: {
                 {props.t("close")}
               </button>
             </div>
-            {error ? <div className="inline-error-banner">{error}</div> : null}
+            {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
             <div className="dialog-form">
               <label>
                 {t("currentOperatorPassword")}
@@ -5809,7 +5811,7 @@ function TimelineDialog(props: { t: (key: string, options?: Record<string, unkno
                 <strong>{row.kind} / {row.action}</strong>
                 <em>{row.status}</em>
               </summary>
-              <p>{row.message}</p>
+              <p>{redactNetworkAddresses(row.message)}</p>
               <pre className="json-block">{jsonPreview(row.detail)}</pre>
             </details>
           ))}
@@ -5881,7 +5883,7 @@ function RoundLogDialog(props: {
                   <strong>{log.title}</strong>
                   <em>{log.status}</em>
                 </summary>
-                <p>{log.message || "--"}</p>
+                <p>{redactNetworkAddresses(log.message || "--")}</p>
                 <pre className="json-block">{jsonPreview(log.details)}</pre>
               </details>
             ))}

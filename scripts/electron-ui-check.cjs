@@ -268,6 +268,16 @@ async function assertZoomLocked(window, label) {
   }
 }
 
+async function assertNoNetworkAddressesVisible(window, label) {
+  const bodyText = await window.webContents.executeJavaScript(
+    `(document.body?.textContent || "").replace(/\\s+/g, " ").trim()`
+  );
+  const match = bodyText.match(/(?:https?|wss?):\/\/[^\s<>"'`]+|\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b|\b103\.147\.13\.98\b/);
+  if (match) {
+    throw new Error(`${label}: visible network address leaked: ${match[0]}`);
+  }
+}
+
 async function main() {
   app.commandLine.appendSwitch("disable-gpu");
   app.setPath("userData", path.join(os.tmpdir(), `paper-trading-ui-check-${process.pid}`));
@@ -389,6 +399,7 @@ async function main() {
     })();
   `);
   await assertZoomLocked(window, "after login");
+  await assertNoNetworkAddressesVisible(window, "after login");
   const trade1440 = await evaluateTradeLayout(window, 1440, 900);
   if (!trade1440.hasTradePage || !trade1440.overflowFree || !trade1440.allModulesPresent || !trade1440.monitorCellsFit) {
     throw new Error(`Trade page 1440x900 check failed: ${JSON.stringify(trade1440)}`);

@@ -1,4 +1,4 @@
-{$PUBLIC_DOMAIN} {
+:10001 {
   encode zstd gzip
 
   @metrics path /metrics

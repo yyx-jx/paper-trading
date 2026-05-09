@@ -10,6 +10,7 @@ import {
   type Role
 } from "../../utils/api";
 import { localLabel, money, signedMoney, timeText } from "../../utils/format";
+import { redactNetworkAddresses } from "../../utils/redaction";
 
 function roleTone(role: Role): "positive" | "negative" | "neutral" | "warning" {
   if (role === "Admin") return "positive";
@@ -99,7 +100,7 @@ export function PersonalHomePage(props: {
         </div>
       </div>
 
-      {error ? <div className="inline-error-banner">{error}</div> : null}
+      {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
 
       <div className="personal-summary-grid">
         <div className="analytics-card">
@@ -141,7 +142,7 @@ export function PersonalHomePage(props: {
           <span>{localLabel(language, "最近动态", "Recent Activity")}</span>
           <div className="personal-activity-list">
             {props.logs.slice(0, 6).map((log) => (
-              <div key={log.eventId}><strong>{log.actionType}</strong><small>{timeText(log.serverRecvTs)} · {log.resultMessage}</small></div>
+              <div key={log.eventId}><strong>{log.actionType}</strong><small>{timeText(log.serverRecvTs)} · {redactNetworkAddresses(log.resultMessage)}</small></div>
             ))}
             {props.logs.length === 0 ? <small>{t("noData")}</small> : null}
           </div>

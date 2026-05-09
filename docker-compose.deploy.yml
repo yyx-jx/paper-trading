@@ -5,8 +5,7 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env}
     ports:
-      - "80:80"
-      - "443:443"
+      - "10001:10001"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
