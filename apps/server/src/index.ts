@@ -18,17 +18,9 @@ import type {
   LogSearchQuery,
   LogSearchResult,
   LogSystem,
-  MarketPayload,
-  MarketRealtimeTick,
-  MarketSnapshot,
-  MarketTickPayload,
-  MarketTransportMeta,
   MatchingEventRecord,
   PermissionLevel,
   Role,
-  RoundRecord,
-  SettlementPreview,
-  SourceHealth,
   TradeSide,
   UnifiedLogRow,
   UserRecord,
@@ -53,6 +45,8 @@ import { CSV_BULK_USER_TEMPLATE, parseBulkUsersCsv, validateBulkCreateUsers } fr
 import { LOG_FACETS } from "./services/log-facets";
 import { buildDatasetExport, previewDatasetExport } from "./services/dataset-export";
 import { appMetrics } from "./services/metrics";
+import { MarketPayloadBuilder } from "./services/market-payloads";
+import { attachMarketWsSession } from "./services/market-ws-session";
 
 const app = Fastify({
   logger: false,
@@ -172,19 +166,14 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
 });
 
-let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
-const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
-
-type CachedMarketHistory = {
-  revision: number;
-  limit: number;
-  rows: Array<RoundRecord & { userPnl: number }>;
-};
-
-const marketHistoryCache = new Map<string, CachedMarketHistory>();
+const marketPayloads = new MarketPayloadBuilder({
+  store,
+  engine,
+  historyCacheMaxUsers: Math.max(serverConfig.marketHistoryCacheMaxUsers, 1)
+});
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -945,177 +934,8 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
   return managerUserId;
 }
 
-function stampSourceForTransport(source: SourceHealth, serverPublishTs: number): SourceHealth {
-  return {
-    ...source,
-    serverPublishTs,
-    frontendLatencyMs: 0
-  };
-}
-
-function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = Date.now()): MarketSnapshot {
-  return {
-    ...snapshot,
-    latencyBreakdown: {
-      ...snapshot.latencyBreakdown,
-      serverComputeLatency: Math.max(serverPublishTs - snapshot.serverNow, 0)
-    },
-    sources: {
-      binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
-      chainlink: stampSourceForTransport(snapshot.sources.chainlink, serverPublishTs),
-      clob: stampSourceForTransport(snapshot.sources.clob, serverPublishTs)
-    }
-  };
-}
-
-function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number, snapshotBuildTs?: number): MarketTransportMeta {
-  const serverPublishTs = Date.now();
-  marketPayloadSeq += 1;
-  return {
-    serverPublishTs,
-    payloadSeq: marketPayloadSeq,
-    coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    serverQueueMs: pendingSince ? Math.max(serverPublishTs - pendingSince, 0) : undefined,
-    snapshotBuildTs
-  };
-}
-
-function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: number }>(
-  round: T
-): T & { settlementPreview?: SettlementPreview } {
-  const settlementPreview = engine.getSettlementPreview(round);
-  return settlementPreview ? { ...round, settlementPreview } : round;
-}
-
-function getCachedHistory(limit: number, userId?: string) {
-  const revision = store.getHistoryRevision();
-  const cacheKey = `${userId ?? "__public__"}:${limit}`;
-  const cached = marketHistoryCache.get(cacheKey);
-  if (cached && cached.revision === revision && cached.limit === limit) {
-    return cached.rows;
-  }
-  const rows = store.getHistory(limit, userId);
-  marketHistoryCache.set(cacheKey, { revision, limit, rows });
-  if (marketHistoryCache.size > MARKET_HISTORY_CACHE_MAX_USERS) {
-    const oldestKey = marketHistoryCache.keys().next().value;
-    if (oldestKey) {
-      marketHistoryCache.delete(oldestKey);
-    }
-  }
-  return rows;
-}
-
-function getHistoryWithSettlementPreview(limit: number, userId?: string) {
-  return getCachedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) {
-  return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, store.marketSnapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const history = getHistoryWithSettlementPreview(10);
-  const settlementPreview =
-    (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
-    engine.getLatestSettlementPreview(history);
-  return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
-    snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
-    settlementPreview,
-    transportMeta
-  };
-}
-
-function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: number): MarketPayload {
-  return {
-    ...createCurrentRoundPayload(coalescedCount, pendingSince),
-    history: getHistoryWithSettlementPreview(10, userId)
-  };
-}
-
-function countdownTargetTsFor(snapshot: MarketSnapshot) {
-  const countdownMs = snapshot.uiMeta.countdownMs;
-  return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
-}
-
-function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
-  const stamped = stampSnapshotForTransport(snapshot, serverPublishTs);
-  const currentRoundUpPricePoint = stamped.clob.currentRoundUpPriceSeries.at(-1);
-  return {
-    symbol: stamped.symbol,
-    marketId: stamped.marketId,
-    marketSlug: stamped.marketSlug,
-    serverNow: stamped.serverNow,
-    currentPrice: stamped.currentPrice,
-    binancePrice: stamped.binancePrice,
-    chainlinkPrice: stamped.chainlinkPrice,
-    priceToBeat: stamped.priceToBeat,
-    displayPriceToBeat: stamped.displayPriceToBeat,
-    displayPriceToBeatSource: stamped.displayPriceToBeatSource,
-    upPrice: stamped.upPrice,
-    downPrice: stamped.downPrice,
-    displayPrices: stamped.displayPrices,
-    displayPriceSource: stamped.displayPriceSource,
-    displayPriceSpread: stamped.displayPriceSpread,
-    latencyBreakdown: stamped.latencyBreakdown,
-    sources: stamped.sources,
-    orderBooks: stamped.orderBooks,
-    binance: {
-      spotPrice: stamped.binance.spotPrice,
-      latestTick: stamped.binance.latestTick
-    },
-    chainlink: {
-      referencePrice: stamped.chainlink.referencePrice,
-      settlementReference: stamped.chainlink.settlementReference,
-      latestTick:
-        stamped.chainlink.referencePrice > 0
-          ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
-          : undefined
-    },
-    clob: {
-      delta: stamped.clob.delta,
-      volume: stamped.clob.volume,
-      currentRoundUpPricePoint,
-      bestBidAskSummary: stamped.clob.bestBidAskSummary
-    },
-    uiMeta: {
-      countdownMs: stamped.uiMeta.countdownMs,
-      countdownTargetTs: countdownTargetTsFor(stamped),
-      acceptingOrders: stamped.uiMeta.acceptingOrders,
-      marketSwitchState: stamped.uiMeta.marketSwitchState,
-      sourceStatusSummary: stamped.uiMeta.sourceStatusSummary
-    }
-  };
-}
-
-function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): MarketTickPayload {
-  const snapshot = store.marketSnapshot;
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
-  return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
-    tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
-    settlementPreview,
-    transportMeta
-  };
-}
-
 function createBootstrapPayload(user: UserRecord) {
-  const market = createCurrentRoundPayload();
-  return {
-    ...market,
-    history: getHistoryWithSettlementPreview(60, user.id),
-    me: store.sanitizeUser(user),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-    profile: store.getProfile(user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getOrders(user.id),
-    logs: store.getRecentLogs(user.id),
-    sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
-  };
+  return marketPayloads.createBootstrapPayload(user);
 }
 
 async function recordLoginAudit(input: {
@@ -2205,7 +2025,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
-      return createCurrentRoundPayload();
+      return marketPayloads.createCurrentRoundPayload();
     })
   );
 
@@ -2214,7 +2034,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
       const limit = Number((request.query as { limit?: string }).limit ?? 10);
-      return getHistoryWithSettlementPreview(limit, user.id);
+      return marketPayloads.getHistoryWithSettlementPreview(limit, user.id);
     })
   );
 
@@ -2226,7 +2046,7 @@ async function bootstrap() {
       }
       const params = request.params as { id: string };
       const parsed = manualSettlementSchema.parse(request.body);
-      return decorateRoundWithSettlementPreview(
+      return marketPayloads.decorateRoundWithSettlementPreview(
         await store.withTransaction(() =>
           engine.manualSettleRound(user, {
             roundId: params.id,
@@ -2244,7 +2064,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const limit = Number((request.query as { limit?: string }).limit ?? 500);
-      return getOperatedHistoryWithSettlementPreview(limit, user.id);
+      return marketPayloads.getOperatedHistoryWithSettlementPreview(limit, user.id);
     })
   );
 
@@ -2664,155 +2484,22 @@ async function bootstrap() {
       wsConnectionCounts.market += 1;
       appMetrics.setWsConnections("market", wsConnectionCounts.market);
 
-      let lastTickSentAt = 0;
-      let lastFullSentAt = 0;
-      let lastSentAt = 0;
-      let sending = false;
-      let pendingTick = false;
-      let pendingFull = false;
-      let pendingSince: number | undefined;
-      let coalescedCount = 0;
-      let retryTimer: NodeJS.Timeout | undefined;
-      let tickTimer: NodeJS.Timeout | undefined;
-      let fullTimer: NodeJS.Timeout | undefined;
-      let closed = false;
-
-      const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
-      const scheduleRetry = (delayMs = MARKET_WS_RETRY_MS) => {
-        if (closed || retryTimer) {
-          return;
-        }
-        retryTimer = setTimeout(() => {
-          retryTimer = undefined;
-          if (pendingFull || pendingTick) {
-            flushPending();
-          }
-        }, Math.max(delayMs, MARKET_WS_RETRY_MS));
-      };
-
-      const deferLatest = (kind: "tick" | "full") => {
-        if (kind === "full") {
-          pendingFull = true;
-        } else {
-          pendingTick = true;
-        }
-        pendingSince ??= Date.now();
-        coalescedCount += 1;
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        const pacingDelay = Math.max(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend, 0);
-        scheduleRetry(pacingDelay);
-      };
-
-      const sendEnvelope = (
-        type: "market:tick" | "market",
-        data: MarketTickPayload | MarketPayload,
-        kind: "tick" | "full"
-      ) => {
-        if (!isSocketOpen()) {
-          return false;
-        }
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
-          socket.close();
-          return false;
-        }
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest(kind);
-          return false;
-        }
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
-          deferLatest(kind);
-          return false;
-        }
-        sending = true;
-        const sendStartedAt = Date.now();
-        data.transportMeta.wsSendStartTs = sendStartedAt;
-        const outbound = JSON.stringify({ type, data });
-        socket.send(outbound, (error?: Error) => {
-          sending = false;
-          appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
-          if (!error) {
-            lastSentAt = Date.now();
-            if (kind === "tick") {
-              lastTickSentAt = lastSentAt;
-            } else {
-              lastFullSentAt = lastSentAt;
-            }
-          }
-          if (pendingFull || pendingTick) {
-            scheduleRetry();
-          }
-        });
-        return true;
-      };
-
-      const sendTick = () => {
-        const data = createMarketTickPayload(coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingTick = false;
-        return sendEnvelope("market:tick", data, "tick");
-      };
-
-      const sendFull = () => {
-        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingFull = false;
-        return sendEnvelope("market", data, "full");
-      };
-
-      const flushPending = () => {
-        if (!isSocketOpen()) {
-          return;
-        }
-        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
-          if (sendFull()) {
-            return;
+      attachMarketWsSession({
+        socket,
+        user,
+        store,
+        payloads: marketPayloads,
+        metrics: appMetrics,
+        minIntervalMs: MARKET_WS_MIN_INTERVAL_MS,
+        retryMs: MARKET_WS_RETRY_MS,
+        fullSnapshotIntervalMs: MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS,
+        onClose: () => {
+          wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
+          appMetrics.setWsConnections("market", wsConnectionCounts.market);
+          if (!consumeHeartbeatTimeout(socket)) {
+            appMetrics.recordWsDisconnect("market", "close");
           }
         }
-        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
-          sendTick();
-        }
-      };
-
-      const tickListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("tick");
-          return;
-        }
-        sendTick();
-      };
-      const fullListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("full");
-          return;
-        }
-        sendFull();
-      };
-
-      sendFull();
-      tickTimer = setInterval(tickListener, Math.max(MARKET_WS_MIN_INTERVAL_MS, 50));
-      fullTimer = setInterval(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS);
-      store.emitter.on("market:update", tickListener);
-      socket.on("close", () => {
-        closed = true;
-        wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
-        appMetrics.setWsConnections("market", wsConnectionCounts.market);
-        if (!consumeHeartbeatTimeout(socket)) {
-          appMetrics.recordWsDisconnect("market", "close");
-        }
-        if (retryTimer) {
-          clearTimeout(retryTimer);
-        }
-        if (tickTimer) {
-          clearInterval(tickTimer);
-        }
-        if (fullTimer) {
-          clearInterval(fullTimer);
-        }
-        store.emitter.off("market:update", tickListener);
       });
     } catch {
       socket.close();
@@ -2842,7 +2529,7 @@ async function bootstrap() {
           type: "user",
           data: {
             profile: store.getProfile(user.id),
-            operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
+            operatedHistory: marketPayloads.getOperatedHistoryWithSettlementPreview(500, user.id),
             positions: store.getPositions(user.id),
             orders: store.getOrders(user.id),
             logs: store.getRecentLogs(user.id)
