@@ -275,10 +275,28 @@ export interface MarketRealtimeTick {
   };
 }
 
+export type MarketFastTick = Omit<MarketRealtimeTick, "orderBooks">;
+
 export interface MarketTickPayload {
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
+  transportMeta?: MarketTransportMeta;
+}
+
+export interface MarketFastTickPayload {
+  currentRound?: RoundRecord;
+  tick: MarketFastTick;
+  settlementPreview?: SettlementPreview;
+  transportMeta?: MarketTransportMeta;
+}
+
+export interface MarketBookPayload {
+  marketId: string;
+  marketSlug?: string;
+  serverNow: number;
+  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
   transportMeta?: MarketTransportMeta;
 }
 
@@ -890,13 +908,15 @@ export const api = {
     }
     return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
-  createWsUrl(path: string, token: string) {
+  createWsUrl(path: string, token: string, params?: Record<string, string>) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
-    return `${base}${path}?token=${token}`;
+    const search = new URLSearchParams({ token, ...(params ?? {}) });
+    return `${base}${path}?${search.toString()}`;
   },
-  createWsTicketUrl(path: string, ticket: string) {
+  createWsTicketUrl(path: string, ticket: string, params?: Record<string, string>) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
-    return `${base}${path}?ticket=${ticket}`;
+    const search = new URLSearchParams({ ticket, ...(params ?? {}) });
+    return `${base}${path}?${search.toString()}`;
   },
   createWsTicket(token: string, channel: "market" | "user") {
     return request<{ ticket: string; expiresAt: number }>("/api/ws/tickets", token, {

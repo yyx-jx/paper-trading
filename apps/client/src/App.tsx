@@ -23,6 +23,8 @@ import {
   type LogFacets,
   type LogSearchQuery,
   type LogSystem,
+  type MarketBookPayload,
+  type MarketFastTickPayload,
   type MarketTrade,
   type MarketPayload,
   type MarketSnapshot,
@@ -78,6 +80,10 @@ const LOG_EXPORT_SYSTEMS: Array<Exclude<LogSystem, "all">> = ["audit", "training
 const ROLE_OPTIONS: Role[] = ["Tester", "Senior Tester", "Test Engineer", "Admin"];
 const LANGUAGE_OPTIONS: Language[] = ["zh-CN", "en-US"];
 const ACTION_STATUS_OPTIONS: Array<NonNullable<LogSearchQuery["actionStatus"]>> = ["success", "failed", "timeout"];
+type PendingMarketRealtimeMessage =
+  | { type: "market:tick"; data: MarketTickPayload; receivedAt: number }
+  | { type: "market:fast_tick"; data: MarketFastTickPayload; receivedAt: number }
+  | { type: "market:book"; data: MarketBookPayload; receivedAt: number };
 const LOG_GROUP_OPTIONS: Array<NonNullable<LogSearchQuery["logGroup"]>> = [
   "operation",
   "settlement",
@@ -2066,6 +2072,8 @@ function App() {
     setCurrentPage,
     setBootstrap,
     setMarketPayload,
+    setMarketFastTickPayload,
+    setMarketBookPayload,
     setMarketTickPayload,
     markMarketRenderCommit,
     setUserPayload,
@@ -2201,7 +2209,7 @@ function App() {
     const marketReconnectStaleMs = 10000;
     const marketFallbackCooldownMs = 3000;
     const userFallbackCooldownMs = 2000;
-    let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
+    let pendingMarketMessages: PendingMarketRealtimeMessage[] = [];
     let marketTickFrame: number | undefined;
 
     const markMarketActivity = (receivedAt = Date.now()) => {
@@ -2345,12 +2353,13 @@ function App() {
       }
       marketSocket?.close();
       updateRealtimeChannel("market", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/market", token);
+      const marketStreamParams = { stream: "layered" };
+      let wsUrl = api.createWsUrl("/ws/market", token, marketStreamParams);
       try {
         const ticket = await api.createWsTicket(token, "market");
-        wsUrl = api.createWsTicketUrl("/ws/market", ticket.ticket);
+        wsUrl = api.createWsTicketUrl("/ws/market", ticket.ticket, marketStreamParams);
       } catch {
-        wsUrl = api.createWsUrl("/ws/market", token);
+        wsUrl = api.createWsUrl("/ws/market", token, marketStreamParams);
       }
       if (disposed) {
         return;
@@ -2363,13 +2372,13 @@ function App() {
       socket.onmessage = (event) => {
         const receivedAt = Date.now();
         let parsed: {
-          type: "market" | "market:tick";
-          data: MarketPayload | MarketTickPayload;
+          type: "market" | "market:tick" | "market:fast_tick" | "market:book";
+          data: MarketPayload | MarketTickPayload | MarketFastTickPayload | MarketBookPayload;
         };
         try {
           parsed = JSON.parse(event.data) as {
-            type: "market" | "market:tick";
-            data: MarketPayload | MarketTickPayload;
+            type: "market" | "market:tick" | "market:fast_tick" | "market:book";
+            data: MarketPayload | MarketTickPayload | MarketFastTickPayload | MarketBookPayload;
           };
         } catch (parseError) {
           updateRealtimeChannel("market", {
@@ -2393,26 +2402,39 @@ function App() {
           }
           return;
         }
-        if (parsed.type === "market:tick") {
-          pendingMarketTick = { data: parsed.data as MarketTickPayload, receivedAt };
+        if (parsed.type === "market:tick" || parsed.type === "market:fast_tick" || parsed.type === "market:book") {
+          pendingMarketMessages = pendingMarketMessages.filter((message) => message.type !== parsed.type);
+          pendingMarketMessages.push({ type: parsed.type, data: parsed.data as never, receivedAt });
           if (typeof marketTickFrame !== "number") {
             marketTickFrame = window.requestAnimationFrame(() => {
               marketTickFrame = undefined;
-              const pending = pendingMarketTick;
-              pendingMarketTick = undefined;
-              if (!pending || disposed) {
+              const pendingMessages = pendingMarketMessages
+                .sort(
+                  (left, right) =>
+                    (left.data.transportMeta?.payloadSeq ?? 0) - (right.data.transportMeta?.payloadSeq ?? 0)
+                );
+              pendingMarketMessages = [];
+              if (pendingMessages.length === 0 || disposed) {
                 return;
               }
-              const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
-              if (publishTs > 0 && pending.receivedAt - publishTs > marketPayloadRejectMs) {
-                if (pending.receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
-                  socket.close();
+              for (const pending of pendingMessages) {
+                const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
+                if (publishTs > 0 && pending.receivedAt - publishTs > marketPayloadRejectMs) {
+                  if (pending.receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
+                    socket.close();
+                  }
+                  continue;
                 }
-                return;
-              }
-              if (setMarketTickPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current)) {
-                markMarketActivity(pending.receivedAt);
-                markMarketRenderCommit(pending.receivedAt);
+                const accepted =
+                  pending.type === "market:tick"
+                    ? setMarketTickPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current)
+                    : pending.type === "market:fast_tick"
+                      ? setMarketFastTickPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current)
+                      : setMarketBookPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current);
+                if (accepted) {
+                  markMarketActivity(pending.receivedAt);
+                  markMarketRenderCommit(pending.receivedAt);
+                }
               }
             });
           }
@@ -2560,13 +2582,23 @@ function App() {
       if (typeof marketTickFrame === "number") {
         window.cancelAnimationFrame(marketTickFrame);
       }
+      pendingMarketMessages = [];
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleForegroundRecovery);
       window.removeEventListener("pageshow", handleForegroundRecovery);
       marketSocket?.close();
       userSocket?.close();
     };
-  }, [token, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, updateRealtimeChannel]);
+  }, [
+    token,
+    setMarketPayload,
+    setMarketTickPayload,
+    setMarketFastTickPayload,
+    setMarketBookPayload,
+    markMarketRenderCommit,
+    setUserPayload,
+    updateRealtimeChannel
+  ]);
 
   const handleLogin = async (username: string, password: string) => {
     setError(undefined);

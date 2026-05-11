@@ -1,4 +1,7 @@
 import type {
+  MarketBookPayload,
+  MarketFastTick,
+  MarketFastTickPayload,
   MarketPayload,
   MarketRealtimeTick,
   MarketSnapshot,
@@ -74,6 +77,35 @@ export class MarketPayloadBuilder {
     };
   }
 
+  createFastTickPayload(coalescedCount = 0, pendingSince?: number): MarketFastTickPayload {
+    const { engine, store } = this.options;
+    const snapshot = store.marketSnapshot;
+    const transportMeta = this.nextTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
+    const currentRound = store.getCurrentRound();
+    const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
+    return {
+      currentRound: currentRound ? this.decorateRoundWithSettlementPreview(currentRound) : undefined,
+      tick: this.createFastTick(snapshot, transportMeta.serverPublishTs),
+      settlementPreview,
+      transportMeta
+    };
+  }
+
+  createBookPayload(coalescedCount = 0, pendingSince?: number): MarketBookPayload {
+    const { store } = this.options;
+    const snapshot = store.marketSnapshot;
+    const transportMeta = this.nextTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
+    const stamped = this.stampSnapshotForTransport(snapshot, transportMeta.serverPublishTs);
+    return {
+      marketId: stamped.marketId,
+      marketSlug: stamped.marketSlug,
+      serverNow: stamped.serverNow,
+      orderBooks: stamped.orderBooks,
+      bestBidAskSummary: stamped.clob.bestBidAskSummary,
+      transportMeta
+    };
+  }
+
   createBootstrapPayload(user: UserRecord) {
     const { store } = this.options;
     const market = this.createCurrentRoundPayload();
@@ -109,6 +141,18 @@ export class MarketPayloadBuilder {
 
   private createRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
     const stamped = this.stampSnapshotForTransport(snapshot, serverPublishTs);
+    return {
+      ...this.createFastTickFromStampedSnapshot(stamped),
+      orderBooks: stamped.orderBooks
+    };
+  }
+
+  private createFastTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketFastTick {
+    const stamped = this.stampSnapshotForTransport(snapshot, serverPublishTs);
+    return this.createFastTickFromStampedSnapshot(stamped);
+  }
+
+  private createFastTickFromStampedSnapshot(stamped: MarketSnapshot): MarketFastTick {
     const currentRoundUpPricePoint = stamped.clob.currentRoundUpPriceSeries.at(-1);
     return {
       symbol: stamped.symbol,
@@ -128,7 +172,6 @@ export class MarketPayloadBuilder {
       displayPriceSpread: stamped.displayPriceSpread,
       latencyBreakdown: stamped.latencyBreakdown,
       sources: stamped.sources,
-      orderBooks: stamped.orderBooks,
       binance: {
         spotPrice: stamped.binance.spotPrice,
         latestTick: stamped.binance.latestTick

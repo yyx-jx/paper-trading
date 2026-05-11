@@ -39,7 +39,7 @@ interface TickLike {
 }
 
 interface MarketMessage {
-  type: "market" | "market:tick";
+  type: "market" | "market:tick" | "market:fast_tick" | "market:book";
   data: {
     tick?: TickLike;
     snapshot?: TickLike;
@@ -59,6 +59,7 @@ const intervals: number[] = [];
 const serverToClientLatencies: number[] = [];
 const tickIntervals: number[] = [];
 const tickServerToClientLatencies: number[] = [];
+const bookServerToClientLatencies: number[] = [];
 const fullServerToClientLatencies: number[] = [];
 const queueLatencies: number[] = [];
 const snapshotAges: number[] = [];
@@ -76,6 +77,8 @@ const sourceAges: Record<"binance" | "chainlink" | "clob", number[]> = {
 };
 
 let tickCount = 0;
+let fastTickCount = 0;
+let bookCount = 0;
 let fullCount = 0;
 let lastMessageAt = 0;
 let lastTickAt = 0;
@@ -93,7 +96,7 @@ async function main() {
   clockOffsetMs = await sampleClockOffset();
   const token = tokenFromEnv ?? (await login());
   const ticket = await createTicket(token);
-  const wsUrl = `${baseUrl.replace("http://", "ws://").replace("https://", "wss://")}/ws/market?ticket=${encodeURIComponent(ticket)}`;
+  const wsUrl = `${baseUrl.replace("http://", "ws://").replace("https://", "wss://")}/ws/market?ticket=${encodeURIComponent(ticket)}&stream=layered`;
   const startedAt = Date.now();
   const socket = new WebSocket(wsUrl, localAddress ? { localAddress } : undefined);
 
@@ -117,7 +120,12 @@ async function main() {
     } catch {
       return;
     }
-    if (parsed.type !== "market" && parsed.type !== "market:tick") {
+    if (
+      parsed.type !== "market" &&
+      parsed.type !== "market:tick" &&
+      parsed.type !== "market:fast_tick" &&
+      parsed.type !== "market:book"
+    ) {
       return;
     }
     const processedAt = Date.now();
@@ -140,12 +148,17 @@ function recordMessage(message: MarketMessage, receivedAt: number, processedAt: 
     intervals.push(receivedAt - lastMessageAt);
   }
   lastMessageAt = receivedAt;
-  if (message.type === "market:tick") {
+  if (message.type === "market:tick" || message.type === "market:fast_tick") {
     if (lastTickAt > 0) {
       tickIntervals.push(receivedAt - lastTickAt);
     }
     lastTickAt = receivedAt;
     tickCount += 1;
+    if (message.type === "market:fast_tick") {
+      fastTickCount += 1;
+    }
+  } else if (message.type === "market:book") {
+    bookCount += 1;
   } else {
     fullCount += 1;
   }
@@ -163,8 +176,10 @@ function recordMessage(message: MarketMessage, receivedAt: number, processedAt: 
   if (transportMeta?.serverPublishTs) {
     const latency = Math.max(receivedAt - transportMeta.serverPublishTs - clockOffsetMs, 0);
     serverToClientLatencies.push(latency);
-    if (message.type === "market:tick") {
+    if (message.type === "market:tick" || message.type === "market:fast_tick") {
       tickServerToClientLatencies.push(latency);
+    } else if (message.type === "market:book") {
+      bookServerToClientLatencies.push(latency);
     } else {
       fullServerToClientLatencies.push(latency);
     }
@@ -198,6 +213,8 @@ function buildResult(startedAt: number, finishedAt: number) {
     finishedAt: new Date(finishedAt).toISOString(),
     durationMs: finishedAt - startedAt,
     tickCount,
+    fastTickCount,
+    bookCount,
     fullCount,
     firstPayloadSeq,
     lastPayloadSeq,
@@ -215,6 +232,9 @@ function buildResult(startedAt: number, finishedAt: number) {
     tickServerToClientP50: percentile(tickServerToClientLatencies, 50),
     tickServerToClientP95: percentile(tickServerToClientLatencies, 95),
     tickServerToClientMax: max(tickServerToClientLatencies),
+    bookServerToClientP50: percentile(bookServerToClientLatencies, 50),
+    bookServerToClientP95: percentile(bookServerToClientLatencies, 95),
+    bookServerToClientMax: max(bookServerToClientLatencies),
     fullServerToClientP50: percentile(fullServerToClientLatencies, 50),
     fullServerToClientP95: percentile(fullServerToClientLatencies, 95),
     fullServerToClientMax: max(fullServerToClientLatencies),

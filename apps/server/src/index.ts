@@ -168,6 +168,7 @@ const engine = new SimulationEngine(store, matchingClient, {
 
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
+const MARKET_WS_BOOK_INTERVAL_MS = 250;
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
 const marketPayloads = new MarketPayloadBuilder({
   store,
@@ -2474,7 +2475,7 @@ async function bootstrap() {
 
   app.get("/ws/market", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string };
+      const query = request.query as { token?: string; ticket?: string; stream?: string };
       const user = getWsUser(query, "market");
       if (!user || !user.isActive) {
         socket.close();
@@ -2491,8 +2492,10 @@ async function bootstrap() {
         payloads: marketPayloads,
         metrics: appMetrics,
         minIntervalMs: MARKET_WS_MIN_INTERVAL_MS,
+        bookIntervalMs: MARKET_WS_BOOK_INTERVAL_MS,
         retryMs: MARKET_WS_RETRY_MS,
         fullSnapshotIntervalMs: MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS,
+        streamMode: query.stream === "layered" ? "layered" : "legacy",
         onClose: () => {
           wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
           appMetrics.setWsConnections("market", wsConnectionCounts.market);

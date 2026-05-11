@@ -3,6 +3,9 @@ import type {
   AuditEvent,
   BootstrapPayload,
   HistoryRound,
+  MarketBookPayload,
+  MarketFastTick,
+  MarketFastTickPayload,
   MarketPayload,
   MarketRealtimeTick,
   MarketTickPayload,
@@ -45,6 +48,8 @@ interface AppState {
   setBootstrap: (data: BootstrapPayload) => void;
   setMarketPayload: (data: MarketPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
   setMarketTickPayload: (data: MarketTickPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
+  setMarketFastTickPayload: (data: MarketFastTickPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
+  setMarketBookPayload: (data: MarketBookPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
   markMarketRenderCommit: (clientRecvTs?: number) => void;
   setUserPayload: (data: UserPayload) => void;
   setSourceStatus: (status: SourceHealth[]) => void;
@@ -124,6 +129,19 @@ function appendRealtimePoint(points: MarketSnapshot["clob"]["currentRoundUpPrice
 }
 
 function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): MarketSnapshot {
+  const merged = mergeFastTick(snapshot, tick);
+  return {
+    ...merged,
+    orderBooks: tick.orderBooks,
+    clob: {
+      ...merged.clob,
+      upBook: tick.orderBooks.UP,
+      downBook: tick.orderBooks.DOWN
+    }
+  };
+}
+
+function mergeFastTick(snapshot: MarketSnapshot, tick: MarketFastTick): MarketSnapshot {
   return {
     ...snapshot,
     marketId: tick.marketId,
@@ -142,7 +160,6 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     displayPriceSpread: tick.displayPriceSpread,
     latencyBreakdown: tick.latencyBreakdown,
     sources: tick.sources,
-    orderBooks: tick.orderBooks,
     binance: {
       ...snapshot.binance,
       spotPrice: tick.binance.spotPrice,
@@ -157,8 +174,6 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
       ...snapshot.clob,
       delta: tick.clob.delta,
       volume: tick.clob.volume,
-      upBook: tick.orderBooks.UP,
-      downBook: tick.orderBooks.DOWN,
       currentRoundUpPriceSeries: appendRealtimePoint(snapshot.clob.currentRoundUpPriceSeries, tick.clob.currentRoundUpPricePoint),
       bestBidAskSummary: tick.clob.bestBidAskSummary
     },
@@ -168,6 +183,22 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
       acceptingOrders: tick.uiMeta.acceptingOrders,
       marketSwitchState: tick.uiMeta.marketSwitchState,
       sourceStatusSummary: tick.uiMeta.sourceStatusSummary
+    }
+  };
+}
+
+function mergeBookPayload(snapshot: MarketSnapshot, data: MarketBookPayload): MarketSnapshot {
+  return {
+    ...snapshot,
+    marketId: data.marketId,
+    marketSlug: data.marketSlug,
+    serverNow: data.serverNow,
+    orderBooks: data.orderBooks,
+    clob: {
+      ...snapshot.clob,
+      upBook: data.orderBooks.UP,
+      downBook: data.orderBooks.DOWN,
+      bestBidAskSummary: data.bestBidAskSummary
     }
   };
 }
@@ -276,6 +307,54 @@ export const useAppStore = create<AppState>((set) => ({
         lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
         lastMarketServerPublishTs: transportMeta.serverPublishTs,
         settlementPreview: data.settlementPreview ?? state.settlementPreview
+      };
+    });
+    return accepted;
+  },
+  setMarketFastTickPayload: (data, clientRecvTs = Date.now(), clientClockOffsetMs = 0) => {
+    let accepted = false;
+    const transportMeta = data.transportMeta;
+    if (!transportMeta) {
+      return false;
+    }
+    set((state) => {
+      if (!state.snapshot || !shouldAcceptMarketPayload(state, transportMeta)) {
+        return state;
+      }
+      accepted = true;
+      const mergedSnapshot = mergeFastTick(state.snapshot, data.tick);
+      return {
+        currentRound: data.currentRound ?? state.currentRound,
+        snapshot: stampSnapshotReceipt(mergedSnapshot, clientRecvTs, transportMeta, clientClockOffsetMs),
+        lastMarketRecvTs: clientRecvTs,
+        lastMarketRenderCommitTs: clientRecvTs,
+        lastMarketRenderLatencyMs: 0,
+        lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
+        lastMarketServerPublishTs: transportMeta.serverPublishTs,
+        settlementPreview: data.settlementPreview ?? state.settlementPreview
+      };
+    });
+    return accepted;
+  },
+  setMarketBookPayload: (data, clientRecvTs = Date.now(), clientClockOffsetMs = 0) => {
+    let accepted = false;
+    const transportMeta = data.transportMeta;
+    if (!transportMeta) {
+      return false;
+    }
+    set((state) => {
+      if (!state.snapshot || !shouldAcceptMarketPayload(state, transportMeta)) {
+        return state;
+      }
+      accepted = true;
+      const mergedSnapshot = mergeBookPayload(state.snapshot, data);
+      return {
+        snapshot: stampSnapshotReceipt(mergedSnapshot, clientRecvTs, transportMeta, clientClockOffsetMs),
+        lastMarketRecvTs: clientRecvTs,
+        lastMarketRenderCommitTs: clientRecvTs,
+        lastMarketRenderLatencyMs: 0,
+        lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
+        lastMarketServerPublishTs: transportMeta.serverPublishTs
       };
     });
     return accepted;

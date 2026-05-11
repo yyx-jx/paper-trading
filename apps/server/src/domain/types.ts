@@ -870,10 +870,28 @@ export interface MarketRealtimeTick {
   };
 }
 
+export type MarketFastTick = Omit<MarketRealtimeTick, "orderBooks">;
+
 export interface MarketTickPayload {
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
+  transportMeta: MarketTransportMeta;
+}
+
+export interface MarketFastTickPayload {
+  currentRound?: RoundRecord;
+  tick: MarketFastTick;
+  settlementPreview?: SettlementPreview;
+  transportMeta: MarketTransportMeta;
+}
+
+export interface MarketBookPayload {
+  marketId: string;
+  marketSlug?: string;
+  serverNow: number;
+  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
   transportMeta: MarketTransportMeta;
 }
 

@@ -1,5 +1,5 @@
 import { WebSocket as WsWebSocket } from "ws";
-import type { MarketPayload, MarketTickPayload, UserRecord } from "../domain/types";
+import type { MarketBookPayload, MarketFastTickPayload, MarketPayload, MarketTickPayload, UserRecord } from "../domain/types";
 import type { MarketPayloadBuilder } from "./market-payloads";
 import type { AppStore } from "./store";
 
@@ -14,21 +14,26 @@ export function attachMarketWsSession(input: {
   payloads: MarketPayloadBuilder;
   metrics: MarketWsMetrics;
   minIntervalMs: number;
+  bookIntervalMs: number;
   retryMs: number;
   fullSnapshotIntervalMs: number;
+  streamMode: "legacy" | "layered";
   onClose: () => void;
 }) {
-  const { fullSnapshotIntervalMs, metrics, minIntervalMs, onClose, payloads, retryMs, socket, store, user } = input;
+  const { bookIntervalMs, fullSnapshotIntervalMs, metrics, minIntervalMs, onClose, payloads, retryMs, socket, store, streamMode, user } = input;
   let lastTickSentAt = 0;
+  let lastBookSentAt = 0;
   let lastFullSentAt = 0;
   let lastSentAt = 0;
   let sending = false;
   let pendingTick = false;
+  let pendingBook = false;
   let pendingFull = false;
   let pendingSince: number | undefined;
   let coalescedCount = 0;
   let retryTimer: NodeJS.Timeout | undefined;
   let tickTimer: NodeJS.Timeout | undefined;
+  let bookTimer: NodeJS.Timeout | undefined;
   let fullTimer: NodeJS.Timeout | undefined;
   let closed = false;
 
@@ -39,15 +44,17 @@ export function attachMarketWsSession(input: {
     }
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
-      if (pendingFull || pendingTick) {
+      if (pendingFull || pendingBook || pendingTick) {
         flushPending();
       }
     }, Math.max(delayMs, retryMs));
   };
 
-  const deferLatest = (kind: "tick" | "full") => {
+  const deferLatest = (kind: "tick" | "book" | "full") => {
     if (kind === "full") {
       pendingFull = true;
+    } else if (kind === "book") {
+      pendingBook = true;
     } else {
       pendingTick = true;
     }
@@ -59,9 +66,9 @@ export function attachMarketWsSession(input: {
   };
 
   const sendEnvelope = (
-    type: "market:tick" | "market",
-    data: MarketTickPayload | MarketPayload,
-    kind: "tick" | "full"
+    type: "market:tick" | "market:fast_tick" | "market:book" | "market",
+    data: MarketTickPayload | MarketFastTickPayload | MarketBookPayload | MarketPayload,
+    kind: "tick" | "book" | "full"
   ) => {
     if (!isSocketOpen()) {
       return false;
@@ -91,11 +98,13 @@ export function attachMarketWsSession(input: {
         lastSentAt = Date.now();
         if (kind === "tick") {
           lastTickSentAt = lastSentAt;
+        } else if (kind === "book") {
+          lastBookSentAt = lastSentAt;
         } else {
           lastFullSentAt = lastSentAt;
         }
       }
-      if (pendingFull || pendingTick) {
+      if (pendingFull || pendingBook || pendingTick) {
         scheduleRetry();
       }
     });
@@ -103,11 +112,22 @@ export function attachMarketWsSession(input: {
   };
 
   const sendTick = () => {
-    const data = payloads.createTickPayload(coalescedCount, pendingSince);
+    const data =
+      streamMode === "layered"
+        ? payloads.createFastTickPayload(coalescedCount, pendingSince)
+        : payloads.createTickPayload(coalescedCount, pendingSince);
     coalescedCount = 0;
     pendingSince = undefined;
     pendingTick = false;
-    return sendEnvelope("market:tick", data, "tick");
+    return sendEnvelope(streamMode === "layered" ? "market:fast_tick" : "market:tick", data, "tick");
+  };
+
+  const sendBook = () => {
+    const data = payloads.createBookPayload(coalescedCount, pendingSince);
+    coalescedCount = 0;
+    pendingSince = undefined;
+    pendingBook = false;
+    return sendEnvelope("market:book", data, "book");
   };
 
   const sendFull = () => {
@@ -122,13 +142,18 @@ export function attachMarketWsSession(input: {
     if (!isSocketOpen()) {
       return;
     }
-    if (pendingFull || Date.now() - lastFullSentAt >= fullSnapshotIntervalMs) {
-      if (sendFull()) {
+    if (pendingTick || Date.now() - lastTickSentAt >= minIntervalMs) {
+      if (sendTick()) {
         return;
       }
     }
-    if (pendingTick || Date.now() - lastTickSentAt >= minIntervalMs) {
-      sendTick();
+    if (streamMode === "layered" && (pendingBook || Date.now() - lastBookSentAt >= bookIntervalMs)) {
+      if (sendBook()) {
+        return;
+      }
+    }
+    if (pendingFull || Date.now() - lastFullSentAt >= fullSnapshotIntervalMs) {
+      sendFull();
     }
   };
 
@@ -138,6 +163,13 @@ export function attachMarketWsSession(input: {
       return;
     }
     sendTick();
+  };
+  const bookListener = () => {
+    if (sending || socket.bufferedAmount > 0) {
+      deferLatest("book");
+      return;
+    }
+    sendBook();
   };
   const fullListener = () => {
     if (sending || socket.bufferedAmount > 0) {
@@ -149,6 +181,9 @@ export function attachMarketWsSession(input: {
 
   sendFull();
   tickTimer = setInterval(tickListener, Math.max(minIntervalMs, 50));
+  if (streamMode === "layered") {
+    bookTimer = setInterval(bookListener, Math.max(bookIntervalMs, minIntervalMs));
+  }
   fullTimer = setInterval(fullListener, fullSnapshotIntervalMs);
   store.emitter.on("market:update", tickListener);
   socket.on("close", () => {
@@ -159,6 +194,9 @@ export function attachMarketWsSession(input: {
     }
     if (tickTimer) {
       clearInterval(tickTimer);
+    }
+    if (bookTimer) {
+      clearInterval(bookTimer);
     }
     if (fullTimer) {
       clearInterval(fullTimer);
