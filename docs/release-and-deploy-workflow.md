@@ -42,7 +42,7 @@ release/
 当前临时 HTTP 版本：
 
 ```bash
-ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001 npm run package:win:prod
+ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://<PRODUCTION_HOST>:10001 npm run package:win:prod
 ```
 
 正式 HTTPS 版本应改为：
@@ -54,14 +54,14 @@ VITE_API_BASE_URL=https://<domain> npm run package:win:prod
 ## 4. 上传服务器
 
 ```bash
-ssh -p 22 root@103.147.13.98 "mkdir -p /srv/p-t/{app,releases,rollback,data/backups}"
-rsync -av -e "ssh -p 22" release/<release>/server/ root@103.147.13.98:/srv/p-t/app/
+ssh -p 22 root@<PRODUCTION_HOST> "mkdir -p /srv/p-t/{app,releases,rollback,data/backups}"
+rsync -av -e "ssh -p 22" release/<release>/server/ root@<PRODUCTION_HOST>:/srv/p-t/app/
 ```
 
 升级前先保存回滚目录：
 
 ```bash
-ssh -p 22 root@103.147.13.98 "ts=$(date +%Y%m%d_%H%M%S); mkdir -p /srv/p-t/rollback/$ts; cp -a /srv/p-t/app/. /srv/p-t/rollback/$ts/"
+ssh -p 22 root@<PRODUCTION_HOST> "ts=$(date +%Y%m%d_%H%M%S); mkdir -p /srv/p-t/rollback/$ts; cp -a /srv/p-t/app/. /srv/p-t/rollback/$ts/"
 ```
 
 ## 5. 备份、迁移、启动
@@ -83,8 +83,8 @@ APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-f
 ## 6. 验收
 
 ```bash
-curl -f http://103.147.13.98:10001/api/health/live
-curl -f http://103.147.13.98:10001/api/health/ready
+curl -f http://<PRODUCTION_HOST>:10001/api/health/live
+curl -f http://<PRODUCTION_HOST>:10001/api/health/ready
 ```
 
 客户端 smoke：

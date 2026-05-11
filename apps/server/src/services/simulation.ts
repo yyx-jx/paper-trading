@@ -422,6 +422,8 @@ export class SimulationEngine {
       pollDelayMs: number;
       gammaPollIntervalMs: number;
       binanceRestUrl: string;
+      binanceFallbackRestUrl: string;
+      binanceFallbackRestPollMs: number;
       binanceWsUrl: string;
       binanceRequestTimeoutMs: number;
       binanceRestPollMs: number;
@@ -436,6 +438,9 @@ export class SimulationEngine {
       chainlinkRtdsWsUrl: string;
       chainlinkRtdsSymbol: string;
       chainlinkRtdsPingMs: number;
+      chainlinkHistoryUrl: string;
+      chainlinkHistoryFeedId: string;
+      chainlinkHistoryPollMs: number;
       gammaBaseUrl: string;
       clobBaseUrl: string;
       dataApiBaseUrl: string;
@@ -446,6 +451,7 @@ export class SimulationEngine {
       polymarketDiscoveryTimeoutMs: number;
       polymarketDiscoveryKeywords: string[];
       marketDiscoveryIntervalMs: number;
+      marketSnapshotIntervalMs: number;
       polymarketBookPollMs: number;
       polymarketBookCalibrationMs: number;
       polymarketTradesPollMs: number;
@@ -455,6 +461,8 @@ export class SimulationEngine {
       symbol: config.symbol,
       wsUrl: config.binanceWsUrl,
       restUrl: config.binanceRestUrl,
+      fallbackRestUrl: config.binanceFallbackRestUrl,
+      fallbackRestPollMs: config.binanceFallbackRestPollMs,
       requestTimeoutMs: config.binanceRequestTimeoutMs,
       restPollMs: config.binanceRestPollMs,
       wsStaleMs: config.binanceWsStaleMs,
@@ -465,6 +473,9 @@ export class SimulationEngine {
       rtdsWsUrl: config.chainlinkRtdsWsUrl,
       rtdsSymbol: config.chainlinkRtdsSymbol,
       rtdsPingMs: config.chainlinkRtdsPingMs,
+      historyUrl: config.chainlinkHistoryUrl,
+      historyFeedId: config.chainlinkHistoryFeedId,
+      historyPollMs: config.chainlinkHistoryPollMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.polymarketConnector = new PolymarketConnector({
@@ -520,7 +531,10 @@ export class SimulationEngine {
       this.chainlinkConnector.start();
     }
     this.polymarketConnector.start();
-    this.reconcileTimer = setInterval(() => this.scheduleReconcile(), 1000);
+    this.reconcileTimer = setInterval(
+      () => this.scheduleReconcile(),
+      Math.max(this.config.marketSnapshotIntervalMs, 50)
+    );
     this.scheduleReconcile();
   }
 
@@ -2816,6 +2830,18 @@ export class SimulationEngine {
     }
   }
 
+  private syncChainlinkHistoryCandles(candlesByInterval?: ChainlinkConnectorState["candlesByInterval"]) {
+    if (!candlesByInterval) {
+      return;
+    }
+    for (const interval of TRADE_CHART_INTERVALS) {
+      const bars = candlesByInterval[interval];
+      if (bars?.length) {
+        this.chainlinkCandlesByInterval[interval] = [...bars];
+      }
+    }
+  }
+
   private recordCurrentRoundUpPricePoint(round: RoundRecord | undefined, price: number, ts: number) {
     if (!round || !Number.isFinite(price) || price <= 0) {
       this.currentRoundUpPriceSeries = [];
@@ -2888,6 +2914,7 @@ export class SimulationEngine {
     const downDisplayPrice = displayPrices.DOWN;
     const chainlinkPrice =
       this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
+    this.syncChainlinkHistoryCandles(this.chainlinkState.candlesByInterval);
     this.recordChainlinkSample(chainlinkPrice, this.chainlinkState.updatedAt || now);
     const binancePrice = this.binanceState.price > 0 ? roundNumber(this.binanceState.price, 2) : 0;
     const countdownTargetTs = currentRound

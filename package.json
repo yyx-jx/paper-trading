@@ -37,6 +37,7 @@
     "test:order-idempotency": "tsx scripts/order-idempotency-check.ts",
     "test:electron-config": "tsx scripts/electron-config-check.ts",
     "test:production-client-load": "tsx scripts/production-client-load-test.ts",
+    "test:market-ws-latency": "tsx scripts/market-ws-latency-sample.ts",
     "test:logs": "tsx scripts/log-search-check.ts",
     "test:bulk-users": "tsx scripts/bulk-user-check.ts",
     "test:csv-bulk-users": "tsx scripts/csv-bulk-user-check.ts",

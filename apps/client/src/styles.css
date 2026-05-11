@@ -197,8 +197,25 @@ thead th {
 }
 
 .topbar-status {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   align-content: center;
+}
+
+.realtime-pill.live strong,
+.terminal-realtime-state.live {
+  color: var(--green);
+}
+
+.realtime-pill.fallback strong,
+.terminal-realtime-state.fallback,
+.realtime-pill.reconnecting strong,
+.terminal-realtime-state.reconnecting {
+  color: var(--amber);
+}
+
+.realtime-pill.offline strong,
+.terminal-realtime-state.offline {
+  color: var(--red);
 }
 
 .topbar-actions {
@@ -1541,6 +1558,7 @@ button:disabled:hover {
 .terminal-top-nav button.active { color:var(--G); border-bottom-color:var(--G); }
 .terminal-top-mid { display:flex; align-items:center; gap:9px; color:var(--t1); min-width:0; overflow:hidden; font-size:12px; flex:1; }
 .terminal-top-mid span { display:inline-flex; align-items:center; gap:4px; min-width:0; }
+.terminal-top-mid .terminal-realtime-state { flex:0 0 auto; padding:1px 6px; border:1px solid var(--bd); border-radius:3px; background:var(--b2); font-weight:700; }
 .terminal-top-right { margin-left:auto; display:flex; align-items:center; gap:5px; }
 .terminal-top-right span { padding:1px 7px; border:1px solid #e8a02025; border-radius:3px; background:#1a1000; color:var(--A); font-size:12px; font-weight:600; text-decoration:none; }
 .terminal-green { color:var(--G)!important; } .terminal-red { color:var(--R)!important; }
@@ -1978,7 +1996,7 @@ button:disabled:hover {
 }
 .app-shell:not(.page-trade) .topbar-status {
   display:grid;
-  grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-columns:repeat(4,minmax(0,1fr));
   gap:5px;
 }
 .app-shell:not(.page-trade) .status-pill,

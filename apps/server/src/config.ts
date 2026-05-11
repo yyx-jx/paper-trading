@@ -8,6 +8,9 @@ export const DEFAULT_CHAINLINK_FALLBACK_RPC_URLS = [
   "https://mainnet.infura.io/v3/b6bf7d3508c941499b10025c0776eaf8"
 ];
 export const DEFAULT_CHAINLINK_RTDS_WS_URL = "wss://ws-live-data.polymarket.com";
+export const DEFAULT_CHAINLINK_HISTORY_URL = "https://data.chain.link/api/historical-data-engine-stream-data";
+export const DEFAULT_CHAINLINK_BTC_USD_STREAM_FEED_ID =
+  "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8";
 
 function textEnv(value: string | undefined, fallback: string) {
   const trimmed = value?.trim();
@@ -69,6 +72,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     freezeWindowMs: Number(env.FREEZE_WINDOW_MS ?? 10000),
     pollDelayMs: Number(env.POLL_DELAY_MS ?? 0),
     marketWsMinIntervalMs: Number(env.MARKET_WS_MIN_INTERVAL_MS ?? 50),
+    marketSnapshotIntervalMs: Number(env.MARKET_SNAPSHOT_INTERVAL_MS ?? 500),
     marketHistoryCacheMaxUsers: Number(env.MARKET_HISTORY_CACHE_MAX_USERS ?? 200),
     strictPersistence: env.SERVER_STRICT_PERSISTENCE !== "false",
     requireSchemaMigrations: isProduction ? env.SERVER_REQUIRE_MIGRATIONS !== "false" : env.SERVER_REQUIRE_MIGRATIONS === "true",
@@ -107,6 +111,8 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     databaseUrl: textEnv(env.DATABASE_URL, "postgresql://postgres:postgres@127.0.0.1:5432/paper_trading"),
     redisUrl: textEnv(env.REDIS_URL, "redis://127.0.0.1:6379"),
     binanceRestUrl: textEnv(env.BINANCE_REST_URL, "https://api.binance.com"),
+    binanceFallbackRestUrl: textEnv(env.BINANCE_FALLBACK_REST_URL, "https://www.okx.com"),
+    binanceFallbackRestPollMs: Number(env.BINANCE_FALLBACK_REST_POLL_MS ?? 1000),
     binanceRequestTimeoutMs: Number(env.BINANCE_REQUEST_TIMEOUT_MS ?? 8000),
     binanceWsUrl: textEnv(
       env.BINANCE_WS_URL,
@@ -122,6 +128,9 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     chainlinkRtdsWsUrl: textEnv(env.CHAINLINK_RTDS_WS_URL, DEFAULT_CHAINLINK_RTDS_WS_URL),
     chainlinkRtdsSymbol: textEnv(env.CHAINLINK_RTDS_SYMBOL, "btc/usd"),
     chainlinkRtdsPingMs: Number(env.CHAINLINK_RTDS_PING_MS ?? 5000),
+    chainlinkHistoryUrl: textEnv(env.CHAINLINK_HISTORY_URL, DEFAULT_CHAINLINK_HISTORY_URL),
+    chainlinkHistoryFeedId: textEnv(env.CHAINLINK_HISTORY_FEED_ID, DEFAULT_CHAINLINK_BTC_USD_STREAM_FEED_ID),
+    chainlinkHistoryPollMs: Number(env.CHAINLINK_HISTORY_POLL_MS ?? 10000),
     gammaBaseUrl: textEnv(env.POLYMARKET_GAMMA_BASE_URL, "https://gamma-api.polymarket.com"),
     clobBaseUrl: textEnv(env.POLYMARKET_CLOB_BASE_URL, "https://clob.polymarket.com"),
     dataApiBaseUrl: textEnv(env.POLYMARKET_DATA_BASE_URL, "https://data-api.polymarket.com"),

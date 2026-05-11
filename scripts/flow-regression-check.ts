@@ -593,10 +593,21 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(appSource, /const endToEndAlert =/);
   assert.match(appSource, /latency\.endToEndLatencyMs > 3000/);
   assert.match(appSource, /source-latency-alert/);
-  assert.match(appSource, /const marketStaleMs = 15000/);
+  assert.match(appSource, /const marketStaleMs = 3000/);
   assert.match(appSource, /const marketPayloadRejectMs = 5000/);
+  assert.match(appSource, /type: "market" \| "market:tick"/);
+  assert.match(appSource, /setMarketTickPayload/);
+  assert.match(appSource, /requestAnimationFrame/);
+  assert.match(appSource, /markMarketRenderCommit/);
   assert.match(appSource, /extractMarketPayloadPublishTs/);
-  assert.match(appSource, /const marketReconnectStaleMs = 45000/);
+  assert.match(appSource, /const marketReconnectStaleMs = 10000/);
+  assert.match(appSource, /window\.setInterval\(\(\) => setNowMs\(Date\.now\(\)\), 250\)/);
+  assert.match(appSource, /transitionRealtimeChannel/);
+  assert.match(appSource, /REALTIME_STATUS_MIN_HOLD_MS = 1500/);
+  assert.match(appSource, /MARKET_LIVE_RECOVERY_PAYLOADS = 2/);
+  assert.match(appSource, /lastMarketRecvTs \+ snapshot\.uiMeta\.countdownMs/);
+  assert.match(appSource, /countdownTargetMs\?: number/);
+  assert.match(appSource, /api\.sampleClockOffset/);
   assert.match(appSource, /scheduleMarketReconnect/);
   assert.match(appSource, /refreshMarketSnapshot/);
   assert.match(appSource, /api\.getCurrentRound\(token\)/);
@@ -611,7 +622,11 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(storeSource, /lastMarketPayloadSeq/);
   assert.match(storeSource, /lastMarketServerPublishTs/);
   assert.match(storeSource, /shouldAcceptMarketPayload/);
+  assert.match(storeSource, /mergeRealtimeTick/);
+  assert.match(storeSource, /setMarketTickPayload/);
+  assert.match(storeSource, /lastMarketRenderLatencyMs/);
   assert.match(storeSource, /transportMeta\.serverPublishTs/);
+  assert.match(storeSource, /clientRecvTs - transportMeta\.serverPublishTs - clientClockOffsetMs/);
   const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
   assert.match(i18nSource, /dataAge:/);
   assert.match(i18nSource, /dataAge: "Data Age"/);
@@ -657,7 +672,7 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.match(appSource, /function AnalyticsPage/);
   assert.match(appSource, /<AnalyticsPage/);
   assert.match(appSource, /api\.getOperatedHistory\(token\)/);
-  assert.match(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt\)/);
+  assert.match(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt, (position\.closedAt \?\? position\.openedAt|order\.createdAt)\)/);
   assert.match(appSource, /analysisText: analysis\.text/);
   assert.match(appSource, /settlementState: "UNSETTLED"/);
   assert.match(appSource, /ANALYTICS_INITIAL_TRADE_LIMIT = 200/);
@@ -799,8 +814,10 @@ async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   assert.match(indexSource, /payloadSeq: marketPayloadSeq/);
   assert.match(indexSource, /snapshot: stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
   assert.match(indexSource, /bufferedAmount > 0/);
-  assert.match(indexSource, /pendingLatest/);
-  assert.match(indexSource, /lastSentSeq/);
+  assert.match(indexSource, /pendingTick/);
+  assert.match(indexSource, /pendingFull/);
+  assert.match(indexSource, /market:tick/);
+  assert.match(indexSource, /wsSendStartTs/);
   assert.doesNotMatch(indexSource, /snapshot: store\.marketSnapshot/);
 }
 
@@ -814,6 +831,7 @@ async function testRealtimeLatencyPacingContracts() {
   const configSource = readFileSync("apps/server/src/config.ts", "utf8");
 
   assert.match(configSource, /marketWsMinIntervalMs: Number\(env\.MARKET_WS_MIN_INTERVAL_MS \?\? 50\)/);
+  assert.match(configSource, /marketSnapshotIntervalMs: Number\(env\.MARKET_SNAPSHOT_INTERVAL_MS \?\? 500\)/);
   assert.match(configSource, /marketHistoryCacheMaxUsers: Number\(env\.MARKET_HISTORY_CACHE_MAX_USERS \?\? 200\)/);
   assert.match(configSource, /polymarketBookCalibrationMs: Number\(env\.POLYMARKET_BOOK_CALIBRATION_MS \?\? env\.POLYMARKET_BOOK_POLL_MS \?\? 5000\)/);
   assert.match(typesSource, /coalescedCount\?: number/);
@@ -822,7 +840,12 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(indexSource, /const marketHistoryCache = new Map/);
   assert.match(indexSource, /store\.getHistoryRevision\(\)/);
   assert.match(indexSource, /createMarketPayload\(user\.id, coalescedCount, pendingSince\)/);
+  assert.match(indexSource, /createMarketTickPayload\(coalescedCount, pendingSince\)/);
   assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
+  assert.match(indexSource, /setInterval\(tickListener, Math\.max\(MARKET_WS_MIN_INTERVAL_MS, 50\)\)/);
+  assert.match(indexSource, /setInterval\(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS\)/);
+  assert.match(indexSource, /clearInterval\(tickTimer\)/);
+  assert.match(indexSource, /clearInterval\(fullTimer\)/);
   assert.match(storeSource, /this\.emitter\.emit\("market:update", snapshot\)/);
   assert.match(storeSource, /this\.queuedMarketSnapshot = snapshot/);
   assert.match(storeSource, /void this\.flushMarketSnapshotCache\(\)/);
@@ -832,9 +855,9 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(simulationSource, /scheduleLatencyLogs\(snapshot\)/);
   assert.match(simulationSource, /setImmediate\(\(\) =>/);
   assert.match(appSource, /requestAnimationFrame/);
-  assert.match(appSource, /pendingMarketPayloadRef/);
-  assert.match(appSource, /queueMarketPayload\(parsed\.data, receivedAt\)/);
-  assert.match(appSource, /flushPendingMarketPayload\(\)/);
+  assert.match(appSource, /pendingMarketTick/);
+  assert.match(appSource, /marketTickFrame/);
+  assert.match(appSource, /setMarketTickPayload\(pending\.data, pending\.receivedAt/);
   assert.match(appSource, /memo\(function TradePage/);
 }
 

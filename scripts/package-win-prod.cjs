@@ -5,6 +5,8 @@ const { execFileSync } = require("node:child_process");
 const root = path.resolve(__dirname, "..");
 const outputDir = path.join(root, "deploy", "windows-production");
 const readmePath = path.join(outputDir, "production-client-readme.md");
+const redactedApiBaseUrl = "http://<PRODUCTION_HOST>:10001";
+const rendererApiBaseUrl = "http://127.0.0.1:18787";
 
 function assertInsideRoot(targetPath) {
   const relative = path.relative(root, targetPath);
@@ -93,7 +95,7 @@ if (!npmCli) {
 }
 
 runNodeScript(npmCli, ["run", "build"], {
-  VITE_API_BASE_URL: process.env.VITE_API_BASE_URL
+  VITE_API_BASE_URL: rendererApiBaseUrl
 });
 let nsisSucceeded = true;
 try {
@@ -131,10 +133,11 @@ fs.writeFileSync(
 
 This installer is the production C/S client. It does not start a local memory backend by default.
 
-- API base URL: ${process.env.VITE_API_BASE_URL}
+- API base URL shown in this README: ${redactedApiBaseUrl}
+- Client runtime URL: ${rendererApiBaseUrl}
 - WebSocket URLs are derived from the API base URL and use WSS for HTTPS origins or WS for temporary HTTP origins.
 - Temporary HTTP mode: ${process.env.ALLOW_INSECURE_PROD_HTTP === "true" ? "enabled" : "disabled"}
-- System proxy bypass: production API host is added to Electron proxy-bypass-list at startup.
+- Connection mode: Electron starts a local proxy on 127.0.0.1 and forwards traffic to the production server.
 - Use this installer only after the Docker + Caddy server is ready.
 `,
   "utf8"

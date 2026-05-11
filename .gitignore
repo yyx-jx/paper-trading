@@ -16,3 +16,24 @@ tmp-*
 .codex-artifacts/
 .tmp-paramiko/
 deploy/windows-production/
+deploy/windows-production-portable/
+release/
+load-test-results/
+paper_deploy_final/
+.claude/
+.codex-run/
+*.rar
+*.docx
+*.patch
+docs/codex-current-state-audit.md
+docs/codex-implementation-notes.md
+docs/file-guide.md
+docs/计划书.md
+docs/连接失败.md
+docs/网络问题.md
+docs/实时推流延迟排查与优化记录.md
+docs/稳定接收与卡顿原因说明.md
+docs/模拟交易平台卡顿与状态跳变.md
+docs/生产环境配置.md
+docs/*副本.md
+docs/* - 副本.md

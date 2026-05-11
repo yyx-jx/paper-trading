@@ -130,6 +130,8 @@ export interface MarketTransportMeta {
   payloadSeq: number;
   coalescedCount?: number;
   serverQueueMs?: number;
+  snapshotBuildTs?: number;
+  wsSendStartTs?: number;
 }
 
 export interface ClobMarketInfo {
@@ -825,6 +827,56 @@ export interface MarketPayload {
   transportMeta: MarketTransportMeta;
 }
 
+export interface MarketRealtimeTick {
+  symbol: string;
+  marketId: string;
+  marketSlug?: string;
+  serverNow: number;
+  currentPrice: number;
+  binancePrice: number;
+  chainlinkPrice: number;
+  priceToBeat: number;
+  displayPriceToBeat?: number;
+  displayPriceToBeatSource?: "official" | "binance_open_fallback";
+  upPrice: number;
+  downPrice: number;
+  displayPrices: Record<TradeSide, number>;
+  displayPriceSource: Record<TradeSide, DisplayPriceSource>;
+  displayPriceSpread: Record<TradeSide, number>;
+  latencyBreakdown: LatencyBreakdown;
+  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  binance: {
+    spotPrice: number;
+    latestTick?: CandlePoint;
+  };
+  chainlink: {
+    referencePrice: number;
+    settlementReference: number;
+    latestTick?: CandlePoint;
+  };
+  clob: {
+    delta: number;
+    volume: number;
+    currentRoundUpPricePoint?: CandlePoint;
+    bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+  };
+  uiMeta: {
+    countdownMs: number;
+    countdownTargetTs?: number;
+    acceptingOrders: boolean;
+    marketSwitchState: MarketSwitchState;
+    sourceStatusSummary: Array<{ source: SourceHealth["source"]; state: ConnectionState }>;
+  };
+}
+
+export interface MarketTickPayload {
+  currentRound?: RoundRecord;
+  tick: MarketRealtimeTick;
+  settlementPreview?: SettlementPreview;
+  transportMeta: MarketTransportMeta;
+}
+
 export interface UserPayload {
   profile: ProfileOverview;
   operatedHistory: Array<RoundRecord & { userPnl: number }>;
@@ -942,6 +994,7 @@ export interface BinanceConnectorState {
 export interface ChainlinkConnectorState {
   price: number;
   updatedAt: number;
+  candlesByInterval?: Partial<Record<CandleInterval, CandleBar[]>>;
   status: SourceHealth;
 }
 

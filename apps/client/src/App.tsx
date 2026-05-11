@@ -26,6 +26,7 @@ import {
   type MarketTrade,
   type MarketPayload,
   type MarketSnapshot,
+  type MarketTickPayload,
   type OrderAction,
   type OrderRecord,
   type PaperOrderKind,
@@ -713,6 +714,7 @@ function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: numb
       backendToFrontendLatencyMs: undefined,
       endToEndLatencyMs: undefined,
       dataAgeMs: 0,
+      sourceDataAgeMs: 0,
       marketUpdateAgeMs: 0,
       disabled: true
     };
@@ -733,6 +735,7 @@ function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: numb
         ? Math.max(source.serverPublishTs - source.sourceEventTs + backendToFrontendLatencyMs, 0)
         : undefined,
     dataAgeMs: Math.max(now - source.normalizedTs, 0),
+    sourceDataAgeMs: Math.max(now - source.normalizedTs, 0),
     marketUpdateAgeMs:
       typeof source.clientRecvTs === "number"
         ? Math.max(now - source.clientRecvTs, 0)
@@ -1357,6 +1360,129 @@ function extractMarketPayloadPublishTs(payload?: Pick<MarketPayload, "snapshot" 
   );
 }
 
+type RealtimeChannel = "market" | "user";
+type RealtimeChannelState = "connecting" | "live" | "reconnecting" | "fallback" | "offline";
+
+interface RealtimeChannelStatus {
+  state: RealtimeChannelState;
+  lastMessageAt?: number;
+  fallbackAt?: number;
+  reconnects: number;
+  stateChangedAt: number;
+  livePayloads: number;
+  consecutiveFailures: number;
+  lastError?: string;
+}
+
+type RealtimeStatus = Record<RealtimeChannel, RealtimeChannelStatus>;
+
+const REALTIME_STATUS_MIN_HOLD_MS = 1500;
+const REALTIME_FAILURES_BEFORE_DEGRADE = 2;
+const MARKET_LIVE_RECOVERY_PAYLOADS = 2;
+const USER_LIVE_RECOVERY_PAYLOADS = 1;
+
+const initialRealtimeStatus = (): RealtimeStatus => ({
+  market: { state: "connecting", reconnects: 0, stateChangedAt: Date.now(), livePayloads: 0, consecutiveFailures: 0 },
+  user: { state: "connecting", reconnects: 0, stateChangedAt: Date.now(), livePayloads: 0, consecutiveFailures: 0 }
+});
+
+function transitionRealtimeChannel(
+  current: RealtimeChannelStatus,
+  patch: Partial<RealtimeChannelStatus>,
+  options: { now?: number; force?: boolean; failure?: boolean; recoverPayloads?: number } = {}
+): RealtimeChannelStatus {
+  const now = options.now ?? Date.now();
+  const currentStateChangedAt = current.stateChangedAt || now;
+  let next: RealtimeChannelStatus = {
+    ...current,
+    ...patch,
+    stateChangedAt: currentStateChangedAt,
+    livePayloads: patch.livePayloads ?? current.livePayloads ?? 0,
+    consecutiveFailures: patch.consecutiveFailures ?? current.consecutiveFailures ?? 0
+  };
+
+  if (options.failure) {
+    next = {
+      ...next,
+      livePayloads: 0,
+      consecutiveFailures: (current.consecutiveFailures ?? 0) + 1
+    };
+  }
+
+  if (patch.state === "live") {
+    const livePayloads = (current.state === "live" ? current.livePayloads : current.livePayloads + 1) || 1;
+    next = {
+      ...next,
+      livePayloads,
+      consecutiveFailures: 0
+    };
+    const requiredPayloads = options.recoverPayloads ?? 1;
+    if (current.state !== "live" && livePayloads < requiredPayloads && !options.force) {
+      return {
+        ...next,
+        state: current.state,
+        stateChangedAt: currentStateChangedAt
+      };
+    }
+  }
+
+  if (
+    current.state === "live" &&
+    patch.state &&
+    patch.state !== "live" &&
+    !options.force &&
+    (next.consecutiveFailures < REALTIME_FAILURES_BEFORE_DEGRADE || now - currentStateChangedAt < REALTIME_STATUS_MIN_HOLD_MS)
+  ) {
+    return {
+      ...next,
+      state: "live",
+      stateChangedAt: currentStateChangedAt
+    };
+  }
+
+  if (patch.state && patch.state !== current.state) {
+    next.stateChangedAt = now;
+  }
+  return next;
+}
+
+function realtimeStatusLabel(status: RealtimeStatus, language: Language) {
+  const states = [status.market.state, status.user.state];
+  if (states.includes("offline")) {
+    return localLabel(language, "后端离线", "Backend offline");
+  }
+  if (states.includes("fallback")) {
+    return localLabel(language, "兜底刷新中", "Fallback refresh");
+  }
+  if (states.includes("reconnecting") || states.includes("connecting")) {
+    return localLabel(language, "重连中", "Reconnecting");
+  }
+  return localLabel(language, "实时连接中", "Live");
+}
+
+function realtimeStatusTone(status: RealtimeStatus) {
+  const states = [status.market.state, status.user.state];
+  if (states.includes("offline")) {
+    return "offline";
+  }
+  if (states.includes("fallback")) {
+    return "fallback";
+  }
+  if (states.includes("reconnecting") || states.includes("connecting")) {
+    return "reconnecting";
+  }
+  return "live";
+}
+
+function realtimeStatusDetail(status: RealtimeStatus, nowMs: number, language: Language) {
+  const ageText = (at?: number) => (at ? `${Math.max(0, Math.round((nowMs - at) / 1000))}s` : "--");
+  return localLabel(
+    language,
+    `行情 ${ageText(status.market.lastMessageAt)} / 用户 ${ageText(status.user.lastMessageAt)}`,
+    `Market ${ageText(status.market.lastMessageAt)} / User ${ageText(status.user.lastMessageAt)}`
+  );
+}
+
 function sourceTone(state?: SourceHealth["state"]) {
   if (state === "healthy") {
     return "positive";
@@ -1940,6 +2066,8 @@ function App() {
     setCurrentPage,
     setBootstrap,
     setMarketPayload,
+    setMarketTickPayload,
+    markMarketRenderCommit,
     setUserPayload,
     setLastOrderLatencyMs
   } = useAppStore();
@@ -1954,6 +2082,7 @@ function App() {
   const [selectedInterval, setSelectedInterval] = useState<CandleInterval>("1m");
   const [chartVisibleCount, setChartVisibleCount] = useState(60);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>(() => initialRealtimeStatus());
   const [tradeBusy, setTradeBusy] = useState(false);
   const [quickBusy, setQuickBusy] = useState(false);
   const [cancelBusyOrderId, setCancelBusyOrderId] = useState<string>();
@@ -1964,9 +2093,10 @@ function App() {
   const [roundLogDialog, setRoundLogDialog] = useState<RoundLogDialogState>();
   const [roundLogBusyRoundId, setRoundLogBusyRoundId] = useState<string>();
   const cancellingOrderIdsRef = useRef(new Set<string>());
+  const clientClockOffsetMsRef = useRef(0);
   const countdownTargetMs =
-    snapshot && typeof snapshot.uiMeta.countdownMs === "number"
-      ? snapshot.serverNow + snapshot.uiMeta.countdownMs
+    snapshot && typeof snapshot.uiMeta.countdownMs === "number" && typeof lastMarketRecvTs === "number"
+      ? lastMarketRecvTs + snapshot.uiMeta.countdownMs
       : currentRound?.endAt;
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
@@ -1977,12 +2107,44 @@ function App() {
   }, [selectedInterval]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
     return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
     if (!token) {
+      clientClockOffsetMsRef.current = 0;
+      return;
+    }
+    let cancelled = false;
+    const updateClockOffset = async () => {
+      const offset = await api.sampleClockOffset().catch(() => undefined);
+      if (!cancelled && typeof offset === "number") {
+        clientClockOffsetMsRef.current = offset;
+      }
+    };
+    void updateClockOffset();
+    const timer = window.setInterval(() => void updateClockOffset(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [token]);
+
+  const updateRealtimeChannel = useCallback((
+    channel: RealtimeChannel,
+    patch: Partial<RealtimeChannelStatus>,
+    options?: { now?: number; force?: boolean; failure?: boolean; recoverPayloads?: number }
+  ) => {
+    setRealtimeStatus((current) => ({
+      ...current,
+      [channel]: transitionRealtimeChannel(current[channel], patch, options)
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!token) {
+      setRealtimeStatus(initialRealtimeStatus());
       return;
     }
 
@@ -2016,9 +2178,11 @@ function App() {
 
   useEffect(() => {
     if (!token) {
+      setRealtimeStatus(initialRealtimeStatus());
       return;
     }
 
+    setRealtimeStatus(initialRealtimeStatus());
     let disposed = false;
     let marketSocket: WebSocket | undefined;
     let userSocket: WebSocket | undefined;
@@ -2026,14 +2190,44 @@ function App() {
     let userReconnectTimer: number | undefined;
     let marketWatchdogTimer: number | undefined;
     let lastMarketMessageAt = Date.now();
+    let lastUserMessageAt = Date.now();
     let refreshingMarket = false;
+    let refreshingUser = false;
+    let lastMarketFallbackAt = 0;
+    let lastUserFallbackAt = 0;
     const reconnectDelayMs = 1000;
     const marketPayloadRejectMs = 5000;
-    const marketStaleMs = 15000;
-    const marketReconnectStaleMs = 45000;
+    const marketStaleMs = 3000;
+    const marketReconnectStaleMs = 10000;
+    const marketFallbackCooldownMs = 3000;
+    const userFallbackCooldownMs = 2000;
+    let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
+    let marketTickFrame: number | undefined;
 
     const markMarketActivity = (receivedAt = Date.now()) => {
       lastMarketMessageAt = receivedAt;
+      updateRealtimeChannel(
+        "market",
+        { state: "live", lastMessageAt: receivedAt, lastError: undefined },
+        { now: receivedAt, recoverPayloads: MARKET_LIVE_RECOVERY_PAYLOADS }
+      );
+    };
+
+    const markUserActivity = (receivedAt = Date.now()) => {
+      lastUserMessageAt = receivedAt;
+      updateRealtimeChannel(
+        "user",
+        { state: "live", lastMessageAt: receivedAt, lastError: undefined },
+        { now: receivedAt, recoverPayloads: USER_LIVE_RECOVERY_PAYLOADS }
+      );
+    };
+
+    const markMarketRendered = (receivedAt: number) => {
+      window.requestAnimationFrame(() => {
+        if (!disposed) {
+          markMarketRenderCommit(receivedAt);
+        }
+      });
     };
 
     const refreshMarketSnapshot = async () => {
@@ -2041,6 +2235,8 @@ function App() {
         return;
       }
       refreshingMarket = true;
+      lastMarketFallbackAt = Date.now();
+      updateRealtimeChannel("market", { state: "fallback", fallbackAt: lastMarketFallbackAt }, { now: lastMarketFallbackAt, failure: true });
       try {
         const [roundData, nextHistory] = await Promise.all([api.getCurrentRound(token), api.getHistory(token)]);
         if (!disposed) {
@@ -2052,18 +2248,60 @@ function App() {
             settlementPreview: roundData.settlementPreview,
             transportMeta: roundData.transportMeta
           };
-          const publishTs = extractMarketPayloadPublishTs(payload);
-          if (publishTs > 0 && receivedAt - publishTs > marketPayloadRejectMs) {
-            return;
-          }
-          if (setMarketPayload(payload, receivedAt)) {
+          if (setMarketPayload(payload, receivedAt, clientClockOffsetMsRef.current)) {
             markMarketActivity(receivedAt);
+            markMarketRendered(receivedAt);
+          } else {
+            updateRealtimeChannel(
+              "market",
+              { state: marketSocket?.readyState === WebSocket.OPEN ? "live" : "fallback" },
+              { now: receivedAt, recoverPayloads: MARKET_LIVE_RECOVERY_PAYLOADS }
+            );
           }
         }
-      } catch {
-        // Socket reconnect remains the primary recovery path; polling is only a stale-data fallback.
+      } catch (refreshError) {
+        updateRealtimeChannel("market", {
+          state: "offline",
+          lastError: refreshError instanceof Error ? redactNetworkAddresses(refreshError.message) : "Market refresh failed."
+        }, { failure: true });
       } finally {
         refreshingMarket = false;
+      }
+    };
+
+    const refreshUserSnapshot = async () => {
+      if (disposed || refreshingUser) {
+        return;
+      }
+      refreshingUser = true;
+      lastUserFallbackAt = Date.now();
+      updateRealtimeChannel("user", { state: "fallback", fallbackAt: lastUserFallbackAt }, { now: lastUserFallbackAt, failure: true });
+      try {
+        const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextLogs] = await Promise.all([
+          api.getProfile(token),
+          api.getOperatedHistory(token),
+          api.getPositions(token),
+          api.getOrders(token),
+          api.getLogs(token)
+        ]);
+        if (!disposed) {
+          const receivedAt = Date.now();
+          setUserPayload({
+            profile: nextProfile,
+            operatedHistory: nextOperatedHistory,
+            positions: nextPositions,
+            orders: nextOrders,
+            logs: nextLogs
+          });
+          markUserActivity(receivedAt);
+        }
+      } catch (refreshError) {
+        updateRealtimeChannel("user", {
+          state: "offline",
+          lastError: refreshError instanceof Error ? redactNetworkAddresses(refreshError.message) : "User refresh failed."
+        }, { failure: true });
+      } finally {
+        refreshingUser = false;
       }
     };
 
@@ -2071,6 +2309,13 @@ function App() {
       if (disposed || typeof marketReconnectTimer === "number") {
         return;
       }
+      setRealtimeStatus((current) => ({
+        ...current,
+        market: transitionRealtimeChannel(current.market, {
+          state: "reconnecting",
+          reconnects: current.market.reconnects + 1
+        }, { failure: true })
+      }));
       marketReconnectTimer = window.setTimeout(() => {
         marketReconnectTimer = undefined;
         void connectMarketSocket();
@@ -2081,6 +2326,13 @@ function App() {
       if (disposed || typeof userReconnectTimer === "number") {
         return;
       }
+      setRealtimeStatus((current) => ({
+        ...current,
+        user: transitionRealtimeChannel(current.user, {
+          state: "reconnecting",
+          reconnects: current.user.reconnects + 1
+        }, { failure: true })
+      }));
       userReconnectTimer = window.setTimeout(() => {
         userReconnectTimer = undefined;
         void connectUserSocket();
@@ -2092,6 +2344,7 @@ function App() {
         return;
       }
       marketSocket?.close();
+      updateRealtimeChannel("market", { state: "connecting", lastError: undefined }, { force: true });
       let wsUrl = api.createWsUrl("/ws/market", token);
       try {
         const ticket = await api.createWsTicket(token, "market");
@@ -2105,16 +2358,28 @@ function App() {
       const socket = new WebSocket(wsUrl);
       marketSocket = socket;
       socket.onopen = () => {
-        markMarketActivity();
+        updateRealtimeChannel("market", { state: "connecting", lastError: undefined });
       };
       socket.onmessage = (event) => {
         const receivedAt = Date.now();
-        const parsed = JSON.parse(event.data) as {
-          type: "market";
-          data: MarketPayload;
+        let parsed: {
+          type: "market" | "market:tick";
+          data: MarketPayload | MarketTickPayload;
         };
+        try {
+          parsed = JSON.parse(event.data) as {
+            type: "market" | "market:tick";
+            data: MarketPayload | MarketTickPayload;
+          };
+        } catch (parseError) {
+          updateRealtimeChannel("market", {
+            lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid market message."
+          });
+          return;
+        }
         if (parsed.type === "market") {
-          const publishTs = extractMarketPayloadPublishTs(parsed.data);
+          const data = parsed.data as MarketPayload;
+          const publishTs = extractMarketPayloadPublishTs(data);
           if (publishTs > 0 && receivedAt - publishTs > marketPayloadRejectMs) {
             void refreshMarketSnapshot();
             if (receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
@@ -2122,12 +2387,39 @@ function App() {
             }
             return;
           }
-          if (setMarketPayload(parsed.data, receivedAt)) {
+          if (setMarketPayload(data, receivedAt, clientClockOffsetMsRef.current)) {
             markMarketActivity(receivedAt);
+            markMarketRendered(receivedAt);
+          }
+          return;
+        }
+        if (parsed.type === "market:tick") {
+          pendingMarketTick = { data: parsed.data as MarketTickPayload, receivedAt };
+          if (typeof marketTickFrame !== "number") {
+            marketTickFrame = window.requestAnimationFrame(() => {
+              marketTickFrame = undefined;
+              const pending = pendingMarketTick;
+              pendingMarketTick = undefined;
+              if (!pending || disposed) {
+                return;
+              }
+              const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
+              if (publishTs > 0 && pending.receivedAt - publishTs > marketPayloadRejectMs) {
+                if (pending.receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
+                  socket.close();
+                }
+                return;
+              }
+              if (setMarketTickPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current)) {
+                markMarketActivity(pending.receivedAt);
+                markMarketRenderCommit(pending.receivedAt);
+              }
+            });
           }
         }
       };
       socket.onerror = () => {
+        updateRealtimeChannel("market", { state: "reconnecting", lastError: "Market stream error." }, { failure: true });
         socket.close();
       };
       socket.onclose = () => {
@@ -2143,6 +2435,7 @@ function App() {
         return;
       }
       userSocket?.close();
+      updateRealtimeChannel("user", { state: "connecting", lastError: undefined }, { force: true });
       let wsUrl = api.createWsUrl("/ws/user", token);
       try {
         const ticket = await api.createWsTicket(token, "user");
@@ -2155,16 +2448,33 @@ function App() {
       }
       const socket = new WebSocket(wsUrl);
       userSocket = socket;
+      socket.onopen = () => {
+        updateRealtimeChannel("user", { state: "connecting", lastError: undefined });
+      };
       socket.onmessage = (event) => {
-        const parsed = JSON.parse(event.data) as {
+        const receivedAt = Date.now();
+        let parsed: {
           type: "user";
           data: UserPayload;
         };
+        try {
+          parsed = JSON.parse(event.data) as {
+            type: "user";
+            data: UserPayload;
+          };
+        } catch (parseError) {
+          updateRealtimeChannel("user", {
+            lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid user message."
+          });
+          return;
+        }
         if (parsed.type === "user") {
           setUserPayload(parsed.data);
+          markUserActivity(receivedAt);
         }
       };
       socket.onerror = () => {
+        updateRealtimeChannel("user", { state: "reconnecting", lastError: "User stream error." }, { failure: true });
         socket.close();
       };
       socket.onclose = () => {
@@ -2180,14 +2490,16 @@ function App() {
         return;
       }
       const now = Date.now();
-      const idleMs = now - lastMarketMessageAt;
+      const marketIdleMs = now - lastMarketMessageAt;
       if (!marketSocket || marketSocket.readyState !== WebSocket.OPEN) {
         void refreshMarketSnapshot();
         scheduleMarketReconnect();
-        return;
-      }
-      if (idleMs > marketStaleMs) {
+      } else if (marketIdleMs > marketStaleMs) {
         void refreshMarketSnapshot();
+      }
+      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
+        void refreshUserSnapshot();
+        scheduleUserReconnect();
       }
     };
 
@@ -2206,20 +2518,33 @@ function App() {
       if (disposed) {
         return;
       }
+      const now = Date.now();
       const socket = marketSocket;
-      if (!socket || socket.readyState === WebSocket.CLOSED) {
-        void refreshMarketSnapshot();
-        scheduleMarketReconnect();
-        return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        if (now - lastMarketFallbackAt > marketFallbackCooldownMs) {
+          void refreshMarketSnapshot();
+        }
+        if (!socket || socket.readyState === WebSocket.CLOSED) {
+          scheduleMarketReconnect();
+        }
+      } else {
+        const idleMs = now - lastMarketMessageAt;
+        if (socket.readyState === WebSocket.OPEN && idleMs > marketStaleMs && now - lastMarketFallbackAt > marketFallbackCooldownMs) {
+          void refreshMarketSnapshot();
+        }
+        if (socket.readyState === WebSocket.OPEN && idleMs > marketReconnectStaleMs) {
+          socket.close();
+        }
       }
-      const idleMs = Date.now() - lastMarketMessageAt;
-      if (socket.readyState === WebSocket.OPEN && idleMs > marketStaleMs) {
-        void refreshMarketSnapshot();
+      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
+        if (now - lastUserFallbackAt > userFallbackCooldownMs) {
+          void refreshUserSnapshot();
+        }
+        if (!userSocket || userSocket.readyState === WebSocket.CLOSED) {
+          scheduleUserReconnect();
+        }
       }
-      if (socket.readyState === WebSocket.OPEN && idleMs > marketReconnectStaleMs) {
-        socket.close();
-      }
-    }, 1000);
+    }, 250);
 
     return () => {
       disposed = true;
@@ -2232,13 +2557,16 @@ function App() {
       if (typeof marketWatchdogTimer === "number") {
         window.clearInterval(marketWatchdogTimer);
       }
+      if (typeof marketTickFrame === "number") {
+        window.cancelAnimationFrame(marketTickFrame);
+      }
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleForegroundRecovery);
       window.removeEventListener("pageshow", handleForegroundRecovery);
       marketSocket?.close();
       userSocket?.close();
     };
-  }, [token, setMarketPayload, setUserPayload]);
+  }, [token, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, updateRealtimeChannel]);
 
   const handleLogin = async (username: string, password: string) => {
     setError(undefined);
@@ -2461,7 +2789,7 @@ function App() {
         snapshot: roundData.snapshot,
         settlementPreview: roundData.settlementPreview,
         transportMeta: roundData.transportMeta
-      });
+      }, Date.now(), clientClockOffsetMsRef.current);
       setUserPayload({
         profile: nextProfile,
         positions: nextPositions,
@@ -2475,6 +2803,10 @@ function App() {
       }
     }
   };
+
+  const realtimeLabel = realtimeStatusLabel(realtimeStatus, language);
+  const realtimeTone = realtimeStatusTone(realtimeStatus);
+  const realtimeDetail = realtimeStatusDetail(realtimeStatus, nowMs, language);
 
   if (!token || !me) {
     return (
@@ -2508,6 +2840,10 @@ function App() {
           <div className="status-pill">
             <span>{t("countdown")}</span>
             <strong>{countdownText}</strong>
+          </div>
+          <div className={`status-pill realtime-pill ${realtimeTone}`}>
+            <span>{localLabel(language, "实时", "Realtime")}</span>
+            <strong>{realtimeLabel}</strong>
           </div>
         </div>
 
@@ -2566,6 +2902,10 @@ function App() {
             chartVisibleCount={chartVisibleCount}
             lastOrderLatencyMs={lastOrderLatencyMs}
             lastMarketRecvTs={lastMarketRecvTs}
+            countdownTargetMs={countdownTargetMs}
+            realtimeLabel={realtimeLabel}
+            realtimeTone={realtimeTone}
+            realtimeDetail={realtimeDetail}
             orderAmount={orderAmount}
             orderQty={orderQty}
             limitPrice={limitPrice}
@@ -2947,6 +3287,10 @@ function TradePageRestored(props: {
   chartVisibleCount: number;
   lastOrderLatencyMs?: number;
   lastMarketRecvTs?: number;
+  countdownTargetMs?: number;
+  realtimeLabel: string;
+  realtimeTone: string;
+  realtimeDetail: string;
   orderAmount: string;
   orderQty: string;
   limitPrice: string;
@@ -3020,7 +3364,10 @@ function TradePageRestored(props: {
   const clobLatency = latencyFor(sourceClob, nowMs, props.lastMarketRecvTs);
   const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs);
   const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs);
-  const countdownMs = snapshot?.uiMeta.countdownMs ?? 0;
+  const countdownMs =
+    typeof props.countdownTargetMs === "number"
+      ? Math.max(props.countdownTargetMs - nowMs, 0)
+      : snapshot?.uiMeta.countdownMs ?? 0;
   const countdownClass = countdownTone(countdownMs);
   const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders && currentRound?.status === "Trading");
   const balanceWarning =
@@ -3125,9 +3472,19 @@ function TradePageRestored(props: {
     downPrice: snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0,
     oddsChange,
     sources: [sourceBinance, sourceChainlink, sourceClob],
-    clobLatencyMs: clobLatency.dataAgeMs,
+    clobLatencyMs: clobLatency.marketUpdateAgeMs,
     nowMs
   });
+  const marketUpdateAge = Math.max(
+    clobLatency.marketUpdateAgeMs,
+    btcLatency.marketUpdateAgeMs,
+    chainlinkLatency.marketUpdateAgeMs
+  );
+  const sourceAgeMax = Math.max(
+    clobLatency.sourceDataAgeMs,
+    btcLatency.sourceDataAgeMs,
+    chainlinkLatency.sourceDataAgeMs
+  );
   const groupedAlerts = [
     { key: "market", label: localLabel(language, "数据源", "Market Data") },
     { key: "trading", label: localLabel(language, "交易风险", "Trading Risk") },
@@ -3135,8 +3492,8 @@ function TradePageRestored(props: {
     { key: "system", label: localLabel(language, "系统延迟", "System Delay") }
   ].map((group) => ({ ...group, items: riskAlerts.filter((alert) => alert.group === group.key) })).filter((group) => group.items.length > 0);
   const latencyRows = [
-    { label: localLabel(language, "CLOB 源数据年龄", "CLOB source age"), value: snapshot?.latencyBreakdown.sourceEventAge.clob },
-    { label: localLabel(language, "CLOB 进入后端", "CLOB ingress"), value: snapshot?.latencyBreakdown.serverIngressLatency.clob },
+    { label: localLabel(language, "最新推送年龄", "Market update age"), value: marketUpdateAge },
+    { label: localLabel(language, "最旧源数据", "Oldest source age"), value: sourceAgeMax },
     { label: localLabel(language, "后端计算", "Backend compute"), value: snapshot?.latencyBreakdown.serverComputeLatency },
     { label: localLabel(language, "推送前端", "Frontend transport"), value: snapshot?.latencyBreakdown.clientTransportLatency }
   ];
@@ -3155,9 +3512,9 @@ function TradePageRestored(props: {
       : undefined;
   const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : localLabel(language, "不可用", "Unavailable");
   const healthRows = [
-    { label: "CLOB", primary: `${Math.round(clobLatency.dataAgeMs)}ms`, secondary: localLabel(language, "盘口 / 展示价", "Book / display"), detail: localLabel(language, "下单与盘口判断", "Orders + book checks"), tone: sourceClob?.state ?? "stale" },
-    { label: "BTC", primary: `${Math.round(btcLatency.dataAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, "主 K 线 / PTB", "Main K-line / PTB"), tone: sourceBinance?.state ?? "stale" },
-    { label: "CL", primary: `${Math.round(chainlinkLatency.dataAgeMs)}ms`, secondary: localLabel(language, "Chainlink 行情", "Chainlink feed"), detail: localLabel(language, "参考价 / 预结算", "Reference / preview"), tone: sourceChainlink?.state ?? "stale" },
+    { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "盘口 / 展示价", "Book / display"), detail: localLabel(language, `源 ${Math.round(clobLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(clobLatency.sourceDataAgeMs)}ms / transport ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceClob?.state ?? "stale" },
+    { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, `源 ${Math.round(btcLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(btcLatency.sourceDataAgeMs)}ms / transport ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceBinance?.state ?? "stale" },
+    { label: "CL", primary: `${Math.round(chainlinkLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Chainlink 行情", "Chainlink feed"), detail: localLabel(language, `源 ${Math.round(chainlinkLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(chainlinkLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(chainlinkLatency.sourceDataAgeMs)}ms / transport ${Math.round(chainlinkLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceChainlink?.state ?? "stale" },
     { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: localLabel(language, "结算轮询", "Settlement poll"), detail: localLabel(language, "正式结果确认", "Final settlement"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
   ];
   const bookStatsFor = (side: TradeSide) => {
@@ -3197,6 +3554,9 @@ function TradePageRestored(props: {
           <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
           <span>UP {tokenPriceText(snapshot?.displayPrices.UP ?? snapshot?.upPrice ?? 0)}</span>
           <span>DN {tokenPriceText(snapshot?.displayPrices.DOWN ?? snapshot?.downPrice ?? 0)}</span>
+          <span className={`terminal-realtime-state ${props.realtimeTone}`} title={props.realtimeDetail}>
+            {props.realtimeLabel}
+          </span>
           <span>{currentRound ? roundTimeRangeText(currentRound) : "--"}</span>
         </div>
         <div className="terminal-top-right">

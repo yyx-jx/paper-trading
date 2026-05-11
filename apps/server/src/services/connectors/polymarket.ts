@@ -84,6 +84,9 @@ interface DetailedMarketPayload {
   }>;
 }
 
+const MARKET_WS_STALE_MS = 2500;
+const MARKET_WS_RECONNECT_MS = 1000;
+
 function emptyStatus(symbol: string): SourceHealth {
   const now = Date.now();
   return {
@@ -442,9 +445,12 @@ export class PolymarketConnector {
   private discoveryTimer?: NodeJS.Timeout;
   private booksTimer?: NodeJS.Timeout;
   private tradesTimer?: NodeJS.Timeout;
+  private marketWsStaleTimer?: NodeJS.Timeout;
+  private marketWsReconnectTimer?: NodeJS.Timeout;
   private marketWs?: WebSocket;
   private subscribedAssetKey = "";
   private reconnectCount = 0;
+  private lastMarketWsMessageAt = 0;
   private readonly listeners = new Set<(state: PolymarketConnectorState) => void>();
   private state: PolymarketConnectorState;
   private readonly proxyDispatcher;
@@ -496,6 +502,9 @@ export class PolymarketConnector {
     this.tradesTimer = setInterval(() => {
       void this.refreshTrades();
     }, this.config.tradesPollMs);
+    this.marketWsStaleTimer = setInterval(() => {
+      this.checkMarketWsStale();
+    }, 1000);
   }
 
   stop() {
@@ -510,6 +519,14 @@ export class PolymarketConnector {
     if (this.tradesTimer) {
       clearInterval(this.tradesTimer);
       this.tradesTimer = undefined;
+    }
+    if (this.marketWsStaleTimer) {
+      clearInterval(this.marketWsStaleTimer);
+      this.marketWsStaleTimer = undefined;
+    }
+    if (this.marketWsReconnectTimer) {
+      clearTimeout(this.marketWsReconnectTimer);
+      this.marketWsReconnectTimer = undefined;
     }
     this.closeMarketWs();
   }
@@ -996,6 +1013,7 @@ export class PolymarketConnector {
 
     this.closeMarketWs(false);
     this.subscribedAssetKey = assetKey;
+    this.lastMarketWsMessageAt = Date.now();
     const socket = new WebSocket(
       "wss://ws-subscriptions-clob.polymarket.com/ws/market",
       this.proxyWsAgent ? { agent: this.proxyWsAgent as Agent } : undefined
@@ -1017,6 +1035,7 @@ export class PolymarketConnector {
       if (this.marketWs !== socket) {
         return;
       }
+      this.lastMarketWsMessageAt = Date.now();
       try {
         const decoded = JSON.parse(buffer.toString()) as unknown;
         const messages = Array.isArray(decoded) ? decoded : [decoded];
@@ -1055,8 +1074,67 @@ export class PolymarketConnector {
       if (this.marketWs === socket) {
         this.marketWs = undefined;
         this.subscribedAssetKey = "";
+        this.scheduleMarketWsReconnect(market, "Polymarket market WebSocket closed.");
       }
     });
+  }
+
+  private checkMarketWsStale() {
+    const market = this.state.currentMarket;
+    if (!market) {
+      return;
+    }
+    const socket = this.marketWs;
+    const ageMs = this.lastMarketWsMessageAt ? Date.now() - this.lastMarketWsMessageAt : Number.POSITIVE_INFINITY;
+    if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+      this.scheduleMarketWsReconnect(market, "Polymarket market WebSocket is not open.");
+      return;
+    }
+    if (socket.readyState === WebSocket.OPEN && ageMs > MARKET_WS_STALE_MS) {
+      this.reconnectCount += 1;
+      this.state = {
+        ...this.state,
+        status: {
+          ...this.state.status,
+          state: this.state.orderBooks.UP.snapshotTs > 0 || this.state.orderBooks.DOWN.snapshotTs > 0 ? "degraded" : "reconnecting",
+          reconnectCount: this.reconnectCount,
+          serverRecvTs: Date.now(),
+          normalizedTs: Date.now(),
+          serverPublishTs: Date.now(),
+          message: `Polymarket market WebSocket stale for ${Math.round(ageMs)}ms; reconnecting.`
+        }
+      };
+      this.emit();
+      socket.terminate();
+      this.marketWs = undefined;
+      this.subscribedAssetKey = "";
+      this.scheduleMarketWsReconnect(market, "Polymarket market WebSocket stale.");
+    }
+  }
+
+  private scheduleMarketWsReconnect(market: PolymarketMarketDetail, message: string) {
+    if (this.marketWsReconnectTimer || this.state.currentMarket?.slug !== market.slug) {
+      return;
+    }
+    this.marketWsReconnectTimer = setTimeout(() => {
+      this.marketWsReconnectTimer = undefined;
+      if (this.state.currentMarket?.slug === market.slug) {
+        this.ensureMarketWs(market);
+      }
+    }, MARKET_WS_RECONNECT_MS);
+    this.state = {
+      ...this.state,
+      status: {
+        ...this.state.status,
+        state: this.state.orderBooks.UP.snapshotTs > 0 || this.state.orderBooks.DOWN.snapshotTs > 0 ? "degraded" : "reconnecting",
+        reconnectCount: this.reconnectCount,
+        serverRecvTs: Date.now(),
+        normalizedTs: Date.now(),
+        serverPublishTs: Date.now(),
+        message
+      }
+    };
+    this.emit();
   }
 
   private closeMarketWs(resetAssetKey = true) {

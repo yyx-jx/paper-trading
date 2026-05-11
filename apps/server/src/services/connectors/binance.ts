@@ -203,6 +203,7 @@ export class BinanceConnector {
   private ws?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
   private restPollTimer?: NodeJS.Timeout;
+  private fallbackRestPollTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private reconnectCount = 0;
   private lastWsMessageAt = 0;
@@ -217,6 +218,8 @@ export class BinanceConnector {
       symbol: string;
       wsUrl: string;
       restUrl: string;
+      fallbackRestUrl: string;
+      fallbackRestPollMs: number;
       requestTimeoutMs: number;
       restPollMs: number;
       wsStaleMs: number;
@@ -244,6 +247,9 @@ export class BinanceConnector {
     this.restPollTimer = setInterval(() => {
       void this.pollRestTicker();
     }, this.config.restPollMs);
+    this.fallbackRestPollTimer = setInterval(() => {
+      void this.pollOkxFallback();
+    }, Math.max(this.config.fallbackRestPollMs, 1000));
     this.staleTimer = setInterval(() => {
       this.checkWsStale();
     }, Math.max(Math.floor(this.config.wsStaleMs / 3), 2000));
@@ -258,6 +264,10 @@ export class BinanceConnector {
     if (this.restPollTimer) {
       clearInterval(this.restPollTimer);
       this.restPollTimer = undefined;
+    }
+    if (this.fallbackRestPollTimer) {
+      clearInterval(this.fallbackRestPollTimer);
+      this.fallbackRestPollTimer = undefined;
     }
     if (this.staleTimer) {
       clearInterval(this.staleTimer);
@@ -398,6 +408,78 @@ export class BinanceConnector {
           ...this.state.status,
           state: this.state.price > 0 ? "degraded" : "reconnecting",
           message: error instanceof Error ? error.message : "Failed to poll Binance REST ticker."
+        }
+      };
+      this.emit();
+    }
+  }
+
+  private shouldUseOkxFallback() {
+    if (!this.config.fallbackRestUrl) {
+      return false;
+    }
+    if (this.lastWsMessageAt === 0) {
+      return true;
+    }
+    return Date.now() - this.lastWsMessageAt > this.config.wsStaleMs;
+  }
+
+  private async pollOkxFallback() {
+    if (!this.shouldUseOkxFallback()) {
+      return;
+    }
+    try {
+      const [ticker, candles1m, candles5m, candles15m, candles1h] = await Promise.all([
+        this.fetchOkxJson<{ data?: Array<{ last?: string; lastSz?: string }> }>(
+          `${this.config.fallbackRestUrl}/api/v5/market/ticker?instId=${encodeURIComponent(this.symbolPair.replace("USDT", "-USDT"))}`
+        ),
+        this.fetchOkxCandles("1m", 120),
+        this.fetchOkxCandles("5m", 60),
+        this.fetchOkxCandles("15m", 48),
+        this.fetchOkxCandles("1H", 48)
+      ]);
+      const now = Date.now();
+      const latest = ticker.data?.[0];
+      const price = Number(latest?.last ?? 0);
+      const qty = Number(latest?.lastSz ?? 0);
+      for (const [interval, bars] of [
+        ["1m", candles1m],
+        ["5m", candles5m],
+        ["15m", candles15m],
+        ["1h", candles1h]
+      ] as Array<[CandleInterval, CandleBar[]]>) {
+        for (const bar of bars) {
+          this.upsertBar(interval, bar);
+        }
+      }
+      if (price > 0) {
+        this.applyTradeTick(price, qty, now);
+      }
+      this.state = {
+        ...this.state,
+        status: {
+          source: "Binance",
+          symbol: this.config.symbol,
+          state: "degraded",
+          reconnectCount: this.reconnectCount,
+          sourceEventTs: now,
+          serverRecvTs: now,
+          normalizedTs: now,
+          serverPublishTs: now,
+          acquireLatencyMs: 0,
+          publishLatencyMs: 0,
+          frontendLatencyMs: 0,
+          message: "Binance upstream unavailable; serving OKX BTC-USDT REST fallback."
+        }
+      };
+      this.emit();
+    } catch (error) {
+      this.state = {
+        ...this.state,
+        status: {
+          ...this.state.status,
+          state: this.state.price > 0 ? "degraded" : "reconnecting",
+          message: error instanceof Error ? error.message : "Failed to poll OKX BTC fallback."
         }
       };
       this.emit();
@@ -605,6 +687,38 @@ export class BinanceConnector {
         volume: Number(item[5])
       }))
     );
+  }
+
+  private async fetchOkxCandles(okxInterval: "1m" | "5m" | "15m" | "1H", limit: number): Promise<CandleBar[]> {
+    const interval = okxInterval === "1H" ? "1h" : okxInterval;
+    const url = `${this.config.fallbackRestUrl}/api/v5/market/candles?instId=${encodeURIComponent(this.symbolPair.replace("USDT", "-USDT"))}&bar=${okxInterval}&limit=${limit}`;
+    const payload = await this.fetchOkxJson<{
+      data?: Array<[string, string, string, string, string, string, string, string, string]>;
+    }>(url);
+    return normalizeBars(
+      interval,
+      (payload.data ?? []).map((item) => {
+        const startTs = Number(item[0]);
+        return {
+          interval,
+          startTs,
+          endTs: startTs + INTERVAL_MS[interval] - 1,
+          open: Number(item[1]),
+          high: Number(item[2]),
+          low: Number(item[3]),
+          close: Number(item[4]),
+          volume: Number(item[5])
+        };
+      })
+    );
+  }
+
+  private async fetchOkxJson<T>(url: string): Promise<T> {
+    try {
+      return await fetchJsonWithTimeout<T>(url, this.config.requestTimeoutMs, this.proxyDispatcher);
+    } catch (error) {
+      throw new Error(`OKX fallback request failed for ${url}: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
   }
 
   private async fetchJson<T>(url: string): Promise<T> {

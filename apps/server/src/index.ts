@@ -19,7 +19,9 @@ import type {
   LogSearchResult,
   LogSystem,
   MarketPayload,
+  MarketRealtimeTick,
   MarketSnapshot,
+  MarketTickPayload,
   MarketTransportMeta,
   MatchingEventRecord,
   PermissionLevel,
@@ -135,6 +137,8 @@ const engine = new SimulationEngine(store, matchingClient, {
   pollDelayMs: serverConfig.pollDelayMs,
   gammaPollIntervalMs: serverConfig.gammaPollIntervalMs,
   binanceRestUrl: serverConfig.binanceRestUrl,
+  binanceFallbackRestUrl: serverConfig.binanceFallbackRestUrl,
+  binanceFallbackRestPollMs: serverConfig.binanceFallbackRestPollMs,
   binanceWsUrl: serverConfig.binanceWsUrl,
   binanceRequestTimeoutMs: serverConfig.binanceRequestTimeoutMs,
   binanceRestPollMs: serverConfig.binanceRestPollMs,
@@ -149,6 +153,9 @@ const engine = new SimulationEngine(store, matchingClient, {
   chainlinkRtdsWsUrl: serverConfig.chainlinkRtdsWsUrl,
   chainlinkRtdsSymbol: serverConfig.chainlinkRtdsSymbol,
   chainlinkRtdsPingMs: serverConfig.chainlinkRtdsPingMs,
+  chainlinkHistoryUrl: serverConfig.chainlinkHistoryUrl,
+  chainlinkHistoryFeedId: serverConfig.chainlinkHistoryFeedId,
+  chainlinkHistoryPollMs: serverConfig.chainlinkHistoryPollMs,
   gammaBaseUrl: serverConfig.gammaBaseUrl,
   clobBaseUrl: serverConfig.clobBaseUrl,
   dataApiBaseUrl: serverConfig.dataApiBaseUrl,
@@ -159,6 +166,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketDiscoveryTimeoutMs: serverConfig.polymarketDiscoveryTimeoutMs,
   polymarketDiscoveryKeywords: serverConfig.polymarketDiscoveryKeywords,
   marketDiscoveryIntervalMs: serverConfig.marketDiscoveryIntervalMs,
+  marketSnapshotIntervalMs: serverConfig.marketSnapshotIntervalMs,
   polymarketBookPollMs: serverConfig.polymarketBookPollMs,
   polymarketBookCalibrationMs: serverConfig.polymarketBookCalibrationMs,
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
@@ -167,6 +175,7 @@ const engine = new SimulationEngine(store, matchingClient, {
 let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
+const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
 const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
 
 type CachedMarketHistory = {
@@ -959,13 +968,15 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
   };
 }
 
-function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number): MarketTransportMeta {
+function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number, snapshotBuildTs?: number): MarketTransportMeta {
+  const serverPublishTs = Date.now();
   marketPayloadSeq += 1;
   return {
-    serverPublishTs: Date.now(),
+    serverPublishTs,
     payloadSeq: marketPayloadSeq,
     coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    serverQueueMs: pendingSince ? Math.max(Date.now() - pendingSince, 0) : undefined
+    serverQueueMs: pendingSince ? Math.max(serverPublishTs - pendingSince, 0) : undefined,
+    snapshotBuildTs
   };
 }
 
@@ -1003,7 +1014,7 @@ function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) 
 }
 
 function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince);
+  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, store.marketSnapshot.serverNow);
   const currentRound = store.getCurrentRound();
   const history = getHistoryWithSettlementPreview(10);
   const settlementPreview =
@@ -1021,6 +1032,74 @@ function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: 
   return {
     ...createCurrentRoundPayload(coalescedCount, pendingSince),
     history: getHistoryWithSettlementPreview(10, userId)
+  };
+}
+
+function countdownTargetTsFor(snapshot: MarketSnapshot) {
+  const countdownMs = snapshot.uiMeta.countdownMs;
+  return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
+}
+
+function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
+  const stamped = stampSnapshotForTransport(snapshot, serverPublishTs);
+  const currentRoundUpPricePoint = stamped.clob.currentRoundUpPriceSeries.at(-1);
+  return {
+    symbol: stamped.symbol,
+    marketId: stamped.marketId,
+    marketSlug: stamped.marketSlug,
+    serverNow: stamped.serverNow,
+    currentPrice: stamped.currentPrice,
+    binancePrice: stamped.binancePrice,
+    chainlinkPrice: stamped.chainlinkPrice,
+    priceToBeat: stamped.priceToBeat,
+    displayPriceToBeat: stamped.displayPriceToBeat,
+    displayPriceToBeatSource: stamped.displayPriceToBeatSource,
+    upPrice: stamped.upPrice,
+    downPrice: stamped.downPrice,
+    displayPrices: stamped.displayPrices,
+    displayPriceSource: stamped.displayPriceSource,
+    displayPriceSpread: stamped.displayPriceSpread,
+    latencyBreakdown: stamped.latencyBreakdown,
+    sources: stamped.sources,
+    orderBooks: stamped.orderBooks,
+    binance: {
+      spotPrice: stamped.binance.spotPrice,
+      latestTick: stamped.binance.latestTick
+    },
+    chainlink: {
+      referencePrice: stamped.chainlink.referencePrice,
+      settlementReference: stamped.chainlink.settlementReference,
+      latestTick:
+        stamped.chainlink.referencePrice > 0
+          ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
+          : undefined
+    },
+    clob: {
+      delta: stamped.clob.delta,
+      volume: stamped.clob.volume,
+      currentRoundUpPricePoint,
+      bestBidAskSummary: stamped.clob.bestBidAskSummary
+    },
+    uiMeta: {
+      countdownMs: stamped.uiMeta.countdownMs,
+      countdownTargetTs: countdownTargetTsFor(stamped),
+      acceptingOrders: stamped.uiMeta.acceptingOrders,
+      marketSwitchState: stamped.uiMeta.marketSwitchState,
+      sourceStatusSummary: stamped.uiMeta.sourceStatusSummary
+    }
+  };
+}
+
+function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): MarketTickPayload {
+  const snapshot = store.marketSnapshot;
+  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
+  const currentRound = store.getCurrentRound();
+  const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
+  return {
+    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
+    tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
+    settlementPreview,
+    transportMeta
   };
 }
 
@@ -2585,13 +2664,17 @@ async function bootstrap() {
       wsConnectionCounts.market += 1;
       appMetrics.setWsConnections("market", wsConnectionCounts.market);
 
-      let lastSentSeq = 0;
+      let lastTickSentAt = 0;
+      let lastFullSentAt = 0;
       let lastSentAt = 0;
       let sending = false;
-      let pendingLatest = false;
+      let pendingTick = false;
+      let pendingFull = false;
       let pendingSince: number | undefined;
       let coalescedCount = 0;
       let retryTimer: NodeJS.Timeout | undefined;
+      let tickTimer: NodeJS.Timeout | undefined;
+      let fullTimer: NodeJS.Timeout | undefined;
       let closed = false;
 
       const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
@@ -2601,15 +2684,18 @@ async function bootstrap() {
         }
         retryTimer = setTimeout(() => {
           retryTimer = undefined;
-          if (pendingLatest) {
-            pendingLatest = false;
-            sendPayload();
+          if (pendingFull || pendingTick) {
+            flushPending();
           }
         }, Math.max(delayMs, MARKET_WS_RETRY_MS));
       };
 
-      const deferLatest = () => {
-        pendingLatest = true;
+      const deferLatest = (kind: "tick" | "full") => {
+        if (kind === "full") {
+          pendingFull = true;
+        } else {
+          pendingTick = true;
+        }
         pendingSince ??= Date.now();
         coalescedCount += 1;
         const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
@@ -2617,56 +2703,99 @@ async function bootstrap() {
         scheduleRetry(pacingDelay);
       };
 
-      const sendPayload = () => {
+      const sendEnvelope = (
+        type: "market:tick" | "market",
+        data: MarketTickPayload | MarketPayload,
+        kind: "tick" | "full"
+      ) => {
         if (!isSocketOpen()) {
-          return;
+          return false;
         }
         const currentUser = store.getUserById(user.id);
         if (!currentUser?.isActive) {
           socket.close();
-          return;
+          return false;
         }
         if (sending || socket.bufferedAmount > 0) {
-          deferLatest();
-          return;
+          deferLatest(kind);
+          return false;
         }
         const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
         if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
-          deferLatest();
-          return;
-        }
-        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        const seq = data.transportMeta.payloadSeq;
-        if (seq <= lastSentSeq) {
-          return;
+          deferLatest(kind);
+          return false;
         }
         sending = true;
-        const outbound = JSON.stringify({ type: "market", data });
         const sendStartedAt = Date.now();
+        data.transportMeta.wsSendStartTs = sendStartedAt;
+        const outbound = JSON.stringify({ type, data });
         socket.send(outbound, (error?: Error) => {
           sending = false;
           appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
           if (!error) {
-            lastSentSeq = Math.max(lastSentSeq, seq);
             lastSentAt = Date.now();
+            if (kind === "tick") {
+              lastTickSentAt = lastSentAt;
+            } else {
+              lastFullSentAt = lastSentAt;
+            }
           }
-          if (pendingLatest) {
+          if (pendingFull || pendingTick) {
             scheduleRetry();
           }
         });
+        return true;
       };
 
-      const listener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest();
+      const sendTick = () => {
+        const data = createMarketTickPayload(coalescedCount, pendingSince);
+        coalescedCount = 0;
+        pendingSince = undefined;
+        pendingTick = false;
+        return sendEnvelope("market:tick", data, "tick");
+      };
+
+      const sendFull = () => {
+        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
+        coalescedCount = 0;
+        pendingSince = undefined;
+        pendingFull = false;
+        return sendEnvelope("market", data, "full");
+      };
+
+      const flushPending = () => {
+        if (!isSocketOpen()) {
           return;
         }
-        sendPayload();
+        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
+          if (sendFull()) {
+            return;
+          }
+        }
+        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
+          sendTick();
+        }
       };
-      sendPayload();
-      store.emitter.on("market:update", listener);
+
+      const tickListener = () => {
+        if (sending || socket.bufferedAmount > 0) {
+          deferLatest("tick");
+          return;
+        }
+        sendTick();
+      };
+      const fullListener = () => {
+        if (sending || socket.bufferedAmount > 0) {
+          deferLatest("full");
+          return;
+        }
+        sendFull();
+      };
+
+      sendFull();
+      tickTimer = setInterval(tickListener, Math.max(MARKET_WS_MIN_INTERVAL_MS, 50));
+      fullTimer = setInterval(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS);
+      store.emitter.on("market:update", tickListener);
       socket.on("close", () => {
         closed = true;
         wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
@@ -2677,7 +2806,13 @@ async function bootstrap() {
         if (retryTimer) {
           clearTimeout(retryTimer);
         }
-        store.emitter.off("market:update", listener);
+        if (tickTimer) {
+          clearInterval(tickTimer);
+        }
+        if (fullTimer) {
+          clearInterval(fullTimer);
+        }
+        store.emitter.off("market:update", tickListener);
       });
     } catch {
       socket.close();

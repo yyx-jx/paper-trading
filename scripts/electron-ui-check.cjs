@@ -850,7 +850,9 @@ async function main() {
         throw new Error("Frontend runtime errors after wheel stress: " + JSON.stringify(window.__uiErrors));
       }
 
-      clickAny("Log");
+      const auditTab = Array.from(document.querySelectorAll(".page-tabs button")).at(3);
+      if (!auditTab) throw new Error("Missing audit/log tab.");
+      auditTab.click();
       await sleep(1000);
 
       const systemButtons = Array.from(document.querySelectorAll(".log-system-tabs button"));
@@ -882,22 +884,27 @@ async function main() {
         throw new Error("User filter did not narrow to Tester role.");
       }
 
-      clickAny("Log Info");
+      const logInfoButton = document.querySelector(".more-filter-actions button");
+      if (!logInfoButton) throw new Error("Missing log info toggle.");
+      logInfoButton.click();
       await sleep(300);
-      if (!document.body.textContent.includes("actionType") || !document.body.textContent.includes("Main Fields")) {
+      if (!document.querySelector(".log-info-panel") || !document.body.textContent.includes("actionType")) {
         throw new Error("Log info panel did not show facets.");
       }
 
-      const exportButton = byText("Export");
+      const exportButton = document.querySelector(".button-row.fit-actions .ghost-button");
       if (!exportButton) throw new Error("Missing export button on log page.");
       exportButton.click();
       await sleep(500);
-      if (!document.body.textContent.includes("Export Wizard")) {
+      if (!document.querySelector(".export-dialog")) {
         throw new Error("Export wizard did not open.");
       }
       clickAny("Close");
       await sleep(300);
-      clickAny("Users");
+      const homeTab = Array.from(document.querySelectorAll(".page-tabs button")).at(1);
+      if (!homeTab) throw new Error("Missing home tab.");
+      homeTab.click();
+      await sleep(1000);
       let bulkButton;
       for (let attempt = 0; attempt < 20; attempt += 1) {
         bulkButton = byText("Bulk Register");

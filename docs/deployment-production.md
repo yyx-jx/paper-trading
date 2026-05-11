@@ -3,8 +3,8 @@
 This target is a temporary HTTP rollout for external desktop clients. Users receive only the Electron client; they do not need a browser URL. The client talks to the server through:
 
 ```text
-API: http://103.147.13.98:10001
-WS:  ws://103.147.13.98:10001
+API: http://<PRODUCTION_HOST>:10001
+WS:  ws://<PRODUCTION_HOST>:10001
 ```
 
 Only Caddy publishes the public business port. PostgreSQL, Redis, matching-service, and app-server stay on the Docker network.
@@ -16,9 +16,9 @@ Create `.env.production` from `.env.production.example` and pass it with `APP_EN
 Required values:
 
 ```text
-PUBLIC_DOMAIN=103.147.13.98
-PUBLIC_BASE_URL=http://103.147.13.98:10001
-CORS_ORIGINS=http://103.147.13.98:10001
+PUBLIC_DOMAIN=<PRODUCTION_HOST>
+PUBLIC_BASE_URL=http://<PRODUCTION_HOST>:10001
+CORS_ORIGINS=http://<PRODUCTION_HOST>:10001
 JWT_SECRET=<strong non-default secret>
 EXPORT_ANONYMIZATION_SECRET=<dedicated export anonymization secret>
 POSTGRES_PASSWORD=<strong database password>
@@ -71,7 +71,7 @@ APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-f
 Build the temporary HTTP production client only after accepting the plaintext transport risk:
 
 ```bash
-ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001 npm run package:win:prod
+ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://<PRODUCTION_HOST>:10001 npm run package:win:prod
 ```
 
 The production client does not start a local backend. WebSocket URLs are derived from the API URL and use `ws://` for this temporary HTTP origin.

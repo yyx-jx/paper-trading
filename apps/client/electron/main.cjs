@@ -3,11 +3,16 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const http = require("node:http");
+const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 
 const LOCAL_API_BASE_URL = "http://127.0.0.1:8787";
+const PRODUCTION_PROXY_PORT = 18787;
 let backendProcess;
 let backendLogStream;
+let productionProxyServer;
+let productionProxyLocalAddress;
 
 function packagedMetadata() {
   try {
@@ -41,6 +46,144 @@ function configureProxyBypass() {
   }
 
   app.commandLine.appendSwitch("proxy-bypass-list", Array.from(bypassRules).join(";"));
+  app.commandLine.appendSwitch("no-proxy-server");
+}
+
+function activeIpv4Addresses() {
+  return Object.values(os.networkInterfaces())
+    .flat()
+    .filter((item) => item && item.family === "IPv4" && !item.internal)
+    .map((item) => item.address);
+}
+
+function requestProductionHealth(target, localAddress) {
+  return new Promise((resolve) => {
+    const request = http.get(
+      {
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: "/api/health/live",
+        localAddress,
+        timeout: 2500
+      },
+      (response) => {
+        response.resume();
+        resolve(Boolean(response.statusCode && response.statusCode >= 200 && response.statusCode < 500));
+      }
+    );
+    request.on("timeout", () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.on("error", () => resolve(false));
+  });
+}
+
+async function pickProductionLocalAddress(target) {
+  if (await requestProductionHealth(target)) {
+    return undefined;
+  }
+  for (const localAddress of activeIpv4Addresses()) {
+    if (await requestProductionHealth(target, localAddress)) {
+      return localAddress;
+    }
+  }
+  return undefined;
+}
+
+function stripHopByHopHeaders(headers, target) {
+  const nextHeaders = { ...headers };
+  for (const key of Object.keys(nextHeaders)) {
+    if (
+      [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade"
+      ].includes(key.toLowerCase())
+    ) {
+      delete nextHeaders[key];
+    }
+  }
+  nextHeaders.host = target.host;
+  return nextHeaders;
+}
+
+async function startProductionProxy() {
+  const apiBaseUrl = productionApiBaseUrl();
+  if (!apiBaseUrl || shouldEmbedBackend()) {
+    return;
+  }
+  const target = new URL(apiBaseUrl);
+  if (target.protocol !== "http:") {
+    throw new Error("Production local proxy currently expects an HTTP backend origin.");
+  }
+  productionProxyLocalAddress = await pickProductionLocalAddress(target);
+  productionProxyServer = http.createServer((request, response) => {
+    const upstream = http.request(
+      {
+        hostname: target.hostname,
+        port: target.port || 80,
+        method: request.method,
+        path: request.url,
+        headers: stripHopByHopHeaders(request.headers, target),
+        localAddress: productionProxyLocalAddress
+      },
+      (upstreamResponse) => {
+        response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+        upstreamResponse.pipe(response);
+      }
+    );
+    upstream.on("error", () => {
+      if (!response.headersSent) {
+        response.writeHead(502, { "content-type": "application/json" });
+      }
+      response.end(JSON.stringify({ ok: false, error: "production_proxy_unavailable" }));
+    });
+    request.pipe(upstream);
+  });
+
+  productionProxyServer.on("upgrade", (request, socket, head) => {
+    const upstream = net.connect(
+      {
+        host: target.hostname,
+        port: Number(target.port || 80),
+        localAddress: productionProxyLocalAddress
+      },
+      () => {
+        const lines = [`${request.method} ${request.url} HTTP/${request.httpVersion}`];
+        for (let index = 0; index < request.rawHeaders.length; index += 2) {
+          const name = request.rawHeaders[index];
+          const value = request.rawHeaders[index + 1];
+          if (!name || name.toLowerCase() === "proxy-connection") {
+            continue;
+          }
+          lines.push(name.toLowerCase() === "host" ? `Host: ${target.host}` : `${name}: ${value}`);
+        }
+        upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
+        if (head.length > 0) {
+          upstream.write(head);
+        }
+        upstream.pipe(socket);
+        socket.pipe(upstream);
+      }
+    );
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+  });
+
+  await new Promise((resolve, reject) => {
+    productionProxyServer.once("error", reject);
+    productionProxyServer.listen(PRODUCTION_PROXY_PORT, "127.0.0.1", () => {
+      productionProxyServer.off("error", reject);
+      resolve();
+    });
+  });
 }
 
 function redactNetworkAddresses(value) {
@@ -152,6 +295,11 @@ function stopBackend() {
   backendLogStream = undefined;
 }
 
+function stopProductionProxy() {
+  productionProxyServer?.close();
+  productionProxyServer = undefined;
+}
+
 function lockRendererZoom(win) {
   const resetZoom = () => {
     if (!win.isDestroyed()) {
@@ -235,6 +383,8 @@ app.whenReady().then(async () => {
 
   if (shouldEmbedBackend()) {
     await startPackagedBackend();
+  } else {
+    await startProductionProxy();
   }
 
   createWindow();
@@ -255,6 +405,7 @@ configureProxyBypass();
 
 app.on("before-quit", () => {
   stopBackend();
+  stopProductionProxy();
 });
 
 app.on("window-all-closed", () => {

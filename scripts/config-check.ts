@@ -35,7 +35,7 @@ assert.equal(migrationGuardConfig.expectedSchemaMigrationId, "000123");
 const productionConfig = buildServerConfig({
   NODE_ENV: "production",
   JWT_SECRET: "production-jwt-secret",
-  CORS_ORIGINS: "http://103.147.13.98:10001",
+  CORS_ORIGINS: "http://<PRODUCTION_HOST>:10001",
   EXPORT_ANONYMIZATION_SECRET: "production-export-secret"
 });
 

@@ -67,6 +67,8 @@ export interface MarketTransportMeta {
   payloadSeq: number;
   coalescedCount?: number;
   serverQueueMs?: number;
+  snapshotBuildTs?: number;
+  wsSendStartTs?: number;
 }
 
 export interface ClobMarketInfo {
@@ -226,6 +228,56 @@ export interface MarketPayload {
   currentRound?: RoundRecord;
   history: HistoryRound[];
   snapshot: MarketSnapshot;
+  settlementPreview?: SettlementPreview;
+  transportMeta?: MarketTransportMeta;
+}
+
+export interface MarketRealtimeTick {
+  symbol: string;
+  marketId: string;
+  marketSlug?: string;
+  serverNow: number;
+  currentPrice: number;
+  binancePrice: number;
+  chainlinkPrice: number;
+  priceToBeat: number;
+  displayPriceToBeat?: number;
+  displayPriceToBeatSource?: "official" | "binance_open_fallback";
+  upPrice: number;
+  downPrice: number;
+  displayPrices: Record<TradeSide, number>;
+  displayPriceSource: Record<TradeSide, DisplayPriceSource>;
+  displayPriceSpread: Record<TradeSide, number>;
+  latencyBreakdown: LatencyBreakdown;
+  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  binance: {
+    spotPrice: number;
+    latestTick?: CandlePoint;
+  };
+  chainlink: {
+    referencePrice: number;
+    settlementReference: number;
+    latestTick?: CandlePoint;
+  };
+  clob: {
+    delta: number;
+    volume: number;
+    currentRoundUpPricePoint?: CandlePoint;
+    bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+  };
+  uiMeta: {
+    countdownMs: number;
+    countdownTargetTs?: number;
+    acceptingOrders: boolean;
+    marketSwitchState: MarketSnapshot["uiMeta"]["marketSwitchState"];
+    sourceStatusSummary: Array<{ source: SourceHealth["source"]; state: SourceHealth["state"] }>;
+  };
+}
+
+export interface MarketTickPayload {
+  currentRound?: RoundRecord;
+  tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
   transportMeta?: MarketTransportMeta;
 }
@@ -824,6 +876,19 @@ export const api = {
   async checkHealth() {
     const response = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(2000) });
     return response.ok;
+  },
+  async sampleClockOffset() {
+    const startedAt = Date.now();
+    const response = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    const receivedAt = Date.now();
+    if (!response.ok) {
+      return undefined;
+    }
+    const data = (await response.json()) as { serverNow?: number };
+    if (typeof data.serverNow !== "number") {
+      return undefined;
+    }
+    return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
   createWsUrl(path: string, token: string) {
     const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
