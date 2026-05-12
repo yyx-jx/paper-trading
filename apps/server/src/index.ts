@@ -18,17 +18,9 @@ import type {
   LogSearchQuery,
   LogSearchResult,
   LogSystem,
-  MarketPayload,
-  MarketRealtimeTick,
-  MarketSnapshot,
-  MarketTickPayload,
-  MarketTransportMeta,
   MatchingEventRecord,
   PermissionLevel,
   Role,
-  RoundRecord,
-  SettlementPreview,
-  SourceHealth,
   TradeSide,
   UnifiedLogRow,
   UserRecord,
@@ -37,7 +29,7 @@ import type {
 import { createMatchingServiceApp } from "./services/matching/app";
 import { MatchingServiceClient } from "./services/matching/client";
 import { SimulationEngine } from "./services/simulation";
-import { AppStore, type UserPayloadScope } from "./services/store";
+import { AppStore } from "./services/store";
 import {
   buildExportEntries,
   createZipArchive,
@@ -53,6 +45,10 @@ import { CSV_BULK_USER_TEMPLATE, parseBulkUsersCsv, validateBulkCreateUsers } fr
 import { LOG_FACETS } from "./services/log-facets";
 import { buildDatasetExport, previewDatasetExport } from "./services/dataset-export";
 import { appMetrics } from "./services/metrics";
+import { MarketPayloadBuilder } from "./services/market-payloads";
+import { UserPayloadBuilder } from "./services/user-payloads";
+import { registerHealthRoutes } from "./routes/health";
+import { registerWsRoutes } from "./routes/ws";
 
 const app = Fastify({
   logger: false,
@@ -172,19 +168,18 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
 });
 
-let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
-const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
-
-type CachedMarketHistory = {
-  revision: number;
-  limit: number;
-  rows: Array<RoundRecord & { userPnl: number }>;
-};
-
-const marketHistoryCache = new Map<string, CachedMarketHistory>();
+const marketPayloads = new MarketPayloadBuilder({
+  store,
+  engine,
+  historyCacheMaxUsers: Math.max(serverConfig.marketHistoryCacheMaxUsers, 1)
+});
+const userPayloads = new UserPayloadBuilder({
+  store,
+  marketPayloads
+});
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -945,194 +940,14 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
   return managerUserId;
 }
 
-function stampSourceForTransport(source: SourceHealth, serverPublishTs: number): SourceHealth {
-  return {
-    ...source,
-    serverPublishTs,
-    frontendLatencyMs: 0
-  };
-}
-
-function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = Date.now()): MarketSnapshot {
-  return {
-    ...snapshot,
-    latencyBreakdown: {
-      ...snapshot.latencyBreakdown,
-      serverComputeLatency: Math.max(serverPublishTs - snapshot.serverNow, 0)
-    },
-    sources: {
-      binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
-      chainlink: stampSourceForTransport(snapshot.sources.chainlink, serverPublishTs),
-      clob: stampSourceForTransport(snapshot.sources.clob, serverPublishTs)
-    }
-  };
-}
-
-function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number, snapshotBuildTs?: number): MarketTransportMeta {
-  const serverPublishTs = Date.now();
-  marketPayloadSeq += 1;
-  return {
-    serverPublishTs,
-    payloadSeq: marketPayloadSeq,
-    coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    serverQueueMs: pendingSince ? Math.max(serverPublishTs - pendingSince, 0) : undefined,
-    snapshotBuildTs
-  };
-}
-
-function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: number }>(
-  round: T
-): T & { settlementPreview?: SettlementPreview } {
-  const settlementPreview = engine.getSettlementPreview(round);
-  return settlementPreview ? { ...round, settlementPreview } : round;
-}
-
-function getCachedHistory(limit: number, userId?: string) {
-  const revision = store.getHistoryRevision();
-  const cacheKey = `${userId ?? "__public__"}:${limit}`;
-  const cached = marketHistoryCache.get(cacheKey);
-  if (cached && cached.revision === revision && cached.limit === limit) {
-    return cached.rows;
-  }
-  const rows = store.getHistory(limit, userId);
-  marketHistoryCache.set(cacheKey, { revision, limit, rows });
-  if (marketHistoryCache.size > MARKET_HISTORY_CACHE_MAX_USERS) {
-    const oldestKey = marketHistoryCache.keys().next().value;
-    if (oldestKey) {
-      marketHistoryCache.delete(oldestKey);
-    }
-  }
-  return rows;
-}
-
-function getHistoryWithSettlementPreview(limit: number, userId?: string) {
-  return getCachedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) {
-  return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, store.marketSnapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const history = getHistoryWithSettlementPreview(10);
-  const settlementPreview =
-    (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
-    engine.getLatestSettlementPreview(history);
-  return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
-    snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
-    settlementPreview,
-    transportMeta
-  };
-}
-
-function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: number): MarketPayload {
-  return {
-    ...createCurrentRoundPayload(coalescedCount, pendingSince),
-    history: getHistoryWithSettlementPreview(10, userId)
-  };
-}
-
-function countdownTargetTsFor(snapshot: MarketSnapshot) {
-  const countdownMs = snapshot.uiMeta.countdownMs;
-  return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
-}
-
-function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
-  const stamped = stampSnapshotForTransport(snapshot, serverPublishTs);
-  const currentRoundUpPricePoint = stamped.clob.currentRoundUpPriceSeries.at(-1);
-  return {
-    symbol: stamped.symbol,
-    marketId: stamped.marketId,
-    marketSlug: stamped.marketSlug,
-    serverNow: stamped.serverNow,
-    currentPrice: stamped.currentPrice,
-    binancePrice: stamped.binancePrice,
-    chainlinkPrice: stamped.chainlinkPrice,
-    priceToBeat: stamped.priceToBeat,
-    displayPriceToBeat: stamped.displayPriceToBeat,
-    displayPriceToBeatSource: stamped.displayPriceToBeatSource,
-    upPrice: stamped.upPrice,
-    downPrice: stamped.downPrice,
-    displayPrices: stamped.displayPrices,
-    displayPriceSource: stamped.displayPriceSource,
-    displayPriceSpread: stamped.displayPriceSpread,
-    latencyBreakdown: stamped.latencyBreakdown,
-    sources: stamped.sources,
-    orderBooks: stamped.orderBooks,
-    binance: {
-      spotPrice: stamped.binance.spotPrice,
-      latestTick: stamped.binance.latestTick
-    },
-    chainlink: {
-      referencePrice: stamped.chainlink.referencePrice,
-      settlementReference: stamped.chainlink.settlementReference,
-      latestTick:
-        stamped.chainlink.referencePrice > 0
-          ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
-          : undefined
-    },
-    clob: {
-      delta: stamped.clob.delta,
-      volume: stamped.clob.volume,
-      currentRoundUpPricePoint,
-      bestBidAskSummary: stamped.clob.bestBidAskSummary
-    },
-    uiMeta: {
-      countdownMs: stamped.uiMeta.countdownMs,
-      countdownTargetTs: countdownTargetTsFor(stamped),
-      acceptingOrders: stamped.uiMeta.acceptingOrders,
-      marketSwitchState: stamped.uiMeta.marketSwitchState,
-      sourceStatusSummary: stamped.uiMeta.sourceStatusSummary
-    }
-  };
-}
-
-function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): MarketTickPayload {
-  const snapshot = store.marketSnapshot;
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
-  return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
-    tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
-    settlementPreview,
-    transportMeta
-  };
-}
-
 function createBootstrapPayload(user: UserRecord) {
-  const market = createCurrentRoundPayload();
+  const market = marketPayloads.createCurrentRoundPayload();
   return {
     ...market,
-    history: getHistoryWithSettlementPreview(60, user.id),
+    history: marketPayloads.getHistoryWithSettlementPreview(60, user.id),
     me: store.sanitizeUser(user),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-    profile: store.getProfile(user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getOrders(user.id),
-    logs: store.getRecentLogs(user.id),
+    ...userPayloads.createFullPayload(user),
     sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
-  };
-}
-
-function createUserFullPayload(user: UserRecord) {
-  return {
-    profile: store.getProfile(user.id),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getOrders(user.id),
-    logs: store.getRecentLogs(user.id)
-  };
-}
-
-function createUserTradePayload(user: UserRecord) {
-  return {
-    profile: store.getProfile(user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getRecentTradeOrders(user.id, 50)
   };
 }
 
@@ -1530,129 +1345,14 @@ async function bootstrap() {
   });
   app.setErrorHandler((error, _request, reply) => sendApiError(reply, error));
 
-  app.get("/health", async () => {
-    const matching = await engine.getMatchingHealth().catch(() => undefined);
-    const sources = store.getSourceStatus();
-    const currentRound = store.getCurrentRound();
-    const memory = store.getMemoryStatus();
-    return {
-      ok: true,
-      serverNow: Date.now(),
-      symbol: serverConfig.symbol,
-      persistence: store.getPersistenceStatus(),
-      heapUsedMb: memory.heapUsedMb,
-      heapLimitMb: memory.heapLimitMb,
-      memoryProtectionState: memory.memoryProtectionState,
-      sources,
-      currentRoundPresent: Boolean(currentRound),
-      currentMarketSlug: store.marketSnapshot.marketSlug ?? null,
-      lastSuccessfulUpdateTs:
-        sources
-          .filter((source) => source.state === "healthy" || source.state === "degraded")
-          .map((source) => source.sourceEventTs)
-          .sort((left, right) => right - left)[0] ?? 0,
-      matchingService: matching
-        ? {
-            reachable: matching.ok,
-            persistence: matching.persistence
-          }
-        : {
-            reachable: false
-          }
-    };
-  });
-
-  app.get("/api/health/live", async () => ({
-    ok: true,
-    shuttingDown,
-    serverNow: Date.now(),
-    uptimeSec: Math.round(process.uptime())
-  }));
-
-  app.get("/api/health/ready", async (request, reply) => {
-    const persistence = store.getPersistenceStatus();
-    const matching = await engine.getMatchingHealth().catch(() => undefined);
-    const persistenceReady =
-      persistence.postgres ||
-      (!serverConfig.isProduction && serverConfig.persistenceMode === "memory" && !serverConfig.strictPersistence);
-    const ready =
-      !shuttingDown &&
-      persistenceReady &&
-      (!serverConfig.strictPersistence || persistence.state.postgres.state === "healthy") &&
-      (!serverConfig.embeddedMatchingService || Boolean(matching?.ok));
-    if (!ready) {
-      reply.code(503);
-    }
-    return {
-      ok: ready,
-      shuttingDown,
-      persistence,
-      matchingService: matching ?? { ok: false },
-      schemaMigration: serverConfig.expectedSchemaMigrationId,
-      sources: store.getSourceStatus(),
-      serverNow: Date.now()
-    };
-  });
-
-  app.get("/api/metrics", async () => {
-    updateRuntimeMetrics();
-    const memory = store.getMemoryStatus();
-    const profileCount = store.listUsers().length;
-    const jsonlStats = store.getJsonlStats();
-    const persistence = store.getPersistenceStatus();
-    const sources = store.getSourceStatus();
-    const orderLatencies = store
-      .getRecentLogs("")
-      .filter((log) => log.actionType === "place_order" && typeof log.backendLatencyMs === "number")
-      .map((log) => log.backendLatencyMs as number)
-      .sort((a, b) => a - b);
-    const p95Index = orderLatencies.length > 0 ? Math.min(orderLatencies.length - 1, Math.ceil(orderLatencies.length * 0.95) - 1) : -1;
-    return {
-      uptimeSec: Math.round(process.uptime()),
-      memoryMb: memory.heapUsedMb,
-      heapLimitMb: memory.heapLimitMb,
-      memoryProtectionState: memory.memoryProtectionState,
-      wsClients: wsConnectionCounts.market + wsConnectionCounts.user,
-      wsClientsByChannel: { ...wsConnectionCounts },
-      users: profileCount,
-      orderLatencyP95Ms: p95Index >= 0 ? orderLatencies[p95Index] : 0,
-      eventLoopLagMs: appMetrics.getEventLoopLagMs(),
-      http: {
-        metricsEnabled: serverConfig.metricsEnabled
-      },
-      ws: {
-        connections: wsConnectionCounts.market + wsConnectionCounts.user,
-        byChannel: { ...wsConnectionCounts }
-      },
-      orders: {
-        latencyP95Ms: p95Index >= 0 ? orderLatencies[p95Index] : 0,
-        sampleCount: orderLatencies.length
-      },
-      jsonl: jsonlStats,
-      persistence,
-      externalSources: sources.map((source) => ({
-        source: source.source,
-        state: source.state,
-        sourceEventAgeMs: Math.max(Date.now() - source.sourceEventTs, 0)
-      })),
-      exports: appMetrics.getExportOverview(),
-      sourceHealth: Object.fromEntries(sources.map((source) => [source.source.toLowerCase(), source.state]))
-    };
-  });
-
-  app.get("/metrics", async (request, reply) => {
-    if (!serverConfig.metricsEnabled) {
-      reply.code(404);
-      return "metrics disabled";
-    }
-    if (!metricsAuthorized(request.headers.authorization)) {
-      reply.header("www-authenticate", 'Basic realm="metrics"');
-      reply.code(401);
-      return "unauthorized";
-    }
-    updateRuntimeMetrics();
-    reply.header("content-type", appMetrics.contentType());
-    return appMetrics.text();
+  registerHealthRoutes(app, {
+    store,
+    engine,
+    metrics: appMetrics,
+    wsConnectionCounts,
+    isShuttingDown: () => shuttingDown,
+    updateRuntimeMetrics,
+    metricsAuthorized
   });
 
   app.post("/api/auth/login", async (request, reply) => {
@@ -2223,7 +1923,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
-      return createCurrentRoundPayload();
+      return marketPayloads.createCurrentRoundPayload();
     })
   );
 
@@ -2232,7 +1932,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
       const limit = Number((request.query as { limit?: string }).limit ?? 10);
-      return getHistoryWithSettlementPreview(limit, user.id);
+      return marketPayloads.getHistoryWithSettlementPreview(limit, user.id);
     })
   );
 
@@ -2244,7 +1944,7 @@ async function bootstrap() {
       }
       const params = request.params as { id: string };
       const parsed = manualSettlementSchema.parse(request.body);
-      return decorateRoundWithSettlementPreview(
+      return marketPayloads.decorateRoundWithSettlementPreview(
         await store.withTransaction(() =>
           engine.manualSettleRound(user, {
             roundId: params.id,
@@ -2262,7 +1962,7 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const limit = Number((request.query as { limit?: string }).limit ?? 500);
-      return getOperatedHistoryWithSettlementPreview(limit, user.id);
+      return marketPayloads.getOperatedHistoryWithSettlementPreview(limit, user.id);
     })
   );
 
@@ -2670,223 +2370,18 @@ async function bootstrap() {
     })
   );
 
-  app.get("/ws/market", { websocket: true }, (socket, request) => {
-    try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "market");
-      if (!user || !user.isActive) {
-        socket.close();
-        return;
-      }
-      attachHeartbeat(socket, "market");
-      wsConnectionCounts.market += 1;
-      appMetrics.setWsConnections("market", wsConnectionCounts.market);
-
-      let lastTickSentAt = 0;
-      let lastFullSentAt = 0;
-      let lastSentAt = 0;
-      let sending = false;
-      let pendingTick = false;
-      let pendingFull = false;
-      let pendingSince: number | undefined;
-      let coalescedCount = 0;
-      let retryTimer: NodeJS.Timeout | undefined;
-      let tickTimer: NodeJS.Timeout | undefined;
-      let fullTimer: NodeJS.Timeout | undefined;
-      let closed = false;
-
-      const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
-      const scheduleRetry = (delayMs = MARKET_WS_RETRY_MS) => {
-        if (closed || retryTimer) {
-          return;
-        }
-        retryTimer = setTimeout(() => {
-          retryTimer = undefined;
-          if (pendingFull || pendingTick) {
-            flushPending();
-          }
-        }, Math.max(delayMs, MARKET_WS_RETRY_MS));
-      };
-
-      const deferLatest = (kind: "tick" | "full") => {
-        if (kind === "full") {
-          pendingFull = true;
-        } else {
-          pendingTick = true;
-        }
-        pendingSince ??= Date.now();
-        coalescedCount += 1;
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        const pacingDelay = Math.max(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend, 0);
-        scheduleRetry(pacingDelay);
-      };
-
-      const sendEnvelope = (
-        type: "market:tick" | "market",
-        data: MarketTickPayload | MarketPayload,
-        kind: "tick" | "full"
-      ) => {
-        if (!isSocketOpen()) {
-          return false;
-        }
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
-          socket.close();
-          return false;
-        }
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest(kind);
-          return false;
-        }
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
-          deferLatest(kind);
-          return false;
-        }
-        sending = true;
-        const sendStartedAt = Date.now();
-        data.transportMeta.wsSendStartTs = sendStartedAt;
-        const outbound = JSON.stringify({ type, data });
-        socket.send(outbound, (error?: Error) => {
-          sending = false;
-          appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
-          if (!error) {
-            lastSentAt = Date.now();
-            if (kind === "tick") {
-              lastTickSentAt = lastSentAt;
-            } else {
-              lastFullSentAt = lastSentAt;
-            }
-          }
-          if (pendingFull || pendingTick) {
-            scheduleRetry();
-          }
-        });
-        return true;
-      };
-
-      const sendTick = () => {
-        const data = createMarketTickPayload(coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingTick = false;
-        return sendEnvelope("market:tick", data, "tick");
-      };
-
-      const sendFull = () => {
-        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingFull = false;
-        return sendEnvelope("market", data, "full");
-      };
-
-      const flushPending = () => {
-        if (!isSocketOpen()) {
-          return;
-        }
-        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
-          if (sendFull()) {
-            return;
-          }
-        }
-        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
-          sendTick();
-        }
-      };
-
-      const tickListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("tick");
-          return;
-        }
-        sendTick();
-      };
-      const fullListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("full");
-          return;
-        }
-        sendFull();
-      };
-
-      sendFull();
-      tickTimer = setInterval(tickListener, Math.max(MARKET_WS_MIN_INTERVAL_MS, 50));
-      fullTimer = setInterval(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS);
-      store.emitter.on("market:update", tickListener);
-      socket.on("close", () => {
-        closed = true;
-        wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
-        appMetrics.setWsConnections("market", wsConnectionCounts.market);
-        if (!consumeHeartbeatTimeout(socket)) {
-          appMetrics.recordWsDisconnect("market", "close");
-        }
-        if (retryTimer) {
-          clearTimeout(retryTimer);
-        }
-        if (tickTimer) {
-          clearInterval(tickTimer);
-        }
-        if (fullTimer) {
-          clearInterval(fullTimer);
-        }
-        store.emitter.off("market:update", tickListener);
-      });
-    } catch {
-      socket.close();
-    }
-  });
-
-  app.get("/ws/user", { websocket: true }, (socket, request) => {
-    try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "user");
-      if (!user || !user.isActive) {
-        socket.close();
-        return;
-      }
-      attachHeartbeat(socket, "user");
-      wsConnectionCounts.user += 1;
-      appMetrics.setWsConnections("user", wsConnectionCounts.user);
-
-      const eventName = `user:${user.id}`;
-      const sendPayload = (scope: UserPayloadScope = "full") => {
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
-          socket.close();
-          return;
-        }
-        const buildStartedAt = Date.now();
-        const outbound = JSON.stringify({
-          type: scope === "trade" ? "user:trade" : "user",
-          data: scope === "trade" ? createUserTradePayload(currentUser) : createUserFullPayload(currentUser)
-        });
-        const buildLatencyMs = Date.now() - buildStartedAt;
-        if (buildLatencyMs > 50 || Buffer.byteLength(outbound) > 200_000) {
-          console.warn(
-            `[ws:user] payload scope=${scope} bytes=${Buffer.byteLength(outbound)} buildMs=${buildLatencyMs}`
-          );
-        }
-        const sendStartedAt = Date.now();
-        socket.send(outbound, (error?: Error) => {
-          appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
-        });
-      };
-
-      const listener = (scope?: UserPayloadScope) => sendPayload(scope ?? "full");
-      sendPayload();
-      store.emitter.on(eventName, listener);
-      socket.on("close", () => {
-        wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
-        appMetrics.setWsConnections("user", wsConnectionCounts.user);
-        if (!consumeHeartbeatTimeout(socket)) {
-          appMetrics.recordWsDisconnect("user", "close");
-        }
-        store.emitter.off(eventName, listener);
-      });
-    } catch {
-      socket.close();
-    }
+  registerWsRoutes(app, {
+    store,
+    marketPayloads,
+    userPayloads,
+    metrics: appMetrics,
+    wsConnectionCounts,
+    marketWsMinIntervalMs: MARKET_WS_MIN_INTERVAL_MS,
+    marketWsRetryMs: MARKET_WS_RETRY_MS,
+    marketWsFullSnapshotIntervalMs: MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS,
+    getWsUser,
+    attachHeartbeat,
+    consumeHeartbeatTimeout
   });
 
   logStartupStage("app.listen start");

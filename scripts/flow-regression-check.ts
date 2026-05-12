@@ -809,21 +809,25 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
 
 async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
-  assert.match(indexSource, /function stampSnapshotForTransport\(snapshot: MarketSnapshot, serverPublishTs = Date\.now\(\)\)/);
-  assert.match(indexSource, /serverPublishTs,/);
-  assert.match(indexSource, /MarketTransportMeta/);
-  assert.match(indexSource, /payloadSeq: marketPayloadSeq/);
-  assert.match(indexSource, /snapshot: stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
-  assert.match(indexSource, /bufferedAmount > 0/);
-  assert.match(indexSource, /pendingTick/);
-  assert.match(indexSource, /pendingFull/);
-  assert.match(indexSource, /market:tick/);
-  assert.match(indexSource, /wsSendStartTs/);
+  const payloadsSource = readFileSync("apps/server/src/services/market-payloads.ts", "utf8");
+  const sessionSource = readFileSync("apps/server/src/services/market-ws-session.ts", "utf8");
+  assert.match(payloadsSource, /private stampSnapshotForTransport\(snapshot: MarketSnapshot, serverPublishTs = Date\.now\(\)\)/);
+  assert.match(payloadsSource, /serverPublishTs,/);
+  assert.match(payloadsSource, /MarketTransportMeta/);
+  assert.match(payloadsSource, /payloadSeq: this\.marketPayloadSeq/);
+  assert.match(payloadsSource, /snapshot: this\.stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
+  assert.match(sessionSource, /bufferedAmount > 0/);
+  assert.match(sessionSource, /pendingTick/);
+  assert.match(sessionSource, /pendingFull/);
+  assert.match(sessionSource, /market:tick/);
+  assert.match(sessionSource, /wsSendStartTs/);
   assert.doesNotMatch(indexSource, /snapshot: store\.marketSnapshot/);
 }
 
 async function testRealtimeLatencyPacingContracts() {
   const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const payloadsSource = readFileSync("apps/server/src/services/market-payloads.ts", "utf8");
+  const sessionSource = readFileSync("apps/server/src/services/market-ws-session.ts", "utf8");
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
@@ -838,15 +842,15 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(typesSource, /coalescedCount\?: number/);
   assert.match(apiSource, /serverQueueMs\?: number/);
   assert.match(indexSource, /const MARKET_WS_MIN_INTERVAL_MS = Math\.max\(serverConfig\.marketWsMinIntervalMs, 0\)/);
-  assert.match(indexSource, /const marketHistoryCache = new Map/);
-  assert.match(indexSource, /store\.getHistoryRevision\(\)/);
-  assert.match(indexSource, /createMarketPayload\(user\.id, coalescedCount, pendingSince\)/);
-  assert.match(indexSource, /createMarketTickPayload\(coalescedCount, pendingSince\)/);
-  assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
-  assert.match(indexSource, /setInterval\(tickListener, Math\.max\(MARKET_WS_MIN_INTERVAL_MS, 50\)\)/);
-  assert.match(indexSource, /setInterval\(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS\)/);
-  assert.match(indexSource, /clearInterval\(tickTimer\)/);
-  assert.match(indexSource, /clearInterval\(fullTimer\)/);
+  assert.match(payloadsSource, /private readonly marketHistoryCache = new Map/);
+  assert.match(payloadsSource, /store\.getHistoryRevision\(\)/);
+  assert.match(sessionSource, /payloads\.createMarketPayload\(user\.id, coalescedCount, pendingSince\)/);
+  assert.match(sessionSource, /payloads\.createTickPayload\(coalescedCount, pendingSince\)/);
+  assert.match(sessionSource, /elapsedSinceLastSend < minIntervalMs/);
+  assert.match(sessionSource, /setInterval\(tickListener, Math\.max\(minIntervalMs, 50\)\)/);
+  assert.match(sessionSource, /setInterval\(fullListener, fullSnapshotIntervalMs\)/);
+  assert.match(sessionSource, /clearInterval\(tickTimer\)/);
+  assert.match(sessionSource, /clearInterval\(fullTimer\)/);
   assert.match(storeSource, /this\.emitter\.emit\("market:update", snapshot\)/);
   assert.match(storeSource, /this\.queuedMarketSnapshot = snapshot/);
   assert.match(storeSource, /void this\.flushMarketSnapshotCache\(\)/);
@@ -866,6 +870,9 @@ async function testOrderFastPathUsesLightUserTradePayloads() {
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const wsRoutesSource = readFileSync("apps/server/src/routes/ws.ts", "utf8");
+  const userPayloadsSource = readFileSync("apps/server/src/services/user-payloads.ts", "utf8");
+  const userSessionSource = readFileSync("apps/server/src/services/user-ws-session.ts", "utf8");
   const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
   const appStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
   const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
@@ -877,9 +884,11 @@ async function testOrderFastPathUsesLightUserTradePayloads() {
   assert.match(storeSource, /export type UserPayloadScope = "full" \| "trade"/);
   assert.match(storeSource, /emitUserPayload\(userId: string, scope: UserPayloadScope = "full"\)/);
   assert.doesNotMatch(storeSource, /const payload: UserPayload = \{\s*profile: this\.getProfile\(userId\),\s*operatedHistory: this\.getOperatedHistory\(500, userId\),/);
-  assert.match(indexSource, /type: scope === "trade" \? "user:trade" : "user"/);
-  assert.match(indexSource, /orders: store\.getRecentTradeOrders\(user\.id/);
-  assert.match(indexSource, /appMetrics\.recordWsSend\("user"/);
+  assert.match(indexSource, /registerWsRoutes/);
+  assert.match(wsRoutesSource, /attachUserWsSession/);
+  assert.match(userSessionSource, /type: scope === "trade" \? "user:trade" : "user"/);
+  assert.match(userPayloadsSource, /orders: store\.getRecentTradeOrders\(user\.id/);
+  assert.match(userSessionSource, /metrics\.recordWsSend\("user"/);
   assert.match(apiSource, /export interface UserTradePayload/);
   assert.match(appStoreSource, /setUserTradePayload: \(data: UserTradePayload\) => void/);
   assert.match(appStoreSource, /setUserTradePayload: \(data\) =>/);
