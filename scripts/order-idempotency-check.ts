@@ -55,7 +55,7 @@ function testStaticContracts() {
   assertInOrder(
     simulationSource,
     "await this.store.findOrderByClientOrderId(user.id, clientOrderId)",
-    "this.assertCanCreateNewOrder(currentRound, now);",
+    "this.assertCanBuyOrder(currentRound, now);",
     "duplicate clientOrderId check before trading mutation"
   );
   assertIncludes(simulationSource, "isClientOrderConflict(writeError)", "unique conflict recovery");

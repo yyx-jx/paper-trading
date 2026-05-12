@@ -37,7 +37,7 @@ import type {
 import { createMatchingServiceApp } from "./services/matching/app";
 import { MatchingServiceClient } from "./services/matching/client";
 import { SimulationEngine } from "./services/simulation";
-import { AppStore } from "./services/store";
+import { AppStore, type UserPayloadScope } from "./services/store";
 import {
   buildExportEntries,
   createZipArchive,
@@ -1115,6 +1115,24 @@ function createBootstrapPayload(user: UserRecord) {
     orders: store.getOrders(user.id),
     logs: store.getRecentLogs(user.id),
     sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
+  };
+}
+
+function createUserFullPayload(user: UserRecord) {
+  return {
+    profile: store.getProfile(user.id),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
+    positions: store.getPositions(user.id),
+    orders: store.getOrders(user.id),
+    logs: store.getRecentLogs(user.id)
+  };
+}
+
+function createUserTradePayload(user: UserRecord) {
+  return {
+    profile: store.getProfile(user.id),
+    positions: store.getPositions(user.id),
+    orders: store.getRecentTradeOrders(user.id, 50)
   };
 }
 
@@ -2832,29 +2850,30 @@ async function bootstrap() {
       appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
       const eventName = `user:${user.id}`;
-      const sendPayload = () => {
+      const sendPayload = (scope: UserPayloadScope = "full") => {
         const currentUser = store.getUserById(user.id);
         if (!currentUser?.isActive) {
           socket.close();
           return;
         }
+        const buildStartedAt = Date.now();
         const outbound = JSON.stringify({
-          type: "user",
-          data: {
-            profile: store.getProfile(user.id),
-            operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-            positions: store.getPositions(user.id),
-            orders: store.getOrders(user.id),
-            logs: store.getRecentLogs(user.id)
-          }
+          type: scope === "trade" ? "user:trade" : "user",
+          data: scope === "trade" ? createUserTradePayload(currentUser) : createUserFullPayload(currentUser)
         });
+        const buildLatencyMs = Date.now() - buildStartedAt;
+        if (buildLatencyMs > 50 || Buffer.byteLength(outbound) > 200_000) {
+          console.warn(
+            `[ws:user] payload scope=${scope} bytes=${Buffer.byteLength(outbound)} buildMs=${buildLatencyMs}`
+          );
+        }
         const sendStartedAt = Date.now();
         socket.send(outbound, (error?: Error) => {
           appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
         });
       };
 
-      const listener = () => sendPayload();
+      const listener = (scope?: UserPayloadScope) => sendPayload(scope ?? "full");
       sendPayload();
       store.emitter.on(eventName, listener);
       socket.on("close", () => {

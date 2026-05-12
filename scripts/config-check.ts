@@ -11,7 +11,7 @@ assert.equal(blankRpcConfig.chainlinkEnabled, true);
 assert.equal(blankRpcConfig.chainlinkRpcUrl, DEFAULT_CHAINLINK_RPC_URL);
 assert.deepEqual(blankRpcConfig.chainlinkFallbackRpcUrls, ["https://rpc.example/a", "https://rpc.example/b"]);
 assert.equal(blankRpcConfig.requireSchemaMigrations, false);
-assert.equal(blankRpcConfig.expectedSchemaMigrationId, "000004");
+assert.equal(blankRpcConfig.expectedSchemaMigrationId, "000005");
 
 const disabledConfig = buildServerConfig({
   CHAINLINK_ENABLED: "false",

@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS order_lifecycle_logs (
 
 CREATE TABLE IF NOT EXISTS positions (
   id TEXT PRIMARY KEY,
+  buy_order_id TEXT,
   user_id TEXT NOT NULL,
   round_id TEXT NOT NULL,
   side TEXT NOT NULL,
@@ -304,6 +305,7 @@ CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_ts ON order_book_snapshots(s
 CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_order_lifecycle_user_time ON order_lifecycle_logs(user_id, order_timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_user_opened ON positions(user_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_positions_buy_order_id ON positions(buy_order_id);
 CREATE INDEX IF NOT EXISTS idx_positions_user_status ON positions(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_positions_round_side ON positions(round_id, side);
 CREATE INDEX IF NOT EXISTS idx_audit_events_user_recv ON audit_events(user_id, server_recv_ts DESC);

@@ -218,6 +218,7 @@ export interface MarketSnapshot {
     marketTitle: string;
     marketSubtitle?: string;
     countdownMs: number;
+    countdownTargetTs?: number;
     acceptingOrders: boolean;
     marketSwitchState: MarketSwitchState;
     sourceStatusSummary: Array<{ source: SourceHealth["source"]; state: SourceHealth["state"] }>;
@@ -288,6 +289,12 @@ export interface UserPayload {
   positions: PositionRecord[];
   orders: OrderRecord[];
   logs: AuditEvent[];
+}
+
+export interface UserTradePayload {
+  profile: ProfileOverview;
+  positions: PositionRecord[];
+  orders: OrderRecord[];
 }
 
 export interface BootstrapPayload extends MarketPayload, UserPayload {
@@ -361,6 +368,7 @@ export interface ProfileOverview {
 
 export interface PositionRecord {
   id: string;
+  buyOrderId?: string;
   userId: string;
   roundId: string;
   side: TradeSide;

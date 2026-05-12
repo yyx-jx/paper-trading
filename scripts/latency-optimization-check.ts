@@ -123,7 +123,7 @@ async function testCloseSideAggregatesIntoOneSellOrder() {
       newId: (prefix: string) => `${prefix}-close`
     },
     getActiveRound: () => testRound,
-    assertCanCreateNewOrder: () => undefined,
+    assertCanSellOrder: () => undefined,
     captureActionSnapshot: () => ({}),
     placeOrder: async (_user: UserRecord, payload: Record<string, unknown>) => {
       calls.push(payload);

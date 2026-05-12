@@ -43,7 +43,6 @@ import type {
   SourceHealth,
   TradeSide,
   TradeTimeline,
-  UserPayload,
   UserRecord
 } from "../domain/types";
 
@@ -58,6 +57,7 @@ const PERSISTENCE_FAILURE_THRESHOLD = 3;
 const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
+export type UserPayloadScope = "full" | "trade";
 
 type PersistenceHealth = {
   enabled: boolean;
@@ -336,6 +336,7 @@ CREATE TABLE IF NOT EXISTS order_lifecycle_logs (
 
 CREATE TABLE IF NOT EXISTS positions (
   id TEXT PRIMARY KEY,
+  buy_order_id TEXT,
   user_id TEXT NOT NULL,
   round_id TEXT NOT NULL,
   side TEXT NOT NULL,
@@ -473,6 +474,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_client_order_id ON orders(user
 CREATE INDEX IF NOT EXISTS idx_order_lifecycle_user_time ON order_lifecycle_logs(user_id, order_timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_order_lifecycle_round ON order_lifecycle_logs(round_id, direction, order_timestamp_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_user_opened ON positions(user_id, opened_at DESC);
+CREATE INDEX IF NOT EXISTS idx_positions_buy_order_id ON positions(buy_order_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_user_recv ON audit_events(user_id, server_recv_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_round_recv ON audit_events(round_id, server_recv_ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_category_action_recv ON audit_events(category, action_type, server_recv_ts DESC);
@@ -507,6 +509,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT
 ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT;
 UPDATE users SET updated_at = created_at WHERE updated_at IS NULL;
 UPDATE users SET manager_user_id = senior_tester_id WHERE manager_user_id IS NULL AND senior_tester_id IS NOT NULL;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS buy_order_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_users_senior_tester ON users(senior_tester_id);
 CREATE INDEX IF NOT EXISTS idx_users_manager_user ON users(manager_user_id);
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
@@ -808,7 +811,7 @@ export class AppStore {
   private readonly orderIndexById = new Map<string, number>();
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
-  private readonly pendingUserPayloadIds = new Set<string>();
+  private readonly pendingUserPayloadIds = new Map<string, UserPayloadScope>();
   private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
   private memoryProtectionState: MemoryProtectionState = "normal";
@@ -888,7 +891,7 @@ export class AppStore {
       seedDefaultUsers: config.seedDefaultUsers ?? true,
       requireSchemaMigrations: config.requireSchemaMigrations ?? false,
       allowDevSchemaBootstrap: config.allowDevSchemaBootstrap ?? true,
-      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000004"
+      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000005"
     };
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
@@ -1707,6 +1710,14 @@ export class AppStore {
       .map((order) => this.sanitizeOrder(order));
   }
 
+  getRecentTradeOrders(userId: string, limit = 50) {
+    return this.orders
+      .filter((order) => order.userId === userId)
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(0, Math.max(1, Math.floor(limit)))
+      .map((order) => this.sanitizeOrder(order));
+  }
+
   getOrderById(orderId: string) {
     const index = this.orderIndexById?.get(orderId);
     return typeof index === "number" ? this.orders[index] : this.orders.find((order) => order.id === orderId);
@@ -2192,8 +2203,9 @@ export class AppStore {
     };
   }
 
-  emitUserPayload(userId: string) {
-    this.pendingUserPayloadIds.add(userId);
+  emitUserPayload(userId: string, scope: UserPayloadScope = "full") {
+    const existingScope = this.pendingUserPayloadIds.get(userId);
+    this.pendingUserPayloadIds.set(userId, existingScope === "full" || scope === "full" ? "full" : "trade");
     if (this.userPayloadFlushScheduled) {
       return;
     }
@@ -2202,18 +2214,11 @@ export class AppStore {
   }
 
   private flushUserPayloads() {
-    const userIds = [...this.pendingUserPayloadIds];
+    const payloadRequests = [...this.pendingUserPayloadIds.entries()];
     this.pendingUserPayloadIds.clear();
     this.userPayloadFlushScheduled = false;
-    for (const userId of userIds) {
-      const payload: UserPayload = {
-        profile: this.getProfile(userId),
-        operatedHistory: this.getOperatedHistory(500, userId),
-        positions: this.getPositions(userId),
-        orders: this.getOrders(userId),
-        logs: this.getRecentLogs(userId)
-      };
-      this.emitter.emit(`user:${userId}`, payload);
+    for (const [userId, scope] of payloadRequests) {
+      this.emitter.emit(`user:${userId}`, scope);
     }
   }
 
@@ -2783,10 +2788,12 @@ export class AppStore {
     exitType: Exclude<OrderLifecycleExitType, "settlement">;
     exitTokenPrice?: number;
     exitFee?: number;
+    buyOrderIds?: string[];
   }) {
     if (input.qty <= QTY_EPSILON || typeof input.exitTokenPrice !== "number") {
       return;
     }
+    const buyOrderIds = input.buyOrderIds ? new Set(input.buyOrderIds) : undefined;
     let remaining = roundNumber(input.qty, 4);
     const logs = this.orderLifecycleLogs
       .filter(
@@ -2794,6 +2801,7 @@ export class AppStore {
           log.userId === input.userId &&
           log.roundId === input.roundId &&
           log.direction === input.side &&
+          (!buyOrderIds || buyOrderIds.has(log.buyOrderId)) &&
           log.remainingTokenQty > QTY_EPSILON
       )
       .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
@@ -2974,16 +2982,17 @@ export class AppStore {
     await this.runDb(
       `
       INSERT INTO positions (
-        id, user_id, round_id, side, qty, locked_qty, average_entry, notional_spent, current_mark,
+        id, buy_order_id, user_id, round_id, side, qty, locked_qty, average_entry, notional_spent, current_mark,
         current_bid, current_ask, current_mid, current_value, source_latency_ms,
         unrealized_pnl, realized_pnl, entry_fee_usdc, exit_fee_usdc, total_fee_usdc,
         cost_basis_usdc, mark_pnl_usdc, executable_pnl_usdc, status, opened_at, closed_at, settlement_result
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
         $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26
+        $21,$22,$23,$24,$25,$26,$27
       )
       ON CONFLICT (id) DO UPDATE SET
+        buy_order_id = EXCLUDED.buy_order_id,
         qty = EXCLUDED.qty,
         locked_qty = EXCLUDED.locked_qty,
         average_entry = EXCLUDED.average_entry,
@@ -3008,6 +3017,7 @@ export class AppStore {
       `,
       [
         position.id,
+        position.buyOrderId ?? null,
         position.userId,
         position.roundId,
         position.side,
@@ -3037,7 +3047,7 @@ export class AppStore {
     );
   }
 
-  async recordLog(event: AuditEvent) {
+  async recordLog(event: AuditEvent, options?: { emitUserPayload?: boolean; payloadScope?: UserPayloadScope }) {
     this.logs.unshift(event);
     this.pruneMemoryCaches(event.serverRecvTs);
     this.auditLogWriter.write(event);
@@ -3081,8 +3091,8 @@ export class AppStore {
       ]
     );
     await this.cleanupRetentionIfDue(event.serverRecvTs);
-    if (event.userId) {
-      this.emitUserPayload(event.userId);
+    if (event.userId && options?.emitUserPayload !== false) {
+      this.emitUserPayload(event.userId, options?.payloadScope ?? "full");
     }
   }
 
@@ -3609,6 +3619,7 @@ export class AppStore {
         ...behaviorRows.rows.map((row) => this.rowToBehaviorLog(row))
       );
       this.rebuildHotIndexes();
+      await this.rebuildLegacyOpenPositionLotsFromLifecycle();
       this.pruneMemoryCaches();
     }
 
@@ -3617,6 +3628,144 @@ export class AppStore {
       if (snapshotJson) {
         this.marketSnapshot = JSON.parse(snapshotJson) as MarketSnapshot;
       }
+    }
+  }
+
+  private legacyPositionLotId(buyOrderId: string) {
+    return `pos_lot_${createHash("sha256").update(`position-lot:${buyOrderId}`).digest("hex").slice(0, 24)}`;
+  }
+
+  private async rebuildLegacyOpenPositionLotsFromLifecycle(now = Date.now()) {
+    const groupKey = (input: { userId: string; roundId: string; side: TradeSide }) =>
+      `${input.userId}\u0000${input.roundId}\u0000${input.side}`;
+    const legacyGroups = new Map<
+      string,
+      { userId: string; roundId: string; side: TradeSide; positions: PositionRecord[] }
+    >();
+    const groupsWithOpenLots = new Set<string>();
+
+    for (const position of this.positions) {
+      if (position.status !== "open") {
+        continue;
+      }
+      const key = groupKey(position);
+      if (position.buyOrderId) {
+        groupsWithOpenLots.add(key);
+        continue;
+      }
+      const group = legacyGroups.get(key) ?? {
+        userId: position.userId,
+        roundId: position.roundId,
+        side: position.side,
+        positions: []
+      };
+      group.positions.push(position);
+      legacyGroups.set(key, group);
+    }
+
+    let migratedGroups = 0;
+    for (const [key, group] of legacyGroups) {
+      if (groupsWithOpenLots.has(key) || group.positions.some((position) => (position.lockedQty ?? 0) > QTY_EPSILON)) {
+        continue;
+      }
+      const lots = this.orderLifecycleLogs
+        .filter(
+          (log) =>
+            log.userId === group.userId &&
+            log.roundId === group.roundId &&
+            log.direction === group.side &&
+            log.remainingTokenQty > QTY_EPSILON
+        )
+        .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
+      if (lots.length === 0) {
+        continue;
+      }
+
+      const legacyQty = roundNumber(
+        group.positions.reduce((sum, position) => sum + Math.max(position.qty, 0), 0),
+        4
+      );
+      const lifecycleQty = roundNumber(
+        lots.reduce((sum, log) => sum + Math.max(log.remainingTokenQty, 0), 0),
+        4
+      );
+      if (Math.abs(legacyQty - lifecycleQty) > 0.0001) {
+        console.warn(
+          `[store] skipped legacy position lot rebuild for ${group.userId}/${group.roundId}/${group.side}: position qty ${legacyQty} != lifecycle qty ${lifecycleQty}`
+        );
+        continue;
+      }
+
+      const aggregate = group.positions[0];
+      if (!aggregate) {
+        continue;
+      }
+
+      for (const log of lots) {
+        const qty = roundNumber(log.remainingTokenQty, 4);
+        const volumeQty = Math.max(log.volumeTokenQty, QTY_EPSILON);
+        const entryFeeUsdc = roundNumber(((log.entryFee ?? 0) * qty) / volumeQty, 8);
+        const fullNotionalWithoutFee = Math.max(log.positionNotional - (log.entryFee ?? 0), 0);
+        const fallbackNotional = typeof log.entryTokenPrice === "number" ? log.entryTokenPrice * qty : 0;
+        const notionalSpent = roundNumber(
+          fullNotionalWithoutFee > QTY_EPSILON ? (fullNotionalWithoutFee * qty) / volumeQty : fallbackNotional,
+          4
+        );
+        const currentMark = roundNumber(aggregate.currentMark, 4);
+        const currentBid = typeof aggregate.currentBid === "number" ? roundNumber(aggregate.currentBid, 4) : undefined;
+        const currentValue = roundNumber(qty * currentMark, 2);
+        const markPnlUsdc = roundNumber(currentValue - notionalSpent, 2);
+        const executablePnlUsdc =
+          typeof currentBid === "number" ? roundNumber(currentBid * qty - notionalSpent, 2) : markPnlUsdc;
+        const position: PositionRecord = {
+          id: this.legacyPositionLotId(log.buyOrderId),
+          buyOrderId: log.buyOrderId,
+          userId: group.userId,
+          roundId: group.roundId,
+          side: group.side,
+          qty,
+          lockedQty: 0,
+          averageEntry: roundNumber(notionalSpent / Math.max(qty, QTY_EPSILON), 4),
+          notionalSpent,
+          currentMark,
+          currentBid,
+          currentAsk: typeof aggregate.currentAsk === "number" ? roundNumber(aggregate.currentAsk, 4) : undefined,
+          currentMid: typeof aggregate.currentMid === "number" ? roundNumber(aggregate.currentMid, 4) : undefined,
+          currentValue,
+          sourceLatencyMs: aggregate.sourceLatencyMs,
+          unrealizedPnl: markPnlUsdc,
+          realizedPnl: 0,
+          entryFeeUsdc,
+          exitFeeUsdc: 0,
+          totalFeeUsdc: entryFeeUsdc,
+          costBasisUsdc: notionalSpent,
+          markPnlUsdc,
+          executablePnlUsdc,
+          status: "open",
+          openedAt: log.orderTimestampMs
+        };
+        await this.persistPosition(position);
+      }
+
+      for (const position of group.positions) {
+        await this.persistPosition({
+          ...position,
+          qty: 0,
+          lockedQty: 0,
+          currentValue: 0,
+          unrealizedPnl: 0,
+          markPnlUsdc: 0,
+          executablePnlUsdc: 0,
+          status: "closed",
+          closedAt: position.closedAt ?? now,
+          settlementResult: "sold"
+        });
+      }
+      migratedGroups += 1;
+    }
+
+    if (migratedGroups > 0) {
+      console.log(`[store] rebuilt ${migratedGroups} legacy open position group(s) into order-level lots`);
     }
   }
 
@@ -3864,6 +4013,7 @@ export class AppStore {
     const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
     return {
       id: String(row.id),
+      buyOrderId: row.buy_order_id ? String(row.buy_order_id) : undefined,
       userId: String(row.user_id),
       roundId: String(row.round_id),
       side: row.side as PositionRecord["side"],

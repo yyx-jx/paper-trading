@@ -70,6 +70,8 @@ const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], numbe
   "1h": 24
 };
 
+type TradeLogTask = () => Promise<void>;
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -411,6 +413,9 @@ export class SimulationEngine {
   private gammaSettlementDiagnostics = new Set<string>();
   private marketSyncSlug?: string;
   private pendingOrdersRunning = false;
+  private tradeLogQueue: TradeLogTask[] = [];
+  private tradeLogFlushScheduled = false;
+  private tradeLogFlushRunning = false;
 
   constructor(
     private readonly store: AppStore,
@@ -695,7 +700,11 @@ export class SimulationEngine {
       if (existingOrder) {
         return { order: existingOrder };
       }
-      this.assertCanCreateNewOrder(currentRound, now);
+      if (action === "buy") {
+        this.assertCanBuyOrder(currentRound, now);
+      } else {
+        this.assertCanSellOrder(currentRound, now);
+      }
       if (orderKind === "limit" && (!payload.limitPrice || payload.limitPrice <= 0)) {
         throw new Error("Limit orders require a positive limit price.");
       }
@@ -833,6 +842,8 @@ export class SimulationEngine {
         createdAt: Date.now()
       };
 
+      let successAuditEvent: AuditEvent | undefined;
+      let successBehaviorLog: BehaviorActionLog | undefined;
       try {
         await this.runTradeWriteTransaction(async () => {
         const persistStartTs = Date.now();
@@ -869,8 +880,7 @@ export class SimulationEngine {
         order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
         order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
 
-        await Promise.all([
-          this.writeAuditLog({
+        successAuditEvent = {
             eventId: this.store.newId("evt"),
             traceId,
             category: "matching",
@@ -934,56 +944,52 @@ export class SimulationEngine {
               marketInfo,
               failureReason: order.failureReason
             }
-          }),
-          this.writeBehaviorLog(
-            this.createBehaviorLog({
-              user,
-              actionType: "place_order",
-              actionStatus: status === "failed" ? "failed" : "success",
-              traceId,
-              orderId: order.id,
-              round: currentRound,
-              snapshot,
-              direction: payload.side,
-              entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-              positionNotional: order.notionalUsdc,
-              bookSnapshot: book,
-              order,
-              actualFillPrice: order.avgFillPrice,
-              slippageBps: order.slippageBps,
-              partialFilled: order.partialFilled,
-              unfilledQty: order.unfilledQty,
-              executionLatencyMs: order.matchLatencyMs,
-              estimatedFee: order.estimatedFee,
-              actualFee: order.actualFee,
-              feeBreakdown: order.feeBreakdown,
-              feeCurrency: order.feeCurrency,
-              failureReason: order.failureReason,
-              contextJson: {
-                roundStatus: currentRound.status,
-                acceptingOrders: currentRound.acceptingOrders,
-                requestAction: action,
-                requestSide: payload.side,
-                requestAmount: payload.amount,
-                requestQty: payload.qty,
-                clientOrderId,
-                orderType: orderKind,
-                isAccepted: status !== "failed",
-                bookSnapshotId: book.snapshotId,
-                bookKey,
-                bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-                localMatchLatencyMs: order.localMatchLatencyMs,
-                persistLatencyMs: order.persistLatencyMs,
-                totalOrderLatencyMs: order.totalOrderLatencyMs,
-                executionBookSource: executionBook.source,
-                executionBookAgeMs: executionBook.ageMs,
-                executionBookFallbackReason: executionBook.fallbackReason,
-                marketInfo
-              }
-            })
-          )
-        ]);
-        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
+          };
+        successBehaviorLog = this.createBehaviorLog({
+          user,
+          actionType: "place_order",
+          actionStatus: status === "failed" ? "failed" : "success",
+          traceId,
+          orderId: order.id,
+          round: currentRound,
+          snapshot,
+          direction: payload.side,
+          entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+          positionNotional: order.notionalUsdc,
+          bookSnapshot: book,
+          order,
+          actualFillPrice: order.avgFillPrice,
+          slippageBps: order.slippageBps,
+          partialFilled: order.partialFilled,
+          unfilledQty: order.unfilledQty,
+          executionLatencyMs: order.matchLatencyMs,
+          estimatedFee: order.estimatedFee,
+          actualFee: order.actualFee,
+          feeBreakdown: order.feeBreakdown,
+          feeCurrency: order.feeCurrency,
+          failureReason: order.failureReason,
+          contextJson: {
+            roundStatus: currentRound.status,
+            acceptingOrders: currentRound.acceptingOrders,
+            requestAction: action,
+            requestSide: payload.side,
+            requestAmount: payload.amount,
+            requestQty: payload.qty,
+            clientOrderId,
+            orderType: orderKind,
+            isAccepted: status !== "failed",
+            bookSnapshotId: book.snapshotId,
+            bookKey,
+            bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+            localMatchLatencyMs: order.localMatchLatencyMs,
+            persistLatencyMs: order.persistLatencyMs,
+            totalOrderLatencyMs: order.totalOrderLatencyMs,
+            executionBookSource: executionBook.source,
+            executionBookAgeMs: executionBook.ageMs,
+            executionBookFallbackReason: executionBook.fallbackReason,
+            marketInfo
+          }
+        });
         });
       } catch (writeError) {
         if (clientOrderId && isClientOrderConflict(writeError)) {
@@ -997,7 +1003,15 @@ export class SimulationEngine {
         }
         throw writeError;
       }
-      this.store.emitUserPayload(user.id);
+      if (successAuditEvent && successBehaviorLog) {
+        const auditEvent = successAuditEvent;
+        const behaviorLog = successBehaviorLog;
+        this.enqueueTradeLog(async () => {
+          await this.writeAuditLog(auditEvent, { emitUserPayload: false });
+          await this.writeBehaviorLog(behaviorLog);
+        });
+      }
+      this.store.emitUserPayload(user.id, "trade");
       return { order };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Order failed.";
@@ -1092,7 +1106,7 @@ export class SimulationEngine {
         }
         order.serverPublishTs = Date.now();
         await this.store.persistOrder(order);
-        await Promise.all([
+        await Promise.allSettled([
           this.writeAuditLog({
             eventId: this.store.newId("evt"),
             traceId: order.traceId,
@@ -1153,7 +1167,7 @@ export class SimulationEngine {
           )
         ]);
       });
-      this.store.emitUserPayload(user.id);
+      this.store.emitUserPayload(user.id, "trade");
       return order;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Cancel order failed.";
@@ -1241,39 +1255,40 @@ export class SimulationEngine {
       if (order.status !== "filled") {
         throw new Error(order.failureReason ?? "Sell order was not fully filled.");
       }
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId: order.traceId,
-        category: "matching",
-        actionType: "sell_position",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "profile.main",
-        moduleName: "position.table",
-        symbol: order.symbol,
-        roundId: order.roundId,
-        serverRecvTs: order.serverRecvTs,
-        serverPublishTs: Date.now(),
-        backendLatencyMs: order.matchLatencyMs,
-        resultCode: "SELL_POSITION_FILLED",
-        resultMessage: "Position was sold against the current Polymarket CLOB snapshot.",
-        details: {
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
           traceId: order.traceId,
+          category: "matching",
+          actionType: "sell_position",
+          actionStatus: "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "profile.main",
+          moduleName: "position.table",
+          symbol: order.symbol,
           roundId: order.roundId,
-          marketId: order.marketId,
-          marketSlug: order.marketSlug,
-          orderId: order.id,
-          positionId,
-          bookKey: order.bookKey,
-          bookSnapshotId: order.bookHash,
-          avgFillPrice: order.avgFillPrice,
-          filledQty: order.filledQty,
-          slippageBps: order.slippageBps
-        }
-      });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+          serverRecvTs: order.serverRecvTs,
+          serverPublishTs: Date.now(),
+          backendLatencyMs: order.matchLatencyMs,
+          resultCode: "SELL_POSITION_FILLED",
+          resultMessage: "Position was sold against the current Polymarket CLOB snapshot.",
+          details: {
+            traceId: order.traceId,
+            roundId: order.roundId,
+            marketId: order.marketId,
+            marketSlug: order.marketSlug,
+            orderId: order.id,
+            positionId,
+            bookKey: order.bookKey,
+            bookSnapshotId: order.bookHash,
+            avgFillPrice: order.avgFillPrice,
+            filledQty: order.filledQty,
+            slippageBps: order.slippageBps
+          }
+        }, { emitUserPayload: false });
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "sell_position",
           actionStatus: "success",
@@ -1297,7 +1312,8 @@ export class SimulationEngine {
             positionId
           }
         })
-      );
+        );
+      });
       return order;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sell position failed.";
@@ -1423,7 +1439,7 @@ export class SimulationEngine {
     const now = Date.now();
     const currentRound = this.getActiveRound(now);
     try {
-      this.assertCanCreateNewOrder(currentRound, now);
+      this.assertCanSellOrder(currentRound, now);
       const positions = this.store.positions
         .filter(
           (position) =>
@@ -1460,39 +1476,40 @@ export class SimulationEngine {
       const closedPositionsCount = positions.filter((position) => position.status === "closed").length;
       const serverNow = Date.now();
 
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId,
-        category: "operation",
-        actionType: "close_side",
-        actionStatus: failures.length > 0 ? "timeout" : "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "quick.actions",
-        symbol: this.config.symbol,
-        roundId: currentRound.id,
-        clientSendTs: payload.clientSendTs,
-        serverRecvTs: serverNow,
-        serverPublishTs: serverNow,
-        backendLatencyMs: 1,
-        resultCode: failures.length > 0 ? "CLOSE_SIDE_PARTIAL" : "CLOSE_SIDE_COMPLETED",
-        resultMessage:
-          failures.length > 0
-            ? "Close side completed with partial failures."
-            : "All positions on the selected side were closed.",
-        details: {
-          side: payload.side,
-          closedPositionsCount,
-          totalQty,
-          totalProceeds,
-          avgFillPrice,
-          failures
-        }
-      });
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId,
+          category: "operation",
+          actionType: "close_side",
+          actionStatus: failures.length > 0 ? "timeout" : "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "trade.main",
+          moduleName: "quick.actions",
+          symbol: this.config.symbol,
+          roundId: currentRound.id,
+          clientSendTs: payload.clientSendTs,
+          serverRecvTs: serverNow,
+          serverPublishTs: serverNow,
+          backendLatencyMs: 1,
+          resultCode: failures.length > 0 ? "CLOSE_SIDE_PARTIAL" : "CLOSE_SIDE_COMPLETED",
+          resultMessage:
+            failures.length > 0
+              ? "Close side completed with partial failures."
+              : "All positions on the selected side were closed.",
+          details: {
+            side: payload.side,
+            closedPositionsCount,
+            totalQty,
+            totalProceeds,
+            avgFillPrice,
+            failures
+          }
+        }, { emitUserPayload: false });
 
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "close_side",
           actionStatus: failures.length > 0 ? "timeout" : "success",
@@ -1513,7 +1530,8 @@ export class SimulationEngine {
             closedPositionsCount
           }
         })
-      );
+        );
+      });
 
       return {
         closedPositionsCount,
@@ -1573,7 +1591,8 @@ export class SimulationEngine {
     const now = Date.now();
     const currentRound = this.getActiveRound(now);
     try {
-      this.assertCanCreateNewOrder(currentRound, now);
+      this.assertCanSellOrder(currentRound, now);
+      this.assertCanBuyOrder(currentRound, now);
       const closeResult = await this.closeSide(user, payload);
       if (closeResult.totalProceeds <= 0) {
         throw new Error("Reverse side requires positive proceeds from the close action.");
@@ -1585,33 +1604,34 @@ export class SimulationEngine {
         clientSendTs: payload.clientSendTs
       });
       const serverNow = Date.now();
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId,
-        category: "operation",
-        actionType: "reverse_side",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "quick.actions",
-        symbol: this.config.symbol,
-        roundId: currentRound?.id,
-        clientSendTs: payload.clientSendTs,
-        serverRecvTs: serverNow,
-        serverPublishTs: serverNow,
-        backendLatencyMs: result.order.matchLatencyMs,
-        resultCode: "REVERSE_SIDE_COMPLETED",
-        resultMessage: "Side was closed and the opposite side was bought.",
-        details: {
-          requestedSide: payload.side,
-          reverseSide,
-          closeResult,
-          reverseOrderId: result.order.id
-        }
-      });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId,
+          category: "operation",
+          actionType: "reverse_side",
+          actionStatus: "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "trade.main",
+          moduleName: "quick.actions",
+          symbol: this.config.symbol,
+          roundId: currentRound?.id,
+          clientSendTs: payload.clientSendTs,
+          serverRecvTs: serverNow,
+          serverPublishTs: serverNow,
+          backendLatencyMs: result.order.matchLatencyMs,
+          resultCode: "REVERSE_SIDE_COMPLETED",
+          resultMessage: "Side was closed and the opposite side was bought.",
+          details: {
+            requestedSide: payload.side,
+            reverseSide,
+            closeResult,
+            reverseOrderId: result.order.id
+          }
+        }, { emitUserPayload: false });
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "reverse_side",
           actionStatus: "success",
@@ -1633,7 +1653,8 @@ export class SimulationEngine {
             reverseOrderId: result.order.id
           }
         })
-      );
+        );
+      });
 
       return {
         closeResult,
@@ -1834,6 +1855,44 @@ export class SimulationEngine {
     await this.store.recordBehaviorLog(log);
   }
 
+  private enqueueTradeLog(task: TradeLogTask) {
+    this.tradeLogQueue ??= [];
+    this.tradeLogQueue.push(task);
+    if (this.tradeLogFlushScheduled || this.tradeLogFlushRunning) {
+      return;
+    }
+    this.tradeLogFlushScheduled = true;
+    setImmediate(() => {
+      this.tradeLogFlushScheduled = false;
+      void this.flushTradeLogQueue();
+    });
+  }
+
+  private async flushTradeLogQueue() {
+    if (this.tradeLogFlushRunning) {
+      return;
+    }
+    this.tradeLogFlushRunning = true;
+    try {
+      while (this.tradeLogQueue.length > 0) {
+        const task = this.tradeLogQueue.shift();
+        if (!task) {
+          continue;
+        }
+        try {
+          await task();
+        } catch (error) {
+          console.warn("[simulation] Background trade log write failed:", error);
+        }
+      }
+    } finally {
+      this.tradeLogFlushRunning = false;
+      if (this.tradeLogQueue.length > 0) {
+        this.enqueueTradeLog(async () => undefined);
+      }
+    }
+  }
+
   private scheduleReconcile() {
     if (this.reconcileRunning) {
       this.reconcileQueued = true;
@@ -1883,19 +1942,30 @@ export class SimulationEngine {
     return round.endAt - now > this.config.freezeWindowMs;
   }
 
-  private assertCanCreateNewOrder(round: RoundRecord | undefined, now = Date.now()) {
+  private assertActiveTradableRound(round: RoundRecord | undefined, now = Date.now(), freezeMessage: string) {
     if (!round || now < round.startAt || now >= round.endAt) {
       throw new Error("No active round is available.");
     }
     if (round.endAt - now <= this.config.freezeWindowMs) {
-      throw new Error("Round entered final 10-second order freeze window.");
-    }
-    if (round.acceptingOrders === false) {
-      throw new Error("Round is not accepting new orders.");
+      throw new Error(freezeMessage);
     }
     if (round.status !== "Trading") {
       throw new Error(`Round is ${round.status}.`);
     }
+  }
+
+  private assertCanBuyOrder(round: RoundRecord | undefined, now = Date.now()) {
+    this.assertActiveTradableRound(round, now, "Round entered final 10-second order freeze window.");
+    if (!round) {
+      throw new Error("No active round is available.");
+    }
+    if (round.acceptingOrders === false) {
+      throw new Error("Round is not accepting new orders.");
+    }
+  }
+
+  private assertCanSellOrder(round: RoundRecord | undefined, now = Date.now()) {
+    this.assertActiveTradableRound(round, now, "Current round entered the final 10-second sell freeze window.");
   }
 
   private assertCanSellPosition(position: PositionRecord, round: RoundRecord | undefined, now = Date.now()) {
@@ -1909,15 +1979,7 @@ export class SimulationEngine {
     if (!activeRound || activeRound.id !== round.id || now < round.startAt || now >= round.endAt) {
       throw new Error("This position does not belong to the current tradable round.");
     }
-    if (round.endAt - now <= this.config.freezeWindowMs) {
-      throw new Error("Current round entered the final 10-second sell freeze window.");
-    }
-    if (round.acceptingOrders === false) {
-      throw new Error("Current round is not accepting sell orders.");
-    }
-    if (round.status !== "Trading") {
-      throw new Error("Current round is frozen and can no longer sell positions.");
-    }
+    this.assertCanSellOrder(round, now);
   }
 
   private resolveBookContext(side: TradeSide, round?: RoundRecord, marketId?: string) {
@@ -2168,6 +2230,7 @@ export class SimulationEngine {
         user.availableUsdc = roundCurrency(user.availableUsdc - totalSpend);
       }
       const position = this.upsertBuyPosition(
+        order.id,
         user.id,
         round.id,
         order.side,
@@ -2182,7 +2245,7 @@ export class SimulationEngine {
         this.store.persistOrder(order)
       ]);
       if (emitUserPayload) {
-        this.store.emitUserPayload(user.id);
+        this.store.emitUserPayload(user.id, "trade");
       }
       return;
     }
@@ -2243,6 +2306,7 @@ export class SimulationEngine {
     if (remainingQty > QTY_EPSILON) {
       throw new Error("Filled sell order could not be applied to local positions.");
     }
+    const buyOrderIds = [...new Set(changedPositions.map((position) => position.buyOrderId).filter(Boolean) as string[])];
     user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
     await Promise.all([
@@ -2256,11 +2320,12 @@ export class SimulationEngine {
         qty: order.filledQty,
         exitType,
         exitTokenPrice: order.avgFillPrice,
-        exitFee: order.actualFee ?? 0
+        exitFee: order.actualFee ?? 0,
+        buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
       })
     ]);
     if (emitUserPayload) {
-      this.store.emitUserPayload(user.id);
+      this.store.emitUserPayload(user.id, "trade");
     }
   }
 
@@ -2377,7 +2442,7 @@ export class SimulationEngine {
         if (order.action === "buy") {
           await this.recordBuyLifecycle(user, round, order, actionSnapshot);
         }
-        await Promise.all([
+        await Promise.allSettled([
           this.writeAuditLog({
             eventId: this.store.newId("evt"),
             traceId: order.traceId,
@@ -2432,7 +2497,7 @@ export class SimulationEngine {
           )
         ]);
       });
-      this.store.emitUserPayload(user.id);
+      this.store.emitUserPayload(user.id, "trade");
     }
   }
 
@@ -2502,7 +2567,7 @@ export class SimulationEngine {
       const now = Date.now();
       const snapshot = this.captureActionSnapshot();
       const round = this.store.getRoundById(order.roundId);
-      await Promise.all([
+      await Promise.allSettled([
         this.writeAuditLog({
           eventId: this.store.newId("evt"),
           traceId: order.traceId,
@@ -2557,7 +2622,7 @@ export class SimulationEngine {
         )
       ]);
     });
-    this.store.emitUserPayload(user.id);
+    this.store.emitUserPayload(user.id, "trade");
   }
 
   private schedulePendingOrderProcessing() {
@@ -3045,6 +3110,7 @@ export class SimulationEngine {
         marketTitle,
         marketSubtitle: currentRound ? utcRangeText(currentRound.startAt, currentRound.endAt) : matchedMarket?.slug,
         countdownMs,
+        countdownTargetTs,
         acceptingOrders:
           this.canCreateNewOrders(currentRound, now) &&
           (matchedMarket?.acceptingOrders ?? currentRound?.acceptingOrders ?? false),
@@ -3567,6 +3633,7 @@ export class SimulationEngine {
   }
 
   private upsertBuyPosition(
+    buyOrderId: string,
     userId: string,
     roundId: string,
     side: TradeSide,
@@ -3575,35 +3642,31 @@ export class SimulationEngine {
     mark: number,
     entryFee = 0
   ) {
-    let position = this.store.positions.find(
-      (item) => item.userId === userId && item.roundId === roundId && item.side === side && item.status === "open"
-    );
-    if (!position) {
-      position = {
-        id: this.store.newId("pos"),
-        userId,
-        roundId,
-        side,
-        qty: 0,
-        lockedQty: 0,
-        averageEntry: 0,
-        notionalSpent: 0,
-        currentMark: mark,
-        unrealizedPnl: 0,
-        realizedPnl: 0,
-        entryFeeUsdc: 0,
-        exitFeeUsdc: 0,
-        totalFeeUsdc: 0,
-        costBasisUsdc: 0,
-        markPnlUsdc: 0,
-        executablePnlUsdc: 0,
-        status: "open",
-        openedAt: Date.now()
-      };
-    }
+    const position: PositionRecord = {
+      id: this.store.newId("pos"),
+      buyOrderId,
+      userId,
+      roundId,
+      side,
+      qty: 0,
+      lockedQty: 0,
+      averageEntry: 0,
+      notionalSpent: 0,
+      currentMark: mark,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      entryFeeUsdc: 0,
+      exitFeeUsdc: 0,
+      totalFeeUsdc: 0,
+      costBasisUsdc: 0,
+      markPnlUsdc: 0,
+      executablePnlUsdc: 0,
+      status: "open",
+      openedAt: Date.now()
+    };
 
-    const totalCost = position.notionalSpent + spent;
-    const totalQty = position.qty + filledQty;
+    const totalCost = spent;
+    const totalQty = filledQty;
     position.averageEntry = roundNumber(totalCost / Math.max(totalQty, QTY_EPSILON), 4);
     position.qty = roundNumber(totalQty, 4);
     position.notionalSpent = roundNumber(totalCost, 4);
@@ -4055,8 +4118,8 @@ export class SimulationEngine {
     }
   }
 
-  private async writeAuditLog(event: AuditEvent) {
-    await this.store.recordLog(event);
+  private async writeAuditLog(event: AuditEvent, options?: { emitUserPayload?: boolean }) {
+    await this.store.recordLog(event, options);
   }
 
   private async publishSettlementMarketSnapshot(round: RoundRecord, reason: string) {

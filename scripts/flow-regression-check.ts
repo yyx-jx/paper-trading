@@ -605,7 +605,8 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(appSource, /transitionRealtimeChannel/);
   assert.match(appSource, /REALTIME_STATUS_MIN_HOLD_MS = 1500/);
   assert.match(appSource, /MARKET_LIVE_RECOVERY_PAYLOADS = 2/);
-  assert.match(appSource, /lastMarketRecvTs \+ snapshot\.uiMeta\.countdownMs/);
+  assert.match(appSource, /snapshot\.uiMeta\.countdownTargetTs \+ clientClockOffsetMsRef\.current/);
+  assert.doesNotMatch(appSource, /lastMarketRecvTs \+ snapshot\.uiMeta\.countdownMs/);
   assert.match(appSource, /countdownTargetMs\?: number/);
   assert.match(appSource, /api\.sampleClockOffset/);
   assert.match(appSource, /scheduleMarketReconnect/);
@@ -859,6 +860,33 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(appSource, /marketTickFrame/);
   assert.match(appSource, /setMarketTickPayload\(pending\.data, pending\.receivedAt/);
   assert.match(appSource, /memo\(function TradePage/);
+}
+
+async function testOrderFastPathUsesLightUserTradePayloads() {
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
+  const appStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+
+  assert.match(simulationSource, /enqueueTradeLog/);
+  assert.match(simulationSource, /void this\.flushTradeLogQueue\(\)/);
+  assert.match(simulationSource, /this\.store\.emitUserPayload\(user\.id, "trade"\)/);
+  assert.doesNotMatch(simulationSource, /await Promise\.all\(\[\s*this\.writeAuditLog\(/);
+  assert.match(storeSource, /export type UserPayloadScope = "full" \| "trade"/);
+  assert.match(storeSource, /emitUserPayload\(userId: string, scope: UserPayloadScope = "full"\)/);
+  assert.doesNotMatch(storeSource, /const payload: UserPayload = \{\s*profile: this\.getProfile\(userId\),\s*operatedHistory: this\.getOperatedHistory\(500, userId\),/);
+  assert.match(indexSource, /type: scope === "trade" \? "user:trade" : "user"/);
+  assert.match(indexSource, /orders: store\.getRecentTradeOrders\(user\.id/);
+  assert.match(indexSource, /appMetrics\.recordWsSend\("user"/);
+  assert.match(apiSource, /export interface UserTradePayload/);
+  assert.match(appStoreSource, /setUserTradePayload: \(data: UserTradePayload\) => void/);
+  assert.match(appStoreSource, /setUserTradePayload: \(data\) =>/);
+  assert.match(appSource, /type: "user" \| "user:trade"/);
+  assert.match(appSource, /requestAnimationFrame\(\(\) => \{/);
+  assert.match(appSource, /startTransition\(\(\) => \{/);
+  assert.match(appSource, /setUserTradePayload\(parsed\.data as UserTradePayload\)/);
 }
 
 async function testClobWsFirstMarketDataContracts() {
@@ -1128,6 +1156,7 @@ async function main() {
   await testSettlementUsesResolvedQueueAndFiveSecondGammaPolling();
   await testBackendTransportStampingKeepsLatencySeparateFromAge();
   await testRealtimeLatencyPacingContracts();
+  await testOrderFastPathUsesLightUserTradePayloads();
   await testClobWsFirstMarketDataContracts();
   await testClobV2FeeMarketInfoAndLatencyContracts();
   await testPolymarketReferencePricesDoNotUseOutcomeOdds();

@@ -14,7 +14,7 @@ const store = new AppStore({
   strictPersistence: false,
   requireSchemaMigrations: false,
   allowDevSchemaBootstrap: true,
-  expectedSchemaMigrationId: "000004",
+  expectedSchemaMigrationId: "000005",
   pgConnectionTimeoutMs: 1000,
   pgIdleTimeoutMs: 1000,
   pgMaxConnections: 1,

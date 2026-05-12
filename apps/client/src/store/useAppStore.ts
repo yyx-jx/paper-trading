@@ -15,7 +15,8 @@ import type {
   RoundRecord,
   SettlementPreview,
   SourceHealth,
-  UserPayload
+  UserPayload,
+  UserTradePayload
 } from "../utils/api";
 
 interface AppState {
@@ -47,6 +48,7 @@ interface AppState {
   setMarketTickPayload: (data: MarketTickPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
   markMarketRenderCommit: (clientRecvTs?: number) => void;
   setUserPayload: (data: UserPayload) => void;
+  setUserTradePayload: (data: UserTradePayload) => void;
   setSourceStatus: (status: SourceHealth[]) => void;
   setLastOrderLatencyMs: (latency?: number) => void;
 }
@@ -165,6 +167,7 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     uiMeta: {
       ...snapshot.uiMeta,
       countdownMs: tick.uiMeta.countdownMs,
+      countdownTargetTs: tick.uiMeta.countdownTargetTs,
       acceptingOrders: tick.uiMeta.acceptingOrders,
       marketSwitchState: tick.uiMeta.marketSwitchState,
       sourceStatusSummary: tick.uiMeta.sourceStatusSummary
@@ -292,6 +295,12 @@ export const useAppStore = create<AppState>((set) => ({
       positions: data.positions,
       orders: data.orders,
       logs: data.logs
+    }),
+  setUserTradePayload: (data) =>
+    set({
+      profile: data.profile,
+      positions: data.positions,
+      orders: data.orders
     }),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),
   setLastOrderLatencyMs: (lastOrderLatencyMs) => set({ lastOrderLatencyMs })

@@ -9,7 +9,7 @@ import path from "node:path";
 import { Pool } from "pg";
 
 const MIGRATIONS_DIR = path.resolve(process.cwd(), "db/migrations");
-const EXPECTED_MIGRATION_ID = "000004";
+const EXPECTED_MIGRATION_ID = "000005";
 
 type Migration = {
   id: string;
@@ -150,6 +150,16 @@ async function assertSchema(databaseUrl: string, expectedId = EXPECTED_MIGRATION
       "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_orders_user_client_order_id') AS exists"
     );
     assert.equal(clientOrderIndex.rows[0]?.exists, true);
+
+    const positionBuyOrderColumn = await pool.query<{ exists: boolean }>(
+      "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'positions' AND column_name = 'buy_order_id') AS exists"
+    );
+    assert.equal(positionBuyOrderColumn.rows[0]?.exists, true);
+
+    const positionBuyOrderIndex = await pool.query<{ exists: boolean }>(
+      "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_positions_buy_order_id') AS exists"
+    );
+    assert.equal(positionBuyOrderIndex.rows[0]?.exists, true);
   } finally {
     await pool.end();
   }
@@ -200,7 +210,7 @@ async function main() {
   await resetDatabase(smokeUrl);
   await expectFailFast(smokeUrl, /schema_migrations is missing/);
   await applyMigrations(smokeUrl, migrations, "000002");
-  await expectFailFast(smokeUrl, /Required migration 000004 is not applied/);
+  await expectFailFast(smokeUrl, /Required migration 000005 is not applied/);
   await applyMigrations(smokeUrl, migrations);
   await assertSchema(smokeUrl);
 

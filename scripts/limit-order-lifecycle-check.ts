@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { SimulationEngine } from "../apps/server/src/services/simulation";
+import { AppStore } from "../apps/server/src/services/store";
 import type {
   AuditEvent,
   BehaviorActionLog,
   MarketSnapshot,
   OrderBookSnapshot,
+  OrderLifecycleRecord,
   OrderRecord,
   PositionRecord,
   RoundRecord,
@@ -176,6 +178,40 @@ function position(input: Partial<PositionRecord> = {}): PositionRecord {
   };
 }
 
+function createMemoryStore() {
+  return new AppStore({
+    initialBalance: 100,
+    logRetentionMs: 24 * 60 * 60 * 1000,
+    snapshotRetentionSeconds: 300,
+    symbol: "BTC",
+    databaseUrl: "",
+    redisUrl: "",
+    persistenceMode: "memory",
+    chainlinkEnabled: false,
+    strictPersistence: false,
+    seedDefaultUsers: false,
+    requireSchemaMigrations: false,
+    allowDevSchemaBootstrap: true,
+    expectedSchemaMigrationId: "000005",
+    pgConnectionTimeoutMs: 1000,
+    pgIdleTimeoutMs: 1000,
+    pgMaxConnections: 1,
+    pgKeepAlive: false,
+    pgReconnectIntervalMs: 1000,
+    pgReconnectMaxIntervalMs: 1000,
+    orderBookSnapshotsMemoryMax: 100,
+    orderBookSnapshotsMemoryMaxAgeMs: 60_000,
+    ordersMemoryMax: 100,
+    positionsMemoryMax: 100,
+    auditLogsMemoryMax: 100,
+    behaviorLogsMemoryMax: 100,
+    orderLifecycleMemoryMax: 100,
+    roundsMemoryMax: 20,
+    serverHeapWarnMb: 256,
+    serverHeapProtectMb: 512
+  });
+}
+
 function createFixture(input?: {
   availableUsdc?: number;
   upBook?: OrderBookSnapshot;
@@ -233,7 +269,7 @@ function createFixture(input?: {
         store.orderLifecycleLogs.push(log);
       }
     },
-    applyLifecycleExit: async (input: { qty: number; exitType: string; exitTokenPrice?: number }) => {
+    applyLifecycleExit: async (input: Record<string, unknown>) => {
       store.orderLifecycleLogs.push({ id: `exit-${store.orderLifecycleLogs.length}`, ...input });
     },
     settleOpenOrderLifecycles: async () => undefined,
@@ -347,6 +383,240 @@ async function testLimitBuyImmediateFillCreatesPosition() {
   assert.equal(store.orderLifecycleLogs.length, 1);
   assert.equal(store.orderLifecycleLogs[0]?.buyOrderId, order.id);
   assert.equal(store.orderLifecycleLogs[0]?.orderBookSnapshotRef, "obs-up-fill-buy");
+}
+
+async function testEachFilledBuyCreatesItsOwnSellablePositionLot() {
+  const { engine, user: currentUser, store } = createFixture({
+    upBook: book("up-fill-lots", [[0.45, 200]], [[0.5, 200]])
+  });
+
+  const first = await engine.placeOrder(currentUser, {
+    action: "buy",
+    side: "UP",
+    orderKind: "market",
+    amount: 20
+  });
+  const second = await engine.placeOrder(currentUser, {
+    action: "buy",
+    side: "UP",
+    orderKind: "market",
+    amount: 10
+  });
+
+  const openLots = store.positions.filter((item) => item.status === "open" && item.side === "UP");
+  assert.equal(openLots.length, 2);
+  assert.deepEqual(
+    openLots.map((item) => (item as PositionRecord & { buyOrderId?: string }).buyOrderId).sort(),
+    [first.order.id, second.order.id].sort()
+  );
+  assert.deepEqual(openLots.map((item) => item.qty), [40, 20]);
+}
+
+async function testSellingOneOrderLotOnlyClosesThatBuyLifecycle() {
+  const currentRound = round({ id: "round-order-lot-sell" });
+  const firstPosition = position({
+    id: "pos-first",
+    roundId: currentRound.id,
+    qty: 40,
+    averageEntry: 0.5,
+    notionalSpent: 20,
+    openedAt: now() - 20_000
+  }) as PositionRecord & { buyOrderId?: string };
+  firstPosition.buyOrderId = "buy-first";
+  const secondPosition = position({
+    id: "pos-second",
+    roundId: currentRound.id,
+    qty: 20,
+    averageEntry: 0.5,
+    notionalSpent: 10,
+    openedAt: now() - 10_000
+  }) as PositionRecord & { buyOrderId?: string };
+  secondPosition.buyOrderId = "buy-second";
+  const { engine, user: currentUser, store } = createFixture({
+    round: currentRound,
+    upBook: book("up-sell-one-lot", [[0.6, 100]], [[0.7, 100]]),
+    positions: [firstPosition, secondPosition]
+  });
+
+  const order = await engine.sellPosition(currentUser, "pos-second");
+
+  assert.equal(order.status, "filled");
+  assert.equal(firstPosition.qty, 40);
+  assert.equal(firstPosition.status, "open");
+  assert.equal(secondPosition.qty, 0);
+  assert.equal(secondPosition.status, "closed");
+  const exitLog = store.orderLifecycleLogs.find((log) => log.id === "exit-0");
+  assert.deepEqual(exitLog?.buyOrderIds, ["buy-second"]);
+}
+
+async function testAcceptingOrdersFalseBlocksBuyButAllowsPositionSell() {
+  const currentRound = round({ id: "round-sell-while-not-accepting", acceptingOrders: false });
+  const currentPosition = position({
+    id: "pos-sell-while-not-accepting",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4,
+    currentBid: 0.6
+  });
+  const { engine, user: currentUser } = createFixture({
+    round: currentRound,
+    upBook: book("up-not-accepting-sell", [[0.6, 100]], [[0.7, 100]]),
+    positions: [currentPosition]
+  });
+
+  await expectRejectsWithMessage(
+    () =>
+      engine.placeOrder(currentUser, {
+        action: "buy",
+        side: "UP",
+        orderKind: "market",
+        amount: 10
+      }),
+    /not accepting new orders/
+  );
+
+  const order = await engine.sellPosition(currentUser, currentPosition.id);
+
+  assert.equal(order.status, "filled");
+  assert.equal(currentPosition.status, "closed");
+  assert.equal(currentPosition.qty, 0);
+}
+
+async function testAcceptingOrdersFalseAllowsCloseSide() {
+  const currentRound = round({ id: "round-close-while-not-accepting", acceptingOrders: false });
+  const firstPosition = position({
+    id: "pos-close-first",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4
+  });
+  const secondPosition = position({
+    id: "pos-close-second",
+    roundId: currentRound.id,
+    qty: 5,
+    averageEntry: 0.5,
+    notionalSpent: 2.5
+  });
+  const { engine, user: currentUser } = createFixture({
+    round: currentRound,
+    upBook: book("up-not-accepting-close", [[0.6, 100]], [[0.7, 100]]),
+    positions: [firstPosition, secondPosition]
+  });
+
+  const result = await engine.closeSide(currentUser, { side: "UP" });
+
+  assert.equal(result.closedPositionsCount, 2);
+  assert.equal(result.totalQty, 15);
+  assert.equal(firstPosition.status, "closed");
+  assert.equal(secondPosition.status, "closed");
+}
+
+async function testAcceptingOrdersFalseRejectsReverseWithoutClosing() {
+  const currentRound = round({ id: "round-reverse-while-not-accepting", acceptingOrders: false });
+  const currentPosition = position({
+    id: "pos-reverse-not-accepting",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4
+  });
+  const { engine, user: currentUser } = createFixture({
+    round: currentRound,
+    upBook: book("up-not-accepting-reverse", [[0.6, 100]], [[0.7, 100]]),
+    downBook: book("down-not-accepting-reverse", [[0.3, 100]], [[0.4, 100]]),
+    positions: [currentPosition]
+  });
+
+  await expectRejectsWithMessage(
+    () => engine.reverseSide(currentUser, { side: "UP" }),
+    /not accepting new orders/
+  );
+
+  assert.equal(currentPosition.status, "open");
+  assert.equal(currentPosition.qty, 10);
+}
+
+async function testLegacyAggregatePositionRebuildsOrderLotsFromLifecycle() {
+  const store = createMemoryStore();
+  const currentRound = round({ id: "round-legacy-lots" });
+  const legacyPosition = position({
+    id: "pos-legacy-aggregate",
+    roundId: currentRound.id,
+    qty: 60,
+    averageEntry: 0.5,
+    notionalSpent: 30,
+    currentMark: 0.6,
+    currentBid: 0.58,
+    currentAsk: 0.62,
+    currentValue: 36,
+    unrealizedPnl: 6
+  });
+  const createdAt = now() - 30_000;
+  const lifecycleBase = {
+    traceId: "trace-legacy",
+    userId: "u1",
+    testerId: "u1",
+    roundId: currentRound.id,
+    symbol: "BTC",
+    assetClass: "BTC" as const,
+    marketId: currentRound.marketId,
+    marketSlug: currentRound.marketSlug,
+    direction: "UP" as TradeSide,
+    btcTradePrice: 80_000,
+    btcOpenPriceToBeat: 80_000,
+    deltaBtc: 0,
+    closedTokenQty: 0,
+    exitNotional: 0,
+    matchLatencyMs: 0,
+    feeCurrency: "USD" as const,
+    createdAt,
+    updatedAt: createdAt
+  };
+  const legacyLogs: OrderLifecycleRecord[] = [
+    {
+      ...lifecycleBase,
+      id: "ol-legacy-first",
+      buyOrderId: "buy-legacy-first",
+      orderTimestampMs: createdAt,
+      entryTokenPrice: 0.5,
+      actualFillPrice: 0.5,
+      volumeTokenQty: 40,
+      remainingTokenQty: 40,
+      positionNotional: 20.2,
+      entryFee: 0.2
+    },
+    {
+      ...lifecycleBase,
+      id: "ol-legacy-second",
+      buyOrderId: "buy-legacy-second",
+      orderTimestampMs: createdAt + 10_000,
+      entryTokenPrice: 0.5,
+      actualFillPrice: 0.5,
+      volumeTokenQty: 20,
+      remainingTokenQty: 20,
+      positionNotional: 10.1,
+      entryFee: 0.1
+    }
+  ];
+  store.positions.push(legacyPosition);
+  store.orderLifecycleLogs.push(...legacyLogs);
+
+  await (store as unknown as { rebuildLegacyOpenPositionLotsFromLifecycle: () => Promise<void> })
+    .rebuildLegacyOpenPositionLotsFromLifecycle();
+
+  const openLots = store.positions.filter((item) => item.status === "open");
+  assert.equal(openLots.length, 2);
+  assert.deepEqual(
+    openLots.map((item) => item.buyOrderId).sort(),
+    ["buy-legacy-first", "buy-legacy-second"]
+  );
+  assert.deepEqual(openLots.map((item) => item.qty), [40, 20]);
+  const archivedLegacyPosition = store.positions.find((item) => item.id === legacyPosition.id);
+  assert.equal(archivedLegacyPosition?.status, "closed");
+  assert.equal(archivedLegacyPosition?.settlementResult, "sold");
+  await store.close();
 }
 
 async function testPendingLimitBuyTriggersFromFutureBook() {
@@ -597,9 +867,63 @@ async function testPendingOrderFailsAndReleasesAssetsInFreezeWindow() {
   assert.equal(store.orderLifecycleLogs.length, 0);
 }
 
+async function testFreezeWindowRejectsBuySellCloseAndReverse() {
+  const currentRound = round({ id: "round-freeze-guards", endAt: now() + 5_000 });
+  const firstPosition = position({
+    id: "pos-freeze-sell",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4
+  });
+  const secondPosition = position({
+    id: "pos-freeze-close",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4
+  });
+  const thirdPosition = position({
+    id: "pos-freeze-reverse",
+    roundId: currentRound.id,
+    qty: 10,
+    averageEntry: 0.4,
+    notionalSpent: 4
+  });
+  const { engine, user: currentUser } = createFixture({
+    round: currentRound,
+    upBook: book("up-freeze-guards", [[0.6, 100]], [[0.7, 100]]),
+    downBook: book("down-freeze-guards", [[0.3, 100]], [[0.4, 100]]),
+    positions: [firstPosition, secondPosition, thirdPosition]
+  });
+
+  await expectRejectsWithMessage(
+    () =>
+      engine.placeOrder(currentUser, {
+        action: "buy",
+        side: "UP",
+        orderKind: "market",
+        amount: 10
+      }),
+    /freeze window/
+  );
+  await expectRejectsWithMessage(() => engine.sellPosition(currentUser, firstPosition.id), /freeze window/);
+  await expectRejectsWithMessage(() => engine.closeSide(currentUser, { side: "UP" }), /freeze window/);
+  await expectRejectsWithMessage(() => engine.reverseSide(currentUser, { side: "UP" }), /freeze window/);
+  assert.equal(firstPosition.status, "open");
+  assert.equal(secondPosition.status, "open");
+  assert.equal(thirdPosition.status, "open");
+}
+
 async function main() {
   await testLimitBuyRestsAndCancelReleasesUsdc();
   await testLimitBuyImmediateFillCreatesPosition();
+  await testEachFilledBuyCreatesItsOwnSellablePositionLot();
+  await testSellingOneOrderLotOnlyClosesThatBuyLifecycle();
+  await testAcceptingOrdersFalseBlocksBuyButAllowsPositionSell();
+  await testAcceptingOrdersFalseAllowsCloseSide();
+  await testAcceptingOrdersFalseRejectsReverseWithoutClosing();
+  await testLegacyAggregatePositionRebuildsOrderLotsFromLifecycle();
   await testPendingLimitBuyTriggersFromFutureBook();
   await testPendingLimitBuyUsesActualClobV2FeeOnTrigger();
   await testOrderCapturesFullBookSnapshotWithoutReferenceLeak();
@@ -608,6 +932,7 @@ async function main() {
   await testPendingLimitSellTriggersFromFutureBook();
   await testInsufficientBuyBalanceDoesNotCreateOrder();
   await testPendingOrderFailsAndReleasesAssetsInFreezeWindow();
+  await testFreezeWindowRejectsBuySellCloseAndReverse();
 
   console.log("limit-order-lifecycle-check ok");
 }

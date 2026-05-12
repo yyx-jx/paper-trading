@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+﻿import { startTransition, useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "./i18n";
 
@@ -42,7 +42,8 @@ import {
   type TradeTimeline,
   type UnifiedLogRow,
   type UpdateUserInput,
-  type UserPayload
+  type UserPayload,
+  type UserTradePayload
 } from "./utils/api";
 import {
   isOrderBookStale,
@@ -533,6 +534,71 @@ function countdownTone(countdownMs: number) {
     return "warn";
   }
   return "live";
+}
+
+function activeRoundTradeBlockReason(round: RoundRecord | undefined, nowMs: number, language: Language) {
+  if (!round || nowMs < round.startAt || nowMs >= round.endAt) {
+    return localLabel(language, "当前没有可交易轮次。", "No active tradable round.");
+  }
+  if (round.status !== "Trading") {
+    return localLabel(language, `当前轮次状态为 ${round.status}。`, `Current round is ${round.status}.`);
+  }
+  if (round.endAt - nowMs <= 10_000) {
+    return localLabel(language, "当前轮次进入最后 10 秒冻结窗口。", "The round entered the final 10-second freeze window.");
+  }
+  return undefined;
+}
+
+function buildTradeAvailability(input: {
+  language: Language;
+  currentRound?: RoundRecord;
+  nowMs: number;
+  selectedSide: TradeSide;
+  orderAction: OrderAction;
+  canPlaceOrder: boolean;
+  canSell: boolean;
+  acceptingOrders?: boolean;
+  tradeBlockReason?: string;
+  openSidePositions: PositionRecord[];
+  orderBook?: MarketSnapshot["orderBooks"][TradeSide];
+  oppositeOrderBook?: MarketSnapshot["orderBooks"][TradeSide];
+  parsedQty: number;
+}) {
+  const roundBlockReason = activeRoundTradeBlockReason(input.currentRound, input.nowMs, input.language);
+  const selectedAskAvailable = (input.orderBook?.bestAsk ?? 0) > 0 && (input.orderBook?.asks.length ?? 0) > 0;
+  const selectedBidAvailable = (input.orderBook?.bestBid ?? 0) > 0 && (input.orderBook?.bids.length ?? 0) > 0;
+  const oppositeAskAvailable = (input.oppositeOrderBook?.bestAsk ?? 0) > 0 && (input.oppositeOrderBook?.asks.length ?? 0) > 0;
+  const hasOpenSidePositions = input.openSidePositions.some((position) => position.qty > 0);
+  const buyReason =
+    roundBlockReason ??
+    (!input.canPlaceOrder ? localLabel(input.language, "当前用户没有下单权限。", "Current user cannot place orders.") : undefined) ??
+    (input.acceptingOrders === false ? localLabel(input.language, "当前市场不接受新买入订单。", "The market is not accepting new buy orders.") : undefined) ??
+    (!selectedAskAvailable ? localLabel(input.language, "当前方向没有可买入盘口。", "No ask depth is available for this side.") : undefined) ??
+    input.tradeBlockReason;
+  const sellReason =
+    roundBlockReason ??
+    (!input.canSell ? localLabel(input.language, "当前用户没有卖出权限。", "Current user cannot sell.") : undefined) ??
+    (!hasOpenSidePositions ? localLabel(input.language, "当前方向没有可卖持仓。", "No open position on this side.") : undefined) ??
+    (!selectedBidAvailable ? localLabel(input.language, "当前方向没有可卖出盘口。", "No bid depth is available for this side.") : undefined) ??
+    (input.orderAction === "sell" && input.parsedQty <= 0
+      ? localLabel(input.language, "请输入有效卖出数量。", "Enter a valid sell quantity.")
+      : undefined) ??
+    input.tradeBlockReason;
+  const reverseReason =
+    sellReason ??
+    (!input.canPlaceOrder ? localLabel(input.language, "当前用户没有反向买入权限。", "Current user cannot place the reverse buy order.") : undefined) ??
+    (input.acceptingOrders === false ? localLabel(input.language, "当前市场不接受反向买入订单。", "The market is not accepting the reverse buy order.") : undefined) ??
+    (!oppositeAskAvailable ? localLabel(input.language, "反方向没有可买入盘口。", "No ask depth is available for the reverse side.") : undefined);
+  return {
+    canBuy: !buyReason,
+    canSell: !sellReason,
+    canCloseSide: !sellReason,
+    canReverseSide: !reverseReason,
+    buyReason,
+    sellReason,
+    closeSideReason: sellReason,
+    reverseReason
+  };
 }
 
 function isCurrentRoundOrder(order: OrderRecord, currentRound?: RoundRecord) {
@@ -2069,6 +2135,7 @@ function App() {
     setMarketTickPayload,
     markMarketRenderCommit,
     setUserPayload,
+    setUserTradePayload,
     setLastOrderLatencyMs
   } = useAppStore();
   const [bootstrapping, setBootstrapping] = useState(false);
@@ -2095,8 +2162,8 @@ function App() {
   const cancellingOrderIdsRef = useRef(new Set<string>());
   const clientClockOffsetMsRef = useRef(0);
   const countdownTargetMs =
-    snapshot && typeof snapshot.uiMeta.countdownMs === "number" && typeof lastMarketRecvTs === "number"
-      ? lastMarketRecvTs + snapshot.uiMeta.countdownMs
+    typeof snapshot?.uiMeta.countdownTargetTs === "number"
+      ? snapshot.uiMeta.countdownTargetTs + clientClockOffsetMsRef.current
       : currentRound?.endAt;
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
@@ -2453,14 +2520,15 @@ function App() {
       };
       socket.onmessage = (event) => {
         const receivedAt = Date.now();
+        const processingStartedAt = performance.now();
         let parsed: {
-          type: "user";
-          data: UserPayload;
+          type: "user" | "user:trade";
+          data: UserPayload | UserTradePayload;
         };
         try {
           parsed = JSON.parse(event.data) as {
-            type: "user";
-            data: UserPayload;
+            type: "user" | "user:trade";
+            data: UserPayload | UserTradePayload;
           };
         } catch (parseError) {
           updateRealtimeChannel("user", {
@@ -2468,9 +2536,28 @@ function App() {
           });
           return;
         }
-        if (parsed.type === "user") {
-          setUserPayload(parsed.data);
-          markUserActivity(receivedAt);
+        const payloadBytes = typeof event.data === "string" ? event.data.length : 0;
+        const warnSlowUserMessage = () => {
+          const elapsedMs = Math.round(performance.now() - processingStartedAt);
+          if (elapsedMs > 50 || payloadBytes > 200_000) {
+            console.warn(`[ws:user] processed type=${parsed.type} bytes=${payloadBytes} elapsedMs=${elapsedMs}`);
+          }
+        };
+        if (parsed.type === "user" || parsed.type === "user:trade") {
+          window.requestAnimationFrame(() => {
+            if (disposed) {
+              return;
+            }
+            startTransition(() => {
+              if (parsed.type === "user:trade") {
+                setUserTradePayload(parsed.data as UserTradePayload);
+              } else {
+                setUserPayload(parsed.data as UserPayload);
+              }
+              markUserActivity(receivedAt);
+              warnSlowUserMessage();
+            });
+          });
         }
       };
       socket.onerror = () => {
@@ -2566,7 +2653,7 @@ function App() {
       marketSocket?.close();
       userSocket?.close();
     };
-  }, [token, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, updateRealtimeChannel]);
+  }, [token, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, setUserTradePayload, updateRealtimeChannel]);
 
   const handleLogin = async (username: string, password: string) => {
     setError(undefined);
@@ -2630,14 +2717,14 @@ function App() {
     }
   };
 
-  const handleCloseSide = async () => {
+  const handleCloseSide = async (side = selectedSide) => {
     if (!token) {
       return;
     }
     try {
       setQuickBusy(true);
       setError(undefined);
-      const result = await api.closeSide(token, selectedSide);
+      const result = await api.closeSide(token, side);
       setLastOrderLatencyMs(result.matchLatencyMs);
     } catch (closeError) {
       setError(closeError instanceof Error ? closeError.message : "Close side failed.");
@@ -3312,7 +3399,7 @@ function TradePageRestored(props: {
   onChartVisibleCountChange: (value: number) => void;
   onSelectSide: (side: TradeSide) => void;
   onPlaceOrder: () => Promise<void>;
-  onCloseSide: () => Promise<void>;
+  onCloseSide: (side?: TradeSide) => Promise<void>;
   onReverseSide: () => Promise<void>;
   onSell: (positionId: string) => Promise<void>;
   onCancel: (orderId: string) => Promise<void>;
@@ -3369,7 +3456,7 @@ function TradePageRestored(props: {
       ? Math.max(props.countdownTargetMs - nowMs, 0)
       : snapshot?.uiMeta.countdownMs ?? 0;
   const countdownClass = countdownTone(countdownMs);
-  const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders && currentRound?.status === "Trading");
+  const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders);
   const balanceWarning =
     props.orderAction === "buy" && parsedAmount > (profile?.availableUsdc ?? 0) + 0.0001
       ? localLabel(
@@ -3379,10 +3466,6 @@ function TradePageRestored(props: {
         )
       : undefined;
   const tradeBlockReason = balanceWarning ?? limitPriceError;
-  const canTrade = (props.orderAction === "buy" ? props.canPlaceOrder : props.canSell) && acceptingOrders && !tradeBlockReason;
-  const recentOrders = [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
-    .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
-    .slice(0, 16);
   const openPositionsBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord[]>>(
     (accumulator, side) => {
       accumulator[side] = currentRoundPositions.filter(
@@ -3396,12 +3479,38 @@ function TradePageRestored(props: {
     },
     { UP: [], DOWN: [] }
   );
-  const sellablePositionBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord | undefined>>(
-    (accumulator, side) => {
-      accumulator[side] = openPositionsBySide[side].find((position) => position.displayStatus === "open");
-      return accumulator;
-    },
-    { UP: undefined, DOWN: undefined }
+  const oppositeSide = selectedSide === "UP" ? "DOWN" : "UP";
+  const tradeAvailability = buildTradeAvailability({
+    language,
+    currentRound,
+    nowMs,
+    selectedSide,
+    orderAction: props.orderAction,
+    canPlaceOrder: props.canPlaceOrder,
+    canSell: props.canSell,
+    acceptingOrders,
+    tradeBlockReason,
+    openSidePositions,
+    orderBook,
+    oppositeOrderBook: snapshot?.orderBooks[oppositeSide],
+    parsedQty
+  });
+  const canTrade = props.orderAction === "buy" ? tradeAvailability.canBuy : tradeAvailability.canSell;
+  const executeBlockReason = props.orderAction === "buy" ? tradeAvailability.buyReason : tradeAvailability.sellReason;
+  const recentOrders = [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
+    .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
+    .slice(0, 16);
+  const sellablePositionByBuyOrderId = new Map(
+    currentRoundPositions
+      .filter(
+        (position) =>
+          position.buyOrderId &&
+          position.status === "open" &&
+          position.displayStatus !== "settled" &&
+          position.displayStatus !== "sold" &&
+          position.qty > 0
+      )
+      .map((position) => [position.buyOrderId!, position])
   );
   const positionCards = (["UP", "DOWN"] as TradeSide[]).map((side) => {
     const sidePositions = openPositionsBySide[side];
@@ -3414,7 +3523,6 @@ function TradePageRestored(props: {
     const entryQty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
     const pnlSummary = summarizePositionPnl(sidePositions);
     const pnl = pnlSummary.markPnlUsdc;
-    const sellablePosition = sellablePositionBySide[side];
     return {
       side,
       qty,
@@ -3422,7 +3530,7 @@ function TradePageRestored(props: {
       averageEntry: entryQty > 0 ? entryNotional / entryQty : 0,
       pnl,
       pnlSummary,
-      sellablePosition
+      hasOpenPositions: sidePositions.some((position) => position.displayStatus === "open")
     };
   });
   const recentRounds: Array<RoundRecord & { settlementPreview?: SettlementPreview; userPnl?: number }> = [
@@ -3634,13 +3742,16 @@ function TradePageRestored(props: {
                     exitFeeUsdc={card.pnlSummary.exitFeeUsdc}
                     totalFeeUsdc={card.pnlSummary.totalFeeUsdc}
                   />
-                  {card.sellablePosition ? (
+                  {card.hasOpenPositions ? (
                     <button
                       type="button"
-                      onClick={() => props.onSell(card.sellablePosition!.id)}
-                      disabled={props.sellBusyPositionId === card.sellablePosition.id}
+                      onClick={() => {
+                        props.onSelectSide(card.side);
+                        void props.onCloseSide(card.side);
+                      }}
+                      disabled={!props.canSell || props.quickBusy}
                     >
-                      {props.sellBusyPositionId === card.sellablePosition.id ? t("loading") : t("sell")}
+                      {props.quickBusy ? t("loading") : localLabel(language, "平仓", "Close side")}
                     </button>
                   ) : null}
                 </div>
@@ -3664,7 +3775,7 @@ function TradePageRestored(props: {
                   </div>
                   {recentOrders.map((order) => {
                     const canCancelOrder = order.orderKind === "limit" && order.status === "pending";
-                    const sellablePosition = sellablePositionBySide[order.side];
+                    const sellablePosition = sellablePositionByBuyOrderId.get(order.id);
                     const canSellPosition = order.action === "buy" && order.status === "filled" && Boolean(sellablePosition);
                     const cancelBusy = props.cancelBusyOrderId === order.id;
                     const sellBusy = Boolean(sellablePosition && props.sellBusyPositionId === sellablePosition.id);
@@ -3698,7 +3809,7 @@ function TradePageRestored(props: {
                               className="terminal-order-action-button terminal-sell-position-button"
                               disabled={sellBusy}
                               onClick={() => props.onSell(sellablePosition.id)}
-                              title={localLabel(language, "卖出该方向持仓", "Sell the current position for this side")}
+                              title={localLabel(language, "卖出该订单持仓", "Sell this order lot")}
                             >
                               {sellBusy ? t("loading") : localLabel(language, "卖出持仓", "Sell position")}
                             </button>
@@ -3945,12 +4056,12 @@ function TradePageRestored(props: {
                 <span>{t("available")}: {money(profile?.availableUsdc ?? 0)}</span>
                 <span>{t("estimatedQty")}: {decimal(estimatedQty, 4)}</span>
               </div>
-              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} title={tradeBlockReason} onClick={props.onPlaceOrder}>
+              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} title={executeBlockReason} onClick={props.onPlaceOrder}>
                 {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `BUY ${selectedSide}` : `SELL ${selectedSide}`}
               </button>
               <div className="quick-row">
-                <button disabled={!props.canSell || props.quickBusy || openSidePositions.length === 0} onClick={props.onCloseSide}>{localLabel(language, "平仓", "Exit")} {selectedSide}</button>
-                <button disabled={!props.canSell || props.quickBusy || openSidePositions.length === 0} onClick={props.onReverseSide}>{localLabel(language, "反手", "Reverse")}</button>
+                <button disabled={!tradeAvailability.canCloseSide || props.quickBusy} title={tradeAvailability.closeSideReason} onClick={() => props.onCloseSide()}>{localLabel(language, "平仓", "Exit")} {selectedSide}</button>
+                <button disabled={!tradeAvailability.canReverseSide || props.quickBusy} title={tradeAvailability.reverseReason} onClick={props.onReverseSide}>{localLabel(language, "反手", "Reverse")}</button>
               </div>
               {balanceWarning ? <div className="inline-error-banner compact-feedback">{balanceWarning}</div> : null}
               {orderBookStale ? (
