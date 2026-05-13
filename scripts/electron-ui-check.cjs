@@ -161,9 +161,109 @@ async function evaluateTradeLayout(window, width, height) {
     (() => {
       const root = document.documentElement;
       const body = document.body;
+      const viewport = {
+        left: 0,
+        top: 0,
+        right: window.innerWidth,
+        bottom: window.innerHeight
+      };
       const intervalButtons = Array.from(document.querySelectorAll(".chart-toolbar.compact button"))
         .map((button) => (button.textContent || "").trim())
         .filter((text) => ["30s", "1m", "5m", "15m", "1h"].includes(text));
+      const rectInfo = (node, name, selector) => {
+        if (!node) {
+          return { name, selector, missing: true, visible: false, inViewport: false, unclipped: false };
+        }
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        let clip = { ...viewport };
+        for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+          const parentStyle = window.getComputedStyle(parent);
+          const overflow = [parentStyle.overflow, parentStyle.overflowX, parentStyle.overflowY].join(" ");
+          if (/(hidden|clip|auto|scroll)/.test(overflow)) {
+            const parentRect = parent.getBoundingClientRect();
+            clip = {
+              left: Math.max(clip.left, parentRect.left),
+              top: Math.max(clip.top, parentRect.top),
+              right: Math.min(clip.right, parentRect.right),
+              bottom: Math.min(clip.bottom, parentRect.bottom)
+            };
+          }
+        }
+        const visible =
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          Number(style.opacity || "1") > 0 &&
+          rect.width > 0 &&
+          rect.height > 0;
+        const inViewport =
+          rect.left >= viewport.left - 1 &&
+          rect.top >= viewport.top - 1 &&
+          rect.right <= viewport.right + 1 &&
+          rect.bottom <= viewport.bottom + 1;
+        const unclipped =
+          rect.left >= clip.left - 1 &&
+          rect.top >= clip.top - 1 &&
+          rect.right <= clip.right + 1 &&
+          rect.bottom <= clip.bottom + 1;
+        return {
+          name,
+          selector,
+          missing: false,
+          visible,
+          inViewport,
+          unclipped,
+          rect: {
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+            right: Math.round(rect.right),
+            bottom: Math.round(rect.bottom),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          },
+          clip: {
+            left: Math.round(clip.left),
+            top: Math.round(clip.top),
+            right: Math.round(clip.right),
+            bottom: Math.round(clip.bottom)
+          },
+          text: (node.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 120)
+        };
+      };
+      const elementInfo = (name, selector) => rectInfo(document.querySelector(selector), name, selector);
+      const criticalSelectors = [
+        ["top bar", ".terminal-top"],
+        ["monitor", ".terminal-monitor"],
+        ["body grid", ".terminal-body"],
+        ["left rail", ".terminal-left"],
+        ["center rail", ".terminal-center"],
+        ["right rail", ".terminal-right"],
+        ["main chart", ".terminal-center .terminal-chart-block:not(.chainlink)"],
+        ["secondary chart or book", ".terminal-center .terminal-chart-block.chainlink, .terminal-orderbook-expanded"],
+        ["depth strip", ".terminal-depth"],
+        ["health grid", ".health-grid"],
+        ["order panel", ".terminal-order"],
+        ["UP selector", ".order-odds .up"],
+        ["DOWN selector", ".order-odds .down"],
+        ["BUY action", ".action-segment button:nth-child(1)"],
+        ["SELL action", ".action-segment button:nth-child(2)"],
+        ["MARKET kind", ".order-kind-segment .kind-market"],
+        ["LIMIT kind", ".order-kind-segment .kind-limit"],
+        ["first amount", ".amount-grid button:nth-child(1)"],
+        ["max amount", ".amount-grid button:nth-child(7)"],
+        ["amount input", ".terminal-order .terminal-input input"],
+        ["price note", ".terminal-price-note"],
+        ["order meta", ".order-meta"],
+        ["execute", ".terminal-order .execute"],
+        ["close side", ".quick-row button:nth-child(1)"],
+        ["reverse side", ".quick-row button:nth-child(2)"],
+        ["strategy list", ".strategy-list"]
+      ];
+      const criticalElements = criticalSelectors.map(([name, selector]) => elementInfo(name, selector));
+      const limitInputLabel = Array.from(document.querySelectorAll(".terminal-order .terminal-input"))
+        .find((label) => /Limit|限价/.test((label.textContent || "").replace(/\\s+/g, " ")));
+      const limitInput = rectInfo(limitInputLabel?.querySelector("input"), "limit input", ".terminal-order limit input");
+      const expandedOrderBook = elementInfo("expanded order book", ".terminal-orderbook-expanded");
       const hasTradePage = Boolean(document.querySelector(".terminal-page"));
       const overflowFree =
         root.scrollWidth === root.clientWidth &&
@@ -215,10 +315,47 @@ async function evaluateTradeLayout(window, width, height) {
         allModulesPresent,
         monitorCellsFit,
         monitorCellMetrics,
+        criticalElementsFit: criticalElements.every((item) => !item.missing && item.visible && item.inViewport && item.unclipped),
+        missingCriticalElements: criticalElements.filter((item) => item.missing).map((item) => item.name),
+        clippedCriticalElements: criticalElements
+          .filter((item) => !item.missing && (!item.visible || !item.inViewport || !item.unclipped))
+          .map((item) => ({
+            name: item.name,
+            selector: item.selector,
+            visible: item.visible,
+            inViewport: item.inViewport,
+            unclipped: item.unclipped,
+            rect: item.rect,
+            clip: item.clip,
+            text: item.text
+          })),
+        limitInputVisible: !limitInput.missing && limitInput.visible && limitInput.inViewport && limitInput.unclipped,
+        limitInput,
+        orderBookExpandedVisible:
+          !expandedOrderBook.missing &&
+          expandedOrderBook.visible &&
+          expandedOrderBook.inViewport &&
+          expandedOrderBook.unclipped,
+        expandedOrderBook,
         intervalButtons
       };
     })();
   `);
+}
+
+function assertTradeLayoutSummary(label, layout, { requireCriticalElements = false, requireLimitInput = false, requireExpandedOrderBook = false } = {}) {
+  if (!layout.hasTradePage || !layout.overflowFree || !layout.allModulesPresent || !layout.monitorCellsFit) {
+    throw new Error(`${label} failed: ${JSON.stringify(layout)}`);
+  }
+  if (requireCriticalElements && !layout.criticalElementsFit) {
+    throw new Error(`${label} core controls clipped or outside viewport: ${JSON.stringify(layout)}`);
+  }
+  if (requireLimitInput && !layout.limitInputVisible) {
+    throw new Error(`${label} limit input is not fully visible: ${JSON.stringify(layout.limitInput)}`);
+  }
+  if (requireExpandedOrderBook && !layout.orderBookExpandedVisible) {
+    throw new Error(`${label} expanded order book is not fully visible: ${JSON.stringify(layout.expandedOrderBook)}`);
+  }
 }
 
 async function waitForRendererSelector(window, selector, label, timeoutMs = 30000) {
@@ -401,23 +538,57 @@ async function main() {
   await assertZoomLocked(window, "after login");
   await assertNoNetworkAddressesVisible(window, "after login");
   const tradeCompact = await evaluateTradeLayout(window, 1400, 820);
-  if (!tradeCompact.hasTradePage || !tradeCompact.overflowFree || !tradeCompact.allModulesPresent || !tradeCompact.monitorCellsFit) {
-    throw new Error(`Trade page compact 1400x820 check failed: ${JSON.stringify(tradeCompact)}`);
-  }
+  assertTradeLayoutSummary("Trade page compact 1400x820 check", tradeCompact);
   if (["30s", "1m", "5m", "15m", "1h"].some((label) => !tradeCompact.intervalButtons.includes(label))) {
     throw new Error(`Missing trade interval buttons at compact 1400x820: ${JSON.stringify(tradeCompact.intervalButtons)}`);
   }
   const trade1440 = await evaluateTradeLayout(window, 1440, 900);
-  if (!trade1440.hasTradePage || !trade1440.overflowFree || !trade1440.allModulesPresent || !trade1440.monitorCellsFit) {
-    throw new Error(`Trade page 1440x900 check failed: ${JSON.stringify(trade1440)}`);
-  }
+  assertTradeLayoutSummary("Trade page 1440x900 check", trade1440, { requireCriticalElements: true });
   if (["30s", "1m", "5m", "15m", "1h"].some((label) => !trade1440.intervalButtons.includes(label))) {
     throw new Error(`Missing trade interval buttons at 1440x900: ${JSON.stringify(trade1440.intervalButtons)}`);
   }
+  await window.webContents.executeJavaScript(`
+    (() => {
+      const limitButton = Array.from(document.querySelectorAll(".order-kind-segment button"))
+        .find((button) => /LIMIT/.test(button.textContent || ""));
+      if (!limitButton) throw new Error("Missing LIMIT button for 1440x900 layout check.");
+      limitButton.click();
+    })();
+  `);
+  await wait(350);
+  const trade1440Limit = await evaluateTradeLayout(window, 1440, 900);
+  assertTradeLayoutSummary("Trade page 1440x900 LIMIT check", trade1440Limit, { requireCriticalElements: true, requireLimitInput: true });
+  await window.webContents.executeJavaScript(`
+    (() => {
+      const openBookButton = Array.from(document.querySelectorAll(".terminal-depth small button"))
+        .find((button) => /Open|展开/.test(button.textContent || ""));
+      if (!openBookButton) throw new Error("Missing order book expand button for 1440x900 layout check.");
+      openBookButton.click();
+    })();
+  `);
+  await wait(450);
+  const trade1440Expanded = await evaluateTradeLayout(window, 1440, 900);
+  assertTradeLayoutSummary("Trade page 1440x900 expanded order book check", trade1440Expanded, {
+    requireCriticalElements: true,
+    requireLimitInput: true,
+    requireExpandedOrderBook: true
+  });
+  await window.webContents.executeJavaScript(`
+    (() => {
+      const hideBookButton = Array.from(document.querySelectorAll(".terminal-depth small button"))
+        .find((button) => /Hide|收起/.test(button.textContent || ""));
+      if (!hideBookButton) throw new Error("Missing order book collapse button after 1440x900 layout check.");
+      hideBookButton.click();
+    })();
+  `);
+  await wait(350);
+  const trade1440Restored = await evaluateTradeLayout(window, 1440, 900);
+  assertTradeLayoutSummary("Trade page 1440x900 restored chart check", trade1440Restored, {
+    requireCriticalElements: true,
+    requireLimitInput: true
+  });
   const trade1920 = await evaluateTradeLayout(window, 1920, 1080);
-  if (!trade1920.hasTradePage || !trade1920.overflowFree || !trade1920.allModulesPresent || !trade1920.monitorCellsFit) {
-    throw new Error(`Trade page 1920x1080 check failed: ${JSON.stringify(trade1920)}`);
-  }
+  assertTradeLayoutSummary("Trade page 1920x1080 check", trade1920);
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "Control" });
   window.webContents.sendInputEvent({ type: "keyDown", keyCode: "+", modifiers: ["control"] });
   window.webContents.sendInputEvent({ type: "keyUp", keyCode: "+", modifiers: ["control"] });

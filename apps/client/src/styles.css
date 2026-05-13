@@ -1749,6 +1749,115 @@ button:disabled:hover {
 .inline-warning-banner.compact-feedback strong { font-size:12px; }
 .inline-warning-banner.compact-feedback span { font-size:11px; line-height:1.35; overflow-wrap:anywhere; }
 
+@media (max-width: 1500px) and (max-height: 930px) {
+  .terminal-page { font-size: 12px; }
+  .terminal-top { height: 28px; gap: 6px; padding: 0 8px; }
+  .terminal-logo { gap: 5px; padding-right: 8px; }
+  .terminal-logo strong { font-size: 14px; }
+  .terminal-logo em { padding: 1px 6px; font-size: 11px; }
+  .terminal-top-nav { padding-right: 6px; }
+  .terminal-top-nav button { height: 24px; padding: 0 8px; font-size: 11px; }
+  .terminal-top-mid { gap: 7px; font-size: 11px; }
+  .terminal-top-right { gap: 4px; }
+  .terminal-top-right span { padding: 1px 6px; font-size: 11px; }
+  .terminal-top-right .terminal-user-badge { max-width: 168px; }
+  .terminal-top-right select, .terminal-top-right button { height: 22px; padding: 1px 6px; font-size: 10px; }
+
+  .terminal-monitor { height: 78px; grid-template-columns:minmax(160px, .52fr) minmax(140px, .42fr) minmax(188px, .6fr) minmax(194px, .62fr) 292px; }
+  .monitor-cell, .monitor-timer { padding: 4px 8px 3px; }
+  .monitor-cell small, .monitor-timer small { font-size: 10px; letter-spacing: .2px; }
+  .monitor-cell strong { margin-top: 1px; font-size: 18px; }
+  .monitor-cell.monitor-analytics strong, .monitor-cell.monitor-spread strong { font-size: 16px; }
+  .monitor-cell.compact strong { font-size: 17px; }
+  .monitor-cell.monitor-balance strong { gap: 8px; }
+  .monitor-cell.monitor-balance strong span { font-size: 18px; }
+  .monitor-cell span, .monitor-timer span { font-size: 10px; }
+  .monitor-timer { padding: 5px 12px 4px; }
+  .monitor-timer strong { font-size: 48px; line-height: .8; }
+  .monitor-latency-breakdown strong { font-size: 11px!important; }
+  .latency-mini-list { gap: 1px 4px; font-size: 8px; }
+
+  .terminal-body { grid-template-columns:352px minmax(0, 1fr) 372px; }
+  .terminal-section-head { height: 26px; padding: 0 8px; font-size: 11px; }
+  .terminal-section-head em { font-size: 10px; }
+  .terminal-left .terminal-section:nth-child(1) { height: 172px; }
+  .terminal-left .terminal-section:nth-child(2) { height: 224px; }
+  .terminal-right .terminal-section:nth-child(1) { height: 206px; }
+  .terminal-right .terminal-section:nth-child(2) { height: 386px; }
+  .terminal-list { height: calc(100% - 26px); padding: 5px 7px; }
+  .terminal-position-cards { height: calc(100% - 26px); gap: 6px; padding: 6px; }
+  .position-token-card { gap: 5px; padding: 9px 10px 8px; }
+  .position-token-card b { font-size: 19px; }
+  .position-token-card strong { font-size: 21px; }
+  .position-token-card button { min-height: 26px; font-size: 11px; }
+  .terminal-trade-head, .terminal-trade-row { grid-template-columns:50px 68px minmax(48px,.82fr) minmax(104px,1.12fr) minmax(50px,.68fr) 94px; gap: 5px; }
+  .terminal-trade-row { min-height: 34px; padding: 4px 3px; font-size: 12px; }
+  .terminal-trade-price { font-size: 13px; }
+  .terminal-trade-action, .terminal-order-action-button { width: 94px; }
+  .terminal-stat-grid { grid-auto-rows: 44px; gap: 4px; padding: 6px 7px 4px; }
+  .terminal-stat-grid div { padding: 5px 7px; }
+  .terminal-stat-grid b { margin-top: 4px; font-size: 16px; }
+
+  .terminal-center, .terminal-center.book-expanded { grid-template-rows:minmax(176px,.78fr) 38px minmax(152px,.72fr) 44px; }
+  .page-trade .chart-toolbar.compact { height: 24px; gap: 4px; padding: 0 6px; }
+  .page-trade .chart-toolbar.compact b { font-size: 11px; }
+  .page-trade .chart-toolbar.compact button { padding: 1px 5px; font-size: 10px; }
+  .page-trade .chart-toolbar.compact span { font-size: 10px; }
+  .page-trade .chart-count-group input { width: 46px; height: 18px; font-size: 10px; }
+  .page-trade .chart-count-group em { top: 21px; min-width: 128px; }
+  .page-trade .terminal-chart-block .candle-chart { inset: 24px 0 0; height: calc(100% - 24px); }
+  .terminal-odds-strip span { top: 4px; font-size: 11px; }
+  .terminal-odds-strip>b { top: 4px; font-size: 13px; }
+  .terminal-odds-strip .mini-values { top: 3px; right: 58px; gap: 8px; min-width: 132px; }
+  .terminal-depth>div { padding: 5px 7px; }
+  .terminal-depth small { font-size: 11px; letter-spacing: .2px; }
+  .terminal-depth-bar { height: 3px; margin: 3px 0; }
+  .terminal-depth b { font-size: 11px; }
+
+  .health-grid { gap: 4px; padding: 5px 7px 2px; }
+  .health-dot { min-height: 48px; gap: 2px 6px; padding: 4px 6px; font-size: 10px; }
+  .health-dot b, .health-dot strong { font-size: 12px; }
+  .health-dot span { font-size: 9.5px; line-height: 1.12; }
+  .stability-meter { gap: 4px; padding: 2px 7px 3px; }
+  .risk-alerts { gap: 4px; padding: 5px 7px 7px; }
+  .risk-alert-group { gap: 3px; }
+  .risk-alert-group header { min-height: 15px; }
+  .risk-alert { padding: 4px 6px; font-size: 10px; line-height: 1.12; }
+  .risk-alert em { font-size: 8.5px; }
+
+  .terminal-order { gap: 4px; padding: 5px 7px; }
+  .order-odds, .terminal-segment, .quick-row, .manual-settle { gap: 4px; }
+  .order-odds button, .terminal-segment button, .amount-grid button, .quick-row button, .manual-settle button { padding: 4px 5px; font-size: 11px; }
+  .order-odds button { min-height: 46px; gap: 2px 6px; padding: 5px 7px; }
+  .order-odds button span { font-size: 12px; }
+  .order-odds button b { font-size: 19px; }
+  .order-odds button em { font-size: 10px; }
+  .terminal-segment button { min-height: 27px; font-size: 12px; }
+  .order-kind-segment button { min-height: 28px; gap: 6px; padding: 4px 7px; }
+  .order-kind-segment button b { font-size: 12px; }
+  .order-kind-segment button small { padding: 1px 5px; font-size: 10px; }
+  .amount-grid { gap: 3px; }
+  .amount-grid button { min-height: 23px; padding: 3px 2px; font-size: 10px; }
+  .terminal-input { gap: 2px; }
+  .terminal-input span { font-size: 10px; }
+  .terminal-input input { height: 28px; padding: 4px 7px; font-size: 13px; }
+  .terminal-input-error { font-size: 10px; line-height: 1.15; }
+  .terminal-price-note { min-height: 15px; font-size: 10px; }
+  .terminal-price-note b { font-size: 13px; }
+  .order-meta { gap: 3px; font-size: 9.5px; line-height: 1.1; }
+  .execute { min-height: 34px; font-size: 14px; }
+  .manual-settle { padding-top: 3px; }
+  .manual-settle span { font-size: 11px; }
+  .inline-warning-banner.compact-feedback { margin-top: 2px; padding: 6px 8px; }
+  .inline-warning-banner.compact-feedback strong { font-size: 11px; }
+  .inline-warning-banner.compact-feedback span { font-size: 10px; line-height: 1.22; }
+
+  .strategy-list { gap: 4px; padding: 7px; }
+  .strategy-list div { grid-template-columns:68px 1fr; gap: 5px; padding: 5px 6px; }
+  .strategy-list span { font-size: 9.5px; }
+  .strategy-list b { font-size: 11px; }
+}
+
 @media (min-width: 1800px) and (min-height: 1000px) {
   .terminal-page { font-size: 15px; }
   .terminal-top { height: 34px; padding: 0 14px; }
