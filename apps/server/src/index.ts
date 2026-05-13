@@ -48,6 +48,7 @@ import { appMetrics } from "./services/metrics";
 import { MarketPayloadBuilder } from "./services/market-payloads";
 import { UserPayloadBuilder } from "./services/user-payloads";
 import { registerHealthRoutes } from "./routes/health";
+import { registerAuthMeRoutes } from "./routes/auth-me";
 import { registerWsRoutes } from "./routes/ws";
 
 const app = Fastify({
@@ -181,15 +182,6 @@ const userPayloads = new UserPayloadBuilder({
   marketPayloads
 });
 
-const loginSchema = z.object({
-  username: z.string().min(1),
-  password: z.string().min(1)
-});
-
-const wsTicketSchema = z.object({
-  channel: z.enum(["market", "user"])
-});
-
 const orderSchema = z.object({
   action: z.enum(["buy", "sell"]).optional(),
   side: z.enum(["UP", "DOWN"]),
@@ -199,15 +191,6 @@ const orderSchema = z.object({
   limitPrice: z.number().positive().optional(),
   clientOrderId: z.string().trim().min(1).max(128).optional(),
   clientSendTs: z.number().optional()
-});
-
-const languageSchema = z.object({
-  language: z.enum(["zh-CN", "en-US"])
-});
-
-const selfProfileSchema = z.object({
-  displayName: z.string().trim().min(1).optional(),
-  language: z.enum(["zh-CN", "en-US"]).optional()
 });
 
 const roleSchema = z.enum(["Tester", "Senior Tester", "Test Engineer", "Admin"]);
@@ -269,8 +252,6 @@ const resetPasswordSchema = z.object({
   password: z.string().min(1),
   confirmPassword: z.string().min(1)
 });
-
-const changePasswordSchema = resetPasswordSchema;
 
 const userBalanceSchema = z.object({
   availableUsdc: z.number().nonnegative()
@@ -940,17 +921,6 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
   return managerUserId;
 }
 
-function createBootstrapPayload(user: UserRecord) {
-  const market = marketPayloads.createCurrentRoundPayload();
-  return {
-    ...market,
-    history: marketPayloads.getHistoryWithSettlementPreview(60, user.id),
-    me: store.sanitizeUser(user),
-    ...userPayloads.createFullPayload(user),
-    sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
-  };
-}
-
 async function recordLoginAudit(input: {
   username?: string;
   user?: UserRecord;
@@ -1355,166 +1325,19 @@ async function bootstrap() {
     metricsAuthorized
   });
 
-  app.post("/api/auth/login", async (request, reply) => {
-    const serverRecvTs = Date.now();
-    const parsed = loginSchema.safeParse(request.body);
-    if (!parsed.success) {
-      const rawUsername = (request.body as { username?: unknown } | undefined)?.username;
-      await recordLoginAudit({
-        username: typeof rawUsername === "string" ? rawUsername : undefined,
-        success: false,
-        serverRecvTs,
-        resultMessage: "Invalid login payload."
-      });
-      reply.code(400);
-      return { message: "Invalid login payload.", code: "VALIDATION_FAILED" };
-    }
-    const candidate = store.findUserByUsername(parsed.data.username);
-    if (candidate && store.isUserLocked(candidate)) {
-      await recordLoginAudit({
-        username: parsed.data.username,
-        user: candidate,
-        success: false,
-        serverRecvTs,
-        resultMessage: "User account is temporarily locked."
-      });
-      reply.code(423);
-      return { message: "User account is temporarily locked.", code: "ACCOUNT_LOCKED" };
-    }
-    const user = store.findUserByCredentials(parsed.data.username, parsed.data.password);
-    if (!user) {
-      const disabledMatch = candidate && store.verifyUserPassword(candidate, parsed.data.password) && !candidate.isActive;
-      if (candidate && !disabledMatch) {
-        await store.recordFailedLogin(candidate);
-      }
-      await recordLoginAudit({
-        username: parsed.data.username,
-        user: disabledMatch ? candidate : undefined,
-        success: false,
-        serverRecvTs,
-        resultMessage: disabledMatch ? "User account is disabled." : "Invalid username or password."
-      });
-      reply.code(disabledMatch ? 403 : 401);
-      return {
-        message: disabledMatch ? "User account is disabled." : "Invalid username or password.",
-        code: disabledMatch ? "ACCOUNT_DISABLED" : "AUTH_FAILED"
-      };
-    }
-
-    const token = signToken(user);
-    await store.recordSuccessfulLogin(user);
-    await recordLoginAudit({
-      user,
-      success: true,
-      serverRecvTs,
-      resultMessage: "Login succeeded."
-    });
-    return {
-      token,
-      user_id: user.id,
-      role: user.role,
-      language: user.language,
-      display_name: user.displayName,
-      permission_codes: user.permissionCodes,
-      username: user.username,
-      available_usdc: user.availableUsdc,
-      is_active: user.isActive,
-      senior_tester_id: user.seniorTesterId,
-      manager_user_id: user.managerUserId ?? user.seniorTesterId,
-      permission_level: user.permissionLevel ?? "Standard",
-      created_at: user.createdAt,
-      updated_at: user.updatedAt
-    };
+  registerAuthMeRoutes(app, {
+    store,
+    engine,
+    marketPayloads,
+    userPayloads,
+    safeRoute,
+    getUserFromRequest,
+    requirePermission,
+    signToken,
+    createWsTicket,
+    recordLoginAudit,
+    recordUserManagementAudit
   });
-
-  app.post("/api/ws/tickets", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      const parsed = wsTicketSchema.parse(request.body);
-      return createWsTicket(user, parsed.channel);
-    })
-  );
-
-  app.get("/api/me", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      return store.sanitizeUser(user);
-    })
-  );
-
-  app.get("/api/bootstrap/full", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      requirePermission(user, "trade:view");
-      requirePermission(user, "profile:view");
-      return createBootstrapPayload(user);
-    })
-  );
-
-  app.post("/api/me/language", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      const parsed = languageSchema.parse(request.body);
-      await engine.updateLanguage(user, parsed.language as Language);
-      store.emitUserPayload(user.id);
-      return store.sanitizeUser(user);
-    })
-  );
-
-  app.patch("/api/me", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      const serverRecvTs = Date.now();
-      const parsed = selfProfileSchema.parse(request.body);
-      const updated = await store.updateUserProfile(user.id, {
-        displayName: parsed.displayName,
-        language: parsed.language as Language | undefined
-      });
-      await recordUserManagementAudit({
-        actor: user,
-        actionType: "user.update",
-        success: true,
-        serverRecvTs,
-        targetUserId: updated.id,
-        resultMessage: "User profile was updated.",
-        details: {
-          username: updated.username,
-          role: updated.role,
-          selfService: true
-        }
-      });
-      return store.sanitizeUser(updated);
-    })
-  );
-
-  app.post("/api/me/password", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      const serverRecvTs = Date.now();
-      const parsed = changePasswordSchema.parse(request.body);
-      if (parsed.password !== parsed.confirmPassword) {
-        throw new Error("Password confirmation does not match.");
-      }
-      const verifiedUser = store.findUserByCredentials(user.username, parsed.currentPassword);
-      if (verifiedUser?.id !== user.id) {
-        throw new Error("Current password is invalid.");
-      }
-      const updated = await store.resetUserPassword(user.id, parsed.password);
-      await recordUserManagementAudit({
-        actor: user,
-        actionType: "user.changePassword",
-        success: true,
-        serverRecvTs,
-        targetUserId: updated.id,
-        resultMessage: "User password was changed.",
-        details: {
-          username: updated.username,
-          role: updated.role
-        }
-      });
-      return store.sanitizeUser(updated);
-    })
-  );
 
   app.get("/api/users", async (request) =>
     safeRoute(async () => {

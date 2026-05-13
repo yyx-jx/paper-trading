@@ -866,6 +866,28 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(appSource, /memo\(function TradePage/);
 }
 
+async function testBackendRouteLayeringContracts() {
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const authMeRoutesSource = readFileSync("apps/server/src/routes/auth-me.ts", "utf8");
+  const healthRoutesSource = readFileSync("apps/server/src/routes/health.ts", "utf8");
+  const wsRoutesSource = readFileSync("apps/server/src/routes/ws.ts", "utf8");
+
+  assert.match(indexSource, /registerHealthRoutes/);
+  assert.match(indexSource, /registerAuthMeRoutes/);
+  assert.match(indexSource, /registerWsRoutes/);
+  assert.match(healthRoutesSource, /registerHealthRoutes/);
+  assert.match(authMeRoutesSource, /registerAuthMeRoutes/);
+  assert.match(wsRoutesSource, /registerWsRoutes/);
+  assert.match(authMeRoutesSource, /\/api\/auth\/login/);
+  assert.match(authMeRoutesSource, /\/api\/bootstrap\/full/);
+  assert.match(authMeRoutesSource, /createBootstrapPayload/);
+  assert.match(authMeRoutesSource, /createWsTicket/);
+  assert.match(authMeRoutesSource, /recordLoginAudit/);
+  assert.doesNotMatch(indexSource, /app\.post\("\/api\/auth\/login"/);
+  assert.doesNotMatch(indexSource, /app\.get\("\/api\/bootstrap\/full"/);
+  assert.doesNotMatch(indexSource, /createBootstrapPayload\(user/);
+}
+
 async function testOrderFastPathUsesLightUserTradePayloads() {
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
@@ -1165,6 +1187,7 @@ async function main() {
   await testSettlementUsesResolvedQueueAndFiveSecondGammaPolling();
   await testBackendTransportStampingKeepsLatencySeparateFromAge();
   await testRealtimeLatencyPacingContracts();
+  await testBackendRouteLayeringContracts();
   await testOrderFastPathUsesLightUserTradePayloads();
   await testClobWsFirstMarketDataContracts();
   await testClobV2FeeMarketInfoAndLatencyContracts();
