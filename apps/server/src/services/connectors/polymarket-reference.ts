@@ -5,6 +5,7 @@ const HISTORY_TIME_RANGE = "1D";
 const HISTORY_CACHE_MS = 30_000;
 const METADATA_CACHE_MS = 6 * 60 * 60_000;
 const MAX_BOUNDARY_SKEW_MS = 60_000;
+const STREAM_URL_PATTERN = /https?:\/\/data\.chain\.link\/streams\/[^\s<>"')\]]+/i;
 
 interface ChainlinkNextDataPayload {
   query?: {
@@ -61,9 +62,34 @@ export interface PolymarketReferenceResolution {
   source: string;
 }
 
-function normalizeStreamUrl(url?: string) {
-  const trimmed = url?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_STREAM_URL;
+function stripTrailingUrlPunctuation(value: string) {
+  return value.replace(/[.,;:!?]+$/g, "");
+}
+
+export function normalizeStreamUrl(source?: string) {
+  const trimmed = source?.trim();
+  if (!trimmed) {
+    return DEFAULT_STREAM_URL;
+  }
+  const match = trimmed.match(STREAM_URL_PATTERN);
+  const candidate = stripTrailingUrlPunctuation(match?.[0] ?? trimmed);
+  try {
+    const parsed = new URL(candidate);
+    const normalizedPath = parsed.pathname.replace(/\/+$/g, "");
+    if (
+      (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+      parsed.hostname === "data.chain.link" &&
+      parsed.pathname.startsWith("/streams/")
+    ) {
+      if (normalizedPath === "/streams/btc-usd") {
+        return DEFAULT_STREAM_URL;
+      }
+      return parsed.toString();
+    }
+  } catch {
+    // Fall back to the canonical BTC stream when Polymarket sends prose instead of a raw URL.
+  }
+  return DEFAULT_STREAM_URL;
 }
 
 function normalizeChainlinkTimestamp(raw: string) {

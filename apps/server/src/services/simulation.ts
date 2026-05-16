@@ -395,6 +395,7 @@ export class SimulationEngine {
   private polymarketState: PolymarketConnectorState;
   private currentRoundUpPriceSeries: CandlePoint[] = [];
   private currentRoundUpPriceSeriesRoundId?: string;
+  private currentRoundChainlinkOpenReferences = new Map<string, number>();
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
   private reconcileRunning = false;
@@ -1927,6 +1928,57 @@ export class SimulationEngine {
     return this.store.rounds
       .filter((round) => round.startAt <= now && round.endAt > now)
       .sort((left, right) => right.startAt - left.startAt)[0];
+  }
+
+  private resolveCurrentRoundChainlinkOpenReference(round: RoundRecord | undefined, now: number, chainlinkPrice: number) {
+    if (!round || round.startAt > now || now >= round.endAt) {
+      return undefined;
+    }
+    if (isBtcReferencePrice(round.chainlinkOpenPrice)) {
+      const persistedReference = roundNumber(round.chainlinkOpenPrice, 2);
+      this.currentRoundChainlinkOpenReferences.set(round.id, persistedReference);
+      return persistedReference;
+    }
+    const cachedReference = this.currentRoundChainlinkOpenReferences.get(round.id);
+    if (isBtcReferencePrice(cachedReference)) {
+      return cachedReference;
+    }
+    if (!isBtcReferencePrice(chainlinkPrice)) {
+      return undefined;
+    }
+    const liveReference = roundNumber(chainlinkPrice, 2);
+    this.currentRoundChainlinkOpenReferences.set(round.id, liveReference);
+    this.pruneCurrentRoundChainlinkOpenReferences(round.id, now);
+    return liveReference;
+  }
+
+  withCurrentRoundChainlinkOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
+    if (!round) {
+      return round;
+    }
+    const chainlinkPrice =
+      this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
+    const reference = this.resolveCurrentRoundChainlinkOpenReference(round, now, chainlinkPrice);
+    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.chainlinkOpenPrice)) {
+      return round;
+    }
+    return { ...round, chainlinkOpenPrice: reference };
+  }
+
+  private pruneCurrentRoundChainlinkOpenReferences(activeRoundId: string, now: number) {
+    if (this.currentRoundChainlinkOpenReferences.size <= 24) {
+      return;
+    }
+    const recentRoundIds = new Set(
+      this.store.rounds
+        .filter((round) => round.id === activeRoundId || round.endAt >= now - 2 * 60 * 60 * 1000)
+        .map((round) => round.id)
+    );
+    for (const roundId of this.currentRoundChainlinkOpenReferences.keys()) {
+      if (!recentRoundIds.has(roundId)) {
+        this.currentRoundChainlinkOpenReferences.delete(roundId);
+      }
+    }
   }
 
   private canCreateNewOrders(round: RoundRecord | undefined, now = Date.now()) {
@@ -4070,6 +4122,8 @@ export class SimulationEngine {
       round.redeemScheduledAt,
       round.binanceOpenPrice,
       round.binanceClosePrice,
+      round.chainlinkOpenPrice,
+      round.chainlinkClosePrice,
       round.redeemStartTs,
       round.redeemFinishTs,
       round.manualReason,

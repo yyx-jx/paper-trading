@@ -227,7 +227,9 @@ CREATE TABLE IF NOT EXISTS rounds (
   settlement_received_at BIGINT,
   redeem_scheduled_at BIGINT,
   binance_open_price DOUBLE PRECISION,
-  binance_close_price DOUBLE PRECISION
+  binance_close_price DOUBLE PRECISION,
+  chainlink_open_price DOUBLE PRECISION,
+  chainlink_close_price DOUBLE PRECISION
 );
 
 CREATE TABLE IF NOT EXISTS order_book_snapshots (
@@ -524,6 +526,8 @@ ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_received_at BIGINT;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS redeem_scheduled_at BIGINT;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_open_price DOUBLE PRECISION;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_close_price DOUBLE PRECISION;
+ALTER TABLE rounds ADD COLUMN IF NOT EXISTS chainlink_open_price DOUBLE PRECISION;
+ALTER TABLE rounds ADD COLUMN IF NOT EXISTS chainlink_close_price DOUBLE PRECISION;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_source TEXT;
 ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_captured_at BIGINT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_kind TEXT;
@@ -1618,7 +1622,9 @@ export class AppStore {
       settlementPrice: round.settlementPrice,
       settlementTs: round.settlementTs,
       settlementSource: round.settlementSource,
-      manualReason: round.manualReason
+      manualReason: round.manualReason,
+      chainlinkOpenPrice: round.chainlinkOpenPrice,
+      chainlinkClosePrice: round.chainlinkClosePrice
     });
   }
 
@@ -2576,10 +2582,10 @@ export class AppStore {
         polymarket_settlement_status, polymarket_open_price, polymarket_close_price,
         polymarket_open_price_source, polymarket_close_price_source,
         settlement_received_at, redeem_scheduled_at,
-        binance_open_price, binance_close_price
+        binance_open_price, binance_close_price, chainlink_open_price, chainlink_close_price
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-        $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41
+        $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43
       )
       ON CONFLICT (id) DO UPDATE SET
         market_id = EXCLUDED.market_id,
@@ -2621,7 +2627,9 @@ export class AppStore {
         settlement_received_at = EXCLUDED.settlement_received_at,
         redeem_scheduled_at = EXCLUDED.redeem_scheduled_at,
         binance_open_price = EXCLUDED.binance_open_price,
-        binance_close_price = EXCLUDED.binance_close_price
+        binance_close_price = EXCLUDED.binance_close_price,
+        chainlink_open_price = EXCLUDED.chainlink_open_price,
+        chainlink_close_price = EXCLUDED.chainlink_close_price
       `,
       [
         round.id,
@@ -2664,7 +2672,9 @@ export class AppStore {
         round.settlementReceivedAt ?? null,
         round.redeemScheduledAt ?? null,
         round.binanceOpenPrice ?? null,
-        round.binanceClosePrice ?? null
+        round.binanceClosePrice ?? null,
+        round.chainlinkOpenPrice ?? null,
+        round.chainlinkClosePrice ?? null
       ]
     );
   }
@@ -3856,6 +3866,8 @@ export class AppStore {
       redeemScheduledAt: numberOrUndefined(row.redeem_scheduled_at),
       binanceOpenPrice: numberOrUndefined(row.binance_open_price),
       binanceClosePrice: numberOrUndefined(row.binance_close_price),
+      chainlinkOpenPrice: numberOrUndefined(row.chainlink_open_price),
+      chainlinkClosePrice: numberOrUndefined(row.chainlink_close_price),
       redeemStartTs: row.redeem_start_ts ? Number(row.redeem_start_ts) : undefined,
       redeemFinishTs: row.redeem_finish_ts ? Number(row.redeem_finish_ts) : undefined,
       manualReason: row.manual_reason ? String(row.manual_reason) : undefined,

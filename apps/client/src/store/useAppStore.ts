@@ -15,6 +15,7 @@ import type {
   RoundRecord,
   SettlementPreview,
   SourceHealth,
+  TradeSide,
   UserPayload,
   UserTradePayload
 } from "../utils/api";
@@ -125,7 +126,23 @@ function appendRealtimePoint(points: MarketSnapshot["clob"]["currentRoundUpPrice
   return [...points, point].slice(-240);
 }
 
+function mergeBookTop(book: MarketSnapshot["orderBooks"][TradeSide], top: { bestBid: number; bestAsk: number }) {
+  const bestBid = Number.isFinite(top.bestBid) ? top.bestBid : book.bestBid;
+  const bestAsk = Number.isFinite(top.bestAsk) ? top.bestAsk : book.bestAsk;
+  const midPrice = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : book.midPrice;
+  return {
+    ...book,
+    bestBid,
+    bestAsk,
+    midPrice
+  };
+}
+
 function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): MarketSnapshot {
+  const topOrderBooks = {
+    UP: mergeBookTop(snapshot.orderBooks.UP, tick.clob.bestBidAskSummary.UP),
+    DOWN: mergeBookTop(snapshot.orderBooks.DOWN, tick.clob.bestBidAskSummary.DOWN)
+  };
   return {
     ...snapshot,
     marketId: tick.marketId,
@@ -144,7 +161,7 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     displayPriceSpread: tick.displayPriceSpread,
     latencyBreakdown: tick.latencyBreakdown,
     sources: tick.sources,
-    orderBooks: tick.orderBooks,
+    orderBooks: topOrderBooks,
     binance: {
       ...snapshot.binance,
       spotPrice: tick.binance.spotPrice,
@@ -153,14 +170,15 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     chainlink: {
       ...snapshot.chainlink,
       referencePrice: tick.chainlink.referencePrice,
-      settlementReference: tick.chainlink.settlementReference
+      settlementReference: tick.chainlink.settlementReference,
+      currentRoundOpenReference: tick.chainlink.currentRoundOpenReference
     },
     clob: {
       ...snapshot.clob,
       delta: tick.clob.delta,
       volume: tick.clob.volume,
-      upBook: tick.orderBooks.UP,
-      downBook: tick.orderBooks.DOWN,
+      upBook: topOrderBooks.UP,
+      downBook: topOrderBooks.DOWN,
       currentRoundUpPriceSeries: appendRealtimePoint(snapshot.clob.currentRoundUpPriceSeries, tick.clob.currentRoundUpPricePoint),
       bestBidAskSummary: tick.clob.bestBidAskSummary
     },

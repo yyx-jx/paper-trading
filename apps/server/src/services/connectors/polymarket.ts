@@ -2,6 +2,12 @@ import { nanoid } from "nanoid";
 import WebSocket from "ws";
 import type { Agent } from "node:http";
 import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from "./network";
+import {
+  createPolymarketComponent,
+  derivePolymarketSourceHealth,
+  type PolymarketHealthComponent,
+  type PolymarketHealthComponents
+} from "./polymarket-health";
 import type {
   ClobMarketInfo,
   MarketTrade,
@@ -87,21 +93,36 @@ interface DetailedMarketPayload {
 const MARKET_WS_STALE_MS = 2500;
 const MARKET_WS_RECONNECT_MS = 1000;
 
-function emptyStatus(symbol: string): SourceHealth {
-  const now = Date.now();
+function initialHealthComponents(now = Date.now()): PolymarketHealthComponents {
   return {
-    source: "CLOB",
-    symbol,
-    state: "reconnecting",
-    reconnectCount: 0,
-    sourceEventTs: now,
-    serverRecvTs: now,
-    normalizedTs: now,
-    serverPublishTs: now,
-    acquireLatencyMs: 0,
-    publishLatencyMs: 0,
-    frontendLatencyMs: 0,
-    message: "Waiting for Polymarket market discovery."
+    discovery: createPolymarketComponent({
+      name: "discovery",
+      state: "reconnecting",
+      sourceEventTs: now,
+      serverRecvTs: now,
+      message: "Waiting for Polymarket market discovery."
+    }),
+    orderBook: createPolymarketComponent({
+      name: "orderBook",
+      state: "reconnecting",
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: "Waiting for Polymarket order books."
+    }),
+    marketWs: createPolymarketComponent({
+      name: "marketWs",
+      state: "reconnecting",
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: "Waiting for Polymarket market WebSocket."
+    }),
+    trades: createPolymarketComponent({
+      name: "trades",
+      state: "reconnecting",
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: "Waiting for Polymarket recent trades."
+    })
   };
 }
 
@@ -451,6 +472,7 @@ export class PolymarketConnector {
   private subscribedAssetKey = "";
   private reconnectCount = 0;
   private lastMarketWsMessageAt = 0;
+  private healthComponents: PolymarketHealthComponents;
   private readonly listeners = new Set<(state: PolymarketConnectorState) => void>();
   private state: PolymarketConnectorState;
   private readonly proxyDispatcher;
@@ -476,6 +498,7 @@ export class PolymarketConnector {
   ) {
     this.proxyDispatcher = createProxyDispatcher(config.upstreamProxyUrl);
     this.proxyWsAgent = createProxyWsAgent(config.upstreamProxyUrl);
+    this.healthComponents = initialHealthComponents();
     this.state = {
       nextMarket: undefined,
       discoveredRounds: [],
@@ -487,7 +510,7 @@ export class PolymarketConnector {
       delta: 0,
       volume: 0,
       resolvedMarkets: [],
-      status: emptyStatus(config.symbol)
+      status: this.deriveStatus()
     };
   }
 
@@ -543,6 +566,69 @@ export class PolymarketConnector {
     return this.state;
   }
 
+  private orderBookFreshMs() {
+    return Math.max(this.config.bookPollMs * 3, 5_000);
+  }
+
+  private deriveStatus(now = Date.now()) {
+    return derivePolymarketSourceHealth({
+      symbol: this.config.symbol,
+      reconnectCount: this.reconnectCount,
+      now,
+      orderBookFreshMs: this.orderBookFreshMs(),
+      components: this.healthComponents
+    });
+  }
+
+  private updateHealthComponent(
+    name: PolymarketHealthComponent,
+    state: SourceHealth["state"],
+    input: { sourceEventTs?: number; serverRecvTs?: number; message?: string } = {}
+  ) {
+    const now = input.serverRecvTs ?? Date.now();
+    const previous = this.healthComponents[name];
+    this.healthComponents = {
+      ...this.healthComponents,
+      [name]: createPolymarketComponent({
+        name,
+        state,
+        sourceEventTs: input.sourceEventTs ?? previous?.sourceEventTs ?? now,
+        serverRecvTs: now,
+        message: input.message
+      })
+    };
+  }
+
+  private refreshStatus(now = Date.now()) {
+    this.state = {
+      ...this.state,
+      status: this.deriveStatus(now)
+    };
+  }
+
+  private resetMarketScopedHealth(message: string, now = Date.now()) {
+    this.updateHealthComponent("orderBook", "reconnecting", {
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: `Waiting for ${message} order books.`
+    });
+    this.updateHealthComponent("marketWs", "reconnecting", {
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: `Waiting for ${message} market WebSocket.`
+    });
+    this.updateHealthComponent("trades", "reconnecting", {
+      sourceEventTs: 0,
+      serverRecvTs: now,
+      message: `Waiting for ${message} recent trades.`
+    });
+  }
+
+  private componentFailureState(name: PolymarketHealthComponent) {
+    const previous = this.healthComponents[name];
+    return previous && previous.sourceEventTs > 0 && previous.state !== "reconnecting" ? "degraded" : "reconnecting";
+  }
+
   async fetchMarketBySlug(slug: string) {
     const url = `${this.config.gammaBaseUrl}/markets?slug=${encodeURIComponent(slug)}`;
     const payload = await this.fetchJson<DetailedMarketPayload[]>(url);
@@ -593,6 +679,14 @@ export class PolymarketConnector {
     const detail = await this.withMarketInfo(rawDetail);
     const switched = this.state.currentMarket?.slug !== detail.slug;
     const now = Date.now();
+    if (switched) {
+      this.resetMarketScopedHealth(detail.slug, now);
+    }
+    this.updateHealthComponent("discovery", "healthy", {
+      sourceEventTs: detail.startAt || now,
+      serverRecvTs: now,
+      message: `Tracking ${detail.slug}.`
+    });
 
     this.state = {
       ...this.state,
@@ -607,18 +701,7 @@ export class PolymarketConnector {
       recentTrades: switched ? [] : this.state.recentTrades,
       delta: switched ? 0 : this.state.delta,
       volume: switched ? 0 : this.state.volume,
-      status: {
-        ...this.state.status,
-        state: "healthy",
-        reconnectCount: this.reconnectCount,
-        sourceEventTs: detail.startAt || now,
-        serverRecvTs: now,
-        normalizedTs: now,
-        serverPublishTs: now,
-        acquireLatencyMs: 0,
-        publishLatencyMs: 0,
-        message: `Tracking ${detail.slug}.`
-      }
+      status: this.deriveStatus(now)
     };
     this.emit();
     this.ensureMarketWs(detail);
@@ -721,26 +804,24 @@ export class PolymarketConnector {
       const nextMarket = trackedMarkets.nextMarket;
       const discoveredRounds = eligibleMarkets.map((detail) => this.toRound(detail));
       const now = Date.now();
+      const switched = Boolean(currentMarket?.slug && this.state.currentMarket?.slug !== currentMarket.slug);
+      if (switched && currentMarket) {
+        this.resetMarketScopedHealth(currentMarket.slug, now);
+      }
+      this.updateHealthComponent("discovery", currentMarket ? "healthy" : "degraded", {
+        sourceEventTs: currentMarket?.startAt ?? now,
+        serverRecvTs: now,
+        message: currentMarket
+          ? `Tracking ${currentMarket.slug}.`
+          : "No active Polymarket BTC 5m market was discovered."
+      });
 
       this.state = {
         ...this.state,
         currentMarket,
         nextMarket,
         discoveredRounds,
-        status: {
-          ...this.state.status,
-          state: currentMarket ? "healthy" : "degraded",
-          reconnectCount: this.reconnectCount,
-          sourceEventTs: currentMarket?.startAt ?? now,
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          acquireLatencyMs: 0,
-          publishLatencyMs: 0,
-          message: currentMarket
-            ? `Tracking ${currentMarket.slug}.`
-            : "No active Polymarket BTC 5m market was discovered."
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       this.ensureMarketWs(currentMarket);
@@ -748,14 +829,13 @@ export class PolymarketConnector {
       await this.refreshTrades(currentMarket);
     } catch (error) {
       this.reconnectCount += 1;
+      this.updateHealthComponent("discovery", this.componentFailureState("discovery"), {
+        serverRecvTs: Date.now(),
+        message: error instanceof Error ? error.message : "Polymarket discovery failed."
+      });
       this.state = {
         ...this.state,
-        status: {
-          ...this.state.status,
-          state: "degraded",
-          reconnectCount: this.reconnectCount,
-          message: error instanceof Error ? error.message : "Polymarket discovery failed."
-        }
+        status: this.deriveStatus()
       };
       this.emit();
     }
@@ -896,6 +976,16 @@ export class PolymarketConnector {
       const downBook = downBookPayload.snapshotTs >= existingDownBook.snapshotTs ? downBookPayload : existingDownBook;
       const sourceEventTs = Math.max(upBook.snapshotTs, downBook.snapshotTs);
       const now = Date.now();
+      this.updateHealthComponent("discovery", "healthy", {
+        sourceEventTs: marketDetail.startAt || now,
+        serverRecvTs: now,
+        message: `Tracking ${marketDetail.slug}.`
+      });
+      this.updateHealthComponent("orderBook", "healthy", {
+        sourceEventTs,
+        serverRecvTs: now,
+        message: `Reading order books for ${marketDetail.slug}.`
+      });
 
       this.state = {
         ...this.state,
@@ -904,20 +994,7 @@ export class PolymarketConnector {
           UP: upBook,
           DOWN: downBook
         },
-        status: {
-          source: "CLOB",
-          symbol: this.config.symbol,
-          state: "healthy",
-          reconnectCount: this.reconnectCount,
-          sourceEventTs,
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          acquireLatencyMs: Math.max(now - sourceEventTs, 0),
-          publishLatencyMs: 0,
-          frontendLatencyMs: 0,
-          message: `Reading order books for ${marketDetail.slug}.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       this.ensureMarketWs(marketDetail);
@@ -926,14 +1003,13 @@ export class PolymarketConnector {
         return;
       }
       this.reconnectCount += 1;
+      this.updateHealthComponent("orderBook", this.componentFailureState("orderBook"), {
+        serverRecvTs: Date.now(),
+        message: error instanceof Error ? error.message : "Failed to refresh Polymarket order books."
+      });
       this.state = {
         ...this.state,
-        status: {
-          ...this.state.status,
-          state: this.state.orderBooks.UP.snapshotTs > 0 ? "degraded" : "reconnecting",
-          reconnectCount: this.reconnectCount,
-          message: error instanceof Error ? error.message : "Failed to refresh Polymarket order books."
-        }
+        status: this.deriveStatus()
       };
       this.emit();
     }
@@ -972,25 +1048,32 @@ export class PolymarketConnector {
 
       const volume = recentTrades.reduce((sum, trade) => sum + trade.qty, 0);
       const delta = recentTrades.reduce((sum, trade) => sum + (trade.side === "UP" ? trade.qty : -trade.qty), 0);
+      const now = Date.now();
+      this.updateHealthComponent("trades", "healthy", {
+        sourceEventTs: recentTrades[0]?.ts ?? now,
+        serverRecvTs: now,
+        message: `Recent trades refreshed for ${targetSlug}.`
+      });
 
       this.state = {
         ...this.state,
         recentTrades,
         delta,
-        volume
+        volume,
+        status: this.deriveStatus(now)
       };
       this.emit();
     } catch (error) {
       if (this.state.currentMarket?.slug !== targetMarket.slug) {
         return;
       }
+      this.updateHealthComponent("trades", this.componentFailureState("trades"), {
+        serverRecvTs: Date.now(),
+        message: error instanceof Error ? error.message : "Failed to refresh Polymarket trades."
+      });
       this.state = {
         ...this.state,
-        status: {
-          ...this.state.status,
-          state: "degraded",
-          message: error instanceof Error ? error.message : "Failed to refresh Polymarket trades."
-        }
+        status: this.deriveStatus()
       };
       this.emit();
     }
@@ -1023,6 +1106,14 @@ export class PolymarketConnector {
       if (this.marketWs !== socket) {
         return;
       }
+      const now = Date.now();
+      this.updateHealthComponent("marketWs", "reconnecting", {
+        sourceEventTs: now,
+        serverRecvTs: now,
+        message: `Connected to Polymarket market WebSocket for ${market.slug}; waiting for messages.`
+      });
+      this.refreshStatus(now);
+      this.emit();
       socket.send(
         JSON.stringify({
           assets_ids: assets,
@@ -1043,13 +1134,13 @@ export class PolymarketConnector {
           this.handleMarketWsMessage(message as Record<string, unknown>, market);
         }
       } catch (error) {
+        this.updateHealthComponent("marketWs", "degraded", {
+          serverRecvTs: Date.now(),
+          message: error instanceof Error ? error.message : "Failed to parse Polymarket market WebSocket message."
+        });
         this.state = {
           ...this.state,
-          status: {
-            ...this.state.status,
-            state: "degraded",
-            message: error instanceof Error ? error.message : "Failed to parse Polymarket market WebSocket message."
-          }
+          status: this.deriveStatus()
         };
         this.emit();
       }
@@ -1059,14 +1150,13 @@ export class PolymarketConnector {
         return;
       }
       this.reconnectCount += 1;
+      this.updateHealthComponent("marketWs", this.componentFailureState("marketWs"), {
+        serverRecvTs: Date.now(),
+        message: error.message || "Polymarket market WebSocket error."
+      });
       this.state = {
         ...this.state,
-        status: {
-          ...this.state.status,
-          state: "degraded",
-          reconnectCount: this.reconnectCount,
-          message: error.message
-        }
+        status: this.deriveStatus()
       };
       this.emit();
     });
@@ -1092,17 +1182,14 @@ export class PolymarketConnector {
     }
     if (socket.readyState === WebSocket.OPEN && ageMs > MARKET_WS_STALE_MS) {
       this.reconnectCount += 1;
+      const now = Date.now();
+      this.updateHealthComponent("marketWs", this.componentFailureState("marketWs"), {
+        serverRecvTs: now,
+        message: `Polymarket market WebSocket stale for ${Math.round(ageMs)}ms; reconnecting.`
+      });
       this.state = {
         ...this.state,
-        status: {
-          ...this.state.status,
-          state: this.state.orderBooks.UP.snapshotTs > 0 || this.state.orderBooks.DOWN.snapshotTs > 0 ? "degraded" : "reconnecting",
-          reconnectCount: this.reconnectCount,
-          serverRecvTs: Date.now(),
-          normalizedTs: Date.now(),
-          serverPublishTs: Date.now(),
-          message: `Polymarket market WebSocket stale for ${Math.round(ageMs)}ms; reconnecting.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       socket.terminate();
@@ -1122,17 +1209,14 @@ export class PolymarketConnector {
         this.ensureMarketWs(market);
       }
     }, MARKET_WS_RECONNECT_MS);
+    const now = Date.now();
+    this.updateHealthComponent("marketWs", this.componentFailureState("marketWs"), {
+      serverRecvTs: now,
+      message
+    });
     this.state = {
       ...this.state,
-      status: {
-        ...this.state.status,
-        state: this.state.orderBooks.UP.snapshotTs > 0 || this.state.orderBooks.DOWN.snapshotTs > 0 ? "degraded" : "reconnecting",
-        reconnectCount: this.reconnectCount,
-        serverRecvTs: Date.now(),
-        normalizedTs: Date.now(),
-        serverPublishTs: Date.now(),
-        message
-      }
+      status: this.deriveStatus(now)
     };
     this.emit();
   }
@@ -1168,26 +1252,23 @@ export class PolymarketConnector {
         return;
       }
       const nextBook = this.bookFromWsMessage(message, side);
+      this.updateHealthComponent("marketWs", "healthy", {
+        sourceEventTs: nextBook.snapshotTs,
+        serverRecvTs: now,
+        message: `Streaming order book for ${market.slug}.`
+      });
+      this.updateHealthComponent("orderBook", "healthy", {
+        sourceEventTs: nextBook.snapshotTs,
+        serverRecvTs: now,
+        message: `Streaming order book for ${market.slug}.`
+      });
       this.state = {
         ...this.state,
         orderBooks: {
           ...this.state.orderBooks,
           [side]: nextBook
         },
-        status: {
-          source: "CLOB",
-          symbol: this.config.symbol,
-          state: "healthy",
-          reconnectCount: this.reconnectCount,
-          sourceEventTs: nextBook.snapshotTs,
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          acquireLatencyMs: Math.max(now - nextBook.snapshotTs, 0),
-          publishLatencyMs: 0,
-          frontendLatencyMs: 0,
-          message: `Streaming order book for ${market.slug}.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       return;
@@ -1213,26 +1294,23 @@ export class PolymarketConnector {
       if (!nextBook) {
         return;
       }
+      this.updateHealthComponent("marketWs", "healthy", {
+        sourceEventTs: snapshotTs,
+        serverRecvTs: now,
+        message: `Streaming best bid/ask for ${market.slug}.`
+      });
+      this.updateHealthComponent("orderBook", "healthy", {
+        sourceEventTs: snapshotTs,
+        serverRecvTs: now,
+        message: `Streaming best bid/ask for ${market.slug}.`
+      });
       this.state = {
         ...this.state,
         orderBooks: {
           ...this.state.orderBooks,
           [side]: nextBook
         },
-        status: {
-          source: "CLOB",
-          symbol: this.config.symbol,
-          state: "healthy",
-          reconnectCount: this.reconnectCount,
-          sourceEventTs: snapshotTs,
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          acquireLatencyMs: Math.max(now - snapshotTs, 0),
-          publishLatencyMs: 0,
-          frontendLatencyMs: 0,
-          message: `Streaming best bid/ask for ${market.slug}.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       return;
@@ -1287,23 +1365,20 @@ export class PolymarketConnector {
       if (!applied) {
         return;
       }
+      this.updateHealthComponent("marketWs", "healthy", {
+        sourceEventTs: latestTs || now,
+        serverRecvTs: now,
+        message: `Streaming price changes for ${market.slug}.`
+      });
+      this.updateHealthComponent("orderBook", "healthy", {
+        sourceEventTs: latestTs || now,
+        serverRecvTs: now,
+        message: `Streaming price changes for ${market.slug}.`
+      });
       this.state = {
         ...this.state,
         orderBooks: nextOrderBooks,
-        status: {
-          source: "CLOB",
-          symbol: this.config.symbol,
-          state: "healthy",
-          reconnectCount: this.reconnectCount,
-          sourceEventTs: latestTs || now,
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          acquireLatencyMs: latestTs ? Math.max(now - latestTs, 0) : 0,
-          publishLatencyMs: 0,
-          frontendLatencyMs: 0,
-          message: `Streaming price changes for ${market.slug}.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
       return;
@@ -1321,11 +1396,22 @@ export class PolymarketConnector {
         qty: Number(message.size ?? 0),
         ts: Number(message.timestamp ?? now)
       };
+      this.updateHealthComponent("marketWs", "healthy", {
+        sourceEventTs: trade.ts,
+        serverRecvTs: now,
+        message: `Streaming trade prices for ${market.slug}.`
+      });
+      this.updateHealthComponent("trades", "healthy", {
+        sourceEventTs: trade.ts,
+        serverRecvTs: now,
+        message: `Streaming trade prices for ${market.slug}.`
+      });
       this.state = {
         ...this.state,
         recentTrades: [trade, ...this.state.recentTrades].slice(0, 20),
         volume: Number((this.state.volume + trade.qty).toFixed(4)),
-        delta: Number((this.state.delta + (trade.side === "UP" ? trade.qty : -trade.qty)).toFixed(4))
+        delta: Number((this.state.delta + (trade.side === "UP" ? trade.qty : -trade.qty)).toFixed(4)),
+        status: this.deriveStatus(now)
       };
       this.emit();
       return;
@@ -1356,19 +1442,17 @@ export class PolymarketConnector {
         settlementPrice,
         receivedAt: now
       };
+      this.updateHealthComponent("marketWs", "healthy", {
+        sourceEventTs: now,
+        serverRecvTs: now,
+        message: `Polymarket resolved ${market.slug} as ${winningOutcome || settledSide || "unknown"}.`
+      });
       this.state = {
         ...this.state,
         currentMarket: this.state.currentMarket?.slug === market.slug ? resolvedMarket : this.state.currentMarket,
         lastResolvedMarket: resolvedEvent,
         resolvedMarkets: [...(this.state.resolvedMarkets ?? []), resolvedEvent].slice(-20),
-        status: {
-          ...this.state.status,
-          state: "healthy",
-          serverRecvTs: now,
-          normalizedTs: now,
-          serverPublishTs: now,
-          message: `Polymarket resolved ${market.slug} as ${winningOutcome || settledSide || "unknown"}.`
-        }
+        status: this.deriveStatus(now)
       };
       this.emit();
     }

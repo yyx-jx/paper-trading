@@ -987,6 +987,11 @@ function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: 
   return settlementPreview ? { ...round, settlementPreview } : round;
 }
 
+function decorateCurrentRoundForTransport(round: RoundRecord | undefined) {
+  const displayRound = engine.withCurrentRoundChainlinkOpenReference(round);
+  return displayRound ? decorateRoundWithSettlementPreview(displayRound) : undefined;
+}
+
 function getCachedHistory(limit: number, userId?: string) {
   const revision = store.getHistoryRevision();
   const cacheKey = `${userId ?? "__public__"}:${limit}`;
@@ -1021,7 +1026,7 @@ function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
     (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
     engine.getLatestSettlementPreview(history);
   return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
+    currentRound: decorateCurrentRoundForTransport(currentRound),
     snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
     settlementPreview,
     transportMeta
@@ -1061,7 +1066,6 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
     displayPriceSpread: stamped.displayPriceSpread,
     latencyBreakdown: stamped.latencyBreakdown,
     sources: stamped.sources,
-    orderBooks: stamped.orderBooks,
     binance: {
       spotPrice: stamped.binance.spotPrice,
       latestTick: stamped.binance.latestTick
@@ -1096,7 +1100,7 @@ function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): Mar
   const currentRound = store.getCurrentRound();
   const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
   return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
+    currentRound: decorateCurrentRoundForTransport(currentRound),
     tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
     settlementPreview,
     transportMeta
@@ -2785,13 +2789,13 @@ async function bootstrap() {
         if (!isSocketOpen()) {
           return;
         }
-        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
-          if (sendFull()) {
+        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
+          if (sendTick()) {
             return;
           }
         }
-        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
-          sendTick();
+        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
+          sendFull();
         }
       };
 

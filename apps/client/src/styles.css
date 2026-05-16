@@ -1562,11 +1562,12 @@ button:disabled:hover {
 .terminal-top-right { margin-left:auto; display:flex; align-items:center; gap:5px; }
 .terminal-top-right span { padding:1px 7px; border:1px solid #e8a02025; border-radius:3px; background:#1a1000; color:var(--A); font-size:12px; font-weight:600; text-decoration:none; }
 .terminal-green { color:var(--G)!important; } .terminal-red { color:var(--R)!important; }
+.terminal-neutral { color:var(--t1)!important; }
 .terminal-yellow { color:var(--A)!important; }
 .terminal-top-right .terminal-user-badge { display:inline-flex; gap:5px; align-items:center; max-width:196px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .terminal-user-badge em { font-style:normal; color:var(--t1); font-size:11px; font-weight:500; }
 .terminal-top-right select, .terminal-top-right button { height:23px; border:1px solid var(--bd); border-radius:3px; background:var(--b2); color:var(--t1); font-size:11px; padding:1px 7px; }
-.terminal-monitor { height:86px; flex-shrink:0; display:grid; grid-template-columns:minmax(176px, 0.56fr) minmax(154px, 0.44fr) minmax(202px, 0.62fr) minmax(214px, 0.7fr) 340px; border-bottom:1px solid var(--bd); background:var(--b1); }
+.terminal-monitor { height:86px; flex-shrink:0; display:grid; grid-template-columns:minmax(176px, 0.54fr) minmax(202px, 0.62fr) minmax(214px, 0.68fr) minmax(220px, 0.7fr) 340px; border-bottom:1px solid var(--bd); background:var(--b1); }
 .monitor-cell, .monitor-timer { position:relative; padding:5px 10px 4px; border-right:1px solid var(--bd); overflow:hidden; }
 .monitor-cell::after, .monitor-timer::after { content:""; position:absolute; left:0; right:0; bottom:0; height:2px; background:var(--bd2); }
 .monitor-cell.hot::after, .monitor-timer::after { background:var(--G); }
@@ -1574,15 +1575,19 @@ button:disabled:hover {
 .monitor-cell small b { color:var(--A); }
 .monitor-cell strong { display:block; margin-top:2px; color:var(--G); font-size:21px; line-height:0.96; font-weight:500; font-variant-numeric:tabular-nums; }
 .monitor-cell strong { display:flex; align-items:center; gap:5px; }
-.monitor-cell.monitor-analytics strong, .monitor-cell.monitor-spread strong { font-size:18px; }
+.monitor-cell.monitor-analytics strong { font-size:18px; }
 .monitor-cell.compact strong { font-size:20px; color:var(--A); }
 .monitor-cell.monitor-balance small { display:flex; align-items:center; justify-content:space-between; gap:6px; }
 .monitor-cell.monitor-balance strong { display:grid; grid-template-columns:1fr 1fr; align-items:end; gap:14px; width:100%; }
 .monitor-cell.monitor-balance strong span { min-width:0; display:grid; gap:2px; margin:0; color:var(--A); font-size:21px; line-height:1; font-weight:800; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .monitor-cell.monitor-balance strong span:last-child { color:var(--G); text-align:right; }
 .monitor-cell.monitor-balance strong i { display:block; color:var(--t1); font-style:normal; font-size:10px; line-height:1; font-weight:700; text-transform:uppercase; }
+.monitor-cell.monitor-reference-spreads strong { display:grid; grid-template-columns:1fr; gap:2px; margin-top:3px; color:var(--t0); font-size:13px; line-height:1.02; }
+.monitor-cell.monitor-reference-spreads strong span { min-width:0; display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:8px; margin:0; color:var(--t1); font-size:12px; line-height:1.05; white-space:nowrap; }
+.monitor-cell.monitor-reference-spreads strong i { min-width:0; overflow:hidden; text-overflow:ellipsis; color:var(--t1); font-style:normal; font-size:10px; font-weight:800; letter-spacing:.2px; }
+.monitor-cell.monitor-reference-spreads strong b { font-size:15px; font-weight:900; font-variant-numeric:tabular-nums; }
 .monitor-cell span, .monitor-timer span { display:block; margin-top:2px; color:var(--t1); font-size:11px; line-height:1.1; }
-.monitor-cell.monitor-analytics span, .monitor-cell.monitor-spread span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.monitor-cell.monitor-analytics span, .monitor-cell.monitor-reference-spreads>span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .monitor-cell.compact span, .monitor-timer.monitor-round-state span { display:-webkit-box; overflow:hidden; white-space:normal; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 .monitor-timer { display:flex; flex-direction:column; align-items:flex-end; justify-content:center; text-align:right; padding:6px 18px 5px; }
 .monitor-timer small { width:100%; white-space:nowrap; text-align:right; }
@@ -1753,12 +1758,13 @@ button:disabled:hover {
   .terminal-page { font-size: 15px; }
   .terminal-top { height: 34px; padding: 0 14px; }
   .terminal-top-right span { padding: 2px 9px; font-size: 13px; }
-  .terminal-monitor { height: 102px; grid-template-columns:minmax(204px, 0.56fr) minmax(182px, 0.44fr) minmax(240px, 0.62fr) minmax(252px, 0.7fr) 418px; }
+  .terminal-monitor { height: 102px; grid-template-columns:minmax(204px, 0.54fr) minmax(240px, 0.62fr) minmax(252px, 0.68fr) minmax(272px, 0.7fr) 418px; }
   .monitor-cell, .monitor-timer { padding: 7px 14px 6px; }
   .monitor-cell small, .monitor-timer small { font-size: 12px; }
   .monitor-cell strong { font-size: 26px; }
-  .monitor-cell.monitor-analytics strong, .monitor-cell.monitor-spread strong { font-size: 22px; }
+  .monitor-cell.monitor-analytics strong { font-size: 22px; }
   .monitor-cell.compact strong { font-size: 24px; }
+  .monitor-cell.monitor-reference-spreads strong b { font-size: 18px; }
   .monitor-cell span, .monitor-timer span { font-size: 12px; }
   .monitor-timer strong { font-size: 76px; }
   .terminal-body { grid-template-columns:448px minmax(0, 0.8fr) 472px; }

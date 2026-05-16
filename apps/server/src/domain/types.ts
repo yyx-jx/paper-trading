@@ -123,6 +123,16 @@ export interface SourceHealth {
   publishLatencyMs: number;
   frontendLatencyMs: number;
   message?: string;
+  components?: Record<string, SourceComponentHealth>;
+}
+
+export interface SourceComponentHealth {
+  name: string;
+  label?: string;
+  state: ConnectionState;
+  sourceEventTs: number;
+  serverRecvTs: number;
+  message?: string;
 }
 
 export interface MarketTransportMeta {
@@ -308,6 +318,7 @@ export interface MarketSnapshot {
   chainlink: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     candles5s: CandleBar[];
     candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
@@ -466,6 +477,8 @@ export interface RoundRecord {
   redeemScheduledAt?: number;
   binanceOpenPrice?: number;
   binanceClosePrice?: number;
+  chainlinkOpenPrice?: number;
+  chainlinkClosePrice?: number;
   redeemStartTs?: number;
   redeemFinishTs?: number;
   manualReason?: string;
@@ -847,7 +860,6 @@ export interface MarketRealtimeTick {
   displayPriceSpread: Record<TradeSide, number>;
   latencyBreakdown: LatencyBreakdown;
   sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
-  orderBooks: Record<TradeSide, OrderBookSnapshot>;
   binance: {
     spotPrice: number;
     latestTick?: CandlePoint;
@@ -855,6 +867,7 @@ export interface MarketRealtimeTick {
   chainlink: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     latestTick?: CandlePoint;
   };
   clob: {

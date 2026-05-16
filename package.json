@@ -1,6 +1,6 @@
 {
   "name": "btc-paper-trading-cs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
@@ -38,6 +38,8 @@
     "test:electron-config": "tsx scripts/electron-config-check.ts",
     "test:production-client-load": "tsx scripts/production-client-load-test.ts",
     "test:market-ws-latency": "tsx scripts/market-ws-latency-sample.ts",
+    "test:market-tick-payload": "tsx scripts/market-tick-payload-check.ts",
+    "test:polymarket-health": "tsx scripts/polymarket-health-check.ts",
     "test:logs": "tsx scripts/log-search-check.ts",
     "test:bulk-users": "tsx scripts/bulk-user-check.ts",
     "test:csv-bulk-users": "tsx scripts/csv-bulk-user-check.ts",

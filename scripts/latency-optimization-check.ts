@@ -228,8 +228,9 @@ function connectorFixture() {
   const connector = Object.create(PolymarketConnector.prototype) as any;
   let emits = 0;
   Object.assign(connector, {
-    config: { symbol: "BTC" },
+    config: { symbol: "BTC", bookPollMs: 1000 },
     reconnectCount: 0,
+    healthComponents: {},
     state: {
       currentMarket: market,
       orderBooks: {
@@ -280,7 +281,8 @@ async function testClobMarketWsBestBidAskUpdatesTopOnly() {
   assert.equal(connector.state.orderBooks.UP.bestAsk, 0.51);
   assert.equal(connector.state.orderBooks.UP.bids[0].price, 0.49);
   assert.equal(connector.state.orderBooks.UP.asks[0].price, 0.52);
-  assert.match(connector.state.status.message, /best bid\/ask/);
+  assert.equal(connector.state.status.state, "healthy");
+  assert.match(connector.state.status.components.marketWs.message, /best bid\/ask/);
   assert.equal(emits(), 1);
 
   connector.handleMarketWsMessage(
@@ -320,7 +322,7 @@ async function testClobMarketWsPriceChangeMaintainsDepth() {
   assert.equal(connector.state.orderBooks.UP.asks[0].price, 0.53);
   assert.equal(connector.state.orderBooks.UP.bestAsk, 0.53);
   assert.equal(connector.state.orderBooks.UP.bids.some((level: { price: number }) => level.price === 0.99), false);
-  assert.match(connector.state.status.message, /price changes/);
+  assert.match(connector.state.status.components.marketWs.message, /price changes/);
 }
 
 async function testClobMarketWsBookStillCalibratesDepth() {

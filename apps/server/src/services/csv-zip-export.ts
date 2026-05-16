@@ -418,6 +418,8 @@ export function operatedRoundsCsv(user: ExportUser, rounds: Array<RoundRecord & 
     { header: "settlement_source", value: (row) => row.settlementSource },
     { header: "binance_open_price", value: (row) => row.binanceOpenPrice },
     { header: "binance_close_price", value: (row) => row.binanceClosePrice },
+    { header: "chainlink_open_price", value: (row) => row.chainlinkOpenPrice },
+    { header: "chainlink_close_price", value: (row) => row.chainlinkClosePrice },
     { header: "polymarket_open_price", value: (row) => row.polymarketOpenPrice },
     { header: "polymarket_close_price", value: (row) => row.polymarketClosePrice },
     { header: "accepting_orders", value: (row) => row.acceptingOrders },

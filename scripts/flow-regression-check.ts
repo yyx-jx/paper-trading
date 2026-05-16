@@ -43,6 +43,8 @@ type RoundStub = {
   polymarketClosePrice?: number;
   binanceOpenPrice?: number;
   binanceClosePrice?: number;
+  chainlinkOpenPrice?: number;
+  chainlinkClosePrice?: number;
 };
 
 function createStoreStub() {
@@ -69,7 +71,10 @@ function createStoreStub() {
 }
 
 function createEngineStub() {
-  return Object.create((globalThis as { __SimulationEngine: { prototype: object } }).__SimulationEngine.prototype) as Record<string, unknown>;
+  const engine = Object.create((globalThis as { __SimulationEngine: { prototype: object } }).__SimulationEngine.prototype) as Record<string, unknown>;
+  engine.config = { chainlinkEnabled: false };
+  engine.chainlinkState = { price: 0 };
+  return engine;
 }
 
 async function testPendingSettlementProfileIsolation() {
@@ -145,7 +150,9 @@ async function testHistoryKeepsMarketOpenCloseFields() {
     polymarketOpenPrice: 77510.25,
     polymarketClosePrice: 77630.75,
     binanceOpenPrice: 77500.25,
-    binanceClosePrice: 77620.75
+    binanceClosePrice: 77620.75,
+    chainlinkOpenPrice: 77495.5,
+    chainlinkClosePrice: 77615.5
   });
 
   const history = store.getHistory(10, "u1") as Array<RoundStub & { userPnl: number }>;
@@ -153,6 +160,8 @@ async function testHistoryKeepsMarketOpenCloseFields() {
   assert.equal(history[0]?.polymarketClosePrice, 77630.75);
   assert.equal(history[0]?.binanceOpenPrice, 77500.25);
   assert.equal(history[0]?.binanceClosePrice, 77620.75);
+  assert.equal(history[0]?.chainlinkOpenPrice, 77495.5);
+  assert.equal(history[0]?.chainlinkClosePrice, 77615.5);
   assert.equal(history[0]?.userPnl, 0);
 }
 
@@ -766,10 +775,12 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(simulationSource, /UP: \{ value: 0, source: "outcome_price", spread: 0 \}/);
   assert.match(simulationSource, /DOWN: \{ value: 0\.01, source: "outcome_price", spread: 0 \}/);
   assert.match(simulationSource, /const upPrice = isPositivePrice\(upBook\.bestAsk\) \? upBook\.bestAsk : 0/);
-  assert.match(appSource, /Binance 对比 CL/);
-  assert.match(appSource, /Binance vs CL/);
-  assert.doesNotMatch(appSource, /CL 对比 PTB/);
-  assert.doesNotMatch(appSource, /CL vs PTB/);
+  assert.match(appSource, /BINANCE VS PTB/);
+  assert.match(appSource, /ChainLink VS PTB/);
+  assert.match(appSource, /spreadToneClass\(binancePtbSpread\)/);
+  assert.match(appSource, /spreadToneClass\(chainlinkPtbSpread\)/);
+  assert.doesNotMatch(appSource, /Binance 对比 CL/);
+  assert.doesNotMatch(appSource, /Binance vs CL/);
   assert.match(appSource, /function parseLimitPriceCentsInput\(value: string\)/);
   assert.match(appSource, /\^\\d\+\$/);
   assert.match(appSource, /parsed < 1 \|\| parsed > 99/);
@@ -958,6 +969,8 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const referenceSource = readFileSync("apps/server/src/services/connectors/polymarket-reference.ts", "utf8");
   const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   assert.doesNotMatch(simulationSource, /getRoundUpMarketPrice/);
   assert.doesNotMatch(simulationSource, /getRoundPolymarketBtcReference/);
   assert.doesNotMatch(simulationSource, /captureReferencePrice/);
@@ -966,6 +979,12 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(simulationSource, /const officialPriceToBeat = roundNumber\(round\.polymarketOpenPrice, 2\)/);
   assert.match(simulationSource, /round\.priceToBeat = officialPriceToBeat/);
   assert.match(simulationSource, /round\.priceToBeatSource = round\.polymarketOpenPriceSource \?\? "Gamma"/);
+  assert.match(simulationSource, /currentRoundChainlinkOpenReferences/);
+  assert.match(simulationSource, /resolveCurrentRoundChainlinkOpenReference/);
+  assert.match(simulationSource, /withCurrentRoundChainlinkOpenReference/);
+  assert.match(simulationSource, /return \{ \.\.\.round, chainlinkOpenPrice: reference \}/);
+  assert.doesNotMatch(simulationSource, /syncRoundChainlinkReferencePrices/);
+  assert.doesNotMatch(simulationSource, /currentRoundOpenReference/);
   assert.match(simulationSource, /PolymarketReferenceResolver/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.startAt/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.endAt/);
@@ -980,6 +999,10 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(appSource, /PTB \(Binance open\)/);
   assert.match(appSource, /`PTB: \$\{btcMoneyOrDash\(round\.priceToBeat\)\}`/);
   assert.doesNotMatch(appSource, /PTB \$\{money\(snapshot\?\.priceToBeat \?\? 0\)\}/);
+  assert.match(indexSource, /decorateCurrentRoundForTransport/);
+  assert.match(indexSource, /engine\.withCurrentRoundChainlinkOpenReference\(round\)/);
+  assert.match(indexSource, /currentRound: decorateCurrentRoundForTransport\(currentRound\)/);
+  assert.doesNotMatch(indexSource, /currentRoundOpenReference: stamped\.chainlink\.currentRoundOpenReference/);
 
   const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
   assert.match(connectorSource, /function normalizeMarketOutcomes\(payload: DetailedMarketPayload\)/);
@@ -991,9 +1014,12 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(connectorSource, /referenceOpenPrice: round\.polymarketOpenPrice/);
   assert.match(connectorSource, /referenceClosePrice: round\.polymarketClosePrice/);
 
-  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
   assert.match(storeSource, /sanitizePolymarketBtcReference/);
   assert.match(storeSource, /polymarketOpenPrice = sanitizePolymarketBtcReference/);
+  assert.match(storeSource, /chainlink_open_price DOUBLE PRECISION/);
+  assert.match(storeSource, /chainlink_close_price DOUBLE PRECISION/);
+  assert.match(storeSource, /round\.chainlinkOpenPrice \?\? null/);
+  assert.match(storeSource, /chainlinkOpenPrice: numberOrUndefined\(row\.chainlink_open_price\)/);
 }
 
 async function testRtdsLoginAuditAndBestAskUiRequirements() {
@@ -1076,10 +1102,12 @@ async function testPolymarketMarketSelectionUsesSlugTime() {
 
 async function testChainlinkReferenceResolverHelpers() {
   const {
+    normalizeStreamUrl,
     parseChainlinkStreamMetadataFromHtml,
     parseChainlinkCandlestickSamples,
     pickFirstSampleAtOrAfter
   } = require("../apps/server/src/services/connectors/polymarket-reference.ts") as {
+    normalizeStreamUrl: (source?: string) => string;
     parseChainlinkStreamMetadataFromHtml: (html: string, fallbackStreamUrl?: string) => {
       feedId: string;
       schema: string;
@@ -1097,6 +1125,16 @@ async function testChainlinkReferenceResolverHelpers() {
     ) => { ts: number; value: number; kind: "open" | "close"; bucket?: string } | undefined;
   };
 
+  assert.equal(
+    normalizeStreamUrl("https://data.chain.link/streams/btc-usd."),
+    "https://data.chain.link/streams/btc-usd-cexprice-streams"
+  );
+  assert.equal(
+    normalizeStreamUrl("Chainlink Data Streams: https://data.chain.link/streams/btc-usd-cexprice-streams."),
+    "https://data.chain.link/streams/btc-usd-cexprice-streams"
+  );
+  assert.equal(normalizeStreamUrl("Chainlink Data Streams btc/usd"), "https://data.chain.link/streams/btc-usd-cexprice-streams");
+
   const html = `
     <html>
       <body>
@@ -1110,7 +1148,7 @@ async function testChainlinkReferenceResolverHelpers() {
   assert.equal(metadata.feedId, "0xfeed");
   assert.equal(metadata.schema, "v3");
   assert.equal(metadata.streamSlug, "btc-usd-cexprice-streams");
-  assert.equal(metadata.streamUrl, "https://data.chain.link/streams/btc-usd");
+  assert.equal(metadata.streamUrl, "https://data.chain.link/streams/btc-usd-cexprice-streams");
 
   const samples = parseChainlinkCandlestickSamples(
     '(version:1,open:(ts:"2026-04-26 03:16:00.538449+00",val:77545.92057),high:(ts:"2026-04-26 03:16:28.541437+00",val:77557.5963),low:(ts:"2026-04-26 03:16:01.102151+00",val:77545.91801),close:(ts:"2026-04-26 03:16:59.559728+00",val:77580.07448),volume:Missing())',

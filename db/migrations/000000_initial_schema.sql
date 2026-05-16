@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS rounds (
   redeem_scheduled_at BIGINT,
   binance_open_price DOUBLE PRECISION,
   binance_close_price DOUBLE PRECISION,
+  chainlink_open_price DOUBLE PRECISION,
+  chainlink_close_price DOUBLE PRECISION,
   data_version INTEGER NOT NULL DEFAULT 1
 );
 
