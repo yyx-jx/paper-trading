@@ -163,7 +163,9 @@ assert.match(appSource, /localLabel\(language, "持仓均价\(含买入费\)", "
 assert.match(appSource, /function orderTradeLabel\(order: OrderRecord, language: Language\)/);
 assert.match(appSource, /function orderPriceQualifier\(order: OrderRecord, language: Language\)/);
 assert.match(appSource, /function displayPriceForSide\(snapshot: MarketSnapshot \| undefined, side: TradeSide\)/);
+assert.match(appSource, /function filledOrderReferencePrice\(order: OrderRecord\)/);
 assert.match(appSource, /function orderReferencePrice\(order: OrderRecord, snapshot\?: MarketSnapshot\)/);
+assert.match(appSource, /if \(order\.status === "filled"\) \{\s*return filledOrderReferencePrice\(order\);\s*\}/);
 assert.match(appSource, /const displayPrice = displayPriceForSide\(snapshot, selectedSide\);/);
 assert.match(appSource, /const upDisplayPrice = displayPriceForSide\(snapshot, "UP"\);/);
 assert.match(appSource, /const downDisplayPrice = displayPriceForSide\(snapshot, "DOWN"\);/);
@@ -257,7 +259,7 @@ assert.match(appSource, /BINANCE VS PTB/);
 assert.match(appSource, /ChainLink VS PTB/);
 assert.match(appSource, /className=\{spreadToneClass\(binancePtbSpread\)\}/);
 assert.match(appSource, /className=\{spreadToneClass\(chainlinkPtbSpread\)\}/);
-assert.match(appSource, /return spread > 0 \? "terminal-red" : "terminal-green";/);
+assert.match(appSource, /return spread > 0 \? "terminal-green" : "terminal-red";/);
 assert.match(appSource, /chartPriceAxisText/);
 assert.match(appSource, /effectiveYZoom/);
 assert.doesNotMatch(appSource, /B5/);

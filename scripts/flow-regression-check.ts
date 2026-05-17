@@ -790,7 +790,7 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(appSource, /ChainLink VS PTB/);
   assert.match(appSource, /spreadToneClass\(binancePtbSpread\)/);
   assert.match(appSource, /spreadToneClass\(chainlinkPtbSpread\)/);
-  assert.match(appSource, /return spread > 0 \? "terminal-red" : "terminal-green";/);
+  assert.match(appSource, /return spread > 0 \? "terminal-green" : "terminal-red";/);
   assert.doesNotMatch(appSource, /B5/);
   assert.doesNotMatch(appSource, /Binance 对比 CL/);
   assert.doesNotMatch(appSource, /Binance vs CL/);

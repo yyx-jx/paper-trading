@@ -670,7 +670,20 @@ function displayPriceForSide(snapshot: MarketSnapshot | undefined, side: TradeSi
   return side === "UP" ? snapshot?.upPrice ?? 0 : snapshot?.downPrice ?? 0;
 }
 
+function filledOrderReferencePrice(order: OrderRecord) {
+  if (typeof order.avgFillPrice === "number" && order.avgFillPrice > 0) {
+    return order.avgFillPrice;
+  }
+  if (typeof order.limitPrice === "number" && order.limitPrice > 0) {
+    return order.limitPrice;
+  }
+  return orderBookExecutionPrice(order) ?? 0;
+}
+
 function orderReferencePrice(order: OrderRecord, snapshot?: MarketSnapshot) {
+  if (order.status === "filled") {
+    return filledOrderReferencePrice(order);
+  }
   const currentDisplayPrice = displayPriceForSide(snapshot, order.side);
   return currentDisplayPrice > 0 ? currentDisplayPrice : orderBookExecutionPrice(order) ?? 0;
 }
@@ -1645,7 +1658,7 @@ function spreadToneClass(spread?: number) {
   if (typeof spread !== "number" || Math.abs(spread) < 0.005) {
     return "terminal-neutral";
   }
-  return spread > 0 ? "terminal-red" : "terminal-green";
+  return spread > 0 ? "terminal-green" : "terminal-red";
 }
 
 function spreadDisplayText(spread?: number) {
