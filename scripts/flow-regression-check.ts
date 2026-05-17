@@ -599,9 +599,9 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.doesNotMatch(appSource, /nowMs - orderBook\.snapshotTs/);
   assert.match(appSource, /sourceToBackendLatencyMs: Math\.max\(source\.acquireLatencyMs,\s*0\)/);
   assert.doesNotMatch(appSource, /sourceToBackendLatencyMs: Math\.max\(source\.serverRecvTs - source\.sourceEventTs,\s*0\)/);
-  assert.match(appSource, /const endToEndAlert =/);
-  assert.match(appSource, /latency\.endToEndLatencyMs > 3000/);
-  assert.match(appSource, /source-latency-alert/);
+  assert.match(appSource, /const topLatency = \[\.\.\.latencyRows\]/);
+  assert.match(appSource, /monitor-latency-breakdown/);
+  assert.match(appSource, /latency-mini-list/);
   assert.match(appSource, /const marketStaleMs = 3000/);
   assert.match(appSource, /const marketPayloadRejectMs = 5000/);
   assert.match(appSource, /type: "market" \| "market:tick"/);
@@ -663,7 +663,8 @@ async function testChainlinkDisplayUsesStrictRtds() {
   assert.match(chainlinkSource, /Strict RTDS mode does not fall back to AggregatorV3/);
   assert.doesNotMatch(chainlinkSource, /createPublicClient/);
   assert.doesNotMatch(chainlinkSource, /latestRoundData/);
-  assert.match(appSource, /CL RTDS WebSocket/);
+  assert.match(appSource, /sourceChainlink/);
+  assert.match(appSource, /ChainLink VS PTB/);
 }
 
 async function testProfileUsesOperatedGroupedRoundViews() {
@@ -675,14 +676,24 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.match(appSource, /type AnalyticsPeriod = "all" \| "year" \| "month" \| "week" \| "day" \| "trades"/);
   assert.match(appSource, /type AnalyticsResult = "WIN" \| "LOSE" \| "SOLD" \| "OPEN" \| "UNFILLED"/);
   assert.match(appSource, /interface AnalyticsTradeRow/);
-  assert.match(appSource, /function buildAnalyticsRows\(history: HistoryRound\[\], positions: PositionRecord\[\], orders: OrderRecord\[\], language: Language\)/);
+  assert.match(apiSource, /export interface OrderLifecycleRecord/);
+  assert.match(apiSource, /orderLifecycles: OrderLifecycleRecord\[\]/);
+  assert.match(appSource, /function buildAnalyticsRows\(\s*history: HistoryRound\[\],\s*positions: PositionRecord\[\],\s*orders: OrderRecord\[\],\s*orderLifecycles: OrderLifecycleRecord\[\],\s*language: Language\s*\)/);
+  assert.match(appSource, /positionNotional/);
+  assert.match(appSource, /actualFillPrice/);
+  assert.match(appSource, /exitNotional/);
   assert.match(appSource, /function filterAnalyticsPeriod\(rows: AnalyticsTradeRow\[\], period: AnalyticsPeriod\)/);
   assert.match(appSource, /function analyticsSummary\(rows: AnalyticsTradeRow\[\]\)/);
   assert.doesNotMatch(appSource, /function analyticsConclusion/);
   assert.match(appSource, /function AnalyticsPage/);
   assert.match(appSource, /<AnalyticsPage/);
   assert.match(appSource, /api\.getOperatedHistory\(token\)/);
-  assert.match(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt, (position\.closedAt \?\? position\.openedAt|order\.createdAt)\)/);
+  assert.match(appSource, /function inferAnalyticsRoundStartAt/);
+  assert.match(appSource, /Math\.floor\(fallbackTs \/ \(5 \* 60_000\)\) \* \(5 \* 60_000\)/);
+  assert.doesNotMatch(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt, log\.orderTimestampMs\)/);
+  assert.match(appSource, /roundLabel: analyticsRoundLabel\(roundStartAt\)/);
+  assert.match(appSource, /dateTimeText\(row\.ts\)/);
+  assert.match(appSource, /HT-\$\{dateTimeText\(roundStartAt\)\}/);
   assert.match(appSource, /analysisText: analysis\.text/);
   assert.match(appSource, /settlementState: "UNSETTLED"/);
   assert.match(appSource, /ANALYTICS_INITIAL_TRADE_LIMIT = 200/);
@@ -779,6 +790,8 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(appSource, /ChainLink VS PTB/);
   assert.match(appSource, /spreadToneClass\(binancePtbSpread\)/);
   assert.match(appSource, /spreadToneClass\(chainlinkPtbSpread\)/);
+  assert.match(appSource, /return spread > 0 \? "terminal-red" : "terminal-green";/);
+  assert.doesNotMatch(appSource, /B5/);
   assert.doesNotMatch(appSource, /Binance 对比 CL/);
   assert.doesNotMatch(appSource, /Binance vs CL/);
   assert.match(appSource, /function parseLimitPriceCentsInput\(value: string\)/);
@@ -802,20 +815,21 @@ async function testSettlementUsesResolvedQueueAndFiveSecondGammaPolling() {
   assert.match(simulationSource, /this\.getPreliminarySettlements\(\)\.delete\(round\.id\)/);
   assert.match(apiSource, /export interface SettlementPreview/);
   assert.match(apiSource, /settlementPreview\?: SettlementPreview/);
-  assert.match(appSource, /settlementPreviewLabel/);
-  assert.match(appSource, /settlementPreviewHelpText/);
-  assert.match(appSource, /shouldRejectStaleMarketPayload/);
-  assert.match(appSource, /if \(seq > 0\) \{\s*return false;\s*\}/);
-  assert.match(appSource, /function hasTwoSidedBook/);
+  assert.match(appSource, /function preliminarySideFromRound\(round: RoundRecord\)/);
+  assert.match(appSource, /function recentRoundOutcome/);
+  assert.match(appSource, /preview\?\.state === "preliminary"/);
+  const clientStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
+  assert.match(clientStoreSource, /function shouldAcceptMarketPayload/);
+  assert.match(clientStoreSource, /transportMeta\.payloadSeq > state\.lastMarketPayloadSeq/);
   assert.match(appSource, /function spreadDisplayText/);
-  assert.match(appSource, /SPREAD --/);
-  assert.match(appSource, /title=\{upDisplayTitle\}/);
-  assert.match(appSource, /title=\{downDisplayTitle\}/);
-  assert.match(appSource, /title=\{selectedDisplayTitleSafe\}/);
-  assert.match(appSource, /settlement-preview-note/);
+  assert.match(appSource, /return "--";/);
+  assert.match(appSource, /title=\{title\}/);
+  assert.match(appSource, /round\.settledSide/);
   assert.doesNotMatch(appSource, /status-pill tone-\$\{settlementPreviewTone\(settlementPreview\)\}/);
   assert.match(appSource, /Manual Review/);
-  assert.match(appSource, /Preliminary/);
+  const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
+  assert.match(i18nSource, /preliminary: "Preliminary"/);
+  assert.match(i18nSource, /manualReview: "Manual Review"/);
 }
 
 async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
@@ -826,8 +840,9 @@ async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   assert.match(indexSource, /payloadSeq: marketPayloadSeq/);
   assert.match(indexSource, /snapshot: stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
   assert.match(indexSource, /bufferedAmount > 0/);
-  assert.match(indexSource, /pendingTick/);
-  assert.match(indexSource, /pendingFull/);
+  assert.match(indexSource, /marketBroadcastPendingSince/);
+  assert.match(indexSource, /marketBroadcastCoalescedCount/);
+  assert.match(indexSource, /MarketBroadcastFrame/);
   assert.match(indexSource, /market:tick/);
   assert.match(indexSource, /wsSendStartTs/);
   assert.doesNotMatch(indexSource, /snapshot: store\.marketSnapshot/);
@@ -849,15 +864,16 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(typesSource, /coalescedCount\?: number/);
   assert.match(apiSource, /serverQueueMs\?: number/);
   assert.match(indexSource, /const MARKET_WS_MIN_INTERVAL_MS = Math\.max\(serverConfig\.marketWsMinIntervalMs, 0\)/);
+  assert.match(indexSource, /const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 100/);
   assert.match(indexSource, /const marketHistoryCache = new Map/);
   assert.match(indexSource, /store\.getHistoryRevision\(\)/);
-  assert.match(indexSource, /createMarketPayload\(user\.id, coalescedCount, pendingSince\)/);
+  assert.match(indexSource, /createMarketPayload\(client\.userId\)/);
   assert.match(indexSource, /createMarketTickPayload\(coalescedCount, pendingSince\)/);
   assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
-  assert.match(indexSource, /setInterval\(tickListener, Math\.max\(MARKET_WS_MIN_INTERVAL_MS, 50\)\)/);
-  assert.match(indexSource, /setInterval\(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS\)/);
-  assert.match(indexSource, /clearInterval\(tickTimer\)/);
-  assert.match(indexSource, /clearInterval\(fullTimer\)/);
+  assert.match(indexSource, /marketBroadcastTickTimer = setInterval/);
+  assert.match(indexSource, /scheduleFullSnapshotForClient/);
+  assert.match(indexSource, /clearInterval\(marketBroadcastTickTimer\)/);
+  assert.match(indexSource, /clearTimeout\(client\.fullTimer\)/);
   assert.match(storeSource, /this\.emitter\.emit\("market:update", snapshot\)/);
   assert.match(storeSource, /this\.queuedMarketSnapshot = snapshot/);
   assert.match(storeSource, /void this\.flushMarketSnapshotCache\(\)/);
@@ -870,7 +886,7 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(appSource, /pendingMarketTick/);
   assert.match(appSource, /marketTickFrame/);
   assert.match(appSource, /setMarketTickPayload\(pending\.data, pending\.receivedAt/);
-  assert.match(appSource, /memo\(function TradePage/);
+  assert.match(appSource, /function TradePageRestored\(props:/);
 }
 
 async function testOrderFastPathUsesLightUserTradePayloads() {
@@ -890,6 +906,11 @@ async function testOrderFastPathUsesLightUserTradePayloads() {
   assert.doesNotMatch(storeSource, /const payload: UserPayload = \{\s*profile: this\.getProfile\(userId\),\s*operatedHistory: this\.getOperatedHistory\(500, userId\),/);
   assert.match(indexSource, /type: scope === "trade" \? "user:trade" : "user"/);
   assert.match(indexSource, /orders: store\.getRecentTradeOrders\(user\.id/);
+  assert.match(indexSource, /let userSendInFlight = false/);
+  assert.match(indexSource, /let pendingUserPayloadScope: UserPayloadScope \| undefined/);
+  assert.match(indexSource, /function queueUserPayload/);
+  assert.match(indexSource, /mergeUserPayloadScope/);
+  assert.match(indexSource, /socket\.bufferedAmount > 0/);
   assert.match(indexSource, /appMetrics\.recordWsSend\("user"/);
   assert.match(apiSource, /export interface UserTradePayload/);
   assert.match(appStoreSource, /setUserTradePayload: \(data: UserTradePayload\) => void/);
@@ -962,7 +983,7 @@ async function testClobV2FeeMarketInfoAndLatencyContracts() {
   assert.match(appSource, /USD/);
   assert.match(appSource, /estimatedOrderFee/);
   assert.match(appSource, /Latency Split/);
-  assert.match(appSource, /parsedAmount \+ estimatedOrderFee > \(profile\?\.availableUsdc \?\? 0\)/);
+  assert.match(appSource, /parsedAmount \+ \(estimatedFee \?\? 0\) > \(profile\?\.availableUsdc \?\? 0\) \+ 0\.0001/);
 }
 
 async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
@@ -1045,8 +1066,9 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
   assert.match(appSource, /defaultVisibleCountForInterval\(selectedInterval\)/);
   assert.match(simulationSource, /private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars\(\)/);
-  assert.match(appSource, /Trace ID/);
-  assert.match(appSource, /Order ID/);
+  const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
+  assert.match(i18nSource, /traceId: "Trace ID"/);
+  assert.match(i18nSource, /orderId: "Order ID"/);
 }
 
 async function testPolymarketMarketSelectionUsesSlugTime() {

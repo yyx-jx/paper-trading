@@ -71,7 +71,7 @@ APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-f
 Build the temporary HTTP production client only after accepting the plaintext transport risk:
 
 ```bash
-ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://<PRODUCTION_HOST>:10001 npm run package:win:prod
+ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001 npm run package:win:prod
 ```
 
 The production client does not start a local backend. WebSocket URLs are derived from the API URL and use `ws://` for this temporary HTTP origin.

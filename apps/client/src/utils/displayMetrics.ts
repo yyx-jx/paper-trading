@@ -1,21 +1,26 @@
-import type { OrderBookSnapshot } from "./api";
+import type { SourceComponentHealth } from "./api";
 
 export const ORDER_BOOK_STALE_WARNING_MS = 2_000;
 
-export function orderBookAgeMs(book: Pick<OrderBookSnapshot, "snapshotTs"> | undefined, nowMs: number) {
-  if (!book || typeof book.snapshotTs !== "number") {
+export function orderBookBackendLatencyMs(bookComponent: Pick<SourceComponentHealth, "sourceEventTs" | "serverRecvTs"> | undefined) {
+  if (
+    !bookComponent ||
+    typeof bookComponent.sourceEventTs !== "number" ||
+    typeof bookComponent.serverRecvTs !== "number" ||
+    bookComponent.sourceEventTs <= 0 ||
+    bookComponent.serverRecvTs <= 0
+  ) {
     return undefined;
   }
-  return Math.max(nowMs - book.snapshotTs, 0);
+  return Math.max(bookComponent.serverRecvTs - bookComponent.sourceEventTs, 0);
 }
 
-export function isOrderBookStale(
-  book: Pick<OrderBookSnapshot, "snapshotTs"> | undefined,
-  nowMs: number,
+export function isOrderBookBackendStale(
+  bookComponent: Pick<SourceComponentHealth, "sourceEventTs" | "serverRecvTs"> | undefined,
   thresholdMs = ORDER_BOOK_STALE_WARNING_MS
 ) {
-  const ageMs = orderBookAgeMs(book, nowMs);
-  return typeof ageMs === "number" && ageMs > thresholdMs;
+  const latencyMs = orderBookBackendLatencyMs(bookComponent);
+  return typeof latencyMs === "number" && latencyMs > thresholdMs;
 }
 
 export function sourceFreshnessLabelKey(sourceName?: string) {

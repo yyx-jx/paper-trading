@@ -3,8 +3,8 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import {
   ORDER_BOOK_STALE_WARNING_MS,
-  isOrderBookStale,
-  orderBookAgeMs,
+  isOrderBookBackendStale,
+  orderBookBackendLatencyMs,
   sourceFreshnessAlertKey,
   sourceFreshnessLabelKey
 } from "../apps/client/src/utils/displayMetrics";
@@ -22,14 +22,15 @@ import {
   nextChartYZoom
 } from "../apps/client/src/utils/chartWheel";
 
-const snapshotTs = 1_000_000;
-const book = { snapshotTs };
+const sourceEventTs = 1_000_000;
+const freshBookComponent = { sourceEventTs, serverRecvTs: sourceEventTs + 250 };
+const slowBookComponent = { sourceEventTs, serverRecvTs: sourceEventTs + 2_001 };
 
 assert.equal(ORDER_BOOK_STALE_WARNING_MS, 2_000);
-assert.equal(orderBookAgeMs(book, snapshotTs + 1_999), 1_999);
-assert.equal(isOrderBookStale(book, snapshotTs + 2_000), false);
-assert.equal(isOrderBookStale(book, snapshotTs + 2_001), true);
-assert.equal(isOrderBookStale(undefined, snapshotTs + 10_000), false);
+assert.equal(orderBookBackendLatencyMs(freshBookComponent), 250);
+assert.equal(isOrderBookBackendStale(freshBookComponent), false);
+assert.equal(isOrderBookBackendStale(slowBookComponent), true);
+assert.equal(isOrderBookBackendStale(undefined), false);
 
 assert.equal(sourceFreshnessLabelKey("Chainlink"), "chainlinkFeedAge");
 assert.equal(sourceFreshnessAlertKey("Chainlink"), "chainlinkFeedStale");
@@ -89,6 +90,8 @@ const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
 const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
 const storeSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
 const styleSource = readFileSync("apps/client/src/styles.css", "utf8");
+const indexHtmlSource = readFileSync("apps/client/src/index.html", "utf8");
+const viteConfigSource = readFileSync("apps/client/vite.config.ts", "utf8");
 const chartWheelSource = readFileSync("apps/client/src/utils/chartWheel.ts", "utf8");
 const electronMainSource = readFileSync("apps/client/electron/main.cjs", "utf8");
 const pnlSource = readFileSync("apps/client/src/features/trade/pnl.ts", "utf8");
@@ -160,13 +163,13 @@ assert.match(appSource, /localLabel\(language, "持仓均价\(含买入费\)", "
 assert.match(appSource, /function orderTradeLabel\(order: OrderRecord, language: Language\)/);
 assert.match(appSource, /function orderPriceQualifier\(order: OrderRecord, language: Language\)/);
 assert.match(appSource, /function displayPriceForSide\(snapshot: MarketSnapshot \| undefined, side: TradeSide\)/);
-assert.match(appSource, /function orderDisplayPrice\(order: OrderRecord, snapshot\?: MarketSnapshot\)/);
+assert.match(appSource, /function orderReferencePrice\(order: OrderRecord, snapshot\?: MarketSnapshot\)/);
 assert.match(appSource, /const displayPrice = displayPriceForSide\(snapshot, selectedSide\);/);
 assert.match(appSource, /const upDisplayPrice = displayPriceForSide\(snapshot, "UP"\);/);
 assert.match(appSource, /const downDisplayPrice = displayPriceForSide\(snapshot, "DOWN"\);/);
-assert.match(appSource, /orderDisplayPrice\(order, snapshot\)/);
+assert.match(appSource, /orderReferencePrice\(order, snapshot\)/);
 assert.match(appSource, /localLabel\(language, "最新成交 \/ 展示价", "Latest trade \/ display"\)/);
-assert.doesNotMatch(appSource, /localLabel\(language, "参考价", "Reference"\)/);
+assert.match(appSource, /localLabel\(language, "参考价", "Reference"\)/);
 assert.match(appSource, /localLabel\(language, "成交价 · 不含 fee", "Fill · excl\. fee"\)/);
 assert.match(appSource, /localLabel\(language, "卖出持仓", "Sell position"\)/);
 assert.match(appSource, /className="terminal-order-action-button terminal-cancel-order-button"/);
@@ -193,6 +196,9 @@ assert.equal([...appSource.matchAll(/onCancel=\{handleCancelOrder\}/g)].length, 
 assert.equal([...appSource.matchAll(/cancelBusyOrderId=\{cancelBusyOrderId\}/g)].length, 1);
 assert.match(styleSource, /\.terminal-body \{ flex:1; min-height:0; display:grid; grid-template-columns:376px minmax\(0, 1fr\) 398px; overflow:hidden; \}/);
 assert.match(styleSource, /@media \(min-width: 1800px\) and \(min-height: 1000px\) \{[\s\S]*?\.terminal-body \{ grid-template-columns:448px minmax\(0, 0\.8fr\) 472px; \}/);
+assert.match(styleSource, /@media \(max-width: 1500px\) and \(max-height: 940px\) \{[\s\S]*?\.terminal-body \{ grid-template-columns:342px minmax\(0, 1fr\) 360px; \}/);
+assert.match(styleSource, /@media \(max-width: 1500px\) and \(max-height: 940px\) \{[\s\S]*?\.terminal-monitor \{ height: 78px;/);
+assert.match(styleSource, /@media \(max-width: 1500px\) and \(max-height: 940px\) \{[\s\S]*?\.terminal-right \.terminal-section:nth-child\(2\) \{ height: 392px; \}/);
 assert.match(styleSource, /\.terminal-trade-row \{ display:grid; grid-template-columns:[^}]*104px;/);
 assert.match(styleSource, /\.terminal-trade-side \{/);
 assert.match(styleSource, /\.terminal-trade-price-block \{/);
@@ -203,44 +209,66 @@ assert.doesNotMatch(styleSource, /\.analytics-day-group \{/);
 assert.doesNotMatch(styleSource, /\.analytics-day-head \{/);
 assert.match(styleSource, /\.terminal-cancel-order-button/);
 assert.match(styleSource, /\.terminal-sell-position-button/);
-assert.match(appSource, /ReplayPage/);
 assert.match(appSource, /ACK/);
 assert.match(appSource, /api\.getBootstrap\(token\)/);
 assert.doesNotMatch(appSource, /api\.getMe\(token\),\s*api\.getCurrentRound\(token\),\s*api\.getHistory\(token\)/);
 assert.match(apiSource, /export interface BootstrapPayload/);
 assert.match(apiSource, /getBootstrap\(token: string\)/);
 assert.match(apiSource, /import\.meta\.env\.VITE_API_BASE_URL/);
+assert.match(apiSource, /const RAW_API_BASE_URL = \(import\.meta\.env\.VITE_API_BASE_URL \?\? ""\)\.trim\(\);/);
+assert.match(apiSource, /import\.meta\.env\.DEV \? "" : "http:\/\/127\.0\.0\.1:8787"/);
+assert.match(apiSource, /function wsBaseUrl\(\)/);
 assert.match(apiSource, /replace\("https:\/\/", "wss:\/\/"\)/);
+assert.match(viteConfigSource, /__APP_VERSION__/);
+assert.match(viteConfigSource, /HT Paper Trading v\$\{appVersion\}/);
+assert.match(indexHtmlSource, /<title>HT Paper Trading v0\.3\.0<\/title>/);
+assert.match(appSource, /const APP_VERSION_LABEL = `v\$\{APP_VERSION\}`/);
+assert.match(appSource, /document\.title = __APP_DISPLAY_TITLE__/);
+assert.match(appSource, /terminal-login-version">\{APP_VERSION_LABEL\} · Hyper Terminal/);
+assert.match(appSource, /className="app-version-badge">\{APP_VERSION_LABEL\}/);
+assert.match(appSource, /className="terminal-version">\{APP_VERSION_LABEL\}/);
+assert.match(styleSource, /\.app-version-badge/);
+assert.match(styleSource, /\.terminal-logo \.terminal-version/);
+assert.match(appSource, /function inferAnalyticsRoundStartAt/);
+assert.match(appSource, /function analyticsRoundLabel\(roundStartAt\?: number\)/);
+assert.match(appSource, /Math\.floor\(fallbackTs \/ \(5 \* 60_000\)\) \* \(5 \* 60_000\)/);
+assert.doesNotMatch(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt/);
+assert.match(viteConfigSource, /VITE_DEV_API_PROXY_TARGET/);
+assert.match(viteConfigSource, /proxy:\s*\{[\s\S]*"\/api"[\s\S]*"\/ws"/);
+assert.match(viteConfigSource, /removeHeader\("origin"\)/);
+assert.match(viteConfigSource, /setHeader\("origin", ""\)/);
 assert.equal([...apiSource.matchAll(/cancelOrder\(token: string, orderId: string\)/g)].length, 1);
 assert.match(storeSource, /setBootstrap: \(data: BootstrapPayload\) => void/);
 assert.match(chartWheelSource, /export function chartWheelStep\(deltaY: number\)/);
 assert.match(chartWheelSource, /export function nextChartVisibleCount\(currentCount: number, deltaY: number\)/);
 assert.match(chartWheelSource, /export function nextChartYZoom\(currentZoom: number, deltaY: number\)/);
 assert.match(chartWheelSource, /export function layoutChartPriceLabels/);
-assert.match(appSource, /addEventListener\("wheel", handleNativeWheel, \{ capture: true, passive: false \}\)/);
 assert.match(appSource, /yZoom\?: number/);
 assert.match(appSource, /onYZoomChange\?: Dispatch<SetStateAction<number>>/);
-assert.match(appSource, /chartYZoom=\{chartYZoom\}/);
-assert.match(appSource, /yZoom=\{props\.chartYZoom\}/);
-assert.match(appSource, /data-y-zoom=\{decimal\(yZoom, 3\)\}/);
+assert.match(appSource, /const \[sharedChartYZoom, setSharedChartYZoom\] = useState\(1\)/);
+assert.match(appSource, /yZoom=\{sharedChartYZoom\}/);
+assert.match(appSource, /onYZoomChange=\{setSharedChartYZoom\}/);
+assert.match(appSource, /data-y-zoom=\{decimal\(effectiveYZoom, 3\)\}/);
 assert.match(appSource, /hoveredCandle \? xForTs\(barCenterTs\(hoveredCandle\)\) : undefined/);
 assert.doesNotMatch(appSource, /barCenterTs\(bars\[hoveredIndex\]\)/);
-assert.match(appSource, /PTB \{decimal\(props\.priceToBeat, 2\)\}/);
+assert.match(appSource, /PTB \{chartPriceAxisText\(props\.priceToBeat\)\}/);
 assert.doesNotMatch(appSource, /BTC \{decimal\(props\.priceToBeat, 2\)\}/);
 assert.match(appSource, /BINANCE VS PTB/);
 assert.match(appSource, /ChainLink VS PTB/);
 assert.match(appSource, /className=\{spreadToneClass\(binancePtbSpread\)\}/);
 assert.match(appSource, /className=\{spreadToneClass\(chainlinkPtbSpread\)\}/);
+assert.match(appSource, /return spread > 0 \? "terminal-red" : "terminal-green";/);
+assert.match(appSource, /chartPriceAxisText/);
+assert.match(appSource, /effectiveYZoom/);
+assert.doesNotMatch(appSource, /B5/);
+assert.match(appSource, /HT UP · 本轮/);
 assert.doesNotMatch(appSource, /binanceChainlinkSpread/);
 assert.doesNotMatch(appSource, /Binance 对比 CL/);
 assert.doesNotMatch(appSource, /Binance vs CL/);
 assert.match(styleSource, /\.monitor-reference-spreads/);
 assert.match(appSource, /data-overlay-label="ptb"/);
 assert.match(appSource, /data-overlay-label="btc"/);
-assert.match(appSource, /Shift\+wheel: sync price-axis zoom/);
-assert.match(appSource, /class AppErrorBoundary extends Component/);
-assert.match(appSource, /app-crash-boundary/);
-assert.match(appSource, /const isolateChartWheelEvent = \(event: WheelEvent\) =>/);
+assert.match(appSource, /event\.shiftKey/);
 assert.doesNotMatch(appSource, /stopImmediatePropagation/);
 assert.doesNotMatch(appSource, /pendingWheelRef/);
 assert.doesNotMatch(appSource, /wheelFrameRef/);

@@ -22,6 +22,14 @@ function packagedMetadata() {
   }
 }
 
+function appVersion() {
+  return String(packagedMetadata().version || "0.0.0");
+}
+
+function windowTitle() {
+  return `HT Paper Trading v${appVersion()}`;
+}
+
 function productionApiBaseUrl() {
   const metadata = packagedMetadata();
   return String(metadata.productionApiBaseUrl || process.env.VITE_API_BASE_URL || "").trim();
@@ -207,6 +215,14 @@ function rendererEntryPath() {
   return path.resolve(__dirname, "../../../dist/renderer/index.html");
 }
 
+function resolveAppIconPath() {
+  const packagedIcon = path.join(process.resourcesPath, "app-icon.png");
+  if (app.isPackaged && fsSync.existsSync(packagedIcon)) {
+    return packagedIcon;
+  }
+  return path.resolve(__dirname, "../assets/app-icon.png");
+}
+
 function checkBackendHealth() {
   return new Promise((resolve) => {
     const request = http.get(`${LOCAL_API_BASE_URL}/health`, (response) => {
@@ -332,7 +348,9 @@ function createWindow() {
     height: 900,
     minWidth: 1280,
     minHeight: 760,
+    title: windowTitle(),
     backgroundColor: "#0b1020",
+    icon: resolveAppIconPath(),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

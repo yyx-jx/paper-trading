@@ -28,6 +28,7 @@ import {
   type MarketSnapshot,
   type MarketTickPayload,
   type OrderAction,
+  type OrderLifecycleRecord,
   type OrderRecord,
   type PaperOrderKind,
   type PermissionLevel,
@@ -46,8 +47,8 @@ import {
   type UserTradePayload
 } from "./utils/api";
 import {
-  isOrderBookStale,
-  orderBookAgeMs
+  isOrderBookBackendStale,
+  orderBookBackendLatencyMs
 } from "./utils/displayMetrics";
 import { layoutChartPriceLabels, nextChartVisibleCount, nextChartYZoom } from "./utils/chartWheel";
 import { FieldChip } from "./components/FieldChip";
@@ -59,6 +60,16 @@ import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenP
 import { redactNetworkAddresses } from "./utils/redaction";
 
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
+
+declare const __APP_VERSION__: string;
+declare const __APP_DISPLAY_TITLE__: string;
+
+const APP_VERSION = __APP_VERSION__;
+const APP_VERSION_LABEL = `v${APP_VERSION}`;
+
+if (typeof document !== "undefined") {
+  document.title = __APP_DISPLAY_TITLE__;
+}
 
 declare global {
   interface Window {
@@ -504,6 +515,10 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max));
 }
 
+function chartPriceAxisText(value: number) {
+  return Math.round(value).toLocaleString("en-US");
+}
+
 function formatCountdown(value?: number, now = Date.now(), mode: "endAt" | "remainingMs" = "endAt") {
   if (typeof value !== "number") {
     return "--:--";
@@ -655,13 +670,7 @@ function displayPriceForSide(snapshot: MarketSnapshot | undefined, side: TradeSi
   return side === "UP" ? snapshot?.upPrice ?? 0 : snapshot?.downPrice ?? 0;
 }
 
-function orderDisplayPrice(order: OrderRecord, snapshot?: MarketSnapshot) {
-  if (typeof order.avgFillPrice === "number") {
-    return order.avgFillPrice;
-  }
-  if (typeof order.limitPrice === "number") {
-    return order.limitPrice;
-  }
+function orderReferencePrice(order: OrderRecord, snapshot?: MarketSnapshot) {
   const currentDisplayPrice = displayPriceForSide(snapshot, order.side);
   return currentDisplayPrice > 0 ? currentDisplayPrice : orderBookExecutionPrice(order) ?? 0;
 }
@@ -1002,7 +1011,7 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
   if (!summary) {
     return (
       <div className="terminal-odds-strip empty">
-        <span>{localLabel(props.language, "B5 UP · 本轮", "B5 UP · This Round")}</span>
+        <span>{localLabel(props.language, "HT UP · 本轮", "HT UP · This Round")}</span>
         <em>{localLabel(props.language, "等待本轮价格点", "Waiting for this-round price points")}</em>
       </div>
     );
@@ -1031,7 +1040,7 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
   const lastY = yForPrice(summary.latest);
   return (
     <div className="terminal-odds-strip">
-      <span>{localLabel(props.language, "B5 UP · 本轮", "B5 UP · This Round")}</span>
+      <span>{localLabel(props.language, "HT UP · 本轮", "HT UP · This Round")}</span>
       <b>{tokenPriceText(summary.latest, 1)}</b>
       <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
         <path className="mini-grid" d={`M0,11.5 H${width} M0,22 H${width} M0,32.5 H${width}`} />
@@ -1636,7 +1645,7 @@ function spreadToneClass(spread?: number) {
   if (typeof spread !== "number" || Math.abs(spread) < 0.005) {
     return "terminal-neutral";
   }
-  return spread > 0 ? "terminal-green" : "terminal-red";
+  return spread > 0 ? "terminal-red" : "terminal-green";
 }
 
 function spreadDisplayText(spread?: number) {
@@ -1795,7 +1804,9 @@ function CandlestickChart(props: {
   const maxWithPadding = max + rawRange * 0.08;
   const minWithPadding = min - rawRange * 0.08;
   const mid = (maxWithPadding + minWithPadding) / 2;
-  const zoomedRange = Math.max((maxWithPadding - minWithPadding) / yZoom, 1);
+  const maxZoomThatKeepsVisibleRange = Math.max((maxWithPadding - minWithPadding) / rawRange, 1);
+  const effectiveYZoom = Math.min(yZoom, maxZoomThatKeepsVisibleRange);
+  const zoomedRange = Math.max((maxWithPadding - minWithPadding) / effectiveYZoom, 1);
   const range = zoomedRange;
   const zoomMax = mid + zoomedRange / 2;
   const zoomMin = mid - zoomedRange / 2;
@@ -1895,7 +1906,7 @@ function CandlestickChart(props: {
       ref={svgRef}
       viewBox={`0 0 ${width} ${height}`}
       className="candle-chart"
-      data-y-zoom={decimal(yZoom, 3)}
+      data-y-zoom={decimal(effectiveYZoom, 3)}
       role="img"
       aria-label="candlestick chart"
       onWheel={handleChartWheel}
@@ -1909,7 +1920,7 @@ function CandlestickChart(props: {
           <g key={tick}>
             <line x1={padding.left} y1={y} x2={width - padding.right} y2={y} className="chart-grid-line" />
             <text x={width - padding.right + 12} y={y + 4} className="chart-axis-label chart-price-axis-label">
-              {decimal(tick, 2)}
+              {chartPriceAxisText(tick)}
             </text>
           </g>
         );
@@ -1962,7 +1973,7 @@ function CandlestickChart(props: {
           <line x1={padding.left} y1={yForPrice(props.priceToBeat)} x2={width - padding.right} y2={yForPrice(props.priceToBeat)} className="chart-target-line" />
           <rect data-overlay-label="ptb-box" x={padding.left + 8} y={yForPrice(props.priceToBeat) - 13} width="76" height="19" rx="6" className="chart-target-label-box" />
           <text data-overlay-label="ptb" x={padding.left + 14} y={yForPrice(props.priceToBeat)} className="chart-target-label">
-            PTB {decimal(props.priceToBeat, 2)}
+            PTB {chartPriceAxisText(props.priceToBeat)}
           </text>
         </g>
       ) : null}
@@ -1971,7 +1982,7 @@ function CandlestickChart(props: {
           <line x1={padding.left} y1={yForPrice(props.latestPrice)} x2={width - padding.right} y2={yForPrice(props.latestPrice)} className="chart-current-line" />
           <rect data-overlay-label="btc-box" x={width - padding.right + 8} y={(latestLabelY ?? yForPrice(props.latestPrice)) - 13} width="76" height="19" rx="6" className="chart-current-label-box" />
           <text data-overlay-label="btc" x={width - padding.right + 14} y={latestLabelY ?? yForPrice(props.latestPrice)} className="chart-current-label">
-            BTC {decimal(props.latestPrice, 2)}
+            BTC {chartPriceAxisText(props.latestPrice)}
           </text>
         </g>
       ) : null}
@@ -2168,7 +2179,7 @@ function LoginScreen(props: {
             {busy ? t("loading") : t("signIn")}
           </button>
         </div>
-        <div className="terminal-login-version">v0.2.0 · Hyper Terminal</div>
+        <div className="terminal-login-version">{APP_VERSION_LABEL} · Hyper Terminal</div>
       </div>
       <div className="terminal-login-status">
         <span className={serverOnline ? "login-status-dot" : "login-status-dot off"} />
@@ -2194,6 +2205,7 @@ function App() {
     profile,
     positions,
     orders,
+    orderLifecycles,
     logs,
     lastOrderLatencyMs,
     lastMarketRecvTs,
@@ -2415,11 +2427,12 @@ function App() {
       lastUserFallbackAt = Date.now();
       updateRealtimeChannel("user", { state: "fallback", fallbackAt: lastUserFallbackAt }, { now: lastUserFallbackAt, failure: true });
       try {
-        const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextLogs] = await Promise.all([
+        const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
           api.getProfile(token),
           api.getOperatedHistory(token),
           api.getPositions(token),
           api.getOrders(token),
+          api.getOrderLifecycles(token),
           api.getLogs(token)
         ]);
         if (!disposed) {
@@ -2429,6 +2442,7 @@ function App() {
             operatedHistory: nextOperatedHistory,
             positions: nextPositions,
             orders: nextOrders,
+            orderLifecycles: nextOrderLifecycles,
             logs: nextLogs
           });
           markUserActivity(receivedAt);
@@ -2833,11 +2847,12 @@ function App() {
     try {
       setError(undefined);
       await api.cancelOrder(token, orderId);
-      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextLogs] = await Promise.all([
+      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
         api.getProfile(token),
         api.getOperatedHistory(token),
         api.getPositions(token),
         api.getOrders(token),
+        api.getOrderLifecycles(token),
         api.getLogs(token)
       ]);
       setUserPayload({
@@ -2845,6 +2860,7 @@ function App() {
         operatedHistory: nextOperatedHistory,
         positions: nextPositions,
         orders: nextOrders,
+        orderLifecycles: nextOrderLifecycles,
         logs: nextLogs
       });
     } catch (cancelError) {
@@ -2900,11 +2916,12 @@ function App() {
       setError(undefined);
       const result = await api.sellPosition(token, positionId);
       setLastOrderLatencyMs(result.matchLatencyMs);
-      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextLogs] = await Promise.all([
+      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
         api.getProfile(token),
         api.getOperatedHistory(token),
         api.getPositions(token),
         api.getOrders(token),
+        api.getOrderLifecycles(token),
         api.getLogs(token)
       ]);
       setUserPayload({
@@ -2912,6 +2929,7 @@ function App() {
         operatedHistory: nextOperatedHistory,
         positions: nextPositions,
         orders: nextOrders,
+        orderLifecycles: nextOrderLifecycles,
         logs: nextLogs
       });
     } catch (sellError) {
@@ -2933,12 +2951,13 @@ function App() {
         side,
         reason: `Manual settlement entered from ${me?.username ?? "client"}`
       });
-      const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextLogs] = await Promise.all([
+      const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
         api.getCurrentRound(token),
         api.getHistory(token),
         api.getProfile(token),
         api.getPositions(token),
         api.getOrders(token),
+        api.getOrderLifecycles(token),
         api.getLogs(token)
       ]);
       setMarketPayload({
@@ -2952,6 +2971,7 @@ function App() {
         profile: nextProfile,
         positions: nextPositions,
         orders: nextOrders,
+        orderLifecycles: nextOrderLifecycles,
         logs: nextLogs
       });
     } catch (manualError) {
@@ -2982,7 +3002,7 @@ function App() {
       <header className="topbar">
         <div className="brand-block">
           <p className="eyebrow">{t("subtitle")}</p>
-          <h1>{t("appTitle")}</h1>
+          <h1>{t("appTitle")} <small className="app-version-badge">{APP_VERSION_LABEL}</small></h1>
           <span>{headerTitle}</span>
         </div>
 
@@ -3138,6 +3158,7 @@ function App() {
             operatedHistory={operatedHistory}
             positions={positions}
             orders={orders}
+            orderLifecycles={orderLifecycles}
             logs={logs}
             onSell={handleSell}
             onTimeline={handleOpenTimeline}
@@ -3169,12 +3190,14 @@ type AnalyticsTone = "positive" | "negative" | "neutral" | "warning";
 type AnalyticsSettlementState = "SETTLED" | "UNSETTLED";
 const ANALYTICS_INITIAL_TRADE_LIMIT = 200;
 const ANALYTICS_TRADE_LIMIT_STEP = 200;
+const ANALYTICS_QTY_EPSILON = 0.0001;
 interface AnalyticsTradeRow {
   id: string;
   ts: number;
+  exitTs?: number;
   result: AnalyticsResult;
   roundId: string;
-  roundCloseAt?: number;
+  roundStartAt?: number;
   roundLabel: string;
   side: TradeSide;
   invested: number;
@@ -3188,9 +3211,116 @@ interface AnalyticsTradeRow {
   settlementState: AnalyticsSettlementState;
 }
 
-function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[], orders: OrderRecord[], language: Language) {
+function roundAnalyticsMoney(value: number) {
+  return Math.round(value * 100) / 100;
+}
+
+function lifecycleEntryPrice(log: OrderLifecycleRecord, order?: OrderRecord) {
+  if (typeof log.actualFillPrice === "number") {
+    return log.actualFillPrice;
+  }
+  if (typeof log.entryTokenPrice === "number") {
+    return log.entryTokenPrice;
+  }
+  if (typeof order?.avgFillPrice === "number") {
+    return order.avgFillPrice;
+  }
+  const entryFee = log.entryFee ?? 0;
+  return Math.max(log.positionNotional - entryFee, 0) / Math.max(log.volumeTokenQty, ANALYTICS_QTY_EPSILON);
+}
+
+function lifecycleResult(log: OrderLifecycleRecord): AnalyticsResult {
+  if (log.remainingTokenQty > ANALYTICS_QTY_EPSILON) {
+    return "OPEN";
+  }
+  if (log.settlementResult === "win") {
+    return "WIN";
+  }
+  if (log.settlementResult === "loss") {
+    return "LOSE";
+  }
+  return log.closedTokenQty > ANALYTICS_QTY_EPSILON ? "SOLD" : "OPEN";
+}
+
+function lifecyclePnl(log: OrderLifecycleRecord, position?: PositionRecord) {
+  const volumeQty = Math.max(log.volumeTokenQty, ANALYTICS_QTY_EPSILON);
+  const closedQty = Math.min(Math.max(log.closedTokenQty, 0), volumeQty);
+  const closedCost = (log.positionNotional * closedQty) / volumeQty;
+  const realizedPnl = (log.exitNotional ?? 0) - (log.exitFee ?? 0) - closedCost;
+  const openPnl = log.remainingTokenQty > ANALYTICS_QTY_EPSILON && position ? positionDisplayedPnl(position) : 0;
+  return roundAnalyticsMoney(realizedPnl + openPnl);
+}
+
+function inferAnalyticsRoundStartAt(input: { round?: HistoryRound; roundId: string; marketSlug?: string; fallbackTs?: number }) {
+  if (typeof input.round?.startAt === "number") {
+    return input.round.startAt;
+  }
+  const slugStartAt = parseBtcFiveMinuteSlugStart(input.marketSlug) ?? parseBtcFiveMinuteSlugStart(input.roundId);
+  if (typeof slugStartAt === "number") {
+    return slugStartAt;
+  }
+  const fallbackTs = input.fallbackTs;
+  if (typeof fallbackTs === "number" && Number.isFinite(fallbackTs)) {
+    return Math.floor(fallbackTs / (5 * 60_000)) * (5 * 60_000);
+  }
+  return undefined;
+}
+
+function buildAnalyticsRows(
+  history: HistoryRound[],
+  positions: PositionRecord[],
+  orders: OrderRecord[],
+  orderLifecycles: OrderLifecycleRecord[],
+  language: Language
+) {
   const rows: AnalyticsTradeRow[] = [];
   const roundsById = new Map(history.map((round) => [round.id, round]));
+  const ordersById = new Map(orders.map((order) => [order.id, order]));
+  const positionsByBuyOrderId = new Map(
+    positions
+      .filter((position) => position.buyOrderId)
+      .map((position) => [position.buyOrderId!, position])
+  );
+  const lifecycleBuyOrderIds = new Set<string>();
+  for (const log of orderLifecycles) {
+    lifecycleBuyOrderIds.add(log.buyOrderId);
+    const round = roundsById.get(log.roundId);
+    const position = positionsByBuyOrderId.get(log.buyOrderId);
+    const order = ordersById.get(log.buyOrderId);
+    const result = lifecycleResult(log);
+    const settlementState = result === "OPEN" ? "UNSETTLED" : "SETTLED";
+    const analysis = analyticsRowAnalysis(result, language);
+    const exitTs =
+      log.closedTokenQty > ANALYTICS_QTY_EPSILON || result !== "OPEN"
+        ? log.settlementTimeMs ?? log.updatedAt
+        : undefined;
+    const roundStartAt = inferAnalyticsRoundStartAt({
+      round,
+      roundId: log.roundId,
+      marketSlug: log.marketSlug ?? order?.marketSlug,
+      fallbackTs: log.orderTimestampMs
+    });
+    rows.push({
+      id: `lifecycle:${log.id}`,
+      ts: log.orderTimestampMs,
+      exitTs,
+      result,
+      roundId: log.roundId,
+      roundStartAt,
+      roundLabel: analyticsRoundLabel(roundStartAt),
+      side: log.direction,
+      invested: log.positionNotional,
+      entryPrice: lifecycleEntryPrice(log, order),
+      settlementPrice: typeof log.exitTokenPrice === "number" ? log.exitTokenPrice : undefined,
+      shares: log.volumeTokenQty,
+      fees: (log.entryFee ?? 0) + (log.exitFee ?? 0),
+      pnl: lifecyclePnl(log, position),
+      analysisText: analysis.text,
+      analysisTone: analysis.tone,
+      settlementState
+    });
+  }
+
   const ordersByRoundSide = new Map<string, OrderRecord[]>();
   for (const order of orders) {
     const key = `${order.roundId}:${order.side}`;
@@ -3199,6 +3329,9 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
     ordersByRoundSide.set(key, next);
   }
   for (const position of positions) {
+    if (position.buyOrderId && lifecycleBuyOrderIds.has(position.buyOrderId)) {
+      continue;
+    }
     const relatedOrders = ordersByRoundSide.get(`${position.roundId}:${position.side}`) ?? [];
     const fees = relatedOrders.reduce((sum, order) => sum + (order.actualFee ?? order.estimatedFee ?? 0), 0);
     const result: AnalyticsResult =
@@ -3212,13 +3345,20 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
     const round = roundsById.get(position.roundId);
     const settlementState = result === "OPEN" ? "UNSETTLED" : "SETTLED";
     const analysis = analyticsRowAnalysis(result, language);
+    const relatedBuyOrder = position.buyOrderId ? ordersById.get(position.buyOrderId) : undefined;
+    const roundStartAt = inferAnalyticsRoundStartAt({
+      round,
+      roundId: position.roundId,
+      marketSlug: relatedBuyOrder?.marketSlug ?? relatedOrders.find((order) => order.marketSlug)?.marketSlug,
+      fallbackTs: position.openedAt
+    });
     rows.push({
       id: `position:${position.id}`,
       ts: position.closedAt ?? position.openedAt,
       result,
       roundId: position.roundId,
-      roundCloseAt: round?.endAt,
-      roundLabel: analyticsRoundLabel(round?.endAt, position.closedAt ?? position.openedAt),
+      roundStartAt,
+      roundLabel: analyticsRoundLabel(roundStartAt),
       side: position.side,
       invested: position.notionalSpent,
       entryPrice: position.averageEntry,
@@ -3237,13 +3377,19 @@ function buildAnalyticsRows(history: HistoryRound[], positions: PositionRecord[]
     }
     const round = roundsById.get(order.roundId);
     const analysis = analyticsRowAnalysis("UNFILLED", language);
+    const roundStartAt = inferAnalyticsRoundStartAt({
+      round,
+      roundId: order.roundId,
+      marketSlug: order.marketSlug,
+      fallbackTs: order.createdAt
+    });
     rows.push({
       id: `order:${order.id}`,
       ts: order.createdAt,
       result: "UNFILLED",
       roundId: order.roundId,
-      roundCloseAt: round?.endAt,
-      roundLabel: analyticsRoundLabel(round?.endAt, order.createdAt),
+      roundStartAt,
+      roundLabel: analyticsRoundLabel(roundStartAt),
       side: order.side,
       invested: order.notionalUsdc,
       entryPrice: order.limitPrice ?? order.bestAsk ?? order.midPrice ?? 0,
@@ -3300,9 +3446,8 @@ function analyticsSummary(rows: AnalyticsTradeRow[]) {
   };
 }
 
-function analyticsRoundLabel(endAt?: number, fallbackTs?: number) {
-  const resolvedTs = endAt ?? fallbackTs;
-  return resolvedTs ? `B5-${chartTimeText(resolvedTs)} UTC` : "B5--";
+function analyticsRoundLabel(roundStartAt?: number) {
+  return roundStartAt ? `HT-${dateTimeText(roundStartAt)}` : "HT--";
 }
 
 function analyticsPeriodLabel(period: AnalyticsPeriod, language: Language) {
@@ -3372,59 +3517,6 @@ function isManualSettlementPermissionError(message: string) {
 function isClobDepthFailure(order: OrderRecord) {
   return typeof order.failureReason === "string" && /insufficient CLOB depth/i.test(order.failureReason);
 }
-
-/*
-Source-contract anchors retained for regression scripts:
-ReplayPage
-shouldRejectStaleMarketPayload
-if (seq > 0) { return false; }
-function hasTwoSidedBook
-function spreadDisplayText
-SPREAD --
-const endToEndAlert =
-latency.endToEndLatencyMs > 3000
-source-latency-alert
-CL RTDS WebSocket
-settlementPreviewLabel
-settlementPreviewHelpText
-settlement-preview-note
-title={upDisplayTitle}
-title={downDisplayTitle}
-title={selectedDisplayTitleSafe}
-parsedAmount + estimatedOrderFee > (profile?.availableUsdc ?? 0)
-requestAnimationFrame
-pendingMarketPayloadRef
-queueMarketPayload(parsed.data, receivedAt)
-flushPendingMarketPayload()
-memo(function TradePage
-addEventListener("wheel", handleNativeWheel, { capture: true, passive: false })
-yZoom?: number
-onYZoomChange?: Dispatch<SetStateAction<number>>
-chartYZoom={chartYZoom}
-yZoom={props.chartYZoom}
-data-y-zoom={decimal(yZoom, 3)}
-hoveredCandle ? xForTs(barCenterTs(hoveredCandle)) : undefined
-PTB {decimal(props.priceToBeat, 2)}
-data-overlay-label="ptb"
-data-overlay-label="btc"
-Shift+wheel: sync price-axis zoom
-const isolateChartWheelEvent = (event: WheelEvent) =>
-class AppErrorBoundary extends Component
-app-crash-boundary
-AUDIT_ACTION_LABELS
-auditActionLabel(actionType, language)
-api.getHistory(token, 200)
-const TRADE_INTERVAL_OPTIONS = ["30s", "1m", "5m", "15m", "1h"]
-snapshot?.chainlink?.candlesByInterval[selectedInterval]
-defaultVisibleCountForInterval(selectedInterval)
-terminal-login-page
-terminal-login-tabs
-ht_saved_users
-Trace ID
-Order ID
-Manual Review
-Preliminary
-*/
 
 function TradePageRestored(props: {
   t: (key: string, options?: Record<string, unknown>) => string;
@@ -3518,10 +3610,18 @@ function TradePageRestored(props: {
   const limitTokenPrice = typeof parsedLimitPriceCents === "number" ? parsedLimitPriceCents / 100 : undefined;
   const estimatedPrice = props.orderKind === "limit" ? limitTokenPrice ?? 0 : displayPrice;
   const estimatedQty = props.orderAction === "buy" ? (estimatedPrice > 0 ? parsedAmount / estimatedPrice : 0) : parsedQty;
-  const orderBook = selectedSide === "UP" ? snapshot?.orderBooks.UP : snapshot?.orderBooks.DOWN;
-  const orderBookStale = isOrderBookStale(orderBook, nowMs);
-  const orderBookAge = orderBookAgeMs(orderBook, nowMs);
+  const feeRate = snapshot?.clob.marketInfo.platformFeeRate;
+  const estimatedFee =
+    typeof feeRate === "number" && snapshot?.clob.marketInfo.feeRateAvailable !== false && estimatedPrice > 0
+      ? props.orderAction === "buy"
+        ? (parsedAmount * feeRate * estimatedPrice * (1 - estimatedPrice)) / estimatedPrice
+        : estimatedQty * feeRate * estimatedPrice * (1 - estimatedPrice)
+      : undefined;
   const clobLatency = latencyFor(sourceClob, nowMs, props.lastMarketRecvTs);
+  const orderBook = selectedSide === "UP" ? snapshot?.orderBooks.UP : snapshot?.orderBooks.DOWN;
+  const orderBookComponent = sourceComponent(sourceClob, "orderBook");
+  const orderBookStale = isOrderBookBackendStale(orderBookComponent);
+  const orderBookBackendLatency = orderBookBackendLatencyMs(orderBookComponent);
   const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs);
   const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs);
   const countdownMs =
@@ -3531,11 +3631,11 @@ function TradePageRestored(props: {
   const countdownClass = countdownTone(countdownMs);
   const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders);
   const balanceWarning =
-    props.orderAction === "buy" && parsedAmount > (profile?.availableUsdc ?? 0) + 0.0001
+    props.orderAction === "buy" && parsedAmount + (estimatedFee ?? 0) > (profile?.availableUsdc ?? 0) + 0.0001
       ? localLabel(
           language,
-          `可用余额不足：本单需冻结 ${money(parsedAmount)}，当前可用 ${money(profile?.availableUsdc ?? 0)}。`,
-          `Insufficient available balance: this order would freeze ${money(parsedAmount)}, current available is ${money(profile?.availableUsdc ?? 0)}.`
+          `可用余额不足：本单需冻结 ${money(parsedAmount + (estimatedFee ?? 0))}，当前可用 ${money(profile?.availableUsdc ?? 0)}。`,
+          `Insufficient available balance: this order would freeze ${money(parsedAmount + (estimatedFee ?? 0))}, current available is ${money(profile?.availableUsdc ?? 0)}.`
         )
       : undefined;
   const tradeBlockReason = balanceWarning ?? limitPriceError;
@@ -3688,13 +3788,6 @@ function TradePageRestored(props: {
     selectedSummary && selectedSummary.bestAsk > 0 && selectedSummary.bestBid > 0
       ? tokenPriceText(selectedSummary.bestAsk - selectedSummary.bestBid)
       : "--";
-  const feeRate = snapshot?.clob.marketInfo.platformFeeRate;
-  const estimatedFee =
-    typeof feeRate === "number" && snapshot?.clob.marketInfo.feeRateAvailable !== false && estimatedPrice > 0
-      ? props.orderAction === "buy"
-        ? parsedAmount * feeRate * estimatedPrice * (1 - estimatedPrice) / estimatedPrice
-        : estimatedQty * feeRate * estimatedPrice * (1 - estimatedPrice)
-      : undefined;
   const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : localLabel(language, "不可用", "Unavailable");
   const healthRows = [
     { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: localLabel(language, `源 ${Math.round(clobLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(clobLatency.sourceDataAgeMs)}ms / transport ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceClob?.state ?? "stale" },
@@ -3728,6 +3821,7 @@ function TradePageRestored(props: {
       <div className="terminal-top">
         <div className="terminal-logo">
           <span>Hyper</span><strong>Terminal</strong><em>PAPER</em>
+          <small className="terminal-version">{APP_VERSION_LABEL}</small>
         </div>
         <div className="terminal-top-nav">
           <button className={props.currentPage === "trade" ? "active" : ""} onClick={() => props.onNavigate("trade")}>{localLabel(language, "交易", "Trade")}</button>
@@ -3761,7 +3855,7 @@ function TradePageRestored(props: {
 
       <div className="terminal-monitor">
         <div className="monitor-cell hot monitor-analytics">
-          <small>{localLabel(language, "B5 变化", "B5 Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tokenPriceText(Math.abs(oddsChange), 1)}</b></small>
+          <small>{localLabel(language, "HT 变化", "HT Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tokenPriceText(Math.abs(oddsChange), 1)}</b></small>
           <strong>{tokenPriceText(upDisplayPrice)}</strong>
           <span>DN {tokenPriceText(downDisplayPrice)} · {localLabel(language, "双边 ASK", "Two-side ask")} {tokenPriceText(doubleSideCost)}</span>
         </div>
@@ -3853,7 +3947,7 @@ function TradePageRestored(props: {
                     <span>Time</span>
                     <span>{localLabel(language, "交易", "Trade")}</span>
                     <span>USD</span>
-                    <span>Price</span>
+                    <span>{localLabel(language, "参考价", "Reference")}</span>
                     <span>Status</span>
                     <span>Action</span>
                   </div>
@@ -3872,7 +3966,7 @@ function TradePageRestored(props: {
                         </span>
                         <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
                         <span className="terminal-trade-price-block">
-                          <strong className="terminal-trade-price">@{tokenPriceText(orderDisplayPrice(order, snapshot))}</strong>
+                          <strong className="terminal-trade-price">@{tokenPriceText(orderReferencePrice(order, snapshot))}</strong>
                           <small>{orderPriceQualifier(order, language)}</small>
                         </span>
                         <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
@@ -4151,7 +4245,7 @@ function TradePageRestored(props: {
               {orderBookStale ? (
                 <div className="inline-warning-banner compact-feedback" role="status">
                   <strong>{t("orderBookStaleTitle")}</strong>
-                  <span>{t("orderBookStaleWarning")} {typeof orderBookAge === "number" ? `${Math.round(orderBookAge)}ms` : ""}</span>
+                  <span>{t("orderBookStaleWarning")} {typeof orderBookBackendLatency === "number" ? `${Math.round(orderBookBackendLatency)}ms` : ""}</span>
                 </div>
               ) : null}
               {canManualSettle ? (
@@ -4184,6 +4278,7 @@ function AnalyticsPage(props: {
   operatedHistory: HistoryRound[];
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
   onSell: (positionId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
@@ -4202,8 +4297,8 @@ function AnalyticsPage(props: {
     setVisibleTradeLimit(ANALYTICS_INITIAL_TRADE_LIMIT);
   }, [direction, period, resultFilter]);
   const rows = useMemo(
-    () => buildAnalyticsRows(props.history, props.positions, props.orders, language),
-    [props.history, props.positions, props.orders, language]
+    () => buildAnalyticsRows(props.history, props.positions, props.orders, props.orderLifecycles, language),
+    [props.history, props.positions, props.orders, props.orderLifecycles, language]
   );
   const periodRows = useMemo(() => filterAnalyticsPeriod(rows, period), [rows, period]);
   const filteredRows = useMemo(
@@ -4347,11 +4442,12 @@ function AnalyticsPage(props: {
             <table>
               <thead>
                 <tr>
-                  <th>{localLabel(language, "时间", "Time")}</th>
+                  <th>{localLabel(language, "买入时间", "Entry Time")}</th>
+                  <th>{localLabel(language, "卖出/结算时间", "Exit/Settle Time")}</th>
                   <th>{localLabel(language, "轮次", "Round")}</th>
                   <th>{localLabel(language, "方向", "Direction")}</th>
-                  <th>{localLabel(language, "投入", "Invested")}</th>
-                  <th>{localLabel(language, "入场价", "Entry")}</th>
+                  <th>{localLabel(language, "买入总花费", "Entry Cost")}</th>
+                  <th>{localLabel(language, "买入成本价", "Entry Price")}</th>
                   <th>{localLabel(language, "结算价/退出价", "Settle/Exit")}</th>
                   <th>{localLabel(language, "份额", "Shares")}</th>
                   <th>{localLabel(language, "费用", "Fees")}</th>
@@ -4364,7 +4460,8 @@ function AnalyticsPage(props: {
               <tbody>
                 {displayedRows.map((row) => (
                   <tr key={row.id}>
-                    <td>{timeText(row.ts)}</td>
+                    <td>{dateTimeText(row.ts)}</td>
+                    <td>{row.exitTs ? dateTimeText(row.exitTs) : "—"}</td>
                     <td>{row.roundLabel}</td>
                     <td><span className={`analytics-tag ${row.side === "UP" ? "up" : "down"}`}>{row.side}</span></td>
                     <td>{money(row.invested)}</td>

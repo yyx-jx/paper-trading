@@ -176,6 +176,9 @@ let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
+const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 100;
+const MARKET_WS_FULL_SNAPSHOT_RETRY_MS = 250;
+const USER_WS_RETRY_MS = 50;
 const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
 
 type CachedMarketHistory = {
@@ -1107,6 +1110,245 @@ function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): Mar
   };
 }
 
+type MarketBroadcastFrame = {
+  data: MarketTickPayload;
+  outbound: string;
+  bytes: number;
+  buildMs: number;
+  serializeMs: number;
+};
+
+type MarketBroadcastClient = {
+  id: string;
+  userId: string;
+  socket: WsWebSocket;
+  closed: boolean;
+  sendingTick: boolean;
+  sendingFull: boolean;
+  fullOrdinal: number;
+  fullTimer?: NodeJS.Timeout;
+  fullRetryTimer?: NodeJS.Timeout;
+};
+
+const marketBroadcastClients = new Set<MarketBroadcastClient>();
+let marketBroadcastClientOrdinal = 0;
+let marketBroadcastLastSentAt = 0;
+let marketBroadcastPendingSince: number | undefined;
+let marketBroadcastCoalescedCount = 0;
+let marketBroadcastRetryTimer: NodeJS.Timeout | undefined;
+let marketBroadcastTickTimer: NodeJS.Timeout | undefined;
+let marketBroadcastBackpressureDropped = false;
+let marketBroadcastStarted = false;
+
+function createMarketBroadcastFrame(
+  coalescedCount = 0,
+  pendingSince?: number,
+  droppedForBackpressure = false
+): MarketBroadcastFrame {
+  const buildStartedAt = Date.now();
+  const data = createMarketTickPayload(coalescedCount, pendingSince);
+  const buildMs = Date.now() - buildStartedAt;
+  data.transportMeta.broadcastBuildMs = buildMs;
+  data.transportMeta.broadcastFanoutSize = marketBroadcastClients.size;
+  data.transportMeta.droppedForBackpressure = droppedForBackpressure || undefined;
+  data.transportMeta.wsSendStartTs = Date.now();
+  const serializeStartedAt = Date.now();
+  const outbound = JSON.stringify({ type: "market:tick", data });
+  const serializeMs = Date.now() - serializeStartedAt;
+  return {
+    data,
+    outbound,
+    bytes: Buffer.byteLength(outbound),
+    buildMs,
+    serializeMs
+  };
+}
+
+function scheduleMarketBroadcastRetry(delayMs = MARKET_WS_RETRY_MS) {
+  if (marketBroadcastRetryTimer) {
+    return;
+  }
+  marketBroadcastRetryTimer = setTimeout(() => {
+    marketBroadcastRetryTimer = undefined;
+    flushMarketBroadcast();
+  }, Math.max(delayMs, MARKET_WS_RETRY_MS));
+}
+
+function broadcastMarketTickFrame(frame: MarketBroadcastFrame) {
+  const sendStartedAt = Date.now();
+  let skippedForBackpressure = 0;
+  let maxBufferedAmount = 0;
+  for (const client of marketBroadcastClients) {
+    if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
+      continue;
+    }
+    const currentUser = store.getUserById(client.userId);
+    if (!currentUser?.isActive) {
+      client.socket.close();
+      continue;
+    }
+    maxBufferedAmount = Math.max(maxBufferedAmount, client.socket.bufferedAmount);
+    if (client.sendingTick || client.socket.bufferedAmount > 0) {
+      skippedForBackpressure += 1;
+      marketBroadcastBackpressureDropped = true;
+      continue;
+    }
+    client.sendingTick = true;
+    client.socket.send(frame.outbound, (error?: Error) => {
+      client.sendingTick = false;
+      appMetrics.recordWsSend("market", frame.bytes, Date.now() - sendStartedAt, !error);
+    });
+  }
+  appMetrics.recordMarketBroadcast({
+    buildMs: frame.buildMs,
+    serializeMs: frame.serializeMs,
+    fanoutSize: marketBroadcastClients.size,
+    skippedForBackpressure,
+    maxBufferedAmount
+  });
+}
+
+function flushMarketBroadcast() {
+  if (marketBroadcastClients.size === 0) {
+    marketBroadcastPendingSince = undefined;
+    marketBroadcastCoalescedCount = 0;
+    return;
+  }
+  const now = Date.now();
+  const elapsedSinceLastSend = marketBroadcastLastSentAt ? now - marketBroadcastLastSentAt : MARKET_WS_MIN_INTERVAL_MS;
+  if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
+    scheduleMarketBroadcastRetry(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend);
+    return;
+  }
+  const frame = createMarketBroadcastFrame(
+    marketBroadcastCoalescedCount,
+    marketBroadcastPendingSince,
+    marketBroadcastBackpressureDropped
+  );
+  marketBroadcastPendingSince = undefined;
+  marketBroadcastCoalescedCount = 0;
+  marketBroadcastBackpressureDropped = false;
+  marketBroadcastLastSentAt = Date.now();
+  broadcastMarketTickFrame(frame);
+}
+
+function requestMarketBroadcastTick(markCoalesced: boolean) {
+  if (markCoalesced) {
+    marketBroadcastPendingSince ??= Date.now();
+    marketBroadcastCoalescedCount += 1;
+  }
+  if (marketBroadcastClients.size === 0) {
+    return;
+  }
+  flushMarketBroadcast();
+}
+
+function handleMarketUpdate() {
+  requestMarketBroadcastTick(true);
+}
+
+function scheduleFullSnapshotForClient(client: MarketBroadcastClient, delayMs = MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
+  if (client.closed || client.fullTimer || client.fullRetryTimer) {
+    return;
+  }
+  client.fullTimer = setTimeout(() => {
+    client.fullTimer = undefined;
+    sendFullSnapshotForClient(client);
+  }, delayMs);
+}
+
+function retryFullSnapshotForClient(client: MarketBroadcastClient) {
+  if (client.closed || client.fullRetryTimer) {
+    return;
+  }
+  client.fullRetryTimer = setTimeout(() => {
+    client.fullRetryTimer = undefined;
+    sendFullSnapshotForClient(client);
+  }, MARKET_WS_FULL_SNAPSHOT_RETRY_MS);
+}
+
+function sendFullSnapshotForClient(client: MarketBroadcastClient) {
+  if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
+    return;
+  }
+  const currentUser = store.getUserById(client.userId);
+  if (!currentUser?.isActive) {
+    client.socket.close();
+    return;
+  }
+  if (client.sendingFull || client.socket.bufferedAmount > 0) {
+    retryFullSnapshotForClient(client);
+    return;
+  }
+  client.sendingFull = true;
+  const data = createMarketPayload(client.userId);
+  const sendStartedAt = Date.now();
+  data.transportMeta.wsSendStartTs = sendStartedAt;
+  const outbound = JSON.stringify({ type: "market", data });
+  const bytes = Buffer.byteLength(outbound);
+  client.socket.send(outbound, (error?: Error) => {
+    client.sendingFull = false;
+    appMetrics.recordWsSend("market", bytes, Date.now() - sendStartedAt, !error);
+    if (!client.closed) {
+      scheduleFullSnapshotForClient(client);
+    }
+  });
+}
+
+function registerMarketBroadcastClient(userId: string, socket: WsWebSocket) {
+  const client: MarketBroadcastClient = {
+    id: nanoid(),
+    userId,
+    socket,
+    closed: false,
+    sendingTick: false,
+    sendingFull: false,
+    fullOrdinal: marketBroadcastClientOrdinal++
+  };
+  marketBroadcastClients.add(client);
+  const initialFullDelayMs = (client.fullOrdinal % 10) * MARKET_WS_FULL_SNAPSHOT_STAGGER_MS;
+  scheduleFullSnapshotForClient(client, initialFullDelayMs);
+  requestMarketBroadcastTick(false);
+  return () => {
+    client.closed = true;
+    marketBroadcastClients.delete(client);
+    if (client.fullTimer) {
+      clearTimeout(client.fullTimer);
+    }
+    if (client.fullRetryTimer) {
+      clearTimeout(client.fullRetryTimer);
+    }
+  };
+}
+
+function startMarketBroadcasting() {
+  if (marketBroadcastStarted) {
+    return;
+  }
+  marketBroadcastStarted = true;
+  marketBroadcastTickTimer = setInterval(
+    () => requestMarketBroadcastTick(false),
+    Math.max(MARKET_WS_MIN_INTERVAL_MS, 50)
+  );
+  store.emitter.on("market:update", handleMarketUpdate);
+}
+
+function stopMarketBroadcasting() {
+  if (!marketBroadcastStarted) {
+    return;
+  }
+  marketBroadcastStarted = false;
+  if (marketBroadcastTickTimer) {
+    clearInterval(marketBroadcastTickTimer);
+    marketBroadcastTickTimer = undefined;
+  }
+  if (marketBroadcastRetryTimer) {
+    clearTimeout(marketBroadcastRetryTimer);
+    marketBroadcastRetryTimer = undefined;
+  }
+  store.emitter.off("market:update", handleMarketUpdate);
+}
+
 function createBootstrapPayload(user: UserRecord) {
   const market = createCurrentRoundPayload();
   return {
@@ -1117,6 +1359,7 @@ function createBootstrapPayload(user: UserRecord) {
     profile: store.getProfile(user.id),
     positions: store.getPositions(user.id),
     orders: store.getOrders(user.id),
+    orderLifecycles: store.getOrderLifecycleLogs(user.id),
     logs: store.getRecentLogs(user.id),
     sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
   };
@@ -1128,6 +1371,7 @@ function createUserFullPayload(user: UserRecord) {
     operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
     positions: store.getPositions(user.id),
     orders: store.getOrders(user.id),
+    orderLifecycles: store.getOrderLifecycleLogs(user.id),
     logs: store.getRecentLogs(user.id)
   };
 }
@@ -1136,7 +1380,8 @@ function createUserTradePayload(user: UserRecord) {
   return {
     profile: store.getProfile(user.id),
     positions: store.getPositions(user.id),
-    orders: store.getRecentTradeOrders(user.id, 50)
+    orders: store.getRecentTradeOrders(user.id, 50),
+    orderLifecycles: store.getOrderLifecycleLogs(user.id)
   };
 }
 
@@ -1459,6 +1704,7 @@ const shutdown = async () => {
     return;
   }
   shuttingDown = true;
+  stopMarketBroadcasting();
   await engine.stop();
   await store.close();
   await matchingRuntime?.close().catch(() => undefined);
@@ -1515,6 +1761,7 @@ async function bootstrap() {
     credentials: true
   });
   await app.register(websocket);
+  startMarketBroadcasting();
   app.addHook("onRequest", async (request, reply) => {
     httpStartTimes.set(request, Date.now());
     const requestId =
@@ -2294,6 +2541,14 @@ async function bootstrap() {
     })
   );
 
+  app.get("/api/order-lifecycles/me", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      requirePermission(user, "profile:view");
+      return store.getOrderLifecycleLogs(user.id);
+    })
+  );
+
   app.post("/api/orders", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
@@ -2685,156 +2940,14 @@ async function bootstrap() {
       attachHeartbeat(socket, "market");
       wsConnectionCounts.market += 1;
       appMetrics.setWsConnections("market", wsConnectionCounts.market);
-
-      let lastTickSentAt = 0;
-      let lastFullSentAt = 0;
-      let lastSentAt = 0;
-      let sending = false;
-      let pendingTick = false;
-      let pendingFull = false;
-      let pendingSince: number | undefined;
-      let coalescedCount = 0;
-      let retryTimer: NodeJS.Timeout | undefined;
-      let tickTimer: NodeJS.Timeout | undefined;
-      let fullTimer: NodeJS.Timeout | undefined;
-      let closed = false;
-
-      const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
-      const scheduleRetry = (delayMs = MARKET_WS_RETRY_MS) => {
-        if (closed || retryTimer) {
-          return;
-        }
-        retryTimer = setTimeout(() => {
-          retryTimer = undefined;
-          if (pendingFull || pendingTick) {
-            flushPending();
-          }
-        }, Math.max(delayMs, MARKET_WS_RETRY_MS));
-      };
-
-      const deferLatest = (kind: "tick" | "full") => {
-        if (kind === "full") {
-          pendingFull = true;
-        } else {
-          pendingTick = true;
-        }
-        pendingSince ??= Date.now();
-        coalescedCount += 1;
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        const pacingDelay = Math.max(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend, 0);
-        scheduleRetry(pacingDelay);
-      };
-
-      const sendEnvelope = (
-        type: "market:tick" | "market",
-        data: MarketTickPayload | MarketPayload,
-        kind: "tick" | "full"
-      ) => {
-        if (!isSocketOpen()) {
-          return false;
-        }
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
-          socket.close();
-          return false;
-        }
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest(kind);
-          return false;
-        }
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
-          deferLatest(kind);
-          return false;
-        }
-        sending = true;
-        const sendStartedAt = Date.now();
-        data.transportMeta.wsSendStartTs = sendStartedAt;
-        const outbound = JSON.stringify({ type, data });
-        socket.send(outbound, (error?: Error) => {
-          sending = false;
-          appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
-          if (!error) {
-            lastSentAt = Date.now();
-            if (kind === "tick") {
-              lastTickSentAt = lastSentAt;
-            } else {
-              lastFullSentAt = lastSentAt;
-            }
-          }
-          if (pendingFull || pendingTick) {
-            scheduleRetry();
-          }
-        });
-        return true;
-      };
-
-      const sendTick = () => {
-        const data = createMarketTickPayload(coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingTick = false;
-        return sendEnvelope("market:tick", data, "tick");
-      };
-
-      const sendFull = () => {
-        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingFull = false;
-        return sendEnvelope("market", data, "full");
-      };
-
-      const flushPending = () => {
-        if (!isSocketOpen()) {
-          return;
-        }
-        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
-          if (sendTick()) {
-            return;
-          }
-        }
-        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
-          sendFull();
-        }
-      };
-
-      const tickListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("tick");
-          return;
-        }
-        sendTick();
-      };
-      const fullListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("full");
-          return;
-        }
-        sendFull();
-      };
-
-      sendFull();
-      tickTimer = setInterval(tickListener, Math.max(MARKET_WS_MIN_INTERVAL_MS, 50));
-      fullTimer = setInterval(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS);
-      store.emitter.on("market:update", tickListener);
+      const unregisterMarketClient = registerMarketBroadcastClient(user.id, socket);
       socket.on("close", () => {
-        closed = true;
+        unregisterMarketClient();
         wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
         appMetrics.setWsConnections("market", wsConnectionCounts.market);
         if (!consumeHeartbeatTimeout(socket)) {
           appMetrics.recordWsDisconnect("market", "close");
         }
-        if (retryTimer) {
-          clearTimeout(retryTimer);
-        }
-        if (tickTimer) {
-          clearInterval(tickTimer);
-        }
-        if (fullTimer) {
-          clearInterval(fullTimer);
-        }
-        store.emitter.off("market:update", tickListener);
       });
     } catch {
       socket.close();
@@ -2854,10 +2967,26 @@ async function bootstrap() {
       appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
       const eventName = `user:${user.id}`;
-      const sendPayload = (scope: UserPayloadScope = "full") => {
+      let userSendInFlight = false;
+      let pendingUserPayloadScope: UserPayloadScope | undefined;
+      let userRetryTimer: NodeJS.Timeout | undefined;
+
+      function mergeUserPayloadScope(current: UserPayloadScope | undefined, next: UserPayloadScope): UserPayloadScope {
+        if (!current) {
+          return next;
+        }
+        return current === "trade" || next === "trade" ? "trade" : "full";
+      }
+
+      const sendPayloadNow = (scope: UserPayloadScope = "full") => {
         const currentUser = store.getUserById(user.id);
         if (!currentUser?.isActive) {
           socket.close();
+          return;
+        }
+        if (userSendInFlight || socket.bufferedAmount > 0) {
+          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+          queueUserPayload();
           return;
         }
         const buildStartedAt = Date.now();
@@ -2872,15 +3001,40 @@ async function bootstrap() {
           );
         }
         const sendStartedAt = Date.now();
+        userSendInFlight = true;
         socket.send(outbound, (error?: Error) => {
+          userSendInFlight = false;
           appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
+          if (pendingUserPayloadScope) {
+            queueUserPayload();
+          }
         });
       };
 
-      const listener = (scope?: UserPayloadScope) => sendPayload(scope ?? "full");
-      sendPayload();
+      function queueUserPayload(scope?: UserPayloadScope) {
+        if (scope) {
+          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+        }
+        if (userSendInFlight || userRetryTimer) {
+          return;
+        }
+        userRetryTimer = setTimeout(() => {
+          userRetryTimer = undefined;
+          const nextScope = pendingUserPayloadScope;
+          pendingUserPayloadScope = undefined;
+          if (nextScope) {
+            sendPayloadNow(nextScope);
+          }
+        }, USER_WS_RETRY_MS);
+      }
+
+      const listener = (scope?: UserPayloadScope) => queueUserPayload(scope ?? "full");
+      queueUserPayload("full");
       store.emitter.on(eventName, listener);
       socket.on("close", () => {
+        if (userRetryTimer) {
+          clearTimeout(userRetryTimer);
+        }
         wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
         appMetrics.setWsConnections("user", wsConnectionCounts.user);
         if (!consumeHeartbeatTimeout(socket)) {

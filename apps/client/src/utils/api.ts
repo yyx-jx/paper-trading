@@ -79,6 +79,9 @@ export interface MarketTransportMeta {
   serverQueueMs?: number;
   snapshotBuildTs?: number;
   wsSendStartTs?: number;
+  broadcastBuildMs?: number;
+  broadcastFanoutSize?: number;
+  droppedForBackpressure?: boolean;
 }
 
 export interface ClobMarketInfo {
@@ -299,6 +302,7 @@ export interface UserPayload {
   operatedHistory?: HistoryRound[];
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
 }
 
@@ -306,6 +310,7 @@ export interface UserTradePayload {
   profile: ProfileOverview;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
 }
 
 export interface BootstrapPayload extends MarketPayload, UserPayload {
@@ -463,6 +468,45 @@ export interface OrderRecord {
   serverRecvTs: number;
   serverPublishTs: number;
   createdAt: number;
+}
+
+export type OrderLifecycleExitType = "manual_sell" | "close_side" | "settlement" | "mixed";
+
+export interface OrderLifecycleRecord {
+  id: string;
+  buyOrderId: string;
+  traceId: string;
+  userId: string;
+  testerId: string;
+  roundId: string;
+  symbol: string;
+  assetClass: "BTC";
+  marketId: string;
+  marketSlug?: string;
+  direction: TradeSide;
+  orderTimestampMs: number;
+  entryTokenPrice?: number;
+  btcTradePrice?: number;
+  btcOpenPriceToBeat?: number;
+  deltaBtc?: number;
+  volumeTokenQty: number;
+  remainingTokenQty: number;
+  closedTokenQty: number;
+  positionNotional: number;
+  exitType?: OrderLifecycleExitType;
+  exitTokenPrice?: number;
+  exitNotional: number;
+  settlementResult?: "win" | "loss";
+  settlementTimeMs?: number;
+  settlementDirection?: TradeSide;
+  actualFillPrice?: number;
+  slippageBps?: number;
+  matchLatencyMs: number;
+  entryFee?: number;
+  exitFee?: number;
+  feeCurrency?: FeeCurrency;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface AuditEvent {
@@ -754,7 +798,16 @@ export interface BulkCreateUsersPreviewResult {
   failed: BulkCreateUsersResult["failed"];
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8787";
+const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
+const API_BASE_URL = RAW_API_BASE_URL || (import.meta.env.DEV ? "" : "http://127.0.0.1:8787");
+
+function wsBaseUrl() {
+  if (API_BASE_URL) {
+    return API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}`;
+}
 
 async function request<T>(path: string, token?: string, init?: RequestInit): Promise<T> {
   const hasBody = typeof init?.body !== "undefined";
@@ -912,11 +965,11 @@ export const api = {
     return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
   createWsUrl(path: string, token: string) {
-    const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+    const base = wsBaseUrl();
     return `${base}${path}?token=${token}`;
   },
   createWsTicketUrl(path: string, ticket: string) {
-    const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+    const base = wsBaseUrl();
     return `${base}${path}?ticket=${ticket}`;
   },
   createWsTicket(token: string, channel: "market" | "user") {
@@ -984,6 +1037,9 @@ export const api = {
   },
   getOrders(token: string) {
     return request<OrderRecord[]>("/api/orders/me", token);
+  },
+  getOrderLifecycles(token: string) {
+    return request<OrderLifecycleRecord[]>("/api/order-lifecycles/me", token);
   },
   getLogs(token: string) {
     return request<AuditEvent[]>("/api/logs/me", token);

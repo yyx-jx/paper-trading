@@ -8,6 +8,7 @@ import type {
   MarketTickPayload,
   MarketSnapshot,
   MarketTransportMeta,
+  OrderLifecycleRecord,
   OrderRecord,
   PositionRecord,
   ProfileOverview,
@@ -31,6 +32,7 @@ interface AppState {
   profile?: ProfileOverview;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
   sourceStatus: SourceHealth[];
   lastOrderLatencyMs?: number;
@@ -200,6 +202,7 @@ export const useAppStore = create<AppState>((set) => ({
   operatedHistory: [],
   positions: [],
   orders: [],
+  orderLifecycles: [],
   logs: [],
   sourceStatus: [],
   setAuth: (token, me) => {
@@ -219,6 +222,7 @@ export const useAppStore = create<AppState>((set) => ({
       operatedHistory: [],
       positions: [],
       orders: [],
+      orderLifecycles: [],
       logs: [],
       sourceStatus: [],
       lastOrderLatencyMs: undefined,
@@ -243,6 +247,7 @@ export const useAppStore = create<AppState>((set) => ({
       profile: data.profile,
       positions: data.positions,
       orders: data.orders,
+      orderLifecycles: data.orderLifecycles,
       logs: data.logs,
       sourceStatus: data.sourceStatus ?? [],
       snapshot: stampSnapshotReceipt(data.snapshot, clientRecvTs, transportMeta),
@@ -312,13 +317,15 @@ export const useAppStore = create<AppState>((set) => ({
       operatedHistory: data.operatedHistory ?? [],
       positions: data.positions,
       orders: data.orders,
+      orderLifecycles: data.orderLifecycles,
       logs: data.logs
     }),
   setUserTradePayload: (data) =>
     set({
       profile: data.profile,
       positions: data.positions,
-      orders: data.orders
+      orders: data.orders,
+      orderLifecycles: data.orderLifecycles
     }),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),
   setLastOrderLatencyMs: (lastOrderLatencyMs) => set({ lastOrderLatencyMs })

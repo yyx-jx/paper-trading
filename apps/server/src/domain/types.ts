@@ -142,6 +142,9 @@ export interface MarketTransportMeta {
   serverQueueMs?: number;
   snapshotBuildTs?: number;
   wsSendStartTs?: number;
+  broadcastBuildMs?: number;
+  broadcastFanoutSize?: number;
+  droppedForBackpressure?: boolean;
 }
 
 export interface ClobMarketInfo {

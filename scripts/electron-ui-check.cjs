@@ -714,8 +714,8 @@ async function main() {
       assertPageStable("before wheel stress");
       if (!chartReadiness.hasMainChart) {
         const tradeText = (document.body.textContent || "").replace(/\\s+/g, " ");
-        if (!tradeText.includes("B5")) {
-          throw new Error("Trade page did not render the B5 chart placeholder.");
+        if (!tradeText.includes("HT")) {
+          throw new Error("Trade page did not render the HT chart placeholder.");
         }
         if ((window.__uiErrors || []).length > 0) {
           throw new Error("Frontend runtime errors with chart placeholders: " + JSON.stringify(window.__uiErrors));
@@ -815,8 +815,8 @@ async function main() {
       if (/Polymarket|\\bodds\\b|赔率/i.test(tradeText)) {
         throw new Error("Trade page still exposes old Polymarket/odds wording.");
       }
-      if (!tradeText.includes("B5")) {
-        throw new Error("Trade page did not render the B5 section.");
+      if (!tradeText.includes("HT")) {
+        throw new Error("Trade page did not render the HT section.");
       }
       const topRightLinkText = Array.from(document.querySelectorAll(".terminal-top-right a"))
         .map((node) => (node.textContent || "").trim())

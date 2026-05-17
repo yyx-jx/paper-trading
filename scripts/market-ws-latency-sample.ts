@@ -214,6 +214,7 @@ function buildResult(startedAt: number, finishedAt: number) {
     serverToClientMax: max(serverToClientLatencies),
     tickServerToClientP50: percentile(tickServerToClientLatencies, 50),
     tickServerToClientP95: percentile(tickServerToClientLatencies, 95),
+    tickServerToClientP99: percentile(tickServerToClientLatencies, 99),
     tickServerToClientMax: max(tickServerToClientLatencies),
     fullServerToClientP50: percentile(fullServerToClientLatencies, 50),
     fullServerToClientP95: percentile(fullServerToClientLatencies, 95),
