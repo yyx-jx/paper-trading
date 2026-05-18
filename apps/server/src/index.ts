@@ -10,7 +10,7 @@ import { serverConfig } from "./config";
 import { ApiError, sendApiError } from "./http-errors";
 import { assertCan, assertCanManageUser } from "./auth/authz";
 import { hasPermission } from "./auth/permissions";
-import { canExportUser, getVisibleUserIdsForActor } from "./auth/scope";
+import { canChangeUserGroupForActor, canCreateUserForActor, canExportUser, canViewUserRecords, getVisibleUserIdsForActor } from "./auth/scope";
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
@@ -65,7 +65,7 @@ const wsConnectionCounts = {
   market: 0,
   user: 0
 };
-const wsTickets = new Map<string, { userId: string; channel: "market" | "user"; expiresAt: number }>();
+const wsTickets = new Map<string, { userId: string; viewedUserId: string; channel: "market" | "user"; expiresAt: number }>();
 const WS_TICKET_TTL_MS = 60_000;
 const WS_HEARTBEAT_MS = 25_000;
 const httpStartTimes = new WeakMap<object, number>();
@@ -200,7 +200,8 @@ const loginSchema = z.object({
 });
 
 const wsTicketSchema = z.object({
-  channel: z.enum(["market", "user"])
+  channel: z.enum(["market", "user"]),
+  viewUserId: z.string().optional()
 });
 
 const orderSchema = z.object({
@@ -224,6 +225,7 @@ const selfProfileSchema = z.object({
 });
 
 const roleSchema = z.enum(["Tester", "Senior Tester", "Test Engineer", "Admin"]);
+const DEFAULT_GROUP_MANAGER_USERNAME = "JDH1";
 
 const createUserSchema = z.object({
   username: z.string().trim().min(1),
@@ -246,6 +248,10 @@ const updateUserSchema = z.object({
   permissionLevel: z.enum(["Initial", "Standard"]).optional(),
   availableUsdc: z.number().nonnegative().optional(),
   isActive: z.boolean().optional()
+});
+
+const changeUserGroupSchema = z.object({
+  managerUserId: z.string().trim().min(1)
 });
 
 const bulkCreateUserItemSchema = z.object({
@@ -303,6 +309,7 @@ const manualSettlementSchema = z.object({
 const trainingLogQuerySchema = z.object({
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   roundId: z.string().optional(),
   actionType: z.string().optional(),
@@ -316,6 +323,7 @@ const trainingLogQuerySchema = z.object({
 const auditLogQuerySchema = z.object({
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   roundId: z.string().optional(),
   category: z.enum(["operation", "matching", "settlement", "latency"]).optional(),
@@ -331,6 +339,7 @@ const logSearchQuerySchema = z.object({
   system: z.enum(["all", "audit", "training", "matching"]).optional(),
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   role: roleSchema.optional(),
   category: z.enum(["operation", "matching", "settlement", "latency"]).optional(),
@@ -431,20 +440,51 @@ function getUserFromRequest(request: { headers: Record<string, string | string[]
   return user;
 }
 
-function createWsTicket(user: UserRecord, channel: "market" | "user") {
+function readViewUserId(query: unknown) {
+  const raw = query && typeof query === "object" ? (query as { viewUserId?: unknown }).viewUserId : undefined;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+function resolveViewedUser(actor: UserRecord, viewUserId?: string) {
+  const target = viewUserId ? store.getUserById(viewUserId) : actor;
+  if (!target) {
+    throw new Error("Target user was not found.");
+  }
+  if (!canViewUserRecords(actor, target, store.listUserRecords())) {
+    throw new Error("Records are not available for this user.");
+  }
+  return target;
+}
+
+function getViewedUserFromRequest(
+  actor: UserRecord,
+  request: { query?: unknown }
+) {
+  return resolveViewedUser(actor, readViewUserId(request.query));
+}
+
+type WsSession = {
+  actor: UserRecord;
+  viewedUser: UserRecord;
+};
+
+function createWsTicket(user: UserRecord, channel: "market" | "user", viewUserId?: string) {
+  const viewedUser = resolveViewedUser(user, viewUserId);
   const ticket = `wst_${nanoid(32)}`;
+  const expiresAt = Date.now() + WS_TICKET_TTL_MS;
   wsTickets.set(ticket, {
     userId: user.id,
+    viewedUserId: viewedUser.id,
     channel,
-    expiresAt: Date.now() + WS_TICKET_TTL_MS
+    expiresAt
   });
   return {
     ticket,
-    expiresAt: Date.now() + WS_TICKET_TTL_MS
+    expiresAt
   };
 }
 
-function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user") {
+function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user"): WsSession | undefined {
   if (!rawTicket) {
     return undefined;
   }
@@ -453,20 +493,34 @@ function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "use
   if (!ticket || ticket.channel !== channel || ticket.expiresAt < Date.now()) {
     return undefined;
   }
-  return store.getUserById(ticket.userId);
+  const actor = store.getUserById(ticket.userId);
+  if (!actor) {
+    return undefined;
+  }
+  return {
+    actor,
+    viewedUser: resolveViewedUser(actor, ticket.viewedUserId)
+  };
 }
 
-function getWsUser(query: { token?: string; ticket?: string }, channel: "market" | "user") {
-  const ticketUser = consumeWsTicket(query.ticket, channel);
-  if (ticketUser) {
-    return ticketUser;
+function getWsSession(query: { token?: string; ticket?: string; viewUserId?: string }, channel: "market" | "user"): WsSession | undefined {
+  const ticketSession = consumeWsTicket(query.ticket, channel);
+  if (ticketSession) {
+    return ticketSession;
   }
   const token = readToken(query.token);
   if (!token) {
     return undefined;
   }
   const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-  return store.getUserById(payload.userId);
+  const actor = store.getUserById(payload.userId);
+  if (!actor) {
+    return undefined;
+  }
+  return {
+    actor,
+    viewedUser: resolveViewedUser(actor, query.viewUserId)
+  };
 }
 
 function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
@@ -537,11 +591,11 @@ function requirePermission(user: UserRecord, code: string) {
 }
 
 function canViewAllLogs(user: UserRecord) {
-  return hasPermission(user, "logs:view:all");
+  return user.role === "Admin";
 }
 
 function canViewTeamLogs(user: UserRecord) {
-  return hasPermission(user, "logs:view:managed") || hasPermission(user, "logs:view:team");
+  return user.role === "Senior Tester" || user.role === "Test Engineer";
 }
 
 function teamVisibleUserIds(user: UserRecord) {
@@ -549,37 +603,39 @@ function teamVisibleUserIds(user: UserRecord) {
 }
 
 function resolveAuditLogFilters(user: UserRecord, parsed: AuditLogQuery): AuditLogQuery {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
   if (canViewAllLogs(user)) {
-    return parsed;
+    return { ...parsed, userId: requestedUserId, viewUserId: undefined };
   }
   if (canViewTeamLogs(user)) {
     const userIds = teamVisibleUserIds(user);
-    if (parsed.userId && !userIds.includes(parsed.userId)) {
+    if (requestedUserId && !userIds.includes(requestedUserId)) {
       throw new Error("Logs are not available for this user.");
     }
-    return { ...parsed, userIds };
+    return requestedUserId ? { ...parsed, userId: requestedUserId, viewUserId: undefined } : { ...parsed, viewUserId: undefined, userIds };
   }
-  if (parsed.userId && parsed.userId !== user.id) {
+  if (requestedUserId && requestedUserId !== user.id) {
     throw new Error("Logs are not available for this user.");
   }
-  return { ...parsed, userId: user.id };
+  return { ...parsed, userId: user.id, viewUserId: undefined };
 }
 
 function resolveBehaviorLogFilters(user: UserRecord, parsed: BehaviorLogQuery): BehaviorLogQuery {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
   if (canViewAllLogs(user)) {
-    return parsed;
+    return { ...parsed, userId: requestedUserId, viewUserId: undefined };
   }
   if (canViewTeamLogs(user)) {
     const userIds = teamVisibleUserIds(user);
-    if (parsed.userId && !userIds.includes(parsed.userId)) {
+    if (requestedUserId && !userIds.includes(requestedUserId)) {
       throw new Error("Logs are not available for this user.");
     }
-    return { ...parsed, userIds };
+    return requestedUserId ? { ...parsed, userId: requestedUserId, viewUserId: undefined } : { ...parsed, viewUserId: undefined, userIds };
   }
-  if (parsed.userId && parsed.userId !== user.id) {
+  if (requestedUserId && requestedUserId !== user.id) {
     throw new Error("Logs are not available for this user.");
   }
-  return { ...parsed, userId: user.id };
+  return { ...parsed, userId: user.id, viewUserId: undefined };
 }
 
 const LOG_SEARCH_DEFAULT_LIMIT = 100;
@@ -639,11 +695,12 @@ function scopedUserIdsForActor(actor: UserRecord) {
 function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): LogSearchQuery {
   const scopedIds = scopedUserIdsForActor(actor);
   const allUsers = store.listUsers() as unknown as UserRecord[];
-  const requestedUser = parsed.userId ? store.getUserById(parsed.userId) : undefined;
-  if (parsed.userId && !requestedUser) {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
+  const requestedUser = requestedUserId ? store.getUserById(requestedUserId) : undefined;
+  if (requestedUserId && !requestedUser) {
     throw new Error("Target user was not found.");
   }
-  if (parsed.userId && scopedIds && !scopedIds.includes(parsed.userId)) {
+  if (requestedUserId && scopedIds && !scopedIds.includes(requestedUserId)) {
     throw new Error("Logs are not available for this user.");
   }
   if (parsed.userIds?.length) {
@@ -657,7 +714,7 @@ function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): Log
     }
   }
 
-  let userIds = parsed.userId ? [parsed.userId] : parsed.userIds?.length ? [...new Set(parsed.userIds)] : scopedIds;
+  let userIds = requestedUserId ? [requestedUserId] : parsed.userIds?.length ? [...new Set(parsed.userIds)] : scopedIds;
   if (parsed.role) {
     const roleIds = new Set(allUsers.filter((user) => user.role === parsed.role).map((user) => user.id));
     userIds = userIds ? userIds.filter((userId) => roleIds.has(userId)) : [...roleIds];
@@ -665,8 +722,9 @@ function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): Log
 
   return {
     ...parsed,
-    userId: parsed.userId,
-    userIds: parsed.userId ? undefined : userIds,
+    viewUserId: undefined,
+    userId: requestedUserId,
+    userIds: requestedUserId ? undefined : userIds,
     system: parsed.system ?? (parsed.systems?.length === 1 ? parsed.systems[0] : parsed.system)
   };
 }
@@ -923,6 +981,15 @@ function listUsersForActor(actor: UserRecord) {
   return store.listUsers().filter((user) => visibleIds.has(user.id));
 }
 
+function isGroupManagerUser(user: UserRecord | undefined) {
+  return Boolean(user && (user.role === "Senior Tester" || user.role === "Test Engineer"));
+}
+
+function getDefaultGroupManagerId() {
+  const manager = store.findUserByUsername(DEFAULT_GROUP_MANAGER_USERNAME);
+  return isGroupManagerUser(manager) ? manager?.id : undefined;
+}
+
 function getTargetUserForManagement(actor: UserRecord, targetUserId: string) {
   const target = store.getUserById(targetUserId);
   if (!target) {
@@ -939,7 +1006,7 @@ function getTargetUserForBalance(actor: UserRecord, targetUserId: string) {
   return getTargetUserForManagement(actor, targetUserId);
 }
 
-function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
+function normalizeManagerUserId(role: Role, managerUserId?: string | null, options?: { requireActive?: boolean }) {
   if (role !== "Tester") {
     return undefined;
   }
@@ -947,8 +1014,11 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
     return undefined;
   }
   const senior = store.getUserById(managerUserId);
-  if (!senior || senior.role !== "Senior Tester") {
-    throw new Error("managerUserId must point to a Senior Tester.");
+  if (!senior || (senior.role !== "Senior Tester" && senior.role !== "Test Engineer")) {
+    throw new Error("managerUserId must point to a Senior Tester or Test Engineer.");
+  }
+  if (options?.requireActive && !senior.isActive) {
+    throw new Error("managerUserId must point to an active Senior Tester or Test Engineer.");
   }
   return managerUserId;
 }
@@ -1032,14 +1102,15 @@ function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) 
   return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
 }
 
-function createCurrentRoundPayload(coalescedCount = 0) {
+function createCurrentRoundPayload(coalescedCount = 0, viewedUserId?: string) {
   const transportMeta = nextMarketTransportMeta(coalescedCount, store.marketSnapshot.serverNow);
   const currentRound = store.getCurrentRound();
-  const history = getHistoryWithSettlementPreview(10);
+  const history = getHistoryWithSettlementPreview(10, viewedUserId);
   const settlementPreview =
     (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
     engine.getLatestSettlementPreview(history);
   return {
+    viewedUserId,
     currentRound: decorateCurrentRoundForTransport(currentRound),
     snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
     settlementPreview,
@@ -1047,10 +1118,11 @@ function createCurrentRoundPayload(coalescedCount = 0) {
   };
 }
 
-function createMarketPayload(userId: string, coalescedCount = 0): MarketPayload {
+function createMarketPayload(viewedUserId: string, coalescedCount = 0): MarketPayload {
   return {
-    ...createCurrentRoundPayload(coalescedCount),
-    history: getHistoryWithSettlementPreview(10, userId)
+    ...createCurrentRoundPayload(coalescedCount, viewedUserId),
+    viewedUserId,
+    history: getHistoryWithSettlementPreview(10, viewedUserId)
   };
 }
 
@@ -1108,12 +1180,13 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
   };
 }
 
-function createMarketTickPayload(coalescedCount = 0): MarketTickPayload {
+function createMarketTickPayload(coalescedCount = 0, viewedUserId = ""): MarketTickPayload {
   const snapshot = store.marketSnapshot;
   const transportMeta = nextMarketTransportMeta(coalescedCount, snapshot.serverNow);
   const currentRound = store.getCurrentRound();
   const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
   return {
+    viewedUserId,
     currentRound: decorateCurrentRoundForTransport(currentRound),
     tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
     settlementPreview,
@@ -1122,14 +1195,15 @@ function createMarketTickPayload(coalescedCount = 0): MarketTickPayload {
 }
 
 type MarketBroadcastFrame = {
-  outbound: string;
+  data: MarketTickPayload;
   bytes: number;
   buildMs: number;
   serializeMs: number;
 };
 
 type MarketBroadcastClient = {
-  userId: string;
+  actorUserId: string;
+  viewedUserId: string;
   socket: WsWebSocket;
   closed: boolean;
   sendingTick: boolean;
@@ -1160,7 +1234,7 @@ function createMarketBroadcastFrame(coalescedCount = 0, droppedForBackpressure =
   const outbound = JSON.stringify({ type: "market:tick", data });
   const serializeMs = Date.now() - serializeStartedAt;
   return {
-    outbound,
+    data,
     bytes: Buffer.byteLength(outbound),
     buildMs,
     serializeMs
@@ -1185,8 +1259,8 @@ function broadcastMarketTickFrame(frame: MarketBroadcastFrame) {
     if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
       continue;
     }
-    const currentUser = store.getUserById(client.userId);
-    if (!currentUser?.isActive) {
+    const actor = store.getUserById(client.actorUserId);
+    if (!actor?.isActive) {
       client.socket.close();
       continue;
     }
@@ -1197,9 +1271,17 @@ function broadcastMarketTickFrame(frame: MarketBroadcastFrame) {
       continue;
     }
     client.sendingTick = true;
-    client.socket.send(frame.outbound, (error?: Error) => {
+    const outbound = JSON.stringify({
+      type: "market:tick",
+      data: {
+        ...frame.data,
+        viewedUserId: client.viewedUserId
+      }
+    });
+    const bytes = Buffer.byteLength(outbound);
+    client.socket.send(outbound, (error?: Error) => {
       client.sendingTick = false;
-      appMetrics.recordWsSend("market", frame.bytes, Date.now() - sendStartedAt, !error);
+      appMetrics.recordWsSend("market", bytes, Date.now() - sendStartedAt, !error);
     });
   }
   appMetrics.recordMarketBroadcast({
@@ -1267,8 +1349,8 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
   if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
     return;
   }
-  const currentUser = store.getUserById(client.userId);
-  if (!currentUser?.isActive) {
+  const actor = store.getUserById(client.actorUserId);
+  if (!actor?.isActive) {
     client.socket.close();
     return;
   }
@@ -1277,7 +1359,7 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
     return;
   }
   client.sendingFull = true;
-  const data = createMarketPayload(client.userId);
+  const data = createMarketPayload(client.viewedUserId);
   const sendStartedAt = markTransportSendStart(data.transportMeta);
   const outbound = JSON.stringify({ type: "market", data });
   const bytes = Buffer.byteLength(outbound);
@@ -1297,9 +1379,10 @@ function initialFullSnapshotDelayMs(client: MarketBroadcastClient) {
   return (client.fullOrdinal % MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS) * MARKET_WS_FULL_SNAPSHOT_STAGGER_MS;
 }
 
-function registerMarketBroadcastClient(userId: string, socket: WsWebSocket) {
+function registerMarketBroadcastClient(actorUserId: string, viewedUserId: string, socket: WsWebSocket) {
   const client: MarketBroadcastClient = {
-    userId,
+    actorUserId,
+    viewedUserId,
     socket,
     closed: false,
     sendingTick: false,
@@ -1349,24 +1432,28 @@ function stopMarketBroadcasting() {
   store.emitter.off("market:update", handleMarketUpdate);
 }
 
-function createBootstrapPayload(user: UserRecord) {
-  const market = createCurrentRoundPayload();
+function createBootstrapPayload(user: UserRecord, viewedUser: UserRecord = user) {
+  const market = createCurrentRoundPayload(0, viewedUser.id);
   return {
     ...market,
-    history: getHistoryWithSettlementPreview(60, user.id),
+    viewedUserId: viewedUser.id,
+    viewedUser: store.sanitizeUser(viewedUser),
+    history: getHistoryWithSettlementPreview(60, viewedUser.id),
     me: store.sanitizeUser(user),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-    profile: store.getProfile(user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getOrders(user.id),
-    orderLifecycles: store.getOrderLifecycleLogs(user.id),
-    logs: store.getRecentLogs(user.id),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(500, viewedUser.id),
+    profile: store.getProfile(viewedUser.id),
+    positions: store.getPositions(viewedUser.id),
+    orders: store.getOrders(viewedUser.id),
+    orderLifecycles: store.getOrderLifecycleLogs(viewedUser.id),
+    logs: store.getRecentLogs(viewedUser.id),
     sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
   };
 }
 
 function createUserFullPayload(user: UserRecord) {
   return {
+    viewedUserId: user.id,
+    viewedUser: store.sanitizeUser(user),
     profile: store.getProfile(user.id),
     operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
     positions: store.getPositions(user.id),
@@ -1378,6 +1465,7 @@ function createUserFullPayload(user: UserRecord) {
 
 function createUserTradePayload(user: UserRecord) {
   return {
+    viewedUserId: user.id,
     profile: store.getProfile(user.id),
     positions: store.getPositions(user.id),
     orders: store.getRecentTradeOrders(user.id, 50),
@@ -1429,6 +1517,7 @@ async function recordUserManagementAudit(input: {
     | "user.enable"
     | "user.resetPassword"
     | "user.changePassword"
+    | "user.group.update"
     | "user.balance.set";
   success: boolean;
   serverRecvTs: number;
@@ -1471,9 +1560,21 @@ async function buildLogsExportZip(actor: UserRecord, query: ExportQuery) {
     anonId: store.anonymizeUserId(user.id)
   }));
   const scopedQuery = resolveLogSearchFilters(actor, query);
-  const baseExportUsers = query.userIds?.length
-    ? resolveExportUsers(actor, allUsers).filter((user) => query.userIds?.includes(user.id))
-    : resolveExportUsers(actor, allUsers, query.userId);
+  const visibleExportUsers = resolveExportUsers(actor, allUsers);
+  const requestedUserIds = query.userIds?.length
+    ? [...new Set(query.userIds)]
+    : scopedQuery.userId
+      ? [scopedQuery.userId]
+      : undefined;
+  if (requestedUserIds?.length) {
+    const visibleIds = new Set(visibleExportUsers.map((user) => user.id));
+    if (requestedUserIds.some((userId) => !visibleIds.has(userId))) {
+      throw new Error("Logs are not available for this user.");
+    }
+  }
+  const baseExportUsers = requestedUserIds?.length
+    ? visibleExportUsers.filter((user) => requestedUserIds.includes(user.id))
+    : visibleExportUsers;
   const exportUsers = baseExportUsers.filter((user) => {
     if (query.role && user.role !== query.role) {
       return false;
@@ -1982,7 +2083,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       const parsed = wsTicketSchema.parse(request.body);
-      return createWsTicket(user, parsed.channel);
+      return createWsTicket(user, parsed.channel, parsed.viewUserId);
     })
   );
 
@@ -1998,7 +2099,8 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
       requirePermission(user, "profile:view");
-      return createBootstrapPayload(user);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return createBootstrapPayload(user, viewedUser);
     })
   );
 
@@ -2083,12 +2185,25 @@ async function bootstrap() {
       requirePermission(actor, "users:create");
       const serverRecvTs = Date.now();
       const parsed = createUserSchema.parse(request.body);
-      const managerUserId = normalizeManagerUserId(parsed.role as Role, parsed.managerUserId ?? parsed.seniorTesterId);
+      const requestedRole = parsed.role as Role;
+      if (!canCreateUserForActor(actor, requestedRole)) {
+        throw new Error("You can only create Tester accounts in your own group.");
+      }
+      const finalRole = actor.role === "Admin" ? requestedRole : "Tester";
+      const requestedManagerUserId = parsed.managerUserId ?? parsed.seniorTesterId;
+      if (actor.role !== "Admin" && requestedManagerUserId && requestedManagerUserId !== actor.id) {
+        throw new Error("You can only assign new Tester accounts to your own group.");
+      }
+      const managerUserId = normalizeManagerUserId(
+        finalRole,
+        actor.role === "Admin" ? requestedManagerUserId ?? getDefaultGroupManagerId() : actor.id,
+        { requireActive: true }
+      );
       const created = await store.createUser({
         username: parsed.username,
         password: parsed.password,
         displayName: parsed.displayName,
-        role: parsed.role as Role,
+        role: finalRole,
         language: (parsed.language ?? "zh-CN") as Language,
         seniorTesterId: managerUserId,
         managerUserId,
@@ -2125,17 +2240,28 @@ async function bootstrap() {
       const target = getTargetUserForManagement(actor, params.id);
       const parsed = updateUserSchema.parse(request.body);
       const nextRole = (parsed.role ?? target.role) as Role;
+      const hasManagerPatch =
+        Object.prototype.hasOwnProperty.call(parsed, "managerUserId") ||
+        Object.prototype.hasOwnProperty.call(parsed, "seniorTesterId");
       if (actor.role !== "Admin" && parsed.role && parsed.role !== target.role) {
         throw new Error("Only Admin can change user roles.");
       }
       if (actor.role !== "Admin" && typeof parsed.isActive === "boolean") {
         throw new Error("Use enable/disable actions for account status changes.");
       }
+      const requestedManagerUserId = parsed.managerUserId ?? parsed.seniorTesterId;
+      const clearingManager = parsed.managerUserId === null || parsed.seniorTesterId === null;
+      if (actor.role !== "Admin" && (clearingManager || (requestedManagerUserId && requestedManagerUserId !== actor.id))) {
+        throw new Error("You can only keep Tester accounts in your own group.");
+      }
       const managerUserId = normalizeManagerUserId(
         nextRole,
-        parsed.managerUserId === null || parsed.seniorTesterId === null
-          ? undefined
-          : parsed.managerUserId ?? parsed.seniorTesterId ?? target.managerUserId ?? target.seniorTesterId
+        actor.role !== "Admin"
+          ? actor.id
+          : clearingManager
+            ? undefined
+            : requestedManagerUserId ?? target.managerUserId ?? target.seniorTesterId,
+        { requireActive: hasManagerPatch && !clearingManager }
       );
       const updated = await store.updateUserProfile(target.id, {
         displayName: parsed.displayName,
@@ -2162,6 +2288,45 @@ async function bootstrap() {
           permissionLevel: updated.permissionLevel ?? "Standard",
           availableUsdc: updated.availableUsdc,
           isActive: updated.isActive
+        }
+      });
+      return store.sanitizeUser(updated);
+    })
+  );
+
+  app.patch("/api/users/:id/group", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:manager:update");
+      if (actor.role !== "Admin") {
+        throw new Error("Only Admin can change user groups.");
+      }
+      const serverRecvTs = Date.now();
+      const params = request.params as { id: string };
+      const target = store.getUserById(params.id);
+      if (!target) {
+        throw new Error("Target user was not found.");
+      }
+      if (!canChangeUserGroupForActor(actor, target)) {
+        throw new Error("Only Tester accounts can be moved between groups.");
+      }
+      const parsed = changeUserGroupSchema.parse(request.body);
+      const managerUserId = normalizeManagerUserId("Tester", parsed.managerUserId, { requireActive: true });
+      const updated = await store.updateUserProfile(target.id, {
+        seniorTesterId: managerUserId,
+        managerUserId
+      });
+      await recordUserManagementAudit({
+        actor,
+        actionType: "user.group.update",
+        success: true,
+        serverRecvTs,
+        targetUserId: updated.id,
+        resultMessage: "User group was changed.",
+        details: {
+          username: updated.username,
+          role: updated.role,
+          managerUserId: updated.managerUserId ?? updated.seniorTesterId
         }
       });
       return store.sanitizeUser(updated);
@@ -2391,7 +2556,7 @@ async function bootstrap() {
   app.post("/api/users/:id/enable", async (request) =>
     safeRoute(async () => {
       const actor = getUserFromRequest(request);
-      requirePermission(actor, "users:disable");
+      requirePermission(actor, "users:enable");
       const serverRecvTs = Date.now();
       const params = request.params as { id: string };
       const target = getTargetUserForManagement(actor, params.id);
@@ -2474,7 +2639,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
-      return createCurrentRoundPayload();
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return createCurrentRoundPayload(0, viewedUser.id);
     })
   );
 
@@ -2482,8 +2648,9 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const limit = Number((request.query as { limit?: string }).limit ?? 10);
-      return getHistoryWithSettlementPreview(limit, user.id);
+      return getHistoryWithSettlementPreview(limit, viewedUser.id);
     })
   );
 
@@ -2512,8 +2679,9 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const limit = Number((request.query as { limit?: string }).limit ?? 500);
-      return getOperatedHistoryWithSettlementPreview(limit, user.id);
+      return getOperatedHistoryWithSettlementPreview(limit, viewedUser.id);
     })
   );
 
@@ -2521,7 +2689,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getProfile(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getProfile(viewedUser.id);
     })
   );
 
@@ -2529,7 +2698,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getPositions(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getPositions(viewedUser.id);
     })
   );
 
@@ -2537,7 +2707,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getOrders(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getOrders(viewedUser.id);
     })
   );
 
@@ -2545,7 +2716,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getOrderLifecycleLogs(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getOrderLifecycleLogs(viewedUser.id);
     })
   );
 
@@ -2654,7 +2826,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getRecentLogs(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getRecentLogs(viewedUser.id);
     })
   );
 
@@ -2814,10 +2987,11 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const parsed = auditLogQuerySchema.pick({ roundId: true }).required().parse(request.query) as { roundId: string };
       return {
-        auditLogs: store.getAuditLogs({ userId: user.id, roundId: parsed.roundId }),
-        behaviorLogs: store.getBehaviorLogs({ userId: user.id, roundId: parsed.roundId })
+        auditLogs: store.getAuditLogs({ userId: viewedUser.id, roundId: parsed.roundId }),
+        behaviorLogs: store.getBehaviorLogs({ userId: viewedUser.id, roundId: parsed.roundId })
       };
     })
   );
@@ -2848,8 +3022,8 @@ async function bootstrap() {
       if (!timeline) {
         throw new Error("Order timeline was not found.");
       }
-      const teamUserIds = canViewTeamLogs(user) ? teamVisibleUserIds(user) : [user.id];
-      if (!canViewAllLogs(user) && !teamUserIds.includes(timeline.order.userId)) {
+      const timelineUser = store.getUserById(timeline.order.userId);
+      if (!timelineUser || !canViewUserRecords(user, timelineUser, store.listUserRecords())) {
         throw new Error("Order timeline is not available for this user.");
       }
       const matchingReplay = timeline.order.bookKey
@@ -2931,16 +3105,16 @@ async function bootstrap() {
 
   app.get("/ws/market", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "market");
-      if (!user || !user.isActive) {
+      const query = request.query as { token?: string; ticket?: string; viewUserId?: string };
+      const session = getWsSession(query, "market");
+      if (!session?.actor.isActive) {
         socket.close();
         return;
       }
       attachHeartbeat(socket, "market");
       wsConnectionCounts.market += 1;
       appMetrics.setWsConnections("market", wsConnectionCounts.market);
-      const unregisterMarketClient = registerMarketBroadcastClient(user.id, socket);
+      const unregisterMarketClient = registerMarketBroadcastClient(session.actor.id, session.viewedUser.id, socket);
       socket.on("close", () => {
         unregisterMarketClient();
         wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
@@ -2956,17 +3130,18 @@ async function bootstrap() {
 
   app.get("/ws/user", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "user");
-      if (!user || !user.isActive) {
+      const query = request.query as { token?: string; ticket?: string; viewUserId?: string };
+      const session = getWsSession(query, "user");
+      if (!session?.actor.isActive) {
         socket.close();
         return;
       }
+      const { actor, viewedUser } = session;
       attachHeartbeat(socket, "user");
       wsConnectionCounts.user += 1;
       appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
-      const eventName = `user:${user.id}`;
+      const eventName = `user:${viewedUser.id}`;
       let userSendInFlight = false;
       let pendingUserPayloadScope: UserPayloadScope | undefined;
       let userRetryTimer: NodeJS.Timeout | undefined;
@@ -2979,8 +3154,9 @@ async function bootstrap() {
       }
 
       const sendPayloadNow = (scope: UserPayloadScope = "full") => {
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
+        const currentActor = store.getUserById(actor.id);
+        const currentViewedUser = store.getUserById(viewedUser.id);
+        if (!currentActor?.isActive || !currentViewedUser || !canViewUserRecords(currentActor, currentViewedUser, store.listUserRecords())) {
           socket.close();
           return;
         }
@@ -2992,7 +3168,7 @@ async function bootstrap() {
         const buildStartedAt = Date.now();
         const outbound = JSON.stringify({
           type: scope === "trade" ? "user:trade" : "user",
-          data: scope === "trade" ? createUserTradePayload(currentUser) : createUserFullPayload(currentUser)
+          data: scope === "trade" ? createUserTradePayload(currentViewedUser) : createUserFullPayload(currentViewedUser)
         });
         const buildLatencyMs = Date.now() - buildStartedAt;
         if (buildLatencyMs > 50 || Buffer.byteLength(outbound) > 200_000) {

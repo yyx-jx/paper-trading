@@ -32,6 +32,7 @@ export interface ExportQuery {
   systems?: LogSearchQuery["systems"];
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -453,16 +454,12 @@ function safePathSegment(value: string) {
 }
 
 export function resolveExportUsers(actor: UserRecord, allUsers: ExportUser[], targetUserId?: string) {
-  const allAllowed =
-    actor.role === "Admin" ||
-    actor.role === "Test Engineer" ||
-    actor.permissionCodes.includes("logs:view:all" as never);
-  const teamAllowed = actor.role === "Senior Tester" || actor.permissionCodes.includes("logs:view:team" as never);
-  const visibleUsers = allAllowed
-    ? allUsers
-    : teamAllowed
-      ? allUsers.filter((user) => user.id === actor.id || (user.role === "Tester" && user.seniorTesterId === actor.id))
-      : allUsers.filter((user) => user.id === actor.id);
+  const visibleUsers =
+    actor.role === "Admin"
+      ? allUsers
+      : actor.role === "Senior Tester" || actor.role === "Test Engineer"
+        ? allUsers.filter((user) => user.id === actor.id || (user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === actor.id))
+        : allUsers.filter((user) => user.id === actor.id);
   if (!targetUserId) {
     return visibleUsers;
   }

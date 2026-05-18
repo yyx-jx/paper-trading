@@ -286,7 +286,7 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
   const existingNames = new Set(existingUsers.map((user) => user.username));
   const seniorLookup = new Map(
     existingUsers
-      .filter((user) => user.role === "Senior Tester" && user.isActive)
+      .filter((user) => (user.role === "Senior Tester" || user.role === "Test Engineer") && user.isActive)
       .flatMap((user) => [
         [user.id, user.id],
         [user.username, user.id]
@@ -344,8 +344,8 @@ function parseBulkUserText(text: string, existingUsers: PublicUser[], language: 
       rowErrors.push(
         localLabel(
           language,
-          "seniorTesterId 必须是有效的 Senior Tester ID 或用户名。",
-          "seniorTesterId must be a valid Senior Tester ID or username."
+          "seniorTesterId 必须是有效的组管理员 ID 或用户名。",
+          "seniorTesterId must be a valid group manager ID or username."
         )
       );
     }
@@ -2213,6 +2213,8 @@ function App() {
   const {
     token,
     me,
+    viewedUserId,
+    viewedUser,
     currentPage,
     currentRound,
     history,
@@ -2228,6 +2230,7 @@ function App() {
     lastMarketRecvTs,
     setAuth,
     setUser,
+    setViewedUserTarget,
     clearAuth,
     setCurrentPage,
     setBootstrap,
@@ -2259,6 +2262,8 @@ function App() {
   const [timelineBusyOrderId, setTimelineBusyOrderId] = useState<string>();
   const [roundLogDialog, setRoundLogDialog] = useState<RoundLogDialogState>();
   const [roundLogBusyRoundId, setRoundLogBusyRoundId] = useState<string>();
+  const [viewUserId, setViewUserId] = useState<string>();
+  const [visibleViewUsers, setVisibleViewUsers] = useState<PublicUser[]>([]);
   const cancellingOrderIdsRef = useRef(new Set<string>());
   const clientClockOffsetMsRef = useRef(0);
   const countdownTargetMs =
@@ -2268,10 +2273,70 @@ function App() {
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
   const canOpenUserManagement = Boolean(me?.permissionCodes.includes("users:list"));
+  const canSelectViewUser = Boolean(me && (me.role === "Admin" || me.role === "Senior Tester" || me.role === "Test Engineer"));
+  const effectiveViewUserId = viewUserId ?? me?.id;
+  const currentViewedUser =
+    (viewedUserId === effectiveViewUserId ? viewedUser : undefined) ??
+    visibleViewUsers.find((user) => user.id === effectiveViewUserId) ??
+    me;
+  const isViewingSelf = !effectiveViewUserId || effectiveViewUserId === me?.id;
 
   useEffect(() => {
     setChartVisibleCount(defaultVisibleCountForInterval(selectedInterval));
   }, [selectedInterval]);
+
+  useEffect(() => {
+    if (!me) {
+      setViewUserId(undefined);
+      setVisibleViewUsers([]);
+      return;
+    }
+    setViewUserId((current) => current ?? me.id);
+  }, [me?.id]);
+
+  const refreshVisibleViewUsers = useCallback(async () => {
+    if (!token || !me) {
+      setVisibleViewUsers([]);
+      return;
+    }
+    if (!canSelectViewUser) {
+      setVisibleViewUsers([me]);
+      setViewUserId(me.id);
+      return;
+    }
+    const users = await api.getUsers(token);
+    const nextUsers = users.length ? users : [me];
+    setVisibleViewUsers(nextUsers);
+    setViewUserId((current) => {
+      const nextId = current ?? me.id;
+      return nextUsers.some((user) => user.id === nextId) ? nextId : me.id;
+    });
+  }, [token, me, canSelectViewUser]);
+
+  const handleViewUserChange = (nextViewUserId: string) => {
+    const nextViewedUser = visibleViewUsers.find((user) => user.id === nextViewUserId) ?? me;
+    setViewUserId(nextViewUserId);
+    setViewedUserTarget(nextViewUserId, nextViewedUser);
+    setError(undefined);
+  };
+
+  useEffect(() => {
+    if (!token || !me) {
+      setVisibleViewUsers([]);
+      return;
+    }
+    let cancelled = false;
+    refreshVisibleViewUsers()
+      .catch(() => {
+        if (!cancelled) {
+          setVisibleViewUsers([me]);
+          setViewUserId(me.id);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, me, refreshVisibleViewUsers]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 250);
@@ -2310,7 +2375,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!token) {
+    if (!token || !me) {
       setRealtimeStatus(initialRealtimeStatus());
       return;
     }
@@ -2319,7 +2384,7 @@ function App() {
     const bootstrap = async () => {
       setBootstrapping(true);
       try {
-        const bootstrapData = await api.getBootstrap(token);
+        const bootstrapData = await api.getBootstrap(token, effectiveViewUserId);
 
         if (cancelled) {
           return;
@@ -2341,14 +2406,17 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [token, clearAuth, i18n, setBootstrap]);
+  }, [token, effectiveViewUserId, clearAuth, i18n, setBootstrap]);
 
   useEffect(() => {
-    if (!token) {
+    if (!token || !me) {
       setRealtimeStatus(initialRealtimeStatus());
       return;
     }
 
+    const activeMe = me;
+    const activeViewUserId = effectiveViewUserId ?? activeMe.id;
+    const activeViewedUser = currentViewedUser ?? activeMe;
     setRealtimeStatus(initialRealtimeStatus());
     let disposed = false;
     let marketSocket: WebSocket | undefined;
@@ -2405,10 +2473,14 @@ function App() {
       lastMarketFallbackAt = Date.now();
       updateRealtimeChannel("market", { state: "fallback", fallbackAt: lastMarketFallbackAt }, { now: lastMarketFallbackAt, failure: true });
       try {
-        const [roundData, nextHistory] = await Promise.all([api.getCurrentRound(token), api.getHistory(token)]);
+        const [roundData, nextHistory] = await Promise.all([
+          api.getCurrentRound(token, activeViewUserId),
+          api.getHistory(token, 60, activeViewUserId)
+        ]);
         if (!disposed) {
           const receivedAt = Date.now();
           const payload = {
+            viewedUserId: roundData.viewedUserId ?? activeViewUserId,
             currentRound: roundData.currentRound,
             history: nextHistory,
             snapshot: roundData.snapshot,
@@ -2445,16 +2517,18 @@ function App() {
       updateRealtimeChannel("user", { state: "fallback", fallbackAt: lastUserFallbackAt }, { now: lastUserFallbackAt, failure: true });
       try {
         const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-          api.getProfile(token),
-          api.getOperatedHistory(token),
-          api.getPositions(token),
-          api.getOrders(token),
-          api.getOrderLifecycles(token),
-          api.getLogs(token)
+          api.getProfile(token, activeViewUserId),
+          api.getOperatedHistory(token, 500, activeViewUserId),
+          api.getPositions(token, activeViewUserId),
+          api.getOrders(token, activeViewUserId),
+          api.getOrderLifecycles(token, activeViewUserId),
+          api.getLogs(token, activeViewUserId)
         ]);
         if (!disposed) {
           const receivedAt = Date.now();
           setUserPayload({
+            viewedUserId: activeViewUserId,
+            viewedUser: activeViewedUser,
             profile: nextProfile,
             operatedHistory: nextOperatedHistory,
             positions: nextPositions,
@@ -2514,12 +2588,12 @@ function App() {
       }
       marketSocket?.close();
       updateRealtimeChannel("market", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/market", token);
+      let wsUrl = api.createWsUrl("/ws/market", token, activeViewUserId);
       try {
-        const ticket = await api.createWsTicket(token, "market");
+        const ticket = await api.createWsTicket(token, "market", activeViewUserId);
         wsUrl = api.createWsTicketUrl("/ws/market", ticket.ticket);
       } catch {
-        wsUrl = api.createWsUrl("/ws/market", token);
+        wsUrl = api.createWsUrl("/ws/market", token, activeViewUserId);
       }
       if (disposed) {
         return;
@@ -2609,12 +2683,12 @@ function App() {
       }
       userSocket?.close();
       updateRealtimeChannel("user", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/user", token);
+      let wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId);
       try {
-        const ticket = await api.createWsTicket(token, "user");
+        const ticket = await api.createWsTicket(token, "user", activeViewUserId);
         wsUrl = api.createWsTicketUrl("/ws/user", ticket.ticket);
       } catch {
-        wsUrl = api.createWsUrl("/ws/user", token);
+        wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId);
       }
       if (disposed) {
         return;
@@ -2759,7 +2833,7 @@ function App() {
       marketSocket?.close();
       userSocket?.close();
     };
-  }, [token, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, setUserTradePayload, updateRealtimeChannel]);
+  }, [token, me, effectiveViewUserId, currentViewedUser?.id, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, setUserTradePayload, updateRealtimeChannel]);
 
   const handleLogin = async (username: string, password: string) => {
     setError(undefined);
@@ -2784,8 +2858,16 @@ function App() {
     }
   };
 
+  const ensureViewingSelfForMutation = () => {
+    if (isViewingSelf) {
+      return true;
+    }
+    setError(localLabel(language, "当前正在查看其他用户，交易操作已锁定。", "Trading actions are locked while viewing another user."));
+    return false;
+  };
+
   const handlePlaceOrder = async () => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     const limitPriceCents = orderKind === "limit" ? parseLimitPriceCentsInput(limitPrice) : undefined;
@@ -2824,7 +2906,7 @@ function App() {
   };
 
   const handleCloseSide = async (side = selectedSide) => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     try {
@@ -2840,7 +2922,7 @@ function App() {
   };
 
   const handleReverseSide = async () => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     try {
@@ -2857,7 +2939,7 @@ function App() {
   };
 
   const handleCancelOrder = async (orderId: string) => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     if (cancellingOrderIdsRef.current.has(orderId)) {
@@ -2869,14 +2951,16 @@ function App() {
       setError(undefined);
       await api.cancelOrder(token, orderId);
       const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getProfile(token),
-        api.getOperatedHistory(token),
-        api.getPositions(token),
-        api.getOrders(token),
-        api.getOrderLifecycles(token),
-        api.getLogs(token)
+        api.getProfile(token, effectiveViewUserId),
+        api.getOperatedHistory(token, 500, effectiveViewUserId),
+        api.getPositions(token, effectiveViewUserId),
+        api.getOrders(token, effectiveViewUserId),
+        api.getOrderLifecycles(token, effectiveViewUserId),
+        api.getLogs(token, effectiveViewUserId)
       ]);
       setUserPayload({
+        viewedUserId: effectiveViewUserId ?? me.id,
+        viewedUser: currentViewedUser ?? me,
         profile: nextProfile,
         operatedHistory: nextOperatedHistory,
         positions: nextPositions,
@@ -2914,7 +2998,7 @@ function App() {
     try {
       setError(undefined);
       setRoundLogBusyRoundId(item.roundId);
-      const activity = await api.getRoundActivity(token, item.roundId);
+      const activity = await api.getRoundActivity(token, item.roundId, effectiveViewUserId);
       setRoundLogDialog({
         item,
         logs: [...activity.auditLogs].sort((left, right) => left.serverRecvTs - right.serverRecvTs),
@@ -2928,7 +3012,7 @@ function App() {
   };
 
   const handleSell = async (positionId: string) => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     try {
@@ -2938,14 +3022,16 @@ function App() {
       const result = await api.sellPosition(token, positionId);
       setLastOrderLatencyMs(result.matchLatencyMs);
       const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getProfile(token),
-        api.getOperatedHistory(token),
-        api.getPositions(token),
-        api.getOrders(token),
-        api.getOrderLifecycles(token),
-        api.getLogs(token)
+        api.getProfile(token, effectiveViewUserId),
+        api.getOperatedHistory(token, 500, effectiveViewUserId),
+        api.getPositions(token, effectiveViewUserId),
+        api.getOrders(token, effectiveViewUserId),
+        api.getOrderLifecycles(token, effectiveViewUserId),
+        api.getLogs(token, effectiveViewUserId)
       ]);
       setUserPayload({
+        viewedUserId: effectiveViewUserId ?? me.id,
+        viewedUser: currentViewedUser ?? me,
         profile: nextProfile,
         operatedHistory: nextOperatedHistory,
         positions: nextPositions,
@@ -2963,7 +3049,7 @@ function App() {
   };
 
   const handleManualSettle = async (roundId: string, side: TradeSide) => {
-    if (!token) {
+    if (!token || !me || !ensureViewingSelfForMutation()) {
       return;
     }
     try {
@@ -2973,15 +3059,16 @@ function App() {
         reason: `Manual settlement entered from ${me?.username ?? "client"}`
       });
       const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getCurrentRound(token),
-        api.getHistory(token),
-        api.getProfile(token),
-        api.getPositions(token),
-        api.getOrders(token),
-        api.getOrderLifecycles(token),
-        api.getLogs(token)
+        api.getCurrentRound(token, effectiveViewUserId),
+        api.getHistory(token, 60, effectiveViewUserId),
+        api.getProfile(token, effectiveViewUserId),
+        api.getPositions(token, effectiveViewUserId),
+        api.getOrders(token, effectiveViewUserId),
+        api.getOrderLifecycles(token, effectiveViewUserId),
+        api.getLogs(token, effectiveViewUserId)
       ]);
       setMarketPayload({
+        viewedUserId: roundData.viewedUserId ?? effectiveViewUserId ?? me.id,
         currentRound: roundData.currentRound,
         history: nextHistory,
         snapshot: roundData.snapshot,
@@ -2989,6 +3076,8 @@ function App() {
         transportMeta: roundData.transportMeta
       }, Date.now(), clientClockOffsetMsRef.current);
       setUserPayload({
+        viewedUserId: effectiveViewUserId ?? me.id,
+        viewedUser: currentViewedUser ?? me,
         profile: nextProfile,
         positions: nextPositions,
         orders: nextOrders,
@@ -3047,6 +3136,24 @@ function App() {
         </div>
 
         <div className="topbar-actions">
+          {canSelectViewUser ? (
+            <label className="view-user-control">
+              <span>{localLabel(language, "查看", "View")}</span>
+              <select value={effectiveViewUserId ?? me.id} onChange={(event) => handleViewUserChange(event.target.value)}>
+                {visibleViewUsers.map((user) => (
+                  <option key={user.id} value={user.id}>
+                    {user.username} / {user.role}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {!isViewingSelf && currentViewedUser ? (
+            <div className="view-user-chip">
+              <strong>{currentViewedUser.displayName || currentViewedUser.username}</strong>
+              <span>{localLabel(language, "只读", "Read only")}</span>
+            </div>
+          ) : null}
           <nav className="page-tabs">
             <button className={currentPage === "trade" ? "active" : ""} onClick={() => setCurrentPage("trade")}>
               {t("trade")}
@@ -3086,6 +3193,8 @@ function App() {
             t={t}
             nowMs={nowMs}
             me={me}
+            viewedUser={currentViewedUser}
+            isViewingSelf={isViewingSelf}
             currentRound={currentRound}
             settlementPreview={settlementPreview}
             currentPage={currentPage}
@@ -3115,9 +3224,9 @@ function App() {
             quickBusy={quickBusy}
             sellBusyPositionId={sellBusyPositionId}
             sellFeedback={sellFeedback}
-            canPlaceOrder={me.permissionCodes.includes("trade:order")}
-            canSell={me.permissionCodes.includes("trade:sell")}
-            canManualSettle={me.role !== "Tester"}
+            canPlaceOrder={isViewingSelf && me.permissionCodes.includes("trade:order")}
+            canSell={isViewingSelf && me.permissionCodes.includes("trade:sell")}
+            canManualSettle={isViewingSelf && me.role !== "Tester"}
             onAmountChange={setOrderAmount}
             onQtyChange={setOrderQty}
             onLimitPriceChange={setLimitPrice}
@@ -3161,6 +3270,7 @@ function App() {
                     const nextMe = await api.getMe(token);
                     setUser(nextMe);
                   }}
+                  onUsersChanged={refreshVisibleViewUsers}
                 />
               ) : undefined
             }
@@ -3182,6 +3292,11 @@ function App() {
             orders={orders}
             orderLifecycles={orderLifecycles}
             logs={logs}
+            viewUsers={visibleViewUsers}
+            viewedUserId={effectiveViewUserId}
+            viewedUser={currentViewedUser}
+            isViewingSelf={isViewingSelf}
+            onViewUserChange={handleViewUserChange}
             onSell={handleSell}
             onTimeline={handleOpenTimeline}
             onOpenRoundLogs={handleOpenRoundLogs}
@@ -3194,6 +3309,7 @@ function App() {
             t={t}
             token={token}
             me={me}
+            viewedUserId={effectiveViewUserId}
             canExport={me.permissionCodes.includes("profile:view") || me.role === "Admin"}
           />
         )}
@@ -3544,6 +3660,8 @@ function TradePageRestored(props: {
   t: (key: string, options?: Record<string, unknown>) => string;
   language: Language;
   me?: PublicUser;
+  viewedUser?: PublicUser;
+  isViewingSelf: boolean;
   nowMs: number;
   currentRound?: RoundRecord;
   settlementPreview?: SettlementPreview;
@@ -3864,6 +3982,11 @@ function TradePageRestored(props: {
         <div className="terminal-top-right">
           <span>{localLabel(language, "总", "EQ")} {money(profile?.totalEquity ?? 0)}</span>
           <span className="terminal-green">{localLabel(language, "可用", "AVL")} {money(profile?.availableUsdc ?? 0)}</span>
+          {!props.isViewingSelf && props.viewedUser ? (
+            <span className="terminal-readonly-badge">
+              {props.viewedUser.displayName || props.viewedUser.username} · {localLabel(language, "只读", "Read only")}
+            </span>
+          ) : null}
           <span className="terminal-user-badge">
             <strong>{props.me?.displayName ?? "--"}</strong>
             <em>{props.me?.role ?? "--"}</em>
@@ -4303,6 +4426,11 @@ function AnalyticsPage(props: {
   orders: OrderRecord[];
   orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
+  viewUsers: PublicUser[];
+  viewedUserId?: string;
+  viewedUser?: PublicUser;
+  isViewingSelf: boolean;
+  onViewUserChange: (viewUserId: string) => void;
   onSell: (positionId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
   onOpenRoundLogs: (item: RoundCalendarItem) => Promise<void>;
@@ -4346,6 +4474,7 @@ function AnalyticsPage(props: {
     () => summarizePositionPnl(props.positions.filter((position) => position.status === "open")),
     [props.positions]
   );
+  const analyticsViewUsers = props.viewUsers.length ? props.viewUsers : props.viewedUser ? [props.viewedUser] : [];
   const periodOptions = [
     { id: "all", label: analyticsPeriodLabel("all", language) },
     { id: "year", label: analyticsPeriodLabel("year", language) },
@@ -4426,6 +4555,25 @@ function AnalyticsPage(props: {
             </button>
           ))}
         </div>
+        <label>
+          <span>{localLabel(language, "查看用户", "View User")}</span>
+          <select
+            className="analytics-view-user-control"
+            value={props.viewedUserId ?? props.viewedUser?.id ?? ""}
+            onChange={(event) => props.onViewUserChange(event.target.value)}
+          >
+            {analyticsViewUsers.map((user) => (
+              <option key={user.id} value={user.id}>
+                {user.username} / {user.role}
+              </option>
+            ))}
+          </select>
+        </label>
+        {!props.isViewingSelf && props.viewedUser ? (
+          <span className="analytics-readonly-badge">
+            {props.viewedUser.displayName || props.viewedUser.username} · {localLabel(language, "只读", "Read only")}
+          </span>
+        ) : null}
         <label>
           <span>{localLabel(language, "标的", "Symbol")}</span>
           <select value="BTC" disabled>
@@ -4520,9 +4668,9 @@ function AnalyticsPage(props: {
   );
 }
 
-function LogSearchPage(props: { t: (key: string, options?: Record<string, unknown>) => string; token: string; me: PublicUser; canExport: boolean }) {
+function LogSearchPage(props: { t: (key: string, options?: Record<string, unknown>) => string; token: string; me: PublicUser; viewedUserId?: string; canExport: boolean }) {
   const { t, token, me } = props;
-  const [filters, setFilters] = useState<Record<string, string>>({ system: "all", limit: "100" });
+  const [filters, setFilters] = useState<Record<string, string>>({ system: "all", limit: "100", userId: props.viewedUserId ?? "" });
   const [logs, setLogs] = useState<UnifiedLogRow[]>([]);
   const [nextCursor, setNextCursor] = useState<string>();
   const [users, setUsers] = useState<PublicUser[]>([]);
@@ -4539,9 +4687,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
   const canFilterUsers =
     me.role === "Admin" ||
     me.role === "Test Engineer" ||
-    me.role === "Senior Tester" ||
-    me.permissionCodes.includes("logs:view:all") ||
-    me.permissionCodes.includes("logs:view:team");
+    me.role === "Senior Tester";
 
   const numberFilter = (key: string) => {
     const value = filters[key];
@@ -4594,6 +4740,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
 
   const toQueryFromFilters = (source: Record<string, string>, cursor?: string): LogSearchQuery => ({
     system: (source.system as LogSystem) || "all",
+    viewUserId: props.viewedUserId,
     from: source.from ? Date.parse(source.from) : undefined,
     to: source.to ? Date.parse(source.to) : undefined,
     userId: source.userId || undefined,
@@ -4650,13 +4797,15 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
   };
 
   useEffect(() => {
-    void search();
+    const nextFilters = { ...filters, userId: props.viewedUserId ?? "" };
+    setFilters(nextFilters);
+    void search("replace", nextFilters);
     if (canFilterUsers) {
       api.getUsers(token).then(setUsers).catch(() => setUsers([]));
     }
-    api.getHistory(token, 200).then(setRoundOptions).catch(() => setRoundOptions([]));
+    api.getHistory(token, 200, props.viewedUserId).then(setRoundOptions).catch(() => setRoundOptions([]));
     api.getLogFacets(token).then(setFacets).catch(() => setFacets(DEFAULT_LOG_FACETS));
-  }, []);
+  }, [token, props.viewedUserId]);
 
   useEffect(() => {
     if (!filters.userId || !filters.role || users.length === 0) {
@@ -5326,6 +5475,7 @@ function LogExportDialog(props: {
   const buildExportQuery = (): LogSearchQuery => ({
     system: systems.length === 1 ? systems[0] : "all",
     systems,
+    viewUserId: baseQuery.viewUserId,
     userIds: selectedUserIds.length ? selectedUserIds : undefined,
     from: form.from ? Date.parse(form.from) : undefined,
     to: form.to ? Date.parse(form.to) : undefined,
@@ -5855,7 +6005,7 @@ function BulkUserDialog(props: {
                 <th>{t("displayName")}</th>
                 <th>{t("role")}</th>
                 <th>{t("language")}</th>
-                <th>{t("seniorTester")}</th>
+                <th>{localLabel(language, "组管理员", "Group Manager")}</th>
                 <th>{t("available")}</th>
                 <th>{t("validation")}</th>
               </tr>
@@ -5926,6 +6076,7 @@ function UserManagementPage(props: {
   language: Language;
   embedded?: boolean;
   onProfileRefresh: () => Promise<void>;
+  onUsersChanged: () => Promise<void>;
 }) {
   const { token, me, language } = props;
   const [users, setUsers] = useState<PublicUser[]>([]);
@@ -5947,11 +6098,11 @@ function UserManagementPage(props: {
     displayName: string;
     role: Role;
     language: Language;
-    managerUserId: string;
     permissionLevel: PermissionLevel;
     availableUsdc: string;
     isActive: boolean;
   }>();
+  const [groupDialog, setGroupDialog] = useState<{ user: PublicUser; managerUserId: string }>();
   const [form, setForm] = useState({
     username: "",
     password: "",
@@ -5962,8 +6113,10 @@ function UserManagementPage(props: {
     availableUsdc: "10000"
   });
   const isAdmin = me.role === "Admin";
+  const isGroupManager = me.role === "Senior Tester" || me.role === "Test Engineer";
   const canBulkCreate = me.permissionCodes.includes("users:bulk-create");
   const canUpdateUsers = me.permissionCodes.includes("users:update");
+  const canCreateSingleUser = me.permissionCodes.includes("users:create") && (isAdmin || isGroupManager);
 
   const loadUsers = async () => {
     try {
@@ -5981,10 +6134,27 @@ function UserManagementPage(props: {
     void loadUsers();
   }, []);
 
-  const seniorOptions = users.filter((user) => user.role === "Senior Tester" && user.isActive);
+  const managerOptions = users.filter((user) => (user.role === "Senior Tester" || user.role === "Test Engineer") && user.isActive);
+  const selectableManagerOptions =
+    isGroupManager && !managerOptions.some((user) => user.id === me.id) ? [me, ...managerOptions] : managerOptions;
+  const defaultManagerUserId = managerOptions.find((user) => user.username === "JDH1")?.id ?? "";
+  const createRole = isAdmin ? form.role : "Tester";
+  const createManagerUserId = createRole === "Tester" ? (isAdmin ? form.seniorTesterId || defaultManagerUserId : me.id) : undefined;
   const canManageTarget = (user: PublicUser) =>
-    isAdmin || (me.role === "Senior Tester" && user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === me.id);
+    isAdmin || ((me.role === "Senior Tester" || me.role === "Test Engineer") && user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === me.id);
+  const canChangeGroup = (user: PublicUser) => isAdmin && user.role === "Tester" && user.id !== me.id;
   const canSetBalance = (user: PublicUser) => canManageTarget(user) || (me.role === "Senior Tester" && user.id === me.id);
+  const groupOptionLabel = (user: PublicUser) => `${user.username} / ${user.role} ${localLabel(language, "组", "group")}`;
+  const groupLabelForUser = (user: PublicUser) => {
+    if (user.role === "Admin") {
+      return localLabel(language, "系统管理员", "System admin");
+    }
+    if (user.role === "Senior Tester" || user.role === "Test Engineer") {
+      return localLabel(language, "组管理员", "Group manager");
+    }
+    const manager = users.find((candidate) => candidate.id === (user.managerUserId ?? user.seniorTesterId));
+    return manager ? groupOptionLabel(manager) : localLabel(language, "未分配", "Unassigned");
+  };
   const visibleUsers = users.filter((user) => {
     const query = searchText.trim().toLowerCase();
     if (roleFilter !== "ALL" && user.role !== roleFilter) return false;
@@ -6000,6 +6170,14 @@ function UserManagementPage(props: {
     { Tester: 0, "Senior Tester": 0, "Test Engineer": 0, Admin: 0 }
   );
 
+  useEffect(() => {
+    if (isAdmin && form.role === "Tester" && !form.seniorTesterId && defaultManagerUserId) {
+      setForm((current) => ({ ...current, seniorTesterId: defaultManagerUserId }));
+    } else if (!isAdmin && isGroupManager && form.seniorTesterId !== me.id) {
+      setForm((current) => ({ ...current, role: "Tester", seniorTesterId: me.id }));
+    }
+  }, [defaultManagerUserId, form.role, form.seniorTesterId, isAdmin, isGroupManager, me.id]);
+
   const createUser = async () => {
     try {
       setBusy(true);
@@ -6008,9 +6186,10 @@ function UserManagementPage(props: {
         username: form.username,
         password: form.password,
         displayName: form.displayName,
-        role: form.role,
+        role: createRole,
         language: form.language,
-        seniorTesterId: form.role === "Tester" ? form.seniorTesterId || undefined : undefined,
+        seniorTesterId: createManagerUserId,
+        managerUserId: createManagerUserId,
         availableUsdc: Number(form.availableUsdc || 0)
       });
       setForm({
@@ -6019,10 +6198,11 @@ function UserManagementPage(props: {
         displayName: "",
         role: "Tester",
         language: "zh-CN",
-        seniorTesterId: "",
+        seniorTesterId: isAdmin ? defaultManagerUserId : me.id,
         availableUsdc: "10000"
       });
       await loadUsers();
+      await props.onUsersChanged();
     } catch (createError) {
       setError(createError instanceof Error ? createError.message : "Create user failed.");
     } finally {
@@ -6128,11 +6308,15 @@ function UserManagementPage(props: {
       displayName: user.displayName,
       role: user.role,
       language: user.language,
-      managerUserId: user.managerUserId ?? user.seniorTesterId ?? "",
       permissionLevel: user.permissionLevel ?? "Standard",
       availableUsdc: String(user.availableUsdc),
       isActive: user.isActive
     });
+  };
+
+  const openGroupDialog = (user: PublicUser) => {
+    setError(undefined);
+    setGroupDialog({ user, managerUserId: user.managerUserId ?? user.seniorTesterId ?? defaultManagerUserId });
   };
 
   const submitEdit = async () => {
@@ -6146,20 +6330,45 @@ function UserManagementPage(props: {
       displayName: editDialog.displayName,
       role: editDialog.role,
       language: editDialog.language,
-      managerUserId: editDialog.role === "Tester" ? editDialog.managerUserId || null : null,
-      seniorTesterId: editDialog.role === "Tester" ? editDialog.managerUserId || null : null,
       permissionLevel: editDialog.permissionLevel,
       availableUsdc: amount,
       isActive: editDialog.isActive
     };
+    if (editDialog.role !== "Tester") {
+      payload.managerUserId = null;
+      payload.seniorTesterId = null;
+    }
     try {
       setBusy(true);
       setError(undefined);
       await api.updateUser(token, editDialog.user.id, payload);
       setEditDialog(undefined);
       await loadUsers();
+      await props.onUsersChanged();
     } catch (editError) {
       setError(editError instanceof Error ? editError.message : "Update user failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitGroupChange = async () => {
+    if (!groupDialog) {
+      return;
+    }
+    if (!groupDialog.managerUserId) {
+      setError(localLabel(language, "请选择组别。", "Select a group."));
+      return;
+    }
+    try {
+      setBusy(true);
+      setError(undefined);
+      await api.changeUserGroup(token, groupDialog.user.id, groupDialog.managerUserId);
+      setGroupDialog(undefined);
+      await loadUsers();
+      await props.onUsersChanged();
+    } catch (groupError) {
+      setError(groupError instanceof Error ? groupError.message : "Change group failed.");
     } finally {
       setBusy(false);
     }
@@ -6209,7 +6418,7 @@ function UserManagementPage(props: {
         <div className="analytics-card"><span>{localLabel(language, "工程/管理", "Engineer/Admin")}</span><strong>{roleCounts["Test Engineer"] + roleCounts.Admin}</strong><small>{roleCounts.Admin} Admin</small></div>
       </div>
 
-      {isAdmin ? (
+      {canCreateSingleUser ? (
         <div className="filter-grid user-create-grid">
           <label>
             {props.t("username")}
@@ -6225,8 +6434,12 @@ function UserManagementPage(props: {
           </label>
           <label>
             {props.t("role")}
-            <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as Role })}>
-              {(["Tester", "Senior Tester", "Test Engineer", "Admin"] as Role[]).map((role) => (
+            <select
+              value={createRole}
+              disabled={!isAdmin}
+              onChange={(event) => setForm({ ...form, role: event.target.value as Role })}
+            >
+              {((isAdmin ? ["Tester", "Senior Tester", "Test Engineer", "Admin"] : ["Tester"]) as Role[]).map((role) => (
                 <option key={role} value={role}>
                   {role}
                 </option>
@@ -6241,12 +6454,16 @@ function UserManagementPage(props: {
             </select>
           </label>
           <label>
-            {t("seniorTester")}
-            <select value={form.seniorTesterId} onChange={(event) => setForm({ ...form, seniorTesterId: event.target.value })} disabled={form.role !== "Tester"}>
-              <option value="">{props.t("all")}</option>
-              {seniorOptions.map((user) => (
+            {localLabel(language, "组别", "Group")}
+            <select
+              value={createManagerUserId ?? ""}
+              onChange={(event) => setForm({ ...form, seniorTesterId: event.target.value })}
+              disabled={!isAdmin || createRole !== "Tester"}
+            >
+              <option value="">{localLabel(language, "未分配 / 请选择", "Unassigned / Select")}</option>
+              {selectableManagerOptions.map((user) => (
                 <option key={user.id} value={user.id}>
-                  {user.username}
+                  {groupOptionLabel(user)}
                 </option>
               ))}
             </select>
@@ -6288,7 +6505,7 @@ function UserManagementPage(props: {
             <th>{t("displayName")}</th>
             <th>{props.t("role")}</th>
             <th>{props.t("status")}</th>
-            <th>{t("seniorTester")}</th>
+            <th>{localLabel(language, "组别", "Group")}</th>
             <th>{localLabel(language, "权限等级", "Permission")}</th>
             <th>{props.t("available")}</th>
             <th>{props.t("action")}</th>
@@ -6301,7 +6518,6 @@ function UserManagementPage(props: {
             </tr>
           ) : (
             visibleUsers.map((user) => {
-              const senior = users.find((candidate) => candidate.id === (user.managerUserId ?? user.seniorTesterId));
               return (
                 <tr key={user.id}>
                   <td>{user.username}</td>
@@ -6313,7 +6529,7 @@ function UserManagementPage(props: {
                       tone={user.isActive ? "positive" : "negative"}
                     />
                   </td>
-                  <td>{senior?.username ?? "--"}</td>
+                  <td>{groupLabelForUser(user)}</td>
                   <td>{user.permissionLevel ?? "Standard"}</td>
                   <td>{money(user.availableUsdc)}</td>
                   <td>
@@ -6321,6 +6537,11 @@ function UserManagementPage(props: {
                       {canUpdateUsers && canManageTarget(user) && user.id !== me.id ? (
                         <button className="ghost-button compact-button" disabled={busy} onClick={() => openEditDialog(user)}>
                           {localLabel(language, "资料", "Edit")}
+                        </button>
+                      ) : null}
+                      {canChangeGroup(user) ? (
+                        <button className="ghost-button compact-button" disabled={busy} onClick={() => openGroupDialog(user)}>
+                          {localLabel(language, "换组", "Move group")}
                         </button>
                       ) : null}
                       {canSetBalance(user) ? (
@@ -6400,19 +6621,6 @@ function UserManagementPage(props: {
                 </select>
               </label>
               <label>
-                {t("seniorTester")}
-                <select
-                  value={editDialog.managerUserId}
-                  disabled={editDialog.role !== "Tester"}
-                  onChange={(event) => setEditDialog({ ...editDialog, managerUserId: event.target.value })}
-                >
-                  <option value="">{props.t("all")}</option>
-                  {seniorOptions.map((user) => (
-                    <option key={user.id} value={user.id}>{user.username}</option>
-                  ))}
-                </select>
-              </label>
-              <label>
                 {localLabel(language, "权限等级", "Permission Level")}
                 <select value={editDialog.permissionLevel} onChange={(event) => setEditDialog({ ...editDialog, permissionLevel: event.target.value as PermissionLevel })}>
                   <option value="Initial">Initial</option>
@@ -6432,6 +6640,40 @@ function UserManagementPage(props: {
               <div className="button-row">
                 <button className="secondary-button" disabled={busy} onClick={submitEdit}>{t("confirm")}</button>
                 <button className="ghost-button" disabled={busy} onClick={() => setEditDialog(undefined)}>{props.t("cancel")}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {groupDialog ? (
+        <div className="modal-backdrop">
+          <div className="panel user-action-dialog">
+            <div className="section-header">
+              <div>
+                <p className="eyebrow">{localLabel(language, "换组", "Move group")}</p>
+                <h2>{groupDialog.user.username}</h2>
+              </div>
+              <button className="ghost-button compact-button" onClick={() => setGroupDialog(undefined)}>
+                {props.t("close")}
+              </button>
+            </div>
+            {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
+            <div className="dialog-form">
+              <label>
+                {localLabel(language, "组别", "Group")}
+                <select
+                  value={groupDialog.managerUserId}
+                  onChange={(event) => setGroupDialog({ ...groupDialog, managerUserId: event.target.value })}
+                >
+                  <option value="">{localLabel(language, "未分配 / 请选择", "Unassigned / Select")}</option>
+                  {selectableManagerOptions.map((user) => (
+                    <option key={user.id} value={user.id}>{groupOptionLabel(user)}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="button-row">
+                <button className="secondary-button" disabled={busy} onClick={submitGroupChange}>{t("confirm")}</button>
+                <button className="ghost-button" disabled={busy} onClick={() => setGroupDialog(undefined)}>{props.t("cancel")}</button>
               </div>
             </div>
           </div>

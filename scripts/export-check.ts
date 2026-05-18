@@ -129,14 +129,17 @@ const senior = user("u-senior", "senior", "Senior Tester");
 const tester = user("u-tester", "tester", "Tester", senior.id);
 const otherTester = user("u-other", "other", "Tester", "u-other-senior");
 const engineer = user("u-engineer", "engineer", "Test Engineer");
+const engineerTester = user("u-engineer-tester", "engineer-tester", "Tester", engineer.id);
 const admin = user("u-admin", "admin", "Admin");
-const users = [senior, tester, otherTester, engineer, admin];
+const users = [senior, tester, otherTester, engineer, engineerTester, admin];
 
 assert.deepEqual(resolveExportUsers(actorFromPublic(admin), users).map((item) => item.id), users.map((item) => item.id));
-assert.deepEqual(resolveExportUsers(actorFromPublic(engineer), users).map((item) => item.id), users.map((item) => item.id));
+assert.deepEqual(new Set(resolveExportUsers(actorFromPublic(engineer), users).map((item) => item.id)), new Set([engineer.id, engineerTester.id]));
 assert.deepEqual(new Set(resolveExportUsers(actorFromPublic(senior), users).map((item) => item.id)), new Set([senior.id, tester.id]));
 assert.deepEqual(resolveExportUsers(actorFromPublic(tester), users).map((item) => item.id), [tester.id]);
 assert.throws(() => resolveExportUsers(actorFromPublic(senior), users, otherTester.id), /not available/);
+assert.throws(() => resolveExportUsers(actorFromPublic(engineer), users, admin.id), /not available/);
+assert.throws(() => resolveExportUsers(actorFromPublic(engineer), users, tester.id), /not available/);
 assert.deepEqual(resolveExportUsers(actorFromPublic(admin), users, tester.id).map((item) => item.id), [tester.id]);
 
 const escaped = toCsv([{ value: 'comma, quote " and\nnewline' }], [{ header: "value", value: (row) => row.value }]);

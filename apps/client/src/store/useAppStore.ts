@@ -24,6 +24,8 @@ import type {
 interface AppState {
   token?: string;
   me?: PublicUser;
+  viewedUserId?: string;
+  viewedUser?: PublicUser;
   currentPage: "trade" | "home" | "profile" | "logs";
   currentRound?: RoundRecord;
   history: HistoryRound[];
@@ -44,6 +46,7 @@ interface AppState {
   settlementPreview?: SettlementPreview;
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
+  setViewedUserTarget: (viewedUserId: string, viewedUser?: PublicUser) => void;
   clearAuth: () => void;
   setCurrentPage: (page: "trade" | "home" | "profile" | "logs") => void;
   setBootstrap: (data: BootstrapPayload) => void;
@@ -83,6 +86,10 @@ function shouldAcceptMarketPayload(
     return transportMeta.serverPublishTs >= state.lastMarketServerPublishTs;
   }
   return true;
+}
+
+function shouldAcceptViewedPayload(state: AppState, viewedUserId?: string) {
+  return !state.viewedUserId || !viewedUserId || state.viewedUserId === viewedUserId;
 }
 
 function stampSourceReceipt(source: SourceHealth, clientRecvTs: number, serverPublishTs: number, clientClockOffsetMs = 0): SourceHealth {
@@ -207,14 +214,27 @@ export const useAppStore = create<AppState>((set) => ({
   sourceStatus: [],
   setAuth: (token, me) => {
     window.localStorage.setItem("paper-trading-token", token);
-    set({ token, me });
+    set({ token, me, viewedUserId: me?.id, viewedUser: me });
   },
   setUser: (me) => set({ me }),
+  setViewedUserTarget: (viewedUserId, viewedUser) =>
+    set({
+      viewedUserId,
+      viewedUser,
+      profile: undefined,
+      positions: [],
+      orders: [],
+      orderLifecycles: [],
+      logs: [],
+      operatedHistory: []
+    }),
   clearAuth: () => {
     window.localStorage.removeItem("paper-trading-token");
     set({
       token: undefined,
       me: undefined,
+      viewedUserId: undefined,
+      viewedUser: undefined,
       currentRound: undefined,
       snapshot: undefined,
       profile: undefined,
@@ -241,6 +261,8 @@ export const useAppStore = create<AppState>((set) => ({
     const transportMeta = data.transportMeta ?? fallbackTransportMeta(data.snapshot);
     set({
       me: data.me,
+      viewedUserId: data.viewedUserId,
+      viewedUser: data.viewedUser,
       currentRound: data.currentRound,
       history: data.history,
       operatedHistory: data.operatedHistory ?? [],
@@ -263,6 +285,9 @@ export const useAppStore = create<AppState>((set) => ({
     let accepted = false;
     const transportMeta = data.transportMeta ?? fallbackTransportMeta(data.snapshot);
     set((state) => {
+      if (!shouldAcceptViewedPayload(state, data.viewedUserId)) {
+        return state;
+      }
       if (!shouldAcceptMarketPayload(state, transportMeta)) {
         return state;
       }
@@ -288,7 +313,7 @@ export const useAppStore = create<AppState>((set) => ({
       return false;
     }
     set((state) => {
-      if (!state.snapshot || !shouldAcceptMarketPayload(state, transportMeta)) {
+      if (!state.snapshot || !shouldAcceptViewedPayload(state, data.viewedUserId) || !shouldAcceptMarketPayload(state, transportMeta)) {
         return state;
       }
       accepted = true;
@@ -312,21 +337,32 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: clientRecvTs ? Math.max(Date.now() - clientRecvTs, 0) : undefined
     }),
   setUserPayload: (data) =>
-    set({
-      profile: data.profile,
-      operatedHistory: data.operatedHistory ?? [],
-      positions: data.positions,
-      orders: data.orders,
-      orderLifecycles: data.orderLifecycles,
-      logs: data.logs
-    }),
+    set((state) =>
+      shouldAcceptViewedPayload(state, data.viewedUserId)
+        ? {
+          viewedUserId: data.viewedUserId,
+          viewedUser: data.viewedUser,
+          profile: data.profile,
+          operatedHistory: data.operatedHistory ?? [],
+          positions: data.positions,
+          orders: data.orders,
+          orderLifecycles: data.orderLifecycles,
+          logs: data.logs
+        }
+        : state
+    ),
   setUserTradePayload: (data) =>
-    set({
-      profile: data.profile,
-      positions: data.positions,
-      orders: data.orders,
-      orderLifecycles: data.orderLifecycles
-    }),
+    set((state) =>
+      shouldAcceptViewedPayload(state, data.viewedUserId)
+        ? {
+          viewedUserId: data.viewedUserId,
+          profile: data.profile,
+          positions: data.positions,
+          orders: data.orders,
+          orderLifecycles: data.orderLifecycles
+        }
+        : state
+    ),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),
   setLastOrderLatencyMs: (lastOrderLatencyMs) => set({ lastOrderLatencyMs })
 }));

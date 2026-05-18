@@ -240,6 +240,7 @@ export interface MarketSnapshot {
 }
 
 export interface MarketPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   history: HistoryRound[];
   snapshot: MarketSnapshot;
@@ -291,6 +292,7 @@ export interface MarketRealtimeTick {
 }
 
 export interface MarketTickPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
@@ -298,6 +300,8 @@ export interface MarketTickPayload {
 }
 
 export interface UserPayload {
+  viewedUserId: string;
+  viewedUser: PublicUser;
   profile: ProfileOverview;
   operatedHistory?: HistoryRound[];
   positions: PositionRecord[];
@@ -307,6 +311,7 @@ export interface UserPayload {
 }
 
 export interface UserTradePayload {
+  viewedUserId: string;
   profile: ProfileOverview;
   positions: PositionRecord[];
   orders: OrderRecord[];
@@ -315,6 +320,7 @@ export interface UserTradePayload {
 
 export interface BootstrapPayload extends MarketPayload, UserPayload {
   me: PublicUser;
+  viewedUser: PublicUser;
   sourceStatus: SourceHealth[];
 }
 
@@ -590,6 +596,7 @@ export interface BehaviorActionLog {
 export interface AuditLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   roundId?: string;
   category?: "operation" | "matching" | "settlement" | "latency";
@@ -604,6 +611,7 @@ export interface AuditLogQuery {
 export interface BehaviorLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   roundId?: string;
   actionType?: string;
@@ -619,6 +627,7 @@ export interface LogSearchQuery {
   systems?: Array<Exclude<LogSystem, "all">>;
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -964,18 +973,22 @@ export const api = {
     }
     return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
-  createWsUrl(path: string, token: string) {
+  createWsUrl(path: string, token: string, viewUserId?: string) {
     const base = wsBaseUrl();
-    return `${base}${path}?token=${token}`;
+    const params = new URLSearchParams({ token });
+    if (viewUserId) {
+      params.set("viewUserId", viewUserId);
+    }
+    return `${base}${path}?${params.toString()}`;
   },
   createWsTicketUrl(path: string, ticket: string) {
     const base = wsBaseUrl();
     return `${base}${path}?ticket=${ticket}`;
   },
-  createWsTicket(token: string, channel: "market" | "user") {
+  createWsTicket(token: string, channel: "market" | "user", viewUserId?: string) {
     return request<{ ticket: string; expiresAt: number }>("/api/ws/tickets", token, {
       method: "POST",
-      body: JSON.stringify({ channel })
+      body: JSON.stringify({ channel, viewUserId })
     });
   },
   async login(username: string, password: string) {
@@ -985,8 +998,8 @@ export const api = {
     });
     return mapLoginResponse(data);
   },
-  getBootstrap(token: string) {
-    return request<BootstrapPayload>("/api/bootstrap/full", token);
+  getBootstrap(token: string, viewUserId?: string) {
+    return request<BootstrapPayload>(`/api/bootstrap/full${buildQuery({ viewUserId })}`, token);
   },
   getMe(token: string) {
     return request<PublicUser>("/api/me", token);
@@ -1009,16 +1022,17 @@ export const api = {
       body: JSON.stringify(input)
     });
   },
-  getCurrentRound(token: string) {
+  getCurrentRound(token: string, viewUserId?: string) {
     return request<{
+      viewedUserId?: string;
       currentRound?: RoundRecord;
       snapshot: MarketSnapshot;
       settlementPreview?: SettlementPreview;
       transportMeta?: MarketTransportMeta;
-    }>("/api/rounds/current", token);
+    }>(`/api/rounds/current${buildQuery({ viewUserId })}`, token);
   },
-  getHistory(token: string, limit = 60) {
-    return request<HistoryRound[]>(`/api/rounds/history?limit=${limit}`, token);
+  getHistory(token: string, limit = 60, viewUserId?: string) {
+    return request<HistoryRound[]>(`/api/rounds/history${buildQuery({ limit, viewUserId })}`, token);
   },
   manualSettleRound(token: string, roundId: string, input: { side: TradeSide; price?: number; reason?: string }) {
     return request<RoundRecord>(`/api/rounds/${roundId}/manual-settlement`, token, {
@@ -1026,23 +1040,23 @@ export const api = {
       body: JSON.stringify(input)
     });
   },
-  getOperatedHistory(token: string, limit = 500) {
-    return request<HistoryRound[]>(`/api/profile/rounds/operated?limit=${limit}`, token);
+  getOperatedHistory(token: string, limit = 500, viewUserId?: string) {
+    return request<HistoryRound[]>(`/api/profile/rounds/operated${buildQuery({ limit, viewUserId })}`, token);
   },
-  getProfile(token: string) {
-    return request<ProfileOverview>("/api/profile/me", token);
+  getProfile(token: string, viewUserId?: string) {
+    return request<ProfileOverview>(`/api/profile/me${buildQuery({ viewUserId })}`, token);
   },
-  getPositions(token: string) {
-    return request<PositionRecord[]>("/api/positions/me", token);
+  getPositions(token: string, viewUserId?: string) {
+    return request<PositionRecord[]>(`/api/positions/me${buildQuery({ viewUserId })}`, token);
   },
-  getOrders(token: string) {
-    return request<OrderRecord[]>("/api/orders/me", token);
+  getOrders(token: string, viewUserId?: string) {
+    return request<OrderRecord[]>(`/api/orders/me${buildQuery({ viewUserId })}`, token);
   },
-  getOrderLifecycles(token: string) {
-    return request<OrderLifecycleRecord[]>("/api/order-lifecycles/me", token);
+  getOrderLifecycles(token: string, viewUserId?: string) {
+    return request<OrderLifecycleRecord[]>(`/api/order-lifecycles/me${buildQuery({ viewUserId })}`, token);
   },
-  getLogs(token: string) {
-    return request<AuditEvent[]>("/api/logs/me", token);
+  getLogs(token: string, viewUserId?: string) {
+    return request<AuditEvent[]>(`/api/logs/me${buildQuery({ viewUserId })}`, token);
   },
   getSourceStatus(token: string) {
     return request<SourceHealth[]>("/api/system/sources/status", token);
@@ -1066,9 +1080,9 @@ export const api = {
   getLogFacets(token: string) {
     return request<LogFacets>("/api/logs/facets", token);
   },
-  getRoundActivity(token: string, roundId: string) {
+  getRoundActivity(token: string, roundId: string, viewUserId?: string) {
     return request<{ auditLogs: AuditEvent[]; behaviorLogs: BehaviorActionLog[] }>(
-      `/api/logs/round-activity${buildQuery({ roundId })}`,
+      `/api/logs/round-activity${buildQuery({ roundId, viewUserId })}`,
       token
     );
   },
@@ -1099,6 +1113,12 @@ export const api = {
     return request<PublicUser>(`/api/users/${userId}`, token, {
       method: "PATCH",
       body: JSON.stringify(input)
+    });
+  },
+  changeUserGroup(token: string, userId: string, managerUserId: string) {
+    return request<PublicUser>(`/api/users/${userId}/group`, token, {
+      method: "PATCH",
+      body: JSON.stringify({ managerUserId })
     });
   },
   bulkCreateUsers(token: string, users: BulkCreateUserInput[]) {

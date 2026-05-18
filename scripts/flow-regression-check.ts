@@ -624,7 +624,7 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(appSource, /api\.sampleClockOffset/);
   assert.match(appSource, /scheduleMarketReconnect/);
   assert.match(appSource, /refreshMarketSnapshot/);
-  assert.match(appSource, /api\.getCurrentRound\(token\)/);
+  assert.match(appSource, /api\.getCurrentRound\(token, activeViewUserId\)/);
   assert.match(appSource, /polymarketOpenPrice/);
   assert.match(appSource, /polymarketClosePrice/);
   assert.match(appSource, /lastMarketRecvTs/);
@@ -691,7 +691,7 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.doesNotMatch(appSource, /function analyticsConclusion/);
   assert.match(appSource, /function AnalyticsPage/);
   assert.match(appSource, /<AnalyticsPage/);
-  assert.match(appSource, /api\.getOperatedHistory\(token\)/);
+  assert.match(appSource, /api\.getOperatedHistory\(token, 500, effectiveViewUserId\)/);
   assert.match(appSource, /function inferAnalyticsRoundStartAt/);
   assert.match(appSource, /Math\.floor\(fallbackTs \/ \(5 \* 60_000\)\) \* \(5 \* 60_000\)/);
   assert.doesNotMatch(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt, log\.orderTimestampMs\)/);
@@ -742,17 +742,20 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.doesNotMatch(appSource, /from "recharts"/);
   assert.doesNotMatch(appSource, /<ResponsiveContainer/);
   assert.doesNotMatch(appSource, /<LineChart/);
-  assert.match(appSource, /api\.getRoundActivity\(token, item\.roundId\)/);
+  assert.match(appSource, /api\.getRoundActivity\(token, item\.roundId, effectiveViewUserId\)/);
   assert.match(appSource, /behaviorLogs: \[\.\.\.activity\.behaviorLogs\]/);
   assert.match(appSource, /state\.behaviorLogs\.map/);
   assert.match(appSource, /source: "Behavior"/);
   assert.doesNotMatch(appSource, /const equityCurve = buildEquityCurve\(props\.history, props\.profile\)/);
-  assert.match(apiSource, /getOperatedHistory\(token: string, limit = 500\)/);
-  assert.match(apiSource, /getRoundActivity\(token: string, roundId: string\)/);
+  assert.match(apiSource, /getOperatedHistory\(token: string, limit = 500, viewUserId\?: string\)/);
+  assert.match(apiSource, /getRoundActivity\(token: string, roundId: string, viewUserId\?: string\)/);
   assert.match(indexSource, /\/api\/logs\/round-activity/);
-  assert.match(indexSource, /behaviorLogs: store\.getBehaviorLogs\(\{ userId: user\.id, roundId: parsed\.roundId \}\)/);
+  assert.match(indexSource, /behaviorLogs: store\.getBehaviorLogs\(\{ userId: viewedUser\.id, roundId: parsed\.roundId \}\)/);
   assert.match(apiSource, /roundsParticipatedTotal\?: number/);
   assert.match(indexSource, /\/api\/profile\/rounds\/operated/);
+  assert.match(indexSource, /\/api\/users\/:id\/group/);
+  assert.match(indexSource, /actionType: "user\.group\.update"/);
+  assert.match(indexSource, /Only Admin can change user groups/);
   assert.match(storeSource, /getOperatedHistory\(limit = 500, userId: string\)/);
   assert.match(storeSource, /roundsParticipatedTotal/);
 }
@@ -874,7 +877,7 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(indexSource, /const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math\.max/);
   assert.match(indexSource, /const marketHistoryCache = new Map/);
   assert.match(indexSource, /store\.getHistoryRevision\(\)/);
-  assert.match(indexSource, /createMarketPayload\(client\.userId\)/);
+  assert.match(indexSource, /createMarketPayload\(client\.viewedUserId\)/);
   assert.match(indexSource, /createMarketTickPayload\(coalescedCount\)/);
   assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
   assert.match(indexSource, /marketBroadcastTickTimer = setInterval/);
@@ -1069,7 +1072,7 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   assert.match(styleSource, /\.terminal-login-card/);
   assert.match(appSource, /AUDIT_ACTION_LABELS/);
   assert.match(appSource, /auditActionLabel\(actionType, language\)/);
-  assert.match(appSource, /api\.getHistory\(token, 200\)/);
+  assert.match(appSource, /api\.getHistory\(token, 200, props\.viewedUserId\)/);
   assert.match(appSource, /const TRADE_INTERVAL_OPTIONS = \["30s", "1m", "5m", "15m", "1h"\]/);
   assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
   assert.match(appSource, /defaultVisibleCountForInterval\(selectedInterval\)/);

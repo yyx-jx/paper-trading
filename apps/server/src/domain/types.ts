@@ -643,6 +643,7 @@ export interface AuditEvent {
 export interface AuditLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   roundId?: string;
@@ -658,6 +659,7 @@ export interface AuditLogQuery {
 export interface BehaviorLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   roundId?: string;
@@ -692,6 +694,7 @@ export interface LogSearchQuery {
   systems?: Array<Exclude<LogSystem, "all">>;
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -838,6 +841,7 @@ export interface ProfileOverview {
 }
 
 export interface MarketPayload {
+  viewedUserId: string;
   snapshot: MarketSnapshot;
   currentRound?: RoundRecord;
   history: Array<RoundRecord & { userPnl: number; settlementPreview?: SettlementPreview }>;
@@ -889,6 +893,7 @@ export interface MarketRealtimeTick {
 }
 
 export interface MarketTickPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
@@ -896,17 +901,22 @@ export interface MarketTickPayload {
 }
 
 export interface UserPayload {
+  viewedUserId: string;
+  viewedUser: PublicUser;
   profile: ProfileOverview;
   operatedHistory: Array<RoundRecord & { userPnl: number }>;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
 }
 
 export interface UserTradePayload {
+  viewedUserId: string;
   profile: ProfileOverview;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
 }
 
 export interface BehaviorActionLog {
