@@ -592,8 +592,12 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.doesNotMatch(appSource, /function latencyFor\(source\?: SourceHealth, now = Date\.now\(\), clientRecvTs = now\)/);
   assert.match(
     appSource,
-    /Math\.max\(clientRecvTs - source\.serverPublishTs,\s*0\)/
+    /Math\.max\(clientRecvTs - source\.serverPublishTs - clientClockOffsetMs,\s*0\)/
   );
+  assert.match(appSource, /function transportAgeMs\(receivedAt: number, publishTs: number, clientClockOffsetMs = 0\)/);
+  assert.match(appSource, /transportAgeMs\(receivedAt, publishTs, clientClockOffsetMsRef\.current\)/);
+  assert.match(appSource, /transportAgeMs\(pending\.receivedAt, publishTs, clientClockOffsetMsRef\.current\)/);
+  assert.match(appSource, /clientClockOffsetMs=\{clientClockOffsetMsRef\.current\}/);
   assert.doesNotMatch(appSource, /source\?\.clientRecvTs \?\? props\.clientRecvTs \?\? props\.nowMs/);
   assert.doesNotMatch(appSource, /sourceClob\?\.clientRecvTs \?\? props\.lastMarketRecvTs \?\? nowMs/);
   assert.doesNotMatch(appSource, /nowMs - orderBook\.snapshotTs/);
@@ -840,7 +844,9 @@ async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   assert.match(indexSource, /payloadSeq: marketPayloadSeq/);
   assert.match(indexSource, /snapshot: stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
   assert.match(indexSource, /bufferedAmount > 0/);
-  assert.match(indexSource, /marketBroadcastPendingSince/);
+  assert.match(indexSource, /function markTransportSendStart\(transportMeta: MarketTransportMeta\)/);
+  assert.match(indexSource, /serverQueueMs = Math\.max\(sendStartedAt - transportMeta\.serverPublishTs, 0\)/);
+  assert.doesNotMatch(indexSource, /marketBroadcastPendingSince/);
   assert.match(indexSource, /marketBroadcastCoalescedCount/);
   assert.match(indexSource, /MarketBroadcastFrame/);
   assert.match(indexSource, /market:tick/);
@@ -864,14 +870,16 @@ async function testRealtimeLatencyPacingContracts() {
   assert.match(typesSource, /coalescedCount\?: number/);
   assert.match(apiSource, /serverQueueMs\?: number/);
   assert.match(indexSource, /const MARKET_WS_MIN_INTERVAL_MS = Math\.max\(serverConfig\.marketWsMinIntervalMs, 0\)/);
-  assert.match(indexSource, /const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 100/);
+  assert.match(indexSource, /const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 40/);
+  assert.match(indexSource, /const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math\.max/);
   assert.match(indexSource, /const marketHistoryCache = new Map/);
   assert.match(indexSource, /store\.getHistoryRevision\(\)/);
   assert.match(indexSource, /createMarketPayload\(client\.userId\)/);
-  assert.match(indexSource, /createMarketTickPayload\(coalescedCount, pendingSince\)/);
+  assert.match(indexSource, /createMarketTickPayload\(coalescedCount\)/);
   assert.match(indexSource, /elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS/);
   assert.match(indexSource, /marketBroadcastTickTimer = setInterval/);
   assert.match(indexSource, /scheduleFullSnapshotForClient/);
+  assert.match(indexSource, /initialFullSnapshotDelayMs\(client\)/);
   assert.match(indexSource, /clearInterval\(marketBroadcastTickTimer\)/);
   assert.match(indexSource, /clearTimeout\(client\.fullTimer\)/);
   assert.match(storeSource, /this\.emitter\.emit\("market:update", snapshot\)/);

@@ -810,7 +810,11 @@ function sortOrdersForTradingPage(left: OrderRecord, right: OrderRecord, current
   return right.createdAt - left.createdAt;
 }
 
-function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: number) {
+function transportAgeMs(receivedAt: number, publishTs: number, clientClockOffsetMs = 0) {
+  return Math.max(receivedAt - publishTs - clientClockOffsetMs, 0);
+}
+
+function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: number, clientClockOffsetMs = 0) {
   if (!source || source.state === "disabled") {
     return {
       sourceToBackendLatencyMs: 0,
@@ -824,9 +828,9 @@ function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: numb
   }
   const backendToFrontendLatencyMs =
     typeof source.clientRecvTs === "number"
-      ? Math.max(source.clientRecvTs - source.serverPublishTs, 0)
+      ? transportAgeMs(source.clientRecvTs, source.serverPublishTs, clientClockOffsetMs)
       : typeof clientRecvTs === "number"
-        ? Math.max(clientRecvTs - source.serverPublishTs, 0)
+        ? Math.max(clientRecvTs - source.serverPublishTs - clientClockOffsetMs, 0)
         : typeof source.frontendLatencyMs === "number"
           ? Math.max(source.frontendLatencyMs, 0)
           : undefined;
@@ -2545,9 +2549,11 @@ function App() {
         if (parsed.type === "market") {
           const data = parsed.data as MarketPayload;
           const publishTs = extractMarketPayloadPublishTs(data);
-          if (publishTs > 0 && receivedAt - publishTs > marketPayloadRejectMs) {
+          const payloadAgeMs =
+            publishTs > 0 ? transportAgeMs(receivedAt, publishTs, clientClockOffsetMsRef.current) : 0;
+          if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
             void refreshMarketSnapshot();
-            if (receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
+            if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
               socket.close();
             }
             return;
@@ -2569,8 +2575,10 @@ function App() {
                 return;
               }
               const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
-              if (publishTs > 0 && pending.receivedAt - publishTs > marketPayloadRejectMs) {
-                if (pending.receivedAt - publishTs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
+              const payloadAgeMs =
+                publishTs > 0 ? transportAgeMs(pending.receivedAt, publishTs, clientClockOffsetMsRef.current) : 0;
+              if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
+                if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
                   socket.close();
                 }
                 return;
@@ -3093,6 +3101,7 @@ function App() {
             chartVisibleCount={chartVisibleCount}
             lastOrderLatencyMs={lastOrderLatencyMs}
             lastMarketRecvTs={lastMarketRecvTs}
+            clientClockOffsetMs={clientClockOffsetMsRef.current}
             countdownTargetMs={countdownTargetMs}
             realtimeLabel={realtimeLabel}
             realtimeTone={realtimeTone}
@@ -3550,6 +3559,7 @@ function TradePageRestored(props: {
   chartVisibleCount: number;
   lastOrderLatencyMs?: number;
   lastMarketRecvTs?: number;
+  clientClockOffsetMs: number;
   countdownTargetMs?: number;
   realtimeLabel: string;
   realtimeTone: string;
@@ -3630,13 +3640,13 @@ function TradePageRestored(props: {
         ? (parsedAmount * feeRate * estimatedPrice * (1 - estimatedPrice)) / estimatedPrice
         : estimatedQty * feeRate * estimatedPrice * (1 - estimatedPrice)
       : undefined;
-  const clobLatency = latencyFor(sourceClob, nowMs, props.lastMarketRecvTs);
+  const clobLatency = latencyFor(sourceClob, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
   const orderBook = selectedSide === "UP" ? snapshot?.orderBooks.UP : snapshot?.orderBooks.DOWN;
   const orderBookComponent = sourceComponent(sourceClob, "orderBook");
   const orderBookStale = isOrderBookBackendStale(orderBookComponent);
   const orderBookBackendLatency = orderBookBackendLatencyMs(orderBookComponent);
-  const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs);
-  const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs);
+  const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
   const countdownMs =
     typeof props.countdownTargetMs === "number"
       ? Math.max(props.countdownTargetMs - nowMs, 0)

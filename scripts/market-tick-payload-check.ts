@@ -46,8 +46,17 @@ assert.match(serverIndexSource, /droppedForBackpressure/);
 assert.match(serverIndexSource, /recordMarketBroadcast/);
 assert.match(serverIndexSource, /scheduleFullSnapshotForClient/);
 assert.match(serverIndexSource, /MARKET_WS_FULL_SNAPSHOT_STAGGER_MS/);
+assert.match(serverIndexSource, /MARKET_WS_INITIAL_FULL_SNAPSHOT_MAX_DELAY_MS/);
+assert.doesNotMatch(serverIndexSource, /marketBroadcastPendingSince/);
 assert.match(serverIndexSource, /store\.emitter\.on\("market:update", handleMarketUpdate\)/);
 assert.match(serverIndexSource, /store\.emitter\.off\("market:update", handleMarketUpdate\)/);
 assert.doesNotMatch(serverIndexSource, /store\.emitter\.on\("market:update", tickListener\)/);
+
+const multiClientLatencySource = readFileSync("scripts/market-ws-multi-client-latency.ts", "utf8");
+assert.match(multiClientLatencySource, /LOAD_TEST_CLOCK_SAMPLES/);
+assert.match(multiClientLatencySource, /healthRttP95/);
+assert.match(multiClientLatencySource, /rawTickServerToClientP95/);
+assert.match(multiClientLatencySource, /wsSendStartToClientP95/);
+assert.match(multiClientLatencySource, /payloadBytesP95/);
 
 console.log("market-tick-payload-check ok");

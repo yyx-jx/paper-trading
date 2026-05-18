@@ -176,7 +176,12 @@ let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
-const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 100;
+const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 40;
+const MARKET_WS_INITIAL_FULL_SNAPSHOT_MAX_DELAY_MS = 2_000;
+const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math.max(
+  1,
+  Math.floor(MARKET_WS_INITIAL_FULL_SNAPSHOT_MAX_DELAY_MS / MARKET_WS_FULL_SNAPSHOT_STAGGER_MS)
+);
 const MARKET_WS_FULL_SNAPSHOT_RETRY_MS = 250;
 const USER_WS_RETRY_MS = 50;
 const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
@@ -971,16 +976,22 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
   };
 }
 
-function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number, snapshotBuildTs?: number): MarketTransportMeta {
+function nextMarketTransportMeta(coalescedCount = 0, snapshotBuildTs?: number): MarketTransportMeta {
   const serverPublishTs = Date.now();
   marketPayloadSeq += 1;
   return {
     serverPublishTs,
     payloadSeq: marketPayloadSeq,
     coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    serverQueueMs: pendingSince ? Math.max(serverPublishTs - pendingSince, 0) : undefined,
     snapshotBuildTs
   };
+}
+
+function markTransportSendStart(transportMeta: MarketTransportMeta) {
+  const sendStartedAt = Date.now();
+  transportMeta.wsSendStartTs = sendStartedAt;
+  transportMeta.serverQueueMs = Math.max(sendStartedAt - transportMeta.serverPublishTs, 0);
+  return sendStartedAt;
 }
 
 function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: number }>(
@@ -1021,8 +1032,8 @@ function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) 
   return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
 }
 
-function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, store.marketSnapshot.serverNow);
+function createCurrentRoundPayload(coalescedCount = 0) {
+  const transportMeta = nextMarketTransportMeta(coalescedCount, store.marketSnapshot.serverNow);
   const currentRound = store.getCurrentRound();
   const history = getHistoryWithSettlementPreview(10);
   const settlementPreview =
@@ -1036,9 +1047,9 @@ function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
   };
 }
 
-function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: number): MarketPayload {
+function createMarketPayload(userId: string, coalescedCount = 0): MarketPayload {
   return {
-    ...createCurrentRoundPayload(coalescedCount, pendingSince),
+    ...createCurrentRoundPayload(coalescedCount),
     history: getHistoryWithSettlementPreview(10, userId)
   };
 }
@@ -1097,9 +1108,9 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
   };
 }
 
-function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): MarketTickPayload {
+function createMarketTickPayload(coalescedCount = 0): MarketTickPayload {
   const snapshot = store.marketSnapshot;
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
+  const transportMeta = nextMarketTransportMeta(coalescedCount, snapshot.serverNow);
   const currentRound = store.getCurrentRound();
   const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
   return {
@@ -1111,7 +1122,6 @@ function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): Mar
 }
 
 type MarketBroadcastFrame = {
-  data: MarketTickPayload;
   outbound: string;
   bytes: number;
   buildMs: number;
@@ -1119,7 +1129,6 @@ type MarketBroadcastFrame = {
 };
 
 type MarketBroadcastClient = {
-  id: string;
   userId: string;
   socket: WsWebSocket;
   closed: boolean;
@@ -1133,30 +1142,24 @@ type MarketBroadcastClient = {
 const marketBroadcastClients = new Set<MarketBroadcastClient>();
 let marketBroadcastClientOrdinal = 0;
 let marketBroadcastLastSentAt = 0;
-let marketBroadcastPendingSince: number | undefined;
 let marketBroadcastCoalescedCount = 0;
 let marketBroadcastRetryTimer: NodeJS.Timeout | undefined;
 let marketBroadcastTickTimer: NodeJS.Timeout | undefined;
 let marketBroadcastBackpressureDropped = false;
 let marketBroadcastStarted = false;
 
-function createMarketBroadcastFrame(
-  coalescedCount = 0,
-  pendingSince?: number,
-  droppedForBackpressure = false
-): MarketBroadcastFrame {
+function createMarketBroadcastFrame(coalescedCount = 0, droppedForBackpressure = false): MarketBroadcastFrame {
   const buildStartedAt = Date.now();
-  const data = createMarketTickPayload(coalescedCount, pendingSince);
+  const data = createMarketTickPayload(coalescedCount);
   const buildMs = Date.now() - buildStartedAt;
   data.transportMeta.broadcastBuildMs = buildMs;
   data.transportMeta.broadcastFanoutSize = marketBroadcastClients.size;
   data.transportMeta.droppedForBackpressure = droppedForBackpressure || undefined;
-  data.transportMeta.wsSendStartTs = Date.now();
+  markTransportSendStart(data.transportMeta);
   const serializeStartedAt = Date.now();
   const outbound = JSON.stringify({ type: "market:tick", data });
   const serializeMs = Date.now() - serializeStartedAt;
   return {
-    data,
     outbound,
     bytes: Buffer.byteLength(outbound),
     buildMs,
@@ -1210,7 +1213,6 @@ function broadcastMarketTickFrame(frame: MarketBroadcastFrame) {
 
 function flushMarketBroadcast() {
   if (marketBroadcastClients.size === 0) {
-    marketBroadcastPendingSince = undefined;
     marketBroadcastCoalescedCount = 0;
     return;
   }
@@ -1220,12 +1222,7 @@ function flushMarketBroadcast() {
     scheduleMarketBroadcastRetry(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend);
     return;
   }
-  const frame = createMarketBroadcastFrame(
-    marketBroadcastCoalescedCount,
-    marketBroadcastPendingSince,
-    marketBroadcastBackpressureDropped
-  );
-  marketBroadcastPendingSince = undefined;
+  const frame = createMarketBroadcastFrame(marketBroadcastCoalescedCount, marketBroadcastBackpressureDropped);
   marketBroadcastCoalescedCount = 0;
   marketBroadcastBackpressureDropped = false;
   marketBroadcastLastSentAt = Date.now();
@@ -1234,7 +1231,6 @@ function flushMarketBroadcast() {
 
 function requestMarketBroadcastTick(markCoalesced: boolean) {
   if (markCoalesced) {
-    marketBroadcastPendingSince ??= Date.now();
     marketBroadcastCoalescedCount += 1;
   }
   if (marketBroadcastClients.size === 0) {
@@ -1282,8 +1278,7 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
   }
   client.sendingFull = true;
   const data = createMarketPayload(client.userId);
-  const sendStartedAt = Date.now();
-  data.transportMeta.wsSendStartTs = sendStartedAt;
+  const sendStartedAt = markTransportSendStart(data.transportMeta);
   const outbound = JSON.stringify({ type: "market", data });
   const bytes = Buffer.byteLength(outbound);
   client.socket.send(outbound, (error?: Error) => {
@@ -1295,9 +1290,15 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
   });
 }
 
+function initialFullSnapshotDelayMs(client: MarketBroadcastClient) {
+  if (marketBroadcastClients.size <= 1) {
+    return 0;
+  }
+  return (client.fullOrdinal % MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS) * MARKET_WS_FULL_SNAPSHOT_STAGGER_MS;
+}
+
 function registerMarketBroadcastClient(userId: string, socket: WsWebSocket) {
   const client: MarketBroadcastClient = {
-    id: nanoid(),
     userId,
     socket,
     closed: false,
@@ -1306,8 +1307,7 @@ function registerMarketBroadcastClient(userId: string, socket: WsWebSocket) {
     fullOrdinal: marketBroadcastClientOrdinal++
   };
   marketBroadcastClients.add(client);
-  const initialFullDelayMs = (client.fullOrdinal % 10) * MARKET_WS_FULL_SNAPSHOT_STAGGER_MS;
-  scheduleFullSnapshotForClient(client, initialFullDelayMs);
+  scheduleFullSnapshotForClient(client, initialFullSnapshotDelayMs(client));
   requestMarketBroadcastTick(false);
   return () => {
     client.closed = true;
