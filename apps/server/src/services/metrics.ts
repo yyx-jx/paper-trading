@@ -119,6 +119,46 @@ export class AppMetrics {
     registers: [this.registry]
   });
 
+  private readonly marketSnapshotRefreshDuration = new Histogram({
+    name: "market_snapshot_refresh_duration_seconds",
+    help: "Market snapshot refresh duration by mode.",
+    labelNames: ["mode"],
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1, 2],
+    registers: [this.registry]
+  });
+
+  private readonly marketSnapshotRefreshQueueAge = new Histogram({
+    name: "market_snapshot_refresh_queue_age_ms",
+    help: "Queued age before a market snapshot refresh starts.",
+    labelNames: ["mode"],
+    buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500],
+    registers: [this.registry]
+  });
+
+  private readonly clobWsApplyDuration = new Histogram({
+    name: "clob_ws_apply_duration_seconds",
+    help: "Polymarket CLOB WebSocket message parse/apply duration.",
+    labelNames: ["event_type"],
+    buckets: [0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
+    registers: [this.registry]
+  });
+
+  private readonly wsUserPayloadBuildDuration = new Histogram({
+    name: "ws_user_payload_build_duration_seconds",
+    help: "User WebSocket payload build and serialization duration.",
+    labelNames: ["scope"],
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1],
+    registers: [this.registry]
+  });
+
+  private readonly wsUserPayloadBytes = new Histogram({
+    name: "ws_user_payload_bytes",
+    help: "User WebSocket payload size by scope.",
+    labelNames: ["scope"],
+    buckets: [512, 1024, 4096, 16384, 65536, 131072, 262144],
+    registers: [this.registry]
+  });
+
   private readonly orderStatus = new Counter({
     name: "order_status_total",
     help: "Order outcomes by status.",
@@ -292,6 +332,22 @@ export class AppMetrics {
     }
     this.marketBroadcastSlowClients.set(input.skippedForBackpressure);
     this.marketBroadcastBufferedAmount.set(input.maxBufferedAmount);
+  }
+
+  recordMarketSnapshotRefresh(input: { mode: "snapshot_only" | "full_reconcile"; durationMs: number; queueAgeMs?: number }) {
+    this.marketSnapshotRefreshDuration.observe({ mode: input.mode }, input.durationMs / 1000);
+    if (typeof input.queueAgeMs === "number") {
+      this.marketSnapshotRefreshQueueAge.observe({ mode: input.mode }, input.queueAgeMs);
+    }
+  }
+
+  recordClobWsApply(eventType: string, durationMs: number) {
+    this.clobWsApplyDuration.observe({ event_type: eventType || "unknown" }, durationMs / 1000);
+  }
+
+  recordUserWsPayload(scope: "full" | "trade", bytes: number, buildMs: number) {
+    this.wsUserPayloadBuildDuration.observe({ scope }, buildMs / 1000);
+    this.wsUserPayloadBytes.observe({ scope }, bytes);
   }
 
   recordOrder(status: string, durationMs: number) {

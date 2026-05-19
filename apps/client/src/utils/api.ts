@@ -269,18 +269,21 @@ export interface MarketRealtimeTick {
   binance: {
     spotPrice: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   chainlink: {
     referencePrice: number;
     settlementReference: number;
     currentRoundOpenReference?: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   clob: {
     delta: number;
     volume: number;
     currentRoundUpPricePoint?: CandlePoint;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+    topLevels?: Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }>;
   };
   uiMeta: {
     countdownMs: number;
@@ -1181,7 +1184,7 @@ export const api = {
       (globalThis.crypto?.randomUUID
         ? globalThis.crypto.randomUUID()
         : `client_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-    return request<{ order: OrderRecord }>("/api/orders", token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>("/api/orders", token, {
       method: "POST",
       body: JSON.stringify({
         ...input,
@@ -1191,12 +1194,12 @@ export const api = {
     });
   },
   cancelOrder(token: string, orderId: string) {
-    return request<OrderRecord>(`/api/orders/${orderId}/cancel`, token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>(`/api/orders/${orderId}/cancel`, token, {
       method: "POST"
     });
   },
   sellPosition(token: string, positionId: string) {
-    return request<OrderRecord>(`/api/positions/${positionId}/sell`, token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>(`/api/positions/${positionId}/sell`, token, {
       method: "POST"
     });
   },
@@ -1208,6 +1211,7 @@ export const api = {
       avgFillPrice?: number;
       matchLatencyMs: number;
       failures: Array<{ positionId: string; message: string }>;
+      tradePatch?: UserTradePayload;
     }>("/api/positions/close-side", token, {
       method: "POST",
       body: JSON.stringify({
@@ -1228,6 +1232,7 @@ export const api = {
       };
       reverseSide: TradeSide;
       reverseOrder: OrderRecord;
+      tradePatch?: UserTradePayload;
     }>("/api/positions/reverse-side", token, {
       method: "POST",
       body: JSON.stringify({

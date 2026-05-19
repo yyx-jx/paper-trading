@@ -14,6 +14,9 @@ import { canChangeUserGroupForActor, canCreateUserForActor, canExportUser, canVi
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
+  BookLevel,
+  CandleBar,
+  CandleInterval,
   Language,
   LogSearchQuery,
   LogSearchResult,
@@ -32,6 +35,7 @@ import type {
   TradeSide,
   UnifiedLogRow,
   UserRecord,
+  UserTradePayload,
   DatasetExportRequest
 } from "./domain/types";
 import { createMatchingServiceApp } from "./services/matching/app";
@@ -167,6 +171,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketDiscoveryKeywords: serverConfig.polymarketDiscoveryKeywords,
   marketDiscoveryIntervalMs: serverConfig.marketDiscoveryIntervalMs,
   marketSnapshotIntervalMs: serverConfig.marketSnapshotIntervalMs,
+  marketFullReconcileIntervalMs: serverConfig.marketFullReconcileIntervalMs,
   polymarketBookPollMs: serverConfig.polymarketBookPollMs,
   polymarketBookCalibrationMs: serverConfig.polymarketBookCalibrationMs,
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
@@ -184,6 +189,12 @@ const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math.max(
 );
 const MARKET_WS_FULL_SNAPSHOT_RETRY_MS = 250;
 const USER_WS_RETRY_MS = 50;
+const USER_TRADE_ORDER_LIMIT = 50;
+const USER_TRADE_LIFECYCLE_LIMIT = 80;
+const MARKET_TRANSPORT_CANDLE_LIMIT = 120;
+const MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT = 10;
+const MARKET_TRANSPORT_RECENT_TRADE_LIMIT = 30;
+const MARKET_TRANSPORT_ODDS_POINT_LIMIT = 120;
 const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
 
 type CachedMarketHistory = {
@@ -1046,6 +1057,52 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
   };
 }
 
+function compactCandlesByInterval(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
+  return Object.fromEntries(
+    Object.entries(candlesByInterval).map(([interval, bars]) => [
+      interval,
+      bars.slice(-MARKET_TRANSPORT_CANDLE_LIMIT)
+    ])
+  ) as Record<CandleInterval, CandleBar[]>;
+}
+
+function compactSnapshotForTransport(snapshot: MarketSnapshot): MarketSnapshot {
+  const orderBooks = {
+    UP: {
+      ...snapshot.orderBooks.UP,
+      bids: snapshot.orderBooks.UP.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
+      asks: snapshot.orderBooks.UP.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
+    },
+    DOWN: {
+      ...snapshot.orderBooks.DOWN,
+      bids: snapshot.orderBooks.DOWN.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
+      asks: snapshot.orderBooks.DOWN.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
+    }
+  };
+  return {
+    ...snapshot,
+    orderBooks,
+    recentTrades: snapshot.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
+    candles: snapshot.candles.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
+    binance: {
+      ...snapshot.binance,
+      candlesByInterval: compactCandlesByInterval(snapshot.binance.candlesByInterval)
+    },
+    chainlink: {
+      ...snapshot.chainlink,
+      candles5s: snapshot.chainlink.candles5s.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
+      candlesByInterval: compactCandlesByInterval(snapshot.chainlink.candlesByInterval)
+    },
+    clob: {
+      ...snapshot.clob,
+      upBook: orderBooks.UP,
+      downBook: orderBooks.DOWN,
+      recentTrades: snapshot.clob.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
+      currentRoundUpPriceSeries: snapshot.clob.currentRoundUpPriceSeries.slice(-MARKET_TRANSPORT_ODDS_POINT_LIMIT)
+    }
+  };
+}
+
 function nextMarketTransportMeta(coalescedCount = 0, snapshotBuildTs?: number): MarketTransportMeta {
   const serverPublishTs = Date.now();
   marketPayloadSeq += 1;
@@ -1072,7 +1129,7 @@ function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: 
 }
 
 function decorateCurrentRoundForTransport(round: RoundRecord | undefined) {
-  const displayRound = engine.withCurrentRoundChainlinkOpenReference(round);
+  const displayRound = engine.withCurrentRoundBinanceOpenReference(engine.withCurrentRoundChainlinkOpenReference(round));
   return displayRound ? decorateRoundWithSettlementPreview(displayRound) : undefined;
 }
 
@@ -1112,7 +1169,7 @@ function createCurrentRoundPayload(coalescedCount = 0, viewedUserId?: string) {
   return {
     viewedUserId,
     currentRound: decorateCurrentRoundForTransport(currentRound),
-    snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
+    snapshot: compactSnapshotForTransport(stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs)),
     settlementPreview,
     transportMeta
   };
@@ -1129,6 +1186,30 @@ function createMarketPayload(viewedUserId: string, coalescedCount = 0): MarketPa
 function countdownTargetTsFor(snapshot: MarketSnapshot) {
   const countdownMs = snapshot.uiMeta.countdownMs;
   return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
+}
+
+function latestCandleUpdates(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
+  const updates: Partial<Record<CandleInterval, CandleBar>> = {};
+  for (const [interval, bars] of Object.entries(candlesByInterval) as Array<[CandleInterval, CandleBar[]]>) {
+    const latest = bars.at(-1);
+    if (latest) {
+      updates[interval] = latest;
+    }
+  }
+  return updates;
+}
+
+function topLevelsForTick(snapshot: MarketSnapshot): Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }> {
+  return {
+    UP: {
+      bids: snapshot.orderBooks.UP.bids.slice(0, 5),
+      asks: snapshot.orderBooks.UP.asks.slice(0, 5)
+    },
+    DOWN: {
+      bids: snapshot.orderBooks.DOWN.bids.slice(0, 5),
+      asks: snapshot.orderBooks.DOWN.asks.slice(0, 5)
+    }
+  };
 }
 
 function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
@@ -1154,11 +1235,14 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
     sources: stamped.sources,
     binance: {
       spotPrice: stamped.binance.spotPrice,
-      latestTick: stamped.binance.latestTick
+      latestTick: stamped.binance.latestTick,
+      candleUpdates: latestCandleUpdates(stamped.binance.candlesByInterval)
     },
     chainlink: {
       referencePrice: stamped.chainlink.referencePrice,
       settlementReference: stamped.chainlink.settlementReference,
+      currentRoundOpenReference: stamped.chainlink.currentRoundOpenReference,
+      candleUpdates: latestCandleUpdates(stamped.chainlink.candlesByInterval),
       latestTick:
         stamped.chainlink.referencePrice > 0
           ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
@@ -1168,7 +1252,8 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
       delta: stamped.clob.delta,
       volume: stamped.clob.volume,
       currentRoundUpPricePoint,
-      bestBidAskSummary: stamped.clob.bestBidAskSummary
+      bestBidAskSummary: stamped.clob.bestBidAskSummary,
+      topLevels: topLevelsForTick(stamped)
     },
     uiMeta: {
       countdownMs: stamped.uiMeta.countdownMs,
@@ -1354,7 +1439,15 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
     client.socket.close();
     return;
   }
-  if (client.sendingFull || client.socket.bufferedAmount > 0) {
+  const tickRecentlySent =
+    marketBroadcastLastSentAt > 0 && Date.now() - marketBroadcastLastSentAt < MARKET_WS_MIN_INTERVAL_MS;
+  if (
+    client.sendingFull ||
+    client.sendingTick ||
+    marketBroadcastRetryTimer ||
+    tickRecentlySent ||
+    client.socket.bufferedAmount > 0
+  ) {
     retryFullSnapshotForClient(client);
     return;
   }
@@ -1390,8 +1483,11 @@ function registerMarketBroadcastClient(actorUserId: string, viewedUserId: string
     fullOrdinal: marketBroadcastClientOrdinal++
   };
   marketBroadcastClients.add(client);
-  scheduleFullSnapshotForClient(client, initialFullSnapshotDelayMs(client));
   requestMarketBroadcastTick(false);
+  scheduleFullSnapshotForClient(
+    client,
+    Math.max(initialFullSnapshotDelayMs(client), MARKET_WS_FULL_SNAPSHOT_RETRY_MS)
+  );
   return () => {
     client.closed = true;
     marketBroadcastClients.delete(client);
@@ -1438,9 +1534,9 @@ function createBootstrapPayload(user: UserRecord, viewedUser: UserRecord = user)
     ...market,
     viewedUserId: viewedUser.id,
     viewedUser: store.sanitizeUser(viewedUser),
-    history: getHistoryWithSettlementPreview(60, viewedUser.id),
+    history: getHistoryWithSettlementPreview(30, viewedUser.id),
     me: store.sanitizeUser(user),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, viewedUser.id),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(200, viewedUser.id),
     profile: store.getProfile(viewedUser.id),
     positions: store.getPositions(viewedUser.id),
     orders: store.getOrders(viewedUser.id),
@@ -1468,8 +1564,8 @@ function createUserTradePayload(user: UserRecord) {
     viewedUserId: user.id,
     profile: store.getProfile(user.id),
     positions: store.getPositions(user.id),
-    orders: store.getRecentTradeOrders(user.id, 50),
-    orderLifecycles: store.getOrderLifecycleLogs(user.id)
+    orders: store.getRecentTradeOrders(user.id, USER_TRADE_ORDER_LIMIT),
+    orderLifecycles: store.getOrderLifecycleLogs(user.id).slice(0, USER_TRADE_LIFECYCLE_LIMIT)
   };
 }
 
@@ -2743,7 +2839,10 @@ async function bootstrap() {
           }
         );
         appMetrics.recordOrder(result.order.status, Date.now() - startedAt);
-        return { order: store.sanitizeOrder(result.order) };
+        return {
+          order: store.sanitizeOrder(result.order),
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordOrder("failed", Date.now() - startedAt);
         throw error;
@@ -2759,7 +2858,10 @@ async function bootstrap() {
       const params = request.params as { id: string };
       const cancelled = store.sanitizeOrder(await engine.cancelOrder(user, params.id));
       appMetrics.recordOrder("cancelled", 0);
-      return cancelled;
+      return {
+        order: cancelled,
+        tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+      };
     })
   );
 
@@ -2772,7 +2874,10 @@ async function bootstrap() {
       try {
         const sold = store.sanitizeOrder(await store.withTransaction(() => engine.sellPosition(user, params.id)));
         appMetrics.recordPositionClose("success");
-        return sold;
+        return {
+          order: sold,
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
         throw error;
@@ -2791,7 +2896,10 @@ async function bootstrap() {
           engine.closeSide(user, parsed as { side: TradeSide; clientSendTs?: number })
         );
         appMetrics.recordPositionClose("success");
-        return result;
+        return {
+          ...result,
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
         throw error;
@@ -2813,7 +2921,8 @@ async function bootstrap() {
         appMetrics.recordPositionClose("success");
         return {
           ...result,
-          reverseOrder: store.sanitizeOrder(result.reverseOrder)
+          reverseOrder: store.sanitizeOrder(result.reverseOrder),
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
@@ -3171,16 +3280,18 @@ async function bootstrap() {
           data: scope === "trade" ? createUserTradePayload(currentViewedUser) : createUserFullPayload(currentViewedUser)
         });
         const buildLatencyMs = Date.now() - buildStartedAt;
-        if (buildLatencyMs > 50 || Buffer.byteLength(outbound) > 200_000) {
+        const outboundBytes = Buffer.byteLength(outbound);
+        appMetrics.recordUserWsPayload(scope, outboundBytes, buildLatencyMs);
+        if (buildLatencyMs > 50 || outboundBytes > 200_000) {
           console.warn(
-            `[ws:user] payload scope=${scope} bytes=${Buffer.byteLength(outbound)} buildMs=${buildLatencyMs}`
+            `[ws:user] payload scope=${scope} bytes=${outboundBytes} buildMs=${buildLatencyMs}`
           );
         }
         const sendStartedAt = Date.now();
         userSendInFlight = true;
         socket.send(outbound, (error?: Error) => {
           userSendInFlight = false;
-          appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
+          appMetrics.recordWsSend("user", outboundBytes, Date.now() - sendStartedAt, !error);
           if (pendingUserPayloadScope) {
             queueUserPayload();
           }

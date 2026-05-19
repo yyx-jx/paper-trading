@@ -8,7 +8,9 @@ import {
   type PolymarketHealthComponent,
   type PolymarketHealthComponents
 } from "./polymarket-health";
+import { appMetrics } from "../metrics";
 import type {
+  BookLevel,
   ClobMarketInfo,
   MarketTrade,
   OrderBookSnapshot,
@@ -225,6 +227,107 @@ function applyPriceChangeToBook(
     snapshotId: input.snapshotId ?? `ws_delta_${input.snapshotTs}`,
     snapshotTs: input.snapshotTs
   };
+}
+
+type ParsedPriceChange = {
+  side: TradeSide;
+  bookSide: "BUY" | "SELL";
+  price: number;
+  qty: number;
+  snapshotTs: number;
+  snapshotId?: string;
+  bestBid?: number;
+  bestAsk?: number;
+};
+
+function applyPriceChangesToBooks(
+  orderBooks: Record<TradeSide, OrderBookSnapshot>,
+  changes: ParsedPriceChange[]
+) {
+  const drafts = new Map<
+    TradeSide,
+    {
+      base: OrderBookSnapshot;
+      bids: BookLevel[];
+      asks: BookLevel[];
+      snapshotTs: number;
+      snapshotId?: string;
+      bestBid?: number;
+      bestAsk?: number;
+    }
+  >();
+  let applied = false;
+  let latestTs = 0;
+
+  for (const change of changes) {
+    const existingBook = orderBooks[change.side];
+    if (change.snapshotTs < existingBook.snapshotTs) {
+      continue;
+    }
+    const draft =
+      drafts.get(change.side) ??
+      {
+        base: existingBook,
+        bids: existingBook.bids,
+        asks: existingBook.asks,
+        snapshotTs: existingBook.snapshotTs,
+        snapshotId: existingBook.snapshotId
+      };
+    if (change.bookSide === "BUY") {
+      draft.bids = upsertBookLevel(draft.bids, { price: change.price, qty: change.qty });
+    } else {
+      draft.asks = upsertBookLevel(draft.asks, { price: change.price, qty: change.qty });
+    }
+    draft.snapshotTs = Math.max(draft.snapshotTs, change.snapshotTs);
+    draft.snapshotId = change.snapshotId ?? draft.snapshotId;
+    draft.bestBid = typeof change.bestBid === "number" ? change.bestBid : draft.bestBid;
+    draft.bestAsk = typeof change.bestAsk === "number" ? change.bestAsk : draft.bestAsk;
+    drafts.set(change.side, draft);
+    latestTs = Math.max(latestTs, change.snapshotTs);
+    applied = true;
+  }
+
+  if (!applied) {
+    return undefined;
+  }
+
+  let nextOrderBooks = orderBooks;
+  for (const [side, draft] of drafts) {
+    const top = recomputeBookTop({ bids: draft.bids, asks: draft.asks });
+    const nextBook = {
+      ...draft.base,
+      ...top,
+      snapshotId: draft.snapshotId ?? `ws_delta_${side}_${draft.snapshotTs}`,
+      snapshotTs: draft.snapshotTs
+    };
+    nextOrderBooks = {
+      ...nextOrderBooks,
+      [side]: applyTopToBook(nextBook, {
+        bestBid: draft.bestBid,
+        bestAsk: draft.bestAsk,
+        snapshotTs: draft.snapshotTs,
+        snapshotId: nextBook.snapshotId
+      }) ?? nextBook
+    };
+  }
+
+  return {
+    orderBooks: nextOrderBooks,
+    latestTs
+  };
+}
+
+function mergeRecentTrades(incoming: MarketTrade[], existing: MarketTrade[], limit = 20) {
+  const byId = new Map<string, MarketTrade>();
+  for (const trade of [...existing, ...incoming]) {
+    const current = byId.get(trade.id);
+    if (!current || trade.ts >= current.ts) {
+      byId.set(trade.id, trade);
+    }
+  }
+  return [...byId.values()]
+    .sort((left, right) => right.ts - left.ts)
+    .slice(0, limit);
 }
 
 function numberFromUnknown(value: unknown): number | undefined {
@@ -1043,21 +1146,22 @@ export class PolymarketConnector {
           side: trade.outcome.toUpperCase() === "UP" ? "UP" : "DOWN",
           price: Number(trade.price),
           qty: Number(trade.size),
-          ts: Number(trade.timestamp) * 1000
+          ts: normalizeWsTimestamp(trade.timestamp)
         }));
+      const mergedTrades = mergeRecentTrades(recentTrades, this.state.recentTrades);
 
-      const volume = recentTrades.reduce((sum, trade) => sum + trade.qty, 0);
-      const delta = recentTrades.reduce((sum, trade) => sum + (trade.side === "UP" ? trade.qty : -trade.qty), 0);
+      const volume = mergedTrades.reduce((sum, trade) => sum + trade.qty, 0);
+      const delta = mergedTrades.reduce((sum, trade) => sum + (trade.side === "UP" ? trade.qty : -trade.qty), 0);
       const now = Date.now();
       this.updateHealthComponent("trades", "healthy", {
-        sourceEventTs: recentTrades[0]?.ts ?? now,
+        sourceEventTs: mergedTrades[0]?.ts ?? now,
         serverRecvTs: now,
         message: `Recent trades refreshed for ${targetSlug}.`
       });
 
       this.state = {
         ...this.state,
-        recentTrades,
+        recentTrades: mergedTrades,
         delta,
         volume,
         status: this.deriveStatus(now)
@@ -1131,7 +1235,10 @@ export class PolymarketConnector {
         const decoded = JSON.parse(buffer.toString()) as unknown;
         const messages = Array.isArray(decoded) ? decoded : [decoded];
         for (const message of messages) {
-          this.handleMarketWsMessage(message as Record<string, unknown>, market);
+          const record = message as Record<string, unknown>;
+          const applyStartedAt = Date.now();
+          this.handleMarketWsMessage(record, market);
+          appMetrics.recordClobWsApply(String(record.event_type ?? "unknown"), Date.now() - applyStartedAt);
         }
       } catch (error) {
         this.updateHealthComponent("marketWs", "degraded", {
@@ -1325,9 +1432,7 @@ export class PolymarketConnector {
         : Array.isArray(message.priceChanges)
           ? message.priceChanges
           : [];
-      let nextOrderBooks = this.state.orderBooks;
-      let latestTs = 0;
-      let applied = false;
+      const parsedChanges: ParsedPriceChange[] = [];
       for (const rawChange of changes) {
         const change = rawChange as Record<string, unknown>;
         const assetId = String(change.asset_id ?? change.assetId ?? message.asset_id ?? "");
@@ -1339,45 +1444,34 @@ export class PolymarketConnector {
           continue;
         }
         const snapshotTs = normalizeWsTimestamp(change.timestamp ?? message.timestamp ?? message.ts, now);
-        const nextBook = applyPriceChangeToBook(nextOrderBooks[side], {
-          side: bookSide,
+        parsedChanges.push({
+          side,
+          bookSide,
           price,
           qty,
           snapshotTs,
-          snapshotId: String(change.hash ?? message.hash ?? `ws_delta_${side}_${snapshotTs}`)
-        });
-        if (!nextBook) {
-          continue;
-        }
-        const bestBook = applyTopToBook(nextBook, {
+          snapshotId: String(change.hash ?? message.hash ?? `ws_delta_${side}_${snapshotTs}`),
           bestBid: numberFromUnknown(change.best_bid ?? change.bestBid),
-          bestAsk: numberFromUnknown(change.best_ask ?? change.bestAsk),
-          snapshotTs,
-          snapshotId: nextBook.snapshotId
-        }) ?? nextBook;
-        nextOrderBooks = {
-          ...nextOrderBooks,
-          [side]: bestBook
-        };
-        latestTs = Math.max(latestTs, snapshotTs);
-        applied = true;
+          bestAsk: numberFromUnknown(change.best_ask ?? change.bestAsk)
+        });
       }
-      if (!applied) {
+      const result = applyPriceChangesToBooks(this.state.orderBooks, parsedChanges);
+      if (!result) {
         return;
       }
       this.updateHealthComponent("marketWs", "healthy", {
-        sourceEventTs: latestTs || now,
+        sourceEventTs: result.latestTs || now,
         serverRecvTs: now,
         message: `Streaming price changes for ${market.slug}.`
       });
       this.updateHealthComponent("orderBook", "healthy", {
-        sourceEventTs: latestTs || now,
+        sourceEventTs: result.latestTs || now,
         serverRecvTs: now,
         message: `Streaming price changes for ${market.slug}.`
       });
       this.state = {
         ...this.state,
-        orderBooks: nextOrderBooks,
+        orderBooks: result.orderBooks,
         status: this.deriveStatus(now)
       };
       this.emit();
@@ -1394,7 +1488,7 @@ export class PolymarketConnector {
         side: side ?? "UP",
         price: Number(message.price ?? 0),
         qty: Number(message.size ?? 0),
-        ts: Number(message.timestamp ?? now)
+        ts: normalizeWsTimestamp(message.timestamp ?? message.ts, now)
       };
       this.updateHealthComponent("marketWs", "healthy", {
         sourceEventTs: trade.ts,

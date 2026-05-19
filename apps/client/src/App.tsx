@@ -56,7 +56,7 @@ import { PersonalHomePage } from "./features/profile/PersonalHomePage";
 import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
 import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
 import { useAppStore } from "./store/useAppStore";
-import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, utcParts } from "./utils/format";
+import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, tradeDisplayPriceText, utcParts } from "./utils/format";
 import { redactNetworkAddresses } from "./utils/redaction";
 
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
@@ -686,6 +686,21 @@ function orderReferencePrice(order: OrderRecord, snapshot?: MarketSnapshot) {
   }
   const currentDisplayPrice = displayPriceForSide(snapshot, order.side);
   return currentDisplayPrice > 0 ? currentDisplayPrice : orderBookExecutionPrice(order) ?? 0;
+}
+
+function orderReferencePriceText(order: OrderRecord, snapshot?: MarketSnapshot) {
+  const referencePrice = orderReferencePrice(order, snapshot);
+  if (order.status === "filled") {
+    return tokenPriceText(referencePrice);
+  }
+  if (order.orderKind === "limit" && order.status === "pending" && typeof order.limitPrice === "number" && order.limitPrice > 0) {
+    return tokenPriceText(order.limitPrice);
+  }
+  const currentDisplayPrice = displayPriceForSide(snapshot, order.side);
+  if (currentDisplayPrice > 0) {
+    return tradeDisplayPriceText(currentDisplayPrice);
+  }
+  return tokenPriceText(referencePrice);
 }
 
 function orderTradeLabel(order: OrderRecord, language: Language) {
@@ -2431,11 +2446,11 @@ function App() {
     let lastMarketFallbackAt = 0;
     let lastUserFallbackAt = 0;
     const reconnectDelayMs = 1000;
-    const marketPayloadRejectMs = 5000;
-    const marketStaleMs = 3000;
-    const marketReconnectStaleMs = 10000;
-    const marketFallbackCooldownMs = 3000;
-    const userFallbackCooldownMs = 2000;
+    const marketPayloadRejectMs = 4000;
+    const marketStaleMs = 1500;
+    const marketReconnectStaleMs = 4000;
+    const marketFallbackCooldownMs = 1500;
+    const userFallbackCooldownMs = 5000;
     let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
     let marketTickFrame: number | undefined;
 
@@ -2473,16 +2488,13 @@ function App() {
       lastMarketFallbackAt = Date.now();
       updateRealtimeChannel("market", { state: "fallback", fallbackAt: lastMarketFallbackAt }, { now: lastMarketFallbackAt, failure: true });
       try {
-        const [roundData, nextHistory] = await Promise.all([
-          api.getCurrentRound(token, activeViewUserId),
-          api.getHistory(token, 60, activeViewUserId)
-        ]);
+        const roundData = await api.getCurrentRound(token, activeViewUserId);
         if (!disposed) {
           const receivedAt = Date.now();
           const payload = {
             viewedUserId: roundData.viewedUserId ?? activeViewUserId,
             currentRound: roundData.currentRound,
-            history: nextHistory,
+            history: useAppStore.getState().history,
             snapshot: roundData.snapshot,
             settlementPreview: roundData.settlementPreview,
             transportMeta: roundData.transportMeta
@@ -2518,7 +2530,7 @@ function App() {
       try {
         const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
           api.getProfile(token, activeViewUserId),
-          api.getOperatedHistory(token, 500, activeViewUserId),
+          api.getOperatedHistory(token, 200, activeViewUserId),
           api.getPositions(token, activeViewUserId),
           api.getOrders(token, activeViewUserId),
           api.getOrderLifecycles(token, activeViewUserId),
@@ -2886,7 +2898,10 @@ function App() {
         qty: orderAction === "sell" ? Number(orderQty) : undefined,
         limitPrice: orderKind === "limit" ? limitPriceCents! / 100 : undefined
       });
-      setLastOrderLatencyMs(result.order.matchLatencyMs);
+      if (result.tradePatch) {
+        setUserTradePayload(result.tradePatch);
+      }
+      setLastOrderLatencyMs(result.order.totalOrderLatencyMs ?? result.order.matchLatencyMs);
     } catch (placeOrderError) {
       const message = placeOrderError instanceof Error ? placeOrderError.message : "Order failed.";
       if (message.includes("Insufficient virtual balance")) {
@@ -2913,6 +2928,9 @@ function App() {
       setQuickBusy(true);
       setError(undefined);
       const result = await api.closeSide(token, side);
+      if (result.tradePatch) {
+        setUserTradePayload(result.tradePatch);
+      }
       setLastOrderLatencyMs(result.matchLatencyMs);
     } catch (closeError) {
       setError(closeError instanceof Error ? closeError.message : "Close side failed.");
@@ -2929,6 +2947,9 @@ function App() {
       setQuickBusy(true);
       setError(undefined);
       const result = await api.reverseSide(token, selectedSide);
+      if (result.tradePatch) {
+        setUserTradePayload(result.tradePatch);
+      }
       setSelectedSide(result.reverseSide);
       setLastOrderLatencyMs(result.reverseOrder.matchLatencyMs);
     } catch (reverseError) {
@@ -2949,25 +2970,10 @@ function App() {
     setCancelBusyOrderId(orderId);
     try {
       setError(undefined);
-      await api.cancelOrder(token, orderId);
-      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getProfile(token, effectiveViewUserId),
-        api.getOperatedHistory(token, 500, effectiveViewUserId),
-        api.getPositions(token, effectiveViewUserId),
-        api.getOrders(token, effectiveViewUserId),
-        api.getOrderLifecycles(token, effectiveViewUserId),
-        api.getLogs(token, effectiveViewUserId)
-      ]);
-      setUserPayload({
-        viewedUserId: effectiveViewUserId ?? me.id,
-        viewedUser: currentViewedUser ?? me,
-        profile: nextProfile,
-        operatedHistory: nextOperatedHistory,
-        positions: nextPositions,
-        orders: nextOrders,
-        orderLifecycles: nextOrderLifecycles,
-        logs: nextLogs
-      });
+      const result = await api.cancelOrder(token, orderId);
+      if (result.tradePatch) {
+        setUserTradePayload(result.tradePatch);
+      }
     } catch (cancelError) {
       setError(cancelError instanceof Error ? cancelError.message : "Cancel failed.");
     } finally {
@@ -3020,25 +3026,10 @@ function App() {
       setSellFeedback(undefined);
       setError(undefined);
       const result = await api.sellPosition(token, positionId);
-      setLastOrderLatencyMs(result.matchLatencyMs);
-      const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getProfile(token, effectiveViewUserId),
-        api.getOperatedHistory(token, 500, effectiveViewUserId),
-        api.getPositions(token, effectiveViewUserId),
-        api.getOrders(token, effectiveViewUserId),
-        api.getOrderLifecycles(token, effectiveViewUserId),
-        api.getLogs(token, effectiveViewUserId)
-      ]);
-      setUserPayload({
-        viewedUserId: effectiveViewUserId ?? me.id,
-        viewedUser: currentViewedUser ?? me,
-        profile: nextProfile,
-        operatedHistory: nextOperatedHistory,
-        positions: nextPositions,
-        orders: nextOrders,
-        orderLifecycles: nextOrderLifecycles,
-        logs: nextLogs
-      });
+      if (result.tradePatch) {
+        setUserTradePayload(result.tradePatch);
+      }
+      setLastOrderLatencyMs(result.order.totalOrderLatencyMs ?? result.order.matchLatencyMs);
     } catch (sellError) {
       const message = sellError instanceof Error ? sellError.message : "Sell failed.";
       setError(message);
@@ -3736,8 +3727,10 @@ function TradePageRestored(props: {
   const sourceClob = snapshot?.sources.clob;
   const currentRoundPositions = positions.filter((position) => position.roundId === currentRound?.id);
   const openSidePositions = currentRoundPositions.filter((position) => position.status === "open" && position.side === selectedSide);
-  const chartBars = filterBarsToRecentWindow(snapshot?.binance.candlesByInterval[selectedInterval] ?? []);
-  const chainlinkBars = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
+  const selectedBinanceBars = snapshot?.binance.candlesByInterval[selectedInterval] ?? [];
+  const selectedChainlinkBars = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
+  const chartBars = useMemo(() => filterBarsToRecentWindow(selectedBinanceBars), [selectedBinanceBars]);
+  const chainlinkBars = useMemo(() => filterBarsToRecentWindow(selectedChainlinkBars), [selectedChainlinkBars]);
   const displayPrice = displayPriceForSide(snapshot, selectedSide);
   const upDisplayPrice = displayPriceForSide(snapshot, "UP");
   const downDisplayPrice = displayPriceForSide(snapshot, "DOWN");
@@ -3870,7 +3863,10 @@ function TradePageRestored(props: {
     return (series.at(-1)?.price ?? 0) - series[0].price;
   })();
   const doubleSideCost = (snapshot?.clob.bestBidAskSummary.UP.bestAsk ?? 0) + (snapshot?.clob.bestBidAskSummary.DOWN.bestAsk ?? 0);
-  const binancePtbSpread = referenceSpread(snapshot?.binance.spotPrice, currentRound?.binanceOpenPrice);
+  const binancePtbReference = isBtcReferencePrice(snapshot?.displayPriceToBeat)
+    ? snapshot.displayPriceToBeat
+    : currentRound?.binanceOpenPrice;
+  const binancePtbSpread = referenceSpread(snapshot?.binance.spotPrice, binancePtbReference);
   const chainlinkPtbReference = isBtcReferencePrice(snapshot?.chainlink.currentRoundOpenReference)
     ? snapshot.chainlink.currentRoundOpenReference
     : currentRound?.chainlinkOpenPrice;
@@ -3972,8 +3968,8 @@ function TradePageRestored(props: {
         </div>
         <div className="terminal-top-mid">
           <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
-          <span>UP {tokenPriceText(upDisplayPrice)}</span>
-          <span>DN {tokenPriceText(downDisplayPrice)}</span>
+          <span>UP {tradeDisplayPriceText(upDisplayPrice)}</span>
+          <span>DN {tradeDisplayPriceText(downDisplayPrice)}</span>
           <span className={`terminal-realtime-state ${props.realtimeTone}`} title={props.realtimeDetail}>
             {props.realtimeLabel}
           </span>
@@ -4001,9 +3997,9 @@ function TradePageRestored(props: {
 
       <div className="terminal-monitor">
         <div className="monitor-cell hot monitor-analytics">
-          <small>{localLabel(language, "HT 变化", "HT Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tokenPriceText(Math.abs(oddsChange), 1)}</b></small>
-          <strong>{tokenPriceText(upDisplayPrice)}</strong>
-          <span>DN {tokenPriceText(downDisplayPrice)} · {localLabel(language, "双边 ASK", "Two-side ask")} {tokenPriceText(doubleSideCost)}</span>
+          <small>{localLabel(language, "HT 变化", "HT Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tradeDisplayPriceText(Math.abs(oddsChange))}</b></small>
+          <strong>{tradeDisplayPriceText(upDisplayPrice)}</strong>
+          <span>DN {tradeDisplayPriceText(downDisplayPrice)} · {localLabel(language, "双边 ASK", "Two-side ask")} {tradeDisplayPriceText(doubleSideCost)}</span>
         </div>
         <div className="monitor-cell monitor-latency-breakdown">
           <small>{localLabel(language, "延迟拆分", "Latency Split")}</small>
@@ -4032,7 +4028,7 @@ function TradePageRestored(props: {
               <b className={spreadToneClass(chainlinkPtbSpread)}>{spreadDisplayText(chainlinkPtbSpread)}</b>
             </span>
           </strong>
-          <span>B PTB {btcMoneyOrDash(currentRound?.binanceOpenPrice)} · CL PTB {btcMoneyOrDash(chainlinkPtbReference)}</span>
+          <span>B PTB {btcMoneyOrDash(binancePtbReference)} · CL PTB {btcMoneyOrDash(chainlinkPtbReference)}</span>
         </div>
         <div className={`monitor-timer monitor-round-state ${countdownClass}`}>
           <small>{currentRound?.status ?? "--"}</small>
@@ -4112,7 +4108,7 @@ function TradePageRestored(props: {
                         </span>
                         <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
                         <span className="terminal-trade-price-block">
-                          <strong className="terminal-trade-price">@{tokenPriceText(orderReferencePrice(order, snapshot))}</strong>
+                          <strong className="terminal-trade-price">@{orderReferencePriceText(order, snapshot)}</strong>
                           <small>{orderPriceQualifier(order, language)}</small>
                         </span>
                         <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
@@ -4336,8 +4332,8 @@ function TradePageRestored(props: {
           <TerminalSection title="BTC/USD" meta={btcUsdMeta}>
             <div className="terminal-order">
               <div className="order-odds">
-                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{decimal(upDisplayPrice * 100, 1)}¢</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
-                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}><span>▼ DOWN</span><b>{decimal(downDisplayPrice * 100, 1)}¢</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
+                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{tradeDisplayPriceText(upDisplayPrice)}</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
+                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}><span>▼ DOWN</span><b>{tradeDisplayPriceText(downDisplayPrice)}</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
               </div>
               <div className="terminal-segment action-segment">
                 {(["buy", "sell"] as OrderAction[]).map((action) => <button key={action} className={props.orderAction === action ? "on" : ""} onClick={() => props.onOrderActionChange(action)}>{action === "buy" ? "BUY / ENTER" : "SELL / EXIT"}</button>)}
@@ -4372,7 +4368,7 @@ function TradePageRestored(props: {
               ) : null}
               <div className="terminal-price-note">
                 <span>{localLabel(language, "展示价", "Display")}</span>
-                <b>{tokenPriceText(displayPrice)}</b>
+                <b>{tradeDisplayPriceText(displayPrice)}</b>
                 <span>{localLabel(language, "价差", "Spread")} {spreadText}</span>
               </div>
               <div className="order-meta">

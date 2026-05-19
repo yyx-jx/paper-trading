@@ -19,7 +19,7 @@ const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
 const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
 const redactionSource = readFileSync("apps/client/src/utils/redaction.ts", "utf8");
 
-assert.equal(packageJson.version, "0.3.0");
+assert.equal(packageJson.version, "0.5.0");
 assert.equal(packageJson.scripts["package:win:test"], "node scripts/package-win-test.cjs");
 assert.equal(packageJson.scripts["package:win:prod"], "node scripts/package-win-prod.cjs");
 assert.equal(packageJson.scripts["test:electron-config"], "tsx scripts/electron-config-check.ts");

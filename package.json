@@ -1,6 +1,6 @@
 {
   "name": "btc-paper-trading-cs",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
@@ -76,6 +76,7 @@
     "react-i18next": "^15.7.3",
     "recharts": "^3.2.1",
     "redis": "^5.8.3",
+    "tsx": "^4.20.6",
     "undici": "^8.1.0",
     "viem": "^2.38.2",
     "ws": "^8.18.3",
@@ -94,7 +95,6 @@
     "electron": "^37.4.0",
     "electron-builder": "^26.8.1",
     "tsup": "^8.5.0",
-    "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "wait-on": "^8.0.5"

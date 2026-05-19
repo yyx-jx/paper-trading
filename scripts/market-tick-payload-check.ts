@@ -29,6 +29,14 @@ assert.doesNotMatch(serverTickType, /\borderBooks\b/, "Server MarketRealtimeTick
 assert.doesNotMatch(clientTickType, /\borderBooks\b/, "Client MarketRealtimeTick must not carry full orderBooks.");
 assert.doesNotMatch(createTickPayload, /\borderBooks\s*:/, "createMarketRealtimeTick must not serialize full orderBooks.");
 assert.doesNotMatch(mergeRealtimeTick, /tick\.orderBooks/, "mergeRealtimeTick must preserve full order books from snapshots.");
+assert.match(serverTickType, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
+assert.match(clientTickType, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
+assert.match(serverTickType, /topLevels\?: Record<TradeSide, \{ bids: BookLevel\[]; asks: BookLevel\[] \}>/);
+assert.match(clientTickType, /topLevels\?: Record<TradeSide, \{ bids: BookLevel\[]; asks: BookLevel\[] \}>/);
+assert.match(createTickPayload, /candleUpdates:/);
+assert.match(createTickPayload, /topLevels:/);
+assert.match(mergeRealtimeTick, /mergeCandleUpdates/);
+assert.match(mergeRealtimeTick, /mergeBookTopLevels/);
 assert.match(serverTypesSource, /broadcastBuildMs\?: number/);
 assert.match(serverTypesSource, /broadcastFanoutSize\?: number/);
 assert.match(serverTypesSource, /droppedForBackpressure\?: boolean/);

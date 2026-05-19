@@ -606,14 +606,14 @@ async function testFrontendLatencyUsesReceiptTimestamp() {
   assert.match(appSource, /const topLatency = \[\.\.\.latencyRows\]/);
   assert.match(appSource, /monitor-latency-breakdown/);
   assert.match(appSource, /latency-mini-list/);
-  assert.match(appSource, /const marketStaleMs = 3000/);
-  assert.match(appSource, /const marketPayloadRejectMs = 5000/);
+  assert.match(appSource, /const marketStaleMs = 1500/);
+  assert.match(appSource, /const marketPayloadRejectMs = 4000/);
   assert.match(appSource, /type: "market" \| "market:tick"/);
   assert.match(appSource, /setMarketTickPayload/);
   assert.match(appSource, /requestAnimationFrame/);
   assert.match(appSource, /markMarketRenderCommit/);
   assert.match(appSource, /extractMarketPayloadPublishTs/);
-  assert.match(appSource, /const marketReconnectStaleMs = 10000/);
+  assert.match(appSource, /const marketReconnectStaleMs = 4000/);
   assert.match(appSource, /window\.setInterval\(\(\) => setNowMs\(Date\.now\(\)\), 250\)/);
   assert.match(appSource, /transitionRealtimeChannel/);
   assert.match(appSource, /REALTIME_STATUS_MIN_HOLD_MS = 1500/);
@@ -691,7 +691,7 @@ async function testProfileUsesOperatedGroupedRoundViews() {
   assert.doesNotMatch(appSource, /function analyticsConclusion/);
   assert.match(appSource, /function AnalyticsPage/);
   assert.match(appSource, /<AnalyticsPage/);
-  assert.match(appSource, /api\.getOperatedHistory\(token, 500, effectiveViewUserId\)/);
+  assert.match(appSource, /api\.getOperatedHistory\(token, 200, activeViewUserId\)/);
   assert.match(appSource, /function inferAnalyticsRoundStartAt/);
   assert.match(appSource, /Math\.floor\(fallbackTs \/ \(5 \* 60_000\)\) \* \(5 \* 60_000\)/);
   assert.doesNotMatch(appSource, /roundLabel: analyticsRoundLabel\(round\?\.endAt, log\.orderTimestampMs\)/);
@@ -845,7 +845,7 @@ async function testBackendTransportStampingKeepsLatencySeparateFromAge() {
   assert.match(indexSource, /serverPublishTs,/);
   assert.match(indexSource, /MarketTransportMeta/);
   assert.match(indexSource, /payloadSeq: marketPayloadSeq/);
-  assert.match(indexSource, /snapshot: stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)/);
+  assert.match(indexSource, /snapshot: compactSnapshotForTransport\(stampSnapshotForTransport\(store\.marketSnapshot, transportMeta\.serverPublishTs\)\)/);
   assert.match(indexSource, /bufferedAmount > 0/);
   assert.match(indexSource, /function markTransportSendStart\(transportMeta: MarketTransportMeta\)/);
   assert.match(indexSource, /serverQueueMs = Math\.max\(sendStartedAt - transportMeta\.serverPublishTs, 0\)/);
@@ -930,6 +930,104 @@ async function testOrderFastPathUsesLightUserTradePayloads() {
   assert.match(appSource, /requestAnimationFrame\(\(\) => \{/);
   assert.match(appSource, /startTransition\(\(\) => \{/);
   assert.match(appSource, /setUserTradePayload\(parsed\.data as UserTradePayload\)/);
+  assert.match(apiSource, /cancelOrder\(token: string, orderId: string\) \{\s*return request<\{ order: OrderRecord; tradePatch\?: UserTradePayload \}>/);
+  assert.match(apiSource, /sellPosition\(token: string, positionId: string\) \{\s*return request<\{ order: OrderRecord; tradePatch\?: UserTradePayload \}>/);
+  assert.match(indexSource, /app\.post\("\/api\/orders\/:id\/cancel"[\s\S]*?tradePatch: createUserTradePayload\(user\) satisfies UserTradePayload/);
+  assert.match(indexSource, /app\.post\("\/api\/positions\/:id\/sell"[\s\S]*?tradePatch: createUserTradePayload\(user\) satisfies UserTradePayload/);
+  assert.doesNotMatch(appSource, /await api\.cancelOrder\(token, orderId\);\s*const \[nextProfile, nextOperatedHistory/);
+  assert.doesNotMatch(appSource, /const result = await api\.sellPosition\(token, positionId\);[\s\S]*?const \[nextProfile, nextOperatedHistory/);
+}
+
+async function testRealtimeSnapshotFastPathContracts() {
+  const configSource = readFileSync("apps/server/src/config.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const metricsSource = readFileSync("apps/server/src/services/metrics.ts", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+
+  assert.match(configSource, /marketFullReconcileIntervalMs/);
+  assert.match(indexSource, /marketFullReconcileIntervalMs: serverConfig\.marketFullReconcileIntervalMs/);
+  assert.match(simulationSource, /private scheduleSnapshotOnlyRefresh/);
+  assert.match(simulationSource, /private async refreshMarketSnapshotOnly/);
+  assert.match(simulationSource, /private scheduleFullReconcile/);
+  assert.match(simulationSource, /private async fullReconcileOnce/);
+  assert.match(simulationSource, /this\.scheduleSnapshotOnlyRefresh\("clob"\)/);
+  assert.match(simulationSource, /this\.scheduleSnapshotOnlyRefresh\("binance"\)/);
+  assert.match(simulationSource, /this\.scheduleSnapshotOnlyRefresh\("chainlink"\)/);
+  assert.doesNotMatch(simulationSource, /this\.polymarketConnector\.subscribe\(\(state\) => \{\s*this\.polymarketState = state;\s*this\.scheduleReconcile\(\);/);
+  assert.match(metricsSource, /market_snapshot_refresh_duration_seconds/);
+  assert.match(metricsSource, /market_snapshot_refresh_queue_age_ms/);
+  assert.match(metricsSource, /recordMarketSnapshotRefresh/);
+}
+
+async function testRealtimeTickIncrementContracts() {
+  const serverTypesSource = readFileSync("apps/server/src/domain/types.ts", "utf8");
+  const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const appStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+
+  assert.match(serverTypesSource, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
+  assert.match(apiSource, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
+  assert.match(serverTypesSource, /topLevels\?: Record<TradeSide, \{ bids: BookLevel\[]; asks: BookLevel\[] \}>/);
+  assert.match(apiSource, /topLevels\?: Record<TradeSide, \{ bids: BookLevel\[]; asks: BookLevel\[] \}>/);
+  assert.match(indexSource, /latestCandleUpdates/);
+  assert.match(indexSource, /topLevelsForTick/);
+  assert.match(appStoreSource, /function mergeCandleUpdates/);
+  assert.match(appStoreSource, /function mergeBookTopLevels/);
+  assert.match(appStoreSource, /tick\.binance\.candleUpdates/);
+  assert.match(appStoreSource, /tick\.chainlink\.candleUpdates/);
+  assert.match(appSource, /useMemo\(\(\) => filterBarsToRecentWindow/);
+  assert.match(simulationSource, /function mergeChainlinkHistoryBars/);
+  assert.match(simulationSource, /mergeChainlinkHistoryBars\(\s*this\.chainlinkCandlesByInterval\[interval\],\s*bars,\s*interval\s*\)/);
+  assert.doesNotMatch(simulationSource, /this\.chainlinkCandlesByInterval\[interval\]\s*=\s*\[\.\.\.bars\]/);
+}
+
+async function testBinancePtbAndChainlinkLiveSampleContracts() {
+  const binanceSource = readFileSync("apps/server/src/services/connectors/binance.ts", "utf8");
+  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
+
+  assert.match(binanceSource, /if \(data\.e === "aggTrade"\)[\s\S]*?this\.applyTradeTick\(price, qty, sourceEventTs \|\| now\);/);
+  assert.doesNotMatch(binanceSource, /const close = Number\(kline\.c \?\? this\.state\.price\);/);
+  assert.doesNotMatch(binanceSource, /price: roundNumber\(close, 2\)/);
+  assert.match(
+    binanceSource,
+    /const shouldApplyRestTicker =\s*this\.lastWsMessageAt === 0 \|\| now - this\.lastWsMessageAt > this\.config\.wsStaleMs \|\| this\.state\.price <= 0;/
+  );
+  assert.match(binanceSource, /if \(price > 0 && shouldApplyRestTicker\) \{/);
+
+  assert.match(simulationSource, /private resolveCurrentRoundBinanceOpenReference\(round: RoundRecord \| undefined, now: number\)/);
+  assert.match(simulationSource, /bar\.startTs === round\.startAt && isBtcReferencePrice\(bar\.open\)/);
+  assert.match(simulationSource, /const reference = roundNumber\(bar\.open, 2\)/);
+  assert.doesNotMatch(
+    simulationSource,
+    /if \(!round\.binanceOpenPrice && round\.startAt <= now && this\.binanceState\.price > 0\)[\s\S]*?round\.binanceOpenPrice = roundNumber\(this\.binanceState\.price, 2\);/
+  );
+  assert.match(simulationSource, /private lastChainlinkSampleKey\?: string/);
+  assert.match(simulationSource, /const sampleKey = `\$\{ts\}:\$\{roundNumber\(price, 2\)\}`/);
+  assert.doesNotMatch(simulationSource, /this\.recordChainlinkSample\(chainlinkPrice, this\.chainlinkState\.updatedAt \|\| now\);/);
+
+  assert.match(
+    appSource,
+    /const binancePtbReference = isBtcReferencePrice\(snapshot\?\.displayPriceToBeat\)\s*\?\s*snapshot\.displayPriceToBeat\s*:\s*currentRound\?\.binanceOpenPrice;/
+  );
+  assert.match(appSource, /const binancePtbSpread = referenceSpread\(snapshot\?\.binance\.spotPrice, binancePtbReference\);/);
+}
+
+async function testUserTradePayloadStaysBoundedAndMerged() {
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
+  const appStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
+  const metricsSource = readFileSync("apps/server/src/services/metrics.ts", "utf8");
+
+  assert.match(indexSource, /USER_TRADE_ORDER_LIMIT/);
+  assert.match(indexSource, /USER_TRADE_LIFECYCLE_LIMIT/);
+  assert.match(indexSource, /store\.getOrderLifecycleLogs\(user\.id\)\.slice\(0, USER_TRADE_LIFECYCLE_LIMIT\)/);
+  assert.match(indexSource, /appMetrics\.recordUserWsPayload/);
+  assert.match(appStoreSource, /mergeRecordsById/);
+  assert.match(appStoreSource, /mergeUserTradePayload/);
+  assert.match(metricsSource, /ws_user_payload_build_duration_seconds/);
+  assert.match(metricsSource, /ws_user_payload_bytes/);
 }
 
 async function testClobWsFirstMarketDataContracts() {
@@ -943,6 +1041,9 @@ async function testClobWsFirstMarketDataContracts() {
   assert.match(connectorSource, /function recomputeBookTop/);
   assert.match(connectorSource, /function applyTopToBook/);
   assert.match(connectorSource, /function applyPriceChangeToBook/);
+  assert.match(connectorSource, /function applyPriceChangesToBooks/);
+  assert.match(connectorSource, /normalizeWsTimestamp\(message\.timestamp/);
+  assert.match(connectorSource, /mergeRecentTrades/);
   assert.match(connectorSource, /input\.snapshotTs < book\.snapshotTs/);
   assert.match(connectorSource, /size=0|input\.qty > 0/);
   assert.match(connectorSource, /Streaming best bid\/ask/);
@@ -1016,7 +1117,7 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(simulationSource, /withCurrentRoundChainlinkOpenReference/);
   assert.match(simulationSource, /return \{ \.\.\.round, chainlinkOpenPrice: reference \}/);
   assert.doesNotMatch(simulationSource, /syncRoundChainlinkReferencePrices/);
-  assert.doesNotMatch(simulationSource, /currentRoundOpenReference/);
+  assert.match(simulationSource, /currentRoundOpenReference: currentRoundChainlinkOpenReference/);
   assert.match(simulationSource, /PolymarketReferenceResolver/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.startAt/);
   assert.match(simulationSource, /resolveBoundaryPrice\(round\.endAt/);
@@ -1034,7 +1135,7 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(indexSource, /decorateCurrentRoundForTransport/);
   assert.match(indexSource, /engine\.withCurrentRoundChainlinkOpenReference\(round\)/);
   assert.match(indexSource, /currentRound: decorateCurrentRoundForTransport\(currentRound\)/);
-  assert.doesNotMatch(indexSource, /currentRoundOpenReference: stamped\.chainlink\.currentRoundOpenReference/);
+  assert.match(indexSource, /currentRoundOpenReference: stamped\.chainlink\.currentRoundOpenReference/);
 
   const connectorSource = readFileSync("apps/server/src/services/connectors/polymarket.ts", "utf8");
   assert.match(connectorSource, /function normalizeMarketOutcomes\(payload: DetailedMarketPayload\)/);
@@ -1228,6 +1329,10 @@ async function main() {
   await testBackendTransportStampingKeepsLatencySeparateFromAge();
   await testRealtimeLatencyPacingContracts();
   await testOrderFastPathUsesLightUserTradePayloads();
+  await testRealtimeSnapshotFastPathContracts();
+  await testRealtimeTickIncrementContracts();
+  await testBinancePtbAndChainlinkLiveSampleContracts();
+  await testUserTradePayloadStaysBoundedAndMerged();
   await testClobWsFirstMarketDataContracts();
   await testClobV2FeeMarketInfoAndLatencyContracts();
   await testPolymarketReferencePricesDoNotUseOutcomeOdds();

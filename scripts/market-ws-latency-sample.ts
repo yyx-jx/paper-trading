@@ -64,6 +64,9 @@ const queueLatencies: number[] = [];
 const snapshotAges: number[] = [];
 const wsSendAges: number[] = [];
 const clientProcessLatencies: number[] = [];
+const payloadBytes: number[] = [];
+const tickPayloadBytes: number[] = [];
+const fullPayloadBytes: number[] = [];
 const sourceToBackend: Record<"binance" | "chainlink" | "clob", number[]> = {
   binance: [],
   chainlink: [],
@@ -77,6 +80,9 @@ const sourceAges: Record<"binance" | "chainlink" | "clob", number[]> = {
 
 let tickCount = 0;
 let fullCount = 0;
+let openedAt = 0;
+let firstTickAt = 0;
+let firstFullAt = 0;
 let lastMessageAt = 0;
 let lastTickAt = 0;
 let firstPayloadSeq = 0;
@@ -100,6 +106,7 @@ async function main() {
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket open.")), 10_000);
     socket.once("open", () => {
+      openedAt = Date.now();
       clearTimeout(timeout);
       resolve();
     });
@@ -121,11 +128,12 @@ async function main() {
       return;
     }
     const processedAt = Date.now();
-    recordMessage(parsed, receivedAt, processedAt);
+    recordMessage(parsed, receivedAt, processedAt, raw);
   });
 
   await sleep(durationMs);
-  socket.close();
+  socket.terminate();
+  await sleep(100);
 
   const result = buildResult(startedAt, Date.now());
   const text = JSON.stringify(result, null, 2);
@@ -135,18 +143,28 @@ async function main() {
   console.log(text);
 }
 
-function recordMessage(message: MarketMessage, receivedAt: number, processedAt: number) {
+function recordMessage(message: MarketMessage, receivedAt: number, processedAt: number, raw: WebSocket.RawData) {
+  const rawBytes = rawDataByteLength(raw);
+  payloadBytes.push(rawBytes);
   if (lastMessageAt > 0) {
     intervals.push(receivedAt - lastMessageAt);
   }
   lastMessageAt = receivedAt;
   if (message.type === "market:tick") {
+    tickPayloadBytes.push(rawBytes);
+    if (!firstTickAt) {
+      firstTickAt = receivedAt;
+    }
     if (lastTickAt > 0) {
       tickIntervals.push(receivedAt - lastTickAt);
     }
     lastTickAt = receivedAt;
     tickCount += 1;
   } else {
+    fullPayloadBytes.push(rawBytes);
+    if (!firstFullAt) {
+      firstFullAt = receivedAt;
+    }
     fullCount += 1;
   }
 
@@ -197,6 +215,9 @@ function buildResult(startedAt: number, finishedAt: number) {
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date(finishedAt).toISOString(),
     durationMs: finishedAt - startedAt,
+    openMs: openedAt ? openedAt - startedAt : 0,
+    firstTickMs: firstTickAt ? firstTickAt - startedAt : 0,
+    firstFullMs: firstFullAt ? firstFullAt - startedAt : 0,
     tickCount,
     fullCount,
     firstPayloadSeq,
@@ -223,6 +244,10 @@ function buildResult(startedAt: number, finishedAt: number) {
     serverQueueP95: percentile(queueLatencies, 95),
     snapshotBuildAgeP95: percentile(snapshotAges, 95),
     renderCommitAgeP95: percentile(clientProcessLatencies, 95),
+    payloadBytesP95: percentile(payloadBytes, 95),
+    payloadBytesMax: max(payloadBytes),
+    tickPayloadBytesP95: percentile(tickPayloadBytes, 95),
+    fullPayloadBytesP95: percentile(fullPayloadBytes, 95),
     binanceSourceToBackendP95: percentile(sourceToBackend.binance, 95),
     clobSourceToBackendP95: percentile(sourceToBackend.clob, 95),
     chainlinkSourceToBackendP95: percentile(sourceToBackend.chainlink, 95),
@@ -332,6 +357,16 @@ function percentile(values: number[], p: number) {
   const sorted = [...values].sort((left, right) => left - right);
   const index = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
   return Math.round(sorted[index]);
+}
+
+function rawDataByteLength(raw: WebSocket.RawData) {
+  if (typeof raw === "string") {
+    return Buffer.byteLength(raw);
+  }
+  if (Array.isArray(raw)) {
+    return raw.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  }
+  return Buffer.from(raw).byteLength;
 }
 
 function max(values: number[]) {

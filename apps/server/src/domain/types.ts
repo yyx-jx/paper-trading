@@ -870,18 +870,21 @@ export interface MarketRealtimeTick {
   binance: {
     spotPrice: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   chainlink: {
     referencePrice: number;
     settlementReference: number;
     currentRoundOpenReference?: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   clob: {
     delta: number;
     volume: number;
     currentRoundUpPricePoint?: CandlePoint;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+    topLevels?: Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }>;
   };
   uiMeta: {
     countdownMs: number;

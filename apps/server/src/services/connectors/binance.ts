@@ -381,7 +381,9 @@ export class BinanceConnector {
           this.upsertBar(interval, bar);
         }
       }
-      if (price > 0) {
+      const shouldApplyRestTicker =
+        this.lastWsMessageAt === 0 || now - this.lastWsMessageAt > this.config.wsStaleMs || this.state.price <= 0;
+      if (price > 0 && shouldApplyRestTicker) {
         this.applyTradeTick(price, 0, now);
       }
       if (this.lastWsMessageAt === 0 || now - this.lastWsMessageAt > this.config.wsStaleMs) {
@@ -556,14 +558,6 @@ export class BinanceConnector {
               close: Number(kline.c ?? 0),
               volume: Number(kline.v ?? 0)
             });
-          }
-          const close = Number(kline.c ?? this.state.price);
-          if (close > 0) {
-            this.state.price = roundNumber(close, 2);
-            this.state.latestTick = {
-              ts: sourceEventTs || now,
-              price: roundNumber(close, 2)
-            };
           }
         }
 

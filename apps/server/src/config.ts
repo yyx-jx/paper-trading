@@ -73,6 +73,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     pollDelayMs: Number(env.POLL_DELAY_MS ?? 0),
     marketWsMinIntervalMs: Number(env.MARKET_WS_MIN_INTERVAL_MS ?? 50),
     marketSnapshotIntervalMs: Number(env.MARKET_SNAPSHOT_INTERVAL_MS ?? 500),
+    marketFullReconcileIntervalMs: Number(env.MARKET_FULL_RECONCILE_INTERVAL_MS ?? 1000),
     marketHistoryCacheMaxUsers: Number(env.MARKET_HISTORY_CACHE_MAX_USERS ?? 200),
     strictPersistence: env.SERVER_STRICT_PERSISTENCE !== "false",
     requireSchemaMigrations: isProduction ? env.SERVER_REQUIRE_MIGRATIONS !== "false" : env.SERVER_REQUIRE_MIGRATIONS === "true",

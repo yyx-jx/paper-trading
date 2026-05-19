@@ -147,10 +147,73 @@ function mergeBookTop(book: MarketSnapshot["orderBooks"][TradeSide], top: { best
   };
 }
 
+function mergeBookTopLevels(
+  book: MarketSnapshot["orderBooks"][TradeSide],
+  top: { bestBid: number; bestAsk: number },
+  levels?: { bids: MarketSnapshot["orderBooks"][TradeSide]["bids"]; asks: MarketSnapshot["orderBooks"][TradeSide]["asks"] }
+) {
+  const mergedTop = mergeBookTop(book, top);
+  return {
+    ...mergedTop,
+    bids: levels?.bids ?? mergedTop.bids,
+    asks: levels?.asks ?? mergedTop.asks
+  };
+}
+
+function mergeCandleBar<T extends { startTs: number }>(bars: T[], update?: T) {
+  if (!update) {
+    return bars;
+  }
+  const next = bars.filter((bar) => bar.startTs !== update.startTs);
+  next.push(update);
+  return next.sort((left, right) => left.startTs - right.startTs).slice(-240);
+}
+
+function mergeCandleUpdates(
+  candlesByInterval: MarketSnapshot["binance"]["candlesByInterval"],
+  updates?: MarketRealtimeTick["binance"]["candleUpdates"]
+) {
+  if (!updates) {
+    return candlesByInterval;
+  }
+  return {
+    ...candlesByInterval,
+    "30s": mergeCandleBar(candlesByInterval["30s"], updates["30s"]),
+    "1m": mergeCandleBar(candlesByInterval["1m"], updates["1m"]),
+    "5m": mergeCandleBar(candlesByInterval["5m"], updates["5m"]),
+    "15m": mergeCandleBar(candlesByInterval["15m"], updates["15m"]),
+    "1h": mergeCandleBar(candlesByInterval["1h"], updates["1h"]),
+    "1d": mergeCandleBar(candlesByInterval["1d"], updates["1d"])
+  };
+}
+
+function mergeRecordsById<T extends { id: string }>(current: T[], updates: T[], limit = 500) {
+  const byId = new Map<string, T>();
+  for (const item of current) {
+    byId.set(item.id, item);
+  }
+  for (const item of updates) {
+    byId.set(item.id, item);
+  }
+  return [...byId.values()].slice(0, limit);
+}
+
+function mergeUserTradePayload(state: AppState, data: UserTradePayload) {
+  return {
+    viewedUserId: data.viewedUserId,
+    profile: data.profile,
+    positions: data.positions,
+    orders: mergeRecordsById(state.orders, data.orders).sort((left, right) => right.createdAt - left.createdAt),
+    orderLifecycles: mergeRecordsById(state.orderLifecycles, data.orderLifecycles).sort(
+      (left, right) => right.orderTimestampMs - left.orderTimestampMs
+    )
+  };
+}
+
 function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): MarketSnapshot {
   const topOrderBooks = {
-    UP: mergeBookTop(snapshot.orderBooks.UP, tick.clob.bestBidAskSummary.UP),
-    DOWN: mergeBookTop(snapshot.orderBooks.DOWN, tick.clob.bestBidAskSummary.DOWN)
+    UP: mergeBookTopLevels(snapshot.orderBooks.UP, tick.clob.bestBidAskSummary.UP, tick.clob.topLevels?.UP),
+    DOWN: mergeBookTopLevels(snapshot.orderBooks.DOWN, tick.clob.bestBidAskSummary.DOWN, tick.clob.topLevels?.DOWN)
   };
   return {
     ...snapshot,
@@ -174,13 +237,15 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     binance: {
       ...snapshot.binance,
       spotPrice: tick.binance.spotPrice,
-      latestTick: tick.binance.latestTick
+      latestTick: tick.binance.latestTick,
+      candlesByInterval: mergeCandleUpdates(snapshot.binance.candlesByInterval, tick.binance.candleUpdates)
     },
     chainlink: {
       ...snapshot.chainlink,
       referencePrice: tick.chainlink.referencePrice,
       settlementReference: tick.chainlink.settlementReference,
-      currentRoundOpenReference: tick.chainlink.currentRoundOpenReference
+      currentRoundOpenReference: tick.chainlink.currentRoundOpenReference,
+      candlesByInterval: mergeCandleUpdates(snapshot.chainlink.candlesByInterval, tick.chainlink.candleUpdates)
     },
     clob: {
       ...snapshot.clob,
@@ -354,13 +419,7 @@ export const useAppStore = create<AppState>((set) => ({
   setUserTradePayload: (data) =>
     set((state) =>
       shouldAcceptViewedPayload(state, data.viewedUserId)
-        ? {
-          viewedUserId: data.viewedUserId,
-          profile: data.profile,
-          positions: data.positions,
-          orders: data.orders,
-          orderLifecycles: data.orderLifecycles
-        }
+        ? mergeUserTradePayload(state, data)
         : state
     ),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),

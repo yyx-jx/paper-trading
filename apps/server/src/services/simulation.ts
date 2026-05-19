@@ -37,6 +37,7 @@ import { MatchingServiceClient } from "./matching/client";
 import { PolymarketConnector } from "./connectors/polymarket";
 import { PolymarketReferenceResolver } from "./connectors/polymarket-reference";
 import { AppStore } from "./store";
+import { appMetrics } from "./metrics";
 
 const LATENCY_LOG_INTERVAL_MS = 15000;
 const REDEEM_DELAY_MS = 2000;
@@ -321,6 +322,32 @@ function upsertSampleBar(
   ].slice(-CHAINLINK_BAR_LIMITS[interval]);
 }
 
+function mergeChainlinkHistoryBars(
+  current: CandleBar[],
+  incoming: CandleBar[] | undefined,
+  interval: (typeof TRADE_CHART_INTERVALS)[number]
+) {
+  if (!incoming?.length) {
+    return current;
+  }
+
+  const barsByStartTs = new Map<number, CandleBar>();
+  for (const bar of incoming) {
+    if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
+      barsByStartTs.set(bar.startTs, { ...bar, interval });
+    }
+  }
+  for (const bar of current) {
+    if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
+      barsByStartTs.set(bar.startTs, { ...bar, interval });
+    }
+  }
+
+  return [...barsByStartTs.values()]
+    .sort((left, right) => left.startTs - right.startTs)
+    .slice(-CHAINLINK_BAR_LIMITS[interval]);
+}
+
 function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
   return {
     snapshotId: snapshot.snapshotId,
@@ -395,11 +422,17 @@ export class SimulationEngine {
   private polymarketState: PolymarketConnectorState;
   private currentRoundUpPriceSeries: CandlePoint[] = [];
   private currentRoundUpPriceSeriesRoundId?: string;
+  private currentRoundBinanceOpenReferences = new Map<string, number>();
   private currentRoundChainlinkOpenReferences = new Map<string, number>();
+  private lastChainlinkSampleKey?: string;
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
   private reconcileRunning = false;
   private reconcileQueued = false;
+  private snapshotRefreshRunning = false;
+  private snapshotRefreshQueued = false;
+  private snapshotRefreshQueuedAt?: number;
+  private readonly snapshotRefreshSources = new Set<"binance" | "chainlink" | "clob">();
   private readonly pollLocks = new Set<string>();
   private redeemLocks = new Set<string>();
   private readonly lastLatencyLogAt = new Map<string, number>();
@@ -458,6 +491,7 @@ export class SimulationEngine {
       polymarketDiscoveryKeywords: string[];
       marketDiscoveryIntervalMs: number;
       marketSnapshotIntervalMs: number;
+      marketFullReconcileIntervalMs: number;
       polymarketBookPollMs: number;
       polymarketBookCalibrationMs: number;
       polymarketTradesPollMs: number;
@@ -515,11 +549,11 @@ export class SimulationEngine {
     this.unsubscribers.push(
       this.binanceConnector.subscribe((state) => {
         this.binanceState = state;
-        this.scheduleReconcile();
+        this.scheduleSnapshotOnlyRefresh("binance");
       }),
       this.polymarketConnector.subscribe((state) => {
         this.polymarketState = state;
-        this.scheduleReconcile();
+        this.scheduleSnapshotOnlyRefresh("clob");
       })
     );
     if (this.config.chainlinkEnabled) {
@@ -527,7 +561,7 @@ export class SimulationEngine {
         this.chainlinkConnector.subscribe((state) => {
           this.chainlinkState = state;
           this.recordChainlinkSample(state.price, state.updatedAt || Date.now());
-          this.scheduleReconcile();
+          this.scheduleSnapshotOnlyRefresh("chainlink");
         })
       );
     }
@@ -538,10 +572,10 @@ export class SimulationEngine {
     }
     this.polymarketConnector.start();
     this.reconcileTimer = setInterval(
-      () => this.scheduleReconcile(),
-      Math.max(this.config.marketSnapshotIntervalMs, 50)
+      () => this.scheduleFullReconcile(),
+      Math.max(this.config.marketFullReconcileIntervalMs, 250)
     );
-    this.scheduleReconcile();
+    this.scheduleFullReconcile();
   }
 
   async stop() {
@@ -1894,7 +1928,70 @@ export class SimulationEngine {
     }
   }
 
+  private scheduleSnapshotOnlyRefresh(source: "binance" | "chainlink" | "clob") {
+    this.snapshotRefreshSources.add(source);
+    this.snapshotRefreshQueued = true;
+    this.snapshotRefreshQueuedAt ??= Date.now();
+    if (this.snapshotRefreshRunning) {
+      return;
+    }
+
+    this.snapshotRefreshRunning = true;
+    setImmediate(() => {
+      void this.snapshotOnlyRefreshLoop();
+    });
+  }
+
+  private async snapshotOnlyRefreshLoop() {
+    try {
+      while (this.snapshotRefreshQueued) {
+        const queuedAt = this.snapshotRefreshQueuedAt;
+        this.snapshotRefreshQueued = false;
+        this.snapshotRefreshQueuedAt = undefined;
+        this.snapshotRefreshSources.clear();
+        try {
+          await this.refreshMarketSnapshotOnly(queuedAt);
+        } catch (error) {
+          if (this.store.isPersistenceUnavailableError(error)) {
+            console.warn("[simulation] Snapshot-only refresh deferred while persistence is unavailable:", error);
+            await sleep(250);
+            this.snapshotRefreshQueued = true;
+            continue;
+          }
+          throw error;
+        }
+      }
+    } finally {
+      this.snapshotRefreshRunning = false;
+      if (this.snapshotRefreshQueued) {
+        this.snapshotRefreshRunning = true;
+        setImmediate(() => {
+          void this.snapshotOnlyRefreshLoop();
+        });
+      }
+    }
+  }
+
+  private async refreshMarketSnapshotOnly(queuedAt?: number) {
+    const startedAt = Date.now();
+    try {
+      const snapshot = this.buildSnapshot();
+      await this.store.setMarketSnapshot(snapshot);
+      this.scheduleLatencyLogs(snapshot);
+    } finally {
+      appMetrics.recordMarketSnapshotRefresh({
+        mode: "snapshot_only",
+        durationMs: Date.now() - startedAt,
+        queueAgeMs: queuedAt ? Math.max(startedAt - queuedAt, 0) : undefined
+      });
+    }
+  }
+
   private scheduleReconcile() {
+    this.scheduleFullReconcile();
+  }
+
+  private scheduleFullReconcile() {
     if (this.reconcileRunning) {
       this.reconcileQueued = true;
       return;
@@ -1913,9 +2010,9 @@ export class SimulationEngine {
         } catch (error) {
           if (this.store.isPersistenceUnavailableError(error)) {
             console.warn("[simulation] Reconcile deferred while PostgreSQL is unavailable:", error);
-            await sleep(250);
-            continue;
-          }
+          await sleep(250);
+          continue;
+        }
           throw error;
         }
       } while (this.reconcileQueued);
@@ -1928,6 +2025,49 @@ export class SimulationEngine {
     return this.store.rounds
       .filter((round) => round.startAt <= now && round.endAt > now)
       .sort((left, right) => right.startAt - left.startAt)[0];
+  }
+
+  private resolveCurrentRoundBinanceOpenReference(round: RoundRecord | undefined, now: number) {
+    if (!round || round.startAt > now) {
+      return undefined;
+    }
+    if (isBtcReferencePrice(round.binanceOpenPrice)) {
+      const persistedReference = roundNumber(round.binanceOpenPrice, 2);
+      this.currentRoundBinanceOpenReferences ??= new Map<string, number>();
+      this.currentRoundBinanceOpenReferences.set(round.id, persistedReference);
+      return persistedReference;
+    }
+    this.currentRoundBinanceOpenReferences ??= new Map<string, number>();
+    const cachedReference = this.currentRoundBinanceOpenReferences.get(round.id);
+    if (isBtcReferencePrice(cachedReference)) {
+      return cachedReference;
+    }
+    if (!this.binanceState.candlesByInterval) {
+      return undefined;
+    }
+    for (const interval of ["5m", "1m", "30s"] as const) {
+      const bar = this.binanceState.candlesByInterval[interval].find(
+        (candidate) => candidate.startTs === round.startAt && isBtcReferencePrice(candidate.open)
+      );
+      if (bar && bar.startTs === round.startAt && isBtcReferencePrice(bar.open)) {
+        const reference = roundNumber(bar.open, 2);
+        this.currentRoundBinanceOpenReferences.set(round.id, reference);
+        this.pruneCurrentRoundBinanceOpenReferences(round.id, now);
+        return reference;
+      }
+    }
+    return undefined;
+  }
+
+  withCurrentRoundBinanceOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
+    if (!round) {
+      return round;
+    }
+    const reference = this.resolveCurrentRoundBinanceOpenReference(round, now);
+    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.binanceOpenPrice)) {
+      return round;
+    }
+    return { ...round, binanceOpenPrice: reference };
   }
 
   private resolveCurrentRoundChainlinkOpenReference(round: RoundRecord | undefined, now: number, chainlinkPrice: number) {
@@ -1963,6 +2103,22 @@ export class SimulationEngine {
       return round;
     }
     return { ...round, chainlinkOpenPrice: reference };
+  }
+
+  private pruneCurrentRoundBinanceOpenReferences(activeRoundId: string, now: number) {
+    if (this.currentRoundBinanceOpenReferences.size <= 24) {
+      return;
+    }
+    const recentRoundIds = new Set(
+      this.store.rounds
+        .filter((round) => round.id === activeRoundId || round.endAt >= now - 2 * 60 * 60 * 1000)
+        .map((round) => round.id)
+    );
+    for (const roundId of this.currentRoundBinanceOpenReferences.keys()) {
+      if (!recentRoundIds.has(roundId)) {
+        this.currentRoundBinanceOpenReferences.delete(roundId);
+      }
+    }
   }
 
   private pruneCurrentRoundChainlinkOpenReferences(activeRoundId: string, now: number) {
@@ -2692,17 +2848,29 @@ export class SimulationEngine {
   }
 
   private async reconcileOnce() {
-    await this.syncDiscoveredRounds();
-    await this.syncCurrentRoundMarket();
-    const roundChangedUsers = await this.processRounds();
-    const snapshot = this.buildSnapshot();
-    const changedUsers = this.refreshOpenPositions(snapshot);
-    await this.store.setMarketSnapshot(snapshot);
-    this.scheduleLatencyLogs(snapshot);
-    for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
-      this.store.emitUserPayload(userId);
+    await this.fullReconcileOnce();
+  }
+
+  private async fullReconcileOnce() {
+    const startedAt = Date.now();
+    try {
+      await this.syncDiscoveredRounds();
+      await this.syncCurrentRoundMarket();
+      const roundChangedUsers = await this.processRounds();
+      const snapshot = this.buildSnapshot();
+      const changedUsers = this.refreshOpenPositions(snapshot);
+      await this.store.setMarketSnapshot(snapshot);
+      this.scheduleLatencyLogs(snapshot);
+      for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
+        this.store.emitUserPayload(userId);
+      }
+      this.schedulePendingOrderProcessing();
+    } finally {
+      appMetrics.recordMarketSnapshotRefresh({
+        mode: "full_reconcile",
+        durationMs: Date.now() - startedAt
+      });
     }
-    this.schedulePendingOrderProcessing();
   }
 
   private scheduleLatencyLogs(snapshot: MarketSnapshot) {
@@ -2805,8 +2973,9 @@ export class SimulationEngine {
         this.applyMarketMetadata(round, liveDetail);
       }
 
-      if (!round.binanceOpenPrice && round.startAt <= now && this.binanceState.price > 0) {
-        round.binanceOpenPrice = roundNumber(this.binanceState.price, 2);
+      const binanceOpenReference = this.resolveCurrentRoundBinanceOpenReference(round, now);
+      if (!round.binanceOpenPrice && isBtcReferencePrice(binanceOpenReference)) {
+        round.binanceOpenPrice = binanceOpenReference;
       }
 
       if (!round.binanceClosePrice && now >= round.endAt && this.binanceState.price > 0) {
@@ -2914,6 +3083,11 @@ export class SimulationEngine {
     if (!this.config.chainlinkEnabled || !Number.isFinite(price) || price <= 0) {
       return;
     }
+    const sampleKey = `${ts}:${roundNumber(price, 2)}`;
+    if (this.lastChainlinkSampleKey === sampleKey) {
+      return;
+    }
+    this.lastChainlinkSampleKey = sampleKey;
     for (const interval of TRADE_CHART_INTERVALS) {
       this.chainlinkCandlesByInterval[interval] = upsertSampleBar(
         this.chainlinkCandlesByInterval[interval],
@@ -2954,7 +3128,11 @@ export class SimulationEngine {
     for (const interval of TRADE_CHART_INTERVALS) {
       const bars = candlesByInterval[interval];
       if (bars?.length) {
-        this.chainlinkCandlesByInterval[interval] = [...bars];
+        this.chainlinkCandlesByInterval[interval] = mergeChainlinkHistoryBars(
+          this.chainlinkCandlesByInterval[interval],
+          bars,
+          interval
+        );
       }
     }
   }
@@ -3032,8 +3210,13 @@ export class SimulationEngine {
     const chainlinkPrice =
       this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
     this.syncChainlinkHistoryCandles(this.chainlinkState.candlesByInterval);
-    this.recordChainlinkSample(chainlinkPrice, this.chainlinkState.updatedAt || now);
     const binancePrice = this.binanceState.price > 0 ? roundNumber(this.binanceState.price, 2) : 0;
+    const currentRoundBinanceOpenReference = this.resolveCurrentRoundBinanceOpenReference(currentRound, now);
+    const currentRoundChainlinkOpenReference = this.resolveCurrentRoundChainlinkOpenReference(
+      currentRound,
+      now,
+      chainlinkPrice
+    );
     const countdownTargetTs = currentRound
       ? currentRound.startAt > now
         ? currentRound.startAt
@@ -3076,8 +3259,8 @@ export class SimulationEngine {
         ? roundNumber(currentRound.priceToBeat, 2)
         : undefined;
     const fallbackDisplayPriceToBeat =
-      !officialPriceToBeat && currentRound && isBtcReferencePrice(currentRound.binanceOpenPrice)
-        ? roundNumber(currentRound.binanceOpenPrice, 2)
+      !officialPriceToBeat && currentRound && isBtcReferencePrice(currentRoundBinanceOpenReference)
+        ? roundNumber(currentRoundBinanceOpenReference, 2)
         : undefined;
 
     return {
@@ -3129,6 +3312,7 @@ export class SimulationEngine {
       chainlink: {
         referencePrice: chainlinkPrice,
         settlementReference: currentRound?.settlementPrice ?? chainlinkPrice,
+        currentRoundOpenReference: currentRoundChainlinkOpenReference,
         candles5s: [...this.chainlinkCandles5s],
         candlesByInterval: {
           "30s": [...this.chainlinkCandlesByInterval["30s"]],

@@ -92,6 +92,7 @@ const storeSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8")
 const styleSource = readFileSync("apps/client/src/styles.css", "utf8");
 const indexHtmlSource = readFileSync("apps/client/src/index.html", "utf8");
 const viteConfigSource = readFileSync("apps/client/vite.config.ts", "utf8");
+const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
 const chartWheelSource = readFileSync("apps/client/src/utils/chartWheel.ts", "utf8");
 const electronMainSource = readFileSync("apps/client/electron/main.cjs", "utf8");
 const pnlSource = readFileSync("apps/client/src/features/trade/pnl.ts", "utf8");
@@ -255,7 +256,7 @@ assert.match(apiSource, /function wsBaseUrl\(\)/);
 assert.match(apiSource, /replace\("https:\/\/", "wss:\/\/"\)/);
 assert.match(viteConfigSource, /__APP_VERSION__/);
 assert.match(viteConfigSource, /HT Paper Trading v\$\{appVersion\}/);
-assert.match(indexHtmlSource, /<title>HT Paper Trading v0\.3\.0<\/title>/);
+assert.match(indexHtmlSource, new RegExp(`<title>HT Paper Trading v${packageJson.version.replace(/\./g, "\\.")}</title>`));
 assert.match(appSource, /const APP_VERSION_LABEL = `v\$\{APP_VERSION\}`/);
 assert.match(appSource, /document\.title = __APP_DISPLAY_TITLE__/);
 assert.match(appSource, /terminal-login-version">\{APP_VERSION_LABEL\} · Hyper Terminal/);

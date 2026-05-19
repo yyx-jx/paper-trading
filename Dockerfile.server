@@ -3,6 +3,11 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
+FROM node:24-alpine AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
 FROM node:24-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
@@ -14,7 +19,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 RUN apk add --no-cache bash postgresql-client
 COPY package.json package-lock.json ./
-COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY scripts ./scripts
 COPY db ./db
