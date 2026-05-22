@@ -26,6 +26,8 @@ import type {
   CandleInterval,
   Language,
   LogSearchQuery,
+  MarketCandleQuery,
+  MarketCandleRecord,
   MarketSnapshot,
   OrderBookSnapshotRecord,
   OrderLifecycleExitType,
@@ -54,6 +56,11 @@ const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
 const LOG_FILE_TAIL_BYTES = 512 * 1024;
 const MEMORY_GUARD_INTERVAL_MS = 15_000;
 const PERSISTENCE_FAILURE_THRESHOLD = 3;
+const MARKET_CANDLE_MEMORY_RETENTION_MS = 24 * 60 * 60_000;
+const MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
+  history_1m_split: 1,
+  rtds_30s: 2
+};
 const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
@@ -231,6 +238,27 @@ CREATE TABLE IF NOT EXISTS rounds (
   chainlink_open_price DOUBLE PRECISION,
   chainlink_close_price DOUBLE PRECISION
 );
+
+CREATE TABLE IF NOT EXISTS market_candles (
+  source TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  open_ts BIGINT NOT NULL,
+  close_ts BIGINT NOT NULL,
+  open DOUBLE PRECISION NOT NULL,
+  high DOUBLE PRECISION NOT NULL,
+  low DOUBLE PRECISION NOT NULL,
+  close DOUBLE PRECISION NOT NULL,
+  volume DOUBLE PRECISION NOT NULL DEFAULT 0,
+  origin TEXT NOT NULL,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY (source, symbol, interval, open_ts),
+  CHECK (open_ts % 30000 = 0),
+  CHECK (close_ts = open_ts + 30000)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_candles_lookup
+  ON market_candles(source, symbol, interval, open_ts DESC);
 
 CREATE TABLE IF NOT EXISTS order_book_snapshots (
   ref TEXT PRIMARY KEY,
@@ -797,6 +825,7 @@ export class AppStore {
   public readonly orderLifecycleLogs: OrderLifecycleRecord[] = [];
   public readonly orderBookSnapshots = new Map<string, OrderBookSnapshotRecord>();
   public readonly positions: PositionRecord[] = [];
+  private readonly marketCandles = new Map<string, MarketCandleRecord[]>();
   public readonly logs: AuditEvent[] = [];
   public readonly behaviorLogs: BehaviorActionLog[] = [];
   public marketSnapshot: MarketSnapshot;
@@ -895,7 +924,7 @@ export class AppStore {
       seedDefaultUsers: config.seedDefaultUsers ?? true,
       requireSchemaMigrations: config.requireSchemaMigrations ?? false,
       allowDevSchemaBootstrap: config.allowDevSchemaBootstrap ?? true,
-      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000005"
+      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000007"
     };
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
@@ -2555,6 +2584,70 @@ export class AppStore {
     return Object.values(this.marketSnapshot.sources).map((source: SourceHealth) => source);
   }
 
+  async upsertMarketCandles(candles: MarketCandleRecord[]) {
+    const validCandles = candles.filter((candle) => this.isValidMarketCandle(candle));
+    if (validCandles.length === 0) {
+      return;
+    }
+    this.mergeMarketCandlesIntoMemory(validCandles);
+    if (!this.postgresEnabled || !this.pool) {
+      return;
+    }
+
+    const values: string[] = [];
+    const params: unknown[] = [];
+    validCandles.forEach((candle, index) => {
+      const offset = index * 12;
+      values.push(
+        `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11},$${offset + 12})`
+      );
+      params.push(
+        candle.source,
+        candle.symbol,
+        candle.interval,
+        candle.openTs,
+        candle.closeTs,
+        candle.open,
+        candle.high,
+        candle.low,
+        candle.close,
+        candle.volume,
+        candle.origin,
+        candle.updatedAt
+      );
+    });
+    await this.runDb(
+      `
+      INSERT INTO market_candles (
+        source, symbol, interval, open_ts, close_ts, open, high, low, close, volume, origin, updated_at
+      ) VALUES ${values.join(",")}
+      ON CONFLICT (source, symbol, interval, open_ts) DO UPDATE SET
+        close_ts = EXCLUDED.close_ts,
+        open = EXCLUDED.open,
+        high = EXCLUDED.high,
+        low = EXCLUDED.low,
+        close = EXCLUDED.close,
+        volume = EXCLUDED.volume,
+        origin = EXCLUDED.origin,
+        updated_at = EXCLUDED.updated_at
+      WHERE market_candles.origin <> 'rtds_30s' OR EXCLUDED.origin = 'rtds_30s'
+      `,
+      params
+    );
+  }
+
+  getMarketCandles(query: MarketCandleQuery) {
+    const key = this.marketCandleKey(query.source, query.symbol, query.interval);
+    const rows = this.marketCandles.get(key) ?? [];
+    const filtered = rows.filter(
+      (candle) =>
+        (typeof query.fromOpenTs !== "number" || candle.openTs >= query.fromOpenTs) &&
+        (typeof query.toOpenTs !== "number" || candle.openTs <= query.toOpenTs)
+    );
+    const limit = query.limit && query.limit > 0 ? query.limit : filtered.length;
+    return filtered.slice(-limit).map((candle) => ({ ...candle }));
+  }
+
   async upsertRound(round: RoundRecord) {
     const index = this.rounds.findIndex((item) => item.id === round.id);
     const previous = index >= 0 ? this.rounds[index] : undefined;
@@ -3562,9 +3655,23 @@ export class AppStore {
 
   private async loadStateFromPersistence() {
     if (this.postgresEnabled && this.pool) {
-      const [userRows, roundRows, snapshotRows, orderRows, lifecycleRows, positionRows, logRows, behaviorRows] = await Promise.all([
+      const [
+        userRows,
+        roundRows,
+        marketCandleRows,
+        snapshotRows,
+        orderRows,
+        lifecycleRows,
+        positionRows,
+        logRows,
+        behaviorRows
+      ] = await Promise.all([
         this.pool.query("SELECT * FROM users ORDER BY created_at ASC"),
         this.pool.query("SELECT * FROM rounds ORDER BY start_at DESC LIMIT 80"),
+        this.pool.query(
+          "SELECT * FROM market_candles WHERE source = $1 AND symbol = $2 AND interval = $3 AND open_ts >= $4 ORDER BY open_ts ASC",
+          ["chainlink", this.config.symbol, "30s", Date.now() - MARKET_CANDLE_MEMORY_RETENTION_MS]
+        ),
         this.pool.query("SELECT * FROM order_book_snapshots ORDER BY snapshot_ts DESC LIMIT 5000"),
         this.pool.query("SELECT * FROM orders ORDER BY created_at DESC LIMIT 2000"),
         this.pool.query("SELECT * FROM order_lifecycle_logs ORDER BY order_timestamp_ms DESC LIMIT 5000"),
@@ -3610,6 +3717,8 @@ export class AppStore {
       }
 
       this.rounds.splice(0, this.rounds.length, ...roundRows.rows.map((row) => this.rowToRound(row)));
+      this.marketCandles.clear();
+      this.mergeMarketCandlesIntoMemory(marketCandleRows.rows.map((row) => this.rowToMarketCandle(row)));
       this.orderBookSnapshots.clear();
       for (const row of snapshotRows.rows) {
         const snapshotRecord = this.rowToOrderBookSnapshotRecord(row);
@@ -3819,6 +3928,64 @@ export class AppStore {
         )
     ).filter((event) => event.serverRecvTs >= threshold);
     await this.auditLogWriter.rewrite(filtered);
+  }
+
+  private marketCandleKey(source: MarketCandleRecord["source"], symbol: string, interval: MarketCandleRecord["interval"]) {
+    return `${source}:${symbol}:${interval}`;
+  }
+
+  private isValidMarketCandle(candle: MarketCandleRecord) {
+    return (
+      candle.source === "chainlink" &&
+      candle.interval === "30s" &&
+      Number.isFinite(candle.openTs) &&
+      Number.isFinite(candle.closeTs) &&
+      candle.openTs % 30_000 === 0 &&
+      candle.closeTs === candle.openTs + 30_000 &&
+      [candle.open, candle.high, candle.low, candle.close].every((value) => Number.isFinite(value) && value > 0)
+    );
+  }
+
+  private mergeMarketCandlesIntoMemory(candles: MarketCandleRecord[], now = Date.now()) {
+    const threshold = now - MARKET_CANDLE_MEMORY_RETENTION_MS;
+    for (const candle of candles) {
+      const key = this.marketCandleKey(candle.source, candle.symbol, candle.interval);
+      const existingRows = this.marketCandles.get(key) ?? [];
+      const byOpenTs = new Map(existingRows.map((row) => [row.openTs, row]));
+      const existing = byOpenTs.get(candle.openTs);
+      const incomingPriority = MARKET_CANDLE_PRIORITY[candle.origin];
+      const existingPriority = existing ? MARKET_CANDLE_PRIORITY[existing.origin] : 0;
+      if (
+        !existing ||
+        incomingPriority > existingPriority ||
+        (incomingPriority === existingPriority && candle.updatedAt >= existing.updatedAt)
+      ) {
+        byOpenTs.set(candle.openTs, { ...candle });
+      }
+      this.marketCandles.set(
+        key,
+        [...byOpenTs.values()]
+          .filter((row) => row.openTs >= threshold)
+          .sort((left, right) => left.openTs - right.openTs)
+      );
+    }
+  }
+
+  private rowToMarketCandle(row: Record<string, unknown>): MarketCandleRecord {
+    return {
+      source: "chainlink",
+      symbol: String(row.symbol),
+      interval: "30s",
+      openTs: Number(row.open_ts),
+      closeTs: Number(row.close_ts),
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+      volume: Number(row.volume ?? 0),
+      origin: String(row.origin) === "rtds_30s" ? "rtds_30s" : "history_1m_split",
+      updatedAt: Number(row.updated_at)
+    };
   }
 
   private rowToRound(row: Record<string, unknown>): RoundRecord {

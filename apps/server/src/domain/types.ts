@@ -257,6 +257,33 @@ export interface CandleBar {
   volume: number;
 }
 
+export type MarketCandleSource = "chainlink";
+export type MarketCandleOrigin = "rtds_30s" | "history_1m_split";
+
+export interface MarketCandleRecord {
+  source: MarketCandleSource;
+  symbol: string;
+  interval: "30s";
+  openTs: number;
+  closeTs: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  origin: MarketCandleOrigin;
+  updatedAt: number;
+}
+
+export interface MarketCandleQuery {
+  source: MarketCandleSource;
+  symbol: string;
+  interval: "30s";
+  fromOpenTs?: number;
+  toOpenTs?: number;
+  limit?: number;
+}
+
 export interface MatchingBookOrder {
   id: string;
   ownerId: string;

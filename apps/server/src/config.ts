@@ -78,7 +78,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     strictPersistence: env.SERVER_STRICT_PERSISTENCE !== "false",
     requireSchemaMigrations: isProduction ? env.SERVER_REQUIRE_MIGRATIONS !== "false" : env.SERVER_REQUIRE_MIGRATIONS === "true",
     allowDevSchemaBootstrap: !isProduction && env.SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP !== "false",
-    expectedSchemaMigrationId: textEnv(env.EXPECTED_SCHEMA_MIGRATION_ID, "000005"),
+    expectedSchemaMigrationId: textEnv(env.EXPECTED_SCHEMA_MIGRATION_ID, "000007"),
     loginRateLimitWindowMs: Number(env.LOGIN_RATE_LIMIT_WINDOW_MS ?? 60_000),
     loginRateLimitMax: Number(env.LOGIN_RATE_LIMIT_MAX ?? 30),
     writeRateLimitWindowMs: Number(env.WRITE_RATE_LIMIT_WINDOW_MS ?? 60_000),

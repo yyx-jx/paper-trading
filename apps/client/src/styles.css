@@ -2406,6 +2406,36 @@ button:disabled:hover {
   min-width:190px;
   border-color:var(--bd2);
 }
+.analytics-date-query {
+  display:flex;
+  align-items:end;
+  gap:7px;
+  flex-wrap:wrap;
+}
+.analytics-date-query label {
+  display:grid;
+  gap:3px;
+}
+.analytics-controls .analytics-date-query input {
+  width:96px;
+  height:28px;
+  border:1px solid var(--bd);
+  border-radius:3px;
+  background:var(--b0);
+  color:var(--t0);
+  padding:0 8px;
+  font-size:12px;
+}
+.analytics-controls .analytics-date-query label:nth-child(2) input {
+  width:116px;
+}
+.analytics-controls .analytics-date-query label:nth-child(3) input {
+  width:132px;
+}
+.analytics-search-button {
+  min-height:28px;
+  padding:0 10px;
+}
 .analytics-readonly-badge {
   display:inline-flex;
   align-items:center;
@@ -2418,10 +2448,15 @@ button:disabled:hover {
   font-size:11px;
   font-weight:800;
 }
-.analytics-controls > span:not(.analytics-readonly-badge) {
+.analytics-controls > span:not(.analytics-readonly-badge):not(.analytics-query-error) {
   margin-left:auto;
   color:var(--t2);
   font-size:11px;
+}
+.analytics-query-error {
+  color:#ff8c8c !important;
+  font-size:11px;
+  font-weight:700;
 }
 .analytics-table-panel {
   display:grid;

@@ -7,7 +7,7 @@ import type { ReactNode } from "react";
 import { useRef } from "react";
 import { useMemo } from "react";
 import { useCallback } from "react";
-import type { ChangeEvent, Dispatch, SetStateAction, WheelEvent as ReactWheelEvent } from "react";
+import type { ChangeEvent, Dispatch, KeyboardEvent as ReactKeyboardEvent, SetStateAction, WheelEvent as ReactWheelEvent } from "react";
 import {
   api,
   type AuditEvent,
@@ -56,6 +56,12 @@ import { PersonalHomePage } from "./features/profile/PersonalHomePage";
 import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
 import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
 import { useAppStore } from "./store/useAppStore";
+import {
+  filterRowsByAnalyticsDate,
+  resolveAnalyticsDateFilter,
+  type AnalyticsDateFilter,
+  type AnalyticsDateQueryError
+} from "./utils/analyticsDateFilter";
 import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, tradeDisplayPriceText, utcParts } from "./utils/format";
 import { redactNetworkAddresses } from "./utils/redaction";
 
@@ -3591,6 +3597,15 @@ function analyticsPeriodLabel(period: AnalyticsPeriod, language: Language) {
   return localLabel(language, labels[period].zh, labels[period].en);
 }
 
+function analyticsDateQueryErrorLabel(error: AnalyticsDateQueryError, language: Language) {
+  const labels: Record<AnalyticsDateQueryError, { zh: string; en: string }> = {
+    year: { zh: "年查询格式必须为 YYYY。", en: "Year query must use YYYY." },
+    month: { zh: "月查询格式必须为 YYYY-MM。", en: "Month query must use YYYY-MM." },
+    day: { zh: "日查询格式必须为 YYYY-MM-DD。", en: "Day query must use YYYY-MM-DD." }
+  };
+  return localLabel(language, labels[error].zh, labels[error].en);
+}
+
 function analyticsResultLabel(result: AnalyticsResult, language: Language) {
   const labels: Record<AnalyticsResult, { zh: string; en: string }> = {
     WIN: { zh: "盈利", en: "Win" },
@@ -4439,18 +4454,24 @@ function AnalyticsPage(props: {
   const [period, setPeriod] = useState<AnalyticsPeriod>("all");
   const [direction, setDirection] = useState<"ALL" | TradeSide>("ALL");
   const [resultFilter, setResultFilter] = useState<AnalyticsResultFilter>("ALL");
+  const [yearQuery, setYearQuery] = useState("");
+  const [monthQuery, setMonthQuery] = useState("");
+  const [dayQuery, setDayQuery] = useState("");
+  const [dateFilter, setDateFilter] = useState<AnalyticsDateFilter>({ kind: "none" });
+  const [dateQueryError, setDateQueryError] = useState<AnalyticsDateQueryError>();
   const [visibleTradeLimit, setVisibleTradeLimit] = useState(ANALYTICS_INITIAL_TRADE_LIMIT);
   useEffect(() => {
     setVisibleTradeLimit(ANALYTICS_INITIAL_TRADE_LIMIT);
-  }, [direction, period, resultFilter]);
+  }, [dateFilter, direction, period, resultFilter]);
   const rows = useMemo(
     () => buildAnalyticsRows(props.history, props.positions, props.orders, props.orderLifecycles, language),
     [props.history, props.positions, props.orders, props.orderLifecycles, language]
   );
   const periodRows = useMemo(() => filterAnalyticsPeriod(rows, period), [rows, period]);
+  const dateRows = useMemo(() => filterRowsByAnalyticsDate(periodRows, dateFilter), [dateFilter, periodRows]);
   const filteredRows = useMemo(
     () =>
-      periodRows.filter((row) => {
+      dateRows.filter((row) => {
         if (direction !== "ALL" && row.side !== direction) {
           return false;
         }
@@ -4459,7 +4480,7 @@ function AnalyticsPage(props: {
         }
         return true;
       }),
-    [direction, periodRows, resultFilter]
+    [dateRows, direction, resultFilter]
   );
   const summary = useMemo(() => analyticsSummary(filteredRows), [filteredRows]);
   const displayedRows = useMemo(
@@ -4479,6 +4500,28 @@ function AnalyticsPage(props: {
     { id: "day", label: analyticsPeriodLabel("day", language) },
     { id: "trades", label: analyticsPeriodLabel("trades", language) }
   ] as const;
+  const clearDateQuery = () => {
+    setYearQuery("");
+    setMonthQuery("");
+    setDayQuery("");
+    setDateFilter({ kind: "none" });
+    setDateQueryError(undefined);
+  };
+  const handleDateSearch = () => {
+    const result = resolveAnalyticsDateFilter({ year: yearQuery, month: monthQuery, day: dayQuery });
+    if ("error" in result) {
+      setDateQueryError(result.error);
+      return;
+    }
+    setDateQueryError(undefined);
+    setDateFilter(result.filter);
+  };
+  const handleDateQueryKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleDateSearch();
+    }
+  };
 
   return (
     <section className="analytics-terminal-page">
@@ -4546,10 +4589,52 @@ function AnalyticsPage(props: {
       <div className="analytics-controls">
         <div className="analytics-period-tabs">
           {periodOptions.map((option) => (
-            <button key={option.id} className={period === option.id ? "active" : ""} onClick={() => setPeriod(option.id)}>
+            <button
+              key={option.id}
+              className={period === option.id ? "active" : ""}
+              onClick={() => {
+                if (option.id === "all") {
+                  clearDateQuery();
+                }
+                setPeriod(option.id);
+              }}
+            >
               {option.label}
             </button>
           ))}
+        </div>
+        <div className="analytics-date-query">
+          <label>
+            <span>{localLabel(language, "年", "Year")}</span>
+            <input
+              value={yearQuery}
+              onChange={(event) => setYearQuery(event.target.value)}
+              onKeyDown={handleDateQueryKeyDown}
+              placeholder="YYYY"
+              inputMode="numeric"
+            />
+          </label>
+          <label>
+            <span>{localLabel(language, "月", "Month")}</span>
+            <input
+              value={monthQuery}
+              onChange={(event) => setMonthQuery(event.target.value)}
+              onKeyDown={handleDateQueryKeyDown}
+              placeholder="YYYY-MM"
+            />
+          </label>
+          <label>
+            <span>{localLabel(language, "日", "Day")}</span>
+            <input
+              value={dayQuery}
+              onChange={(event) => setDayQuery(event.target.value)}
+              onKeyDown={handleDateQueryKeyDown}
+              placeholder="YYYY-MM-DD"
+            />
+          </label>
+          <button type="button" className="secondary-button analytics-search-button" onClick={handleDateSearch}>
+            {localLabel(language, "搜索", "Search")}
+          </button>
         </div>
         <label>
           <span>{localLabel(language, "查看用户", "View User")}</span>
@@ -4595,6 +4680,7 @@ function AnalyticsPage(props: {
             <option value="UNFILLED">{analyticsResultLabel("UNFILLED", language)}</option>
           </select>
         </label>
+        {dateQueryError ? <span className="analytics-query-error">{analyticsDateQueryErrorLabel(dateQueryError, language)}</span> : null}
         <span>{localLabel(language, "所有时间均以 UTC 显示", "All times shown in UTC")}</span>
       </div>
 
