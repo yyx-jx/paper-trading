@@ -912,6 +912,19 @@ async function testOrderFastPathUsesLightUserTradePayloads() {
   assert.match(simulationSource, /void this\.flushTradeLogQueue\(\)/);
   assert.match(simulationSource, /this\.store\.emitUserPayload\(user\.id, "trade"\)/);
   assert.doesNotMatch(simulationSource, /await Promise\.all\(\[\s*this\.writeAuditLog\(/);
+  const placeOrderBody = simulationSource.match(/async placeOrder\([\s\S]*?\n  async cancelOrder/)?.[0] ?? "";
+  const placeOrderTransactionBody =
+    placeOrderBody.match(/await this\.runTradeWriteTransaction\(async \(\) => \{[\s\S]*?\n        \}\);\n      \} catch/)?.[0] ?? "";
+  assert.match(placeOrderBody, /await this\.runTradeWriteTransaction/);
+  assert.match(placeOrderTransactionBody, /this\.store\.persistOrder\(order\)/);
+  assert.match(placeOrderTransactionBody, /this\.store\.persistUser\(user\)/);
+  assert.match(placeOrderTransactionBody, /this\.recordBuyLifecycle\(user, currentRound, order, snapshot\)/);
+  assert.doesNotMatch(placeOrderTransactionBody, /writeAuditLog|writeBehaviorLog|createBehaviorLog/);
+  assert.match(placeOrderBody, /const successAuditEvent: AuditEvent =/);
+  assert.match(placeOrderBody, /const successBehaviorLog = this\.createBehaviorLog/);
+  assert.match(placeOrderBody, /const failureAuditEvent: AuditEvent =/);
+  assert.match(placeOrderBody, /const failureBehaviorLog = this\.createBehaviorLog/);
+  assert.match(placeOrderBody, /this\.enqueueTradeLog\(async \(\) => \{\s*await this\.writeAuditLog\(failureAuditEvent, \{ emitUserPayload: false \}\);\s*await this\.writeBehaviorLog\(failureBehaviorLog\);/);
   assert.match(storeSource, /export type UserPayloadScope = "full" \| "trade"/);
   assert.match(storeSource, /emitUserPayload\(userId: string, scope: UserPayloadScope = "full"\)/);
   assert.doesNotMatch(storeSource, /const payload: UserPayload = \{\s*profile: this\.getProfile\(userId\),\s*operatedHistory: this\.getOperatedHistory\(500, userId\),/);
@@ -979,7 +992,11 @@ async function testRealtimeTickIncrementContracts() {
   assert.match(appStoreSource, /tick\.chainlink\.candleUpdates/);
   assert.match(appSource, /useMemo\(\(\) => filterBarsToRecentWindow/);
   assert.match(simulationSource, /function mergeChainlinkHistoryBars/);
-  assert.match(simulationSource, /mergeChainlinkHistoryBars\(\s*this\.chainlinkCandlesByInterval\[interval\],\s*bars,\s*interval\s*\)/);
+  assert.match(simulationSource, /private mergeChainlinkThirtySecondBars/);
+  assert.match(simulationSource, /this\.chainlinkCandlesByInterval\["30s"\]\s*=\s*mergeChainlinkHistoryBars/);
+  assert.match(simulationSource, /refreshChainlinkAggregateBucketFromThirtySecondBar/);
+  const recordChainlinkSampleBody = simulationSource.match(/private recordChainlinkSample[\s\S]*?\n  private syncChainlinkHistoryCandles/)?.[0] ?? "";
+  assert.doesNotMatch(recordChainlinkSampleBody, /refreshChainlinkAggregatesFromThirtySecondBars/);
   assert.doesNotMatch(simulationSource, /this\.chainlinkCandlesByInterval\[interval\]\s*=\s*\[\.\.\.bars\]/);
 }
 
@@ -1112,8 +1129,9 @@ async function testPolymarketReferencePricesDoNotUseOutcomeOdds() {
   assert.match(simulationSource, /const officialPriceToBeat = roundNumber\(round\.polymarketOpenPrice, 2\)/);
   assert.match(simulationSource, /round\.priceToBeat = officialPriceToBeat/);
   assert.match(simulationSource, /round\.priceToBeatSource = round\.polymarketOpenPriceSource \?\? "Gamma"/);
-  assert.match(simulationSource, /currentRoundChainlinkOpenReferences/);
+  assert.doesNotMatch(simulationSource, /currentRoundChainlinkOpenReferences/);
   assert.match(simulationSource, /resolveCurrentRoundChainlinkOpenReference/);
+  assert.doesNotMatch(simulationSource, /resolveCurrentRoundChainlinkOpenReference\([^)]*chainlinkPrice/);
   assert.match(simulationSource, /withCurrentRoundChainlinkOpenReference/);
   assert.match(simulationSource, /return \{ \.\.\.round, chainlinkOpenPrice: reference \}/);
   assert.doesNotMatch(simulationSource, /syncRoundChainlinkReferencePrices/);
@@ -1160,6 +1178,7 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   const styleSource = readFileSync("apps/client/src/styles.css", "utf8");
   const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
   const binanceSource = readFileSync("apps/server/src/services/connectors/binance.ts", "utf8");
+  const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
 
   assert.match(simulationSource, /const upPrice = isPositivePrice\(upBook\.bestAsk\) \? upBook\.bestAsk : 0/);
   assert.match(simulationSource, /const downPrice = isPositivePrice\(downBook\.bestAsk\) \? downBook\.bestAsk : 0/);
@@ -1178,6 +1197,20 @@ async function testRtdsLoginAuditAndBestAskUiRequirements() {
   assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
   assert.match(appSource, /defaultVisibleCountForInterval\(selectedInterval\)/);
   assert.match(simulationSource, /private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars\(\)/);
+  assert.doesNotMatch(simulationSource, /currentRoundChainlinkOpenReferences/);
+  assert.match(simulationSource, /flushPendingChainlinkMarketCandles/);
+  const syncHistoryBody = simulationSource.match(/private syncChainlinkHistoryCandles[\s\S]*?\n  private recordCurrentRoundUpPricePoint/)?.[0] ?? "";
+  assert.doesNotMatch(syncHistoryBody, /store\.upsertMarketCandles/);
+  assert.match(syncHistoryBody, /queueChainlinkMarketCandle/);
+  assert.match(simulationSource, /"rtds_30s"/);
+  assert.match(simulationSource, /"history_1m_split"/);
+  assert.match(appSource, /snapshot\?\.chainlink\.candlesByInterval\[selectedInterval\]/);
+  assert.match(indexSource, /latestCandleUpdates\(stamped\.chainlink\.candlesByInterval\)/);
+  assert.match(indexSource, /compactCandlesByInterval/);
+  const tickPayloadBody = indexSource.match(/function createMarketTickPayload[\s\S]*?^}/m)?.[0] ?? "";
+  const realtimeTickBody = indexSource.match(/function createMarketRealtimeTick[\s\S]*?^}/m)?.[0] ?? "";
+  assert.doesNotMatch(tickPayloadBody, /getMarketCandles|upsertMarketCandles/);
+  assert.doesNotMatch(realtimeTickBody, /getMarketCandles|upsertMarketCandles/);
   const i18nSource = readFileSync("apps/client/src/i18n/index.ts", "utf8");
   assert.match(i18nSource, /traceId: "Trace ID"/);
   assert.match(i18nSource, /orderId: "Order ID"/);

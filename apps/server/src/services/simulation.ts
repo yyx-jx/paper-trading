@@ -98,9 +98,14 @@ const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], numb
   "15m": 15 * 60_000,
   "1h": 60 * 60_000
 };
-const CHAINLINK_MARKET_CANDLE_FLUSH_MS = 1000;
-const CHAINLINK_MARKET_CANDLE_FLUSH_SIZE = 20;
+const CHAINLINK_MARKET_CANDLE_FLUSH_MS = 5000;
+const CHAINLINK_MARKET_CANDLE_FLUSH_SIZE = 50;
 const CHAINLINK_MARKET_CANDLE_RESTORE_MS = 24 * 60 * 60_000;
+const CHAINLINK_HISTORY_CANDLE_SYNC_MIN_MS = 60_000;
+const CHAINLINK_MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
+  history_1m_split: 1,
+  rtds_30s: 2
+};
 
 function isPositivePrice(value?: number): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -384,6 +389,15 @@ function marketCandleToBar(candle: MarketCandleRecord): CandleBar {
   };
 }
 
+function shouldReplaceChainlinkMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
+  if (!existing) {
+    return true;
+  }
+  const existingPriority = CHAINLINK_MARKET_CANDLE_PRIORITY[existing.origin];
+  const incomingPriority = CHAINLINK_MARKET_CANDLE_PRIORITY[incoming.origin];
+  return incomingPriority > existingPriority || (incomingPriority === existingPriority && incoming.updatedAt >= existing.updatedAt);
+}
+
 function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
   return {
     snapshotId: snapshot.snapshotId,
@@ -461,6 +475,7 @@ export class SimulationEngine {
   private currentRoundBinanceOpenReferences = new Map<string, number>();
   private lastChainlinkSampleKey?: string;
   private lastChainlinkHistorySyncKey?: string;
+  private lastChainlinkHistorySyncAt = 0;
   private pendingChainlinkMarketCandles = new Map<number, MarketCandleRecord>();
   private chainlinkMarketCandleFlushTimer?: NodeJS.Timeout;
   private chainlinkMarketCandleFlushRunning = false;
@@ -925,154 +940,41 @@ export class SimulationEngine {
         createdAt: Date.now()
       };
 
-      let successAuditEvent: AuditEvent | undefined;
-      let successBehaviorLog: BehaviorActionLog | undefined;
       try {
         await this.runTradeWriteTransaction(async () => {
-        const persistStartTs = Date.now();
-        if (status === "pending") {
-          if (action === "buy") {
-            const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
-            user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
-            order.frozenUsdc = frozen;
-          } else {
-            const frozenQty = roundNumber(payload.qty ?? 0, 4);
-            await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
-            order.frozenQty = frozenQty;
-          }
-          await Promise.all([
-            this.store.persistOrder(order),
-            ...(action === "buy" ? [this.store.persistUser(user)] : [])
-          ]);
-        } else if (status === "filled" && estimate.avgPrice) {
-          await this.applyFilledOrder(
-            user,
-            currentRound,
-            order,
-            estimate,
-            payload.positionIds,
-            payload.exitType ?? "manual_sell",
-            false
-          );
-          if (order.action === "buy") {
-            await this.recordBuyLifecycle(user, currentRound, order, snapshot);
-          }
-        } else {
-          await this.store.persistOrder(order);
-        }
-        order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
-        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
-
-        successAuditEvent = {
-            eventId: this.store.newId("evt"),
-            traceId,
-            category: "matching",
-            actionType: "place_order",
-            actionStatus: status === "failed" ? "failed" : "success",
-            userId: user.id,
-            role: user.role,
-            pageName: "trade.main",
-            moduleName: "order.panel",
-            symbol: this.config.symbol,
-            roundId: currentRound.id,
-            clientSendTs: payload.clientSendTs,
-            serverRecvTs,
-            engineStartTs,
-            engineFinishTs,
-            serverPublishTs: order.serverPublishTs,
-            backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
-            resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
-            resultMessage:
-              status === "failed"
-                ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
-                : status === "pending"
-                  ? "Limit order is pending against future Polymarket CLOB depth."
-                  : "Order fully matched against the current Polymarket CLOB snapshot.",
-            details: {
-              traceId,
-              roundId: currentRound.id,
-              marketId,
-              marketSlug: currentRound.marketSlug,
-              orderId: order.id,
-              clientOrderId,
-              positionId: payload.positionIds?.[0],
-              bookKey,
-              bookHash: book.snapshotId,
-              bookSnapshotId: book.snapshotId,
-              matchingSequence: undefined,
-              tokenId,
-              action,
-              side: payload.side,
-              orderKind,
-              timeInForce: order.timeInForce,
-              limitPrice: payload.limitPrice,
-              notionalUsdc: payload.amount,
-              requestedQty: payload.qty,
-              filledQty: order.filledQty,
-              unfilledQty: order.unfilledQty,
-              avgFillPrice: order.avgFillPrice,
-              bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-              localMatchLatencyMs: order.localMatchLatencyMs,
-              persistLatencyMs: order.persistLatencyMs,
-              totalOrderLatencyMs: order.totalOrderLatencyMs,
-              executionBookSource: executionBook.source,
-              executionBookAgeMs: executionBook.ageMs,
-              executionBookFallbackReason: executionBook.fallbackReason,
-              sourceLatencyMs,
-              slippageBps: order.slippageBps,
-              estimatedFee: order.estimatedFee,
-              actualFee: order.actualFee,
-              feeBreakdown: order.feeBreakdown,
-              feeCurrency: order.feeCurrency,
-              marketInfo,
-              failureReason: order.failureReason
+          const persistStartTs = Date.now();
+          if (status === "pending") {
+            if (action === "buy") {
+              const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
+              user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
+              order.frozenUsdc = frozen;
+            } else {
+              const frozenQty = roundNumber(payload.qty ?? 0, 4);
+              await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
+              order.frozenQty = frozenQty;
             }
-          };
-        successBehaviorLog = this.createBehaviorLog({
-          user,
-          actionType: "place_order",
-          actionStatus: status === "failed" ? "failed" : "success",
-          traceId,
-          orderId: order.id,
-          round: currentRound,
-          snapshot,
-          direction: payload.side,
-          entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-          positionNotional: order.notionalUsdc,
-          bookSnapshot: book,
-          order,
-          actualFillPrice: order.avgFillPrice,
-          slippageBps: order.slippageBps,
-          partialFilled: order.partialFilled,
-          unfilledQty: order.unfilledQty,
-          executionLatencyMs: order.matchLatencyMs,
-          estimatedFee: order.estimatedFee,
-          actualFee: order.actualFee,
-          feeBreakdown: order.feeBreakdown,
-          feeCurrency: order.feeCurrency,
-          failureReason: order.failureReason,
-          contextJson: {
-            roundStatus: currentRound.status,
-            acceptingOrders: currentRound.acceptingOrders,
-            requestAction: action,
-            requestSide: payload.side,
-            requestAmount: payload.amount,
-            requestQty: payload.qty,
-            clientOrderId,
-            orderType: orderKind,
-            isAccepted: status !== "failed",
-            bookSnapshotId: book.snapshotId,
-            bookKey,
-            bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-            localMatchLatencyMs: order.localMatchLatencyMs,
-            persistLatencyMs: order.persistLatencyMs,
-            totalOrderLatencyMs: order.totalOrderLatencyMs,
-            executionBookSource: executionBook.source,
-            executionBookAgeMs: executionBook.ageMs,
-            executionBookFallbackReason: executionBook.fallbackReason,
-            marketInfo
+            await Promise.all([
+              this.store.persistOrder(order),
+              ...(action === "buy" ? [this.store.persistUser(user)] : [])
+            ]);
+          } else if (status === "filled" && estimate.avgPrice) {
+            await this.applyFilledOrder(
+              user,
+              currentRound,
+              order,
+              estimate,
+              payload.positionIds,
+              payload.exitType ?? "manual_sell",
+              false
+            );
+            if (order.action === "buy") {
+              await this.recordBuyLifecycle(user, currentRound, order, snapshot);
+            }
+          } else {
+            await this.store.persistOrder(order);
           }
-        });
+          order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
+          order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
         });
       } catch (writeError) {
         if (clientOrderId && isClientOrderConflict(writeError)) {
@@ -1086,20 +988,127 @@ export class SimulationEngine {
         }
         throw writeError;
       }
-      if (successAuditEvent && successBehaviorLog) {
-        const auditEvent = successAuditEvent;
-        const behaviorLog = successBehaviorLog;
-        this.enqueueTradeLog(async () => {
-          await this.writeAuditLog(auditEvent, { emitUserPayload: false });
-          await this.writeBehaviorLog(behaviorLog);
-        });
-      }
+
+      const successAuditEvent: AuditEvent = {
+        eventId: this.store.newId("evt"),
+        traceId,
+        category: "matching",
+        actionType: "place_order",
+        actionStatus: status === "failed" ? "failed" : "success",
+        userId: user.id,
+        role: user.role,
+        pageName: "trade.main",
+        moduleName: "order.panel",
+        symbol: this.config.symbol,
+        roundId: currentRound.id,
+        clientSendTs: payload.clientSendTs,
+        serverRecvTs,
+        engineStartTs,
+        engineFinishTs,
+        serverPublishTs: order.serverPublishTs,
+        backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
+        resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
+        resultMessage:
+          status === "failed"
+            ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
+            : status === "pending"
+              ? "Limit order is pending against future Polymarket CLOB depth."
+              : "Order fully matched against the current Polymarket CLOB snapshot.",
+        details: {
+          traceId,
+          roundId: currentRound.id,
+          marketId,
+          marketSlug: currentRound.marketSlug,
+          orderId: order.id,
+          clientOrderId,
+          positionId: payload.positionIds?.[0],
+          bookKey,
+          bookHash: book.snapshotId,
+          bookSnapshotId: book.snapshotId,
+          matchingSequence: undefined,
+          tokenId,
+          action,
+          side: payload.side,
+          orderKind,
+          timeInForce: order.timeInForce,
+          limitPrice: payload.limitPrice,
+          notionalUsdc: payload.amount,
+          requestedQty: payload.qty,
+          filledQty: order.filledQty,
+          unfilledQty: order.unfilledQty,
+          avgFillPrice: order.avgFillPrice,
+          bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+          localMatchLatencyMs: order.localMatchLatencyMs,
+          persistLatencyMs: order.persistLatencyMs,
+          totalOrderLatencyMs: order.totalOrderLatencyMs,
+          executionBookSource: executionBook.source,
+          executionBookAgeMs: executionBook.ageMs,
+          executionBookFallbackReason: executionBook.fallbackReason,
+          sourceLatencyMs,
+          slippageBps: order.slippageBps,
+          estimatedFee: order.estimatedFee,
+          actualFee: order.actualFee,
+          feeBreakdown: order.feeBreakdown,
+          feeCurrency: order.feeCurrency,
+          marketInfo,
+          failureReason: order.failureReason
+        }
+      };
+      const successBehaviorLog = this.createBehaviorLog({
+        user,
+        actionType: "place_order",
+        actionStatus: status === "failed" ? "failed" : "success",
+        traceId,
+        orderId: order.id,
+        round: currentRound,
+        snapshot,
+        direction: payload.side,
+        entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+        positionNotional: order.notionalUsdc,
+        bookSnapshot: book,
+        order,
+        actualFillPrice: order.avgFillPrice,
+        slippageBps: order.slippageBps,
+        partialFilled: order.partialFilled,
+        unfilledQty: order.unfilledQty,
+        executionLatencyMs: order.matchLatencyMs,
+        estimatedFee: order.estimatedFee,
+        actualFee: order.actualFee,
+        feeBreakdown: order.feeBreakdown,
+        feeCurrency: order.feeCurrency,
+        failureReason: order.failureReason,
+        contextJson: {
+          roundStatus: currentRound.status,
+          acceptingOrders: currentRound.acceptingOrders,
+          requestAction: action,
+          requestSide: payload.side,
+          requestAmount: payload.amount,
+          requestQty: payload.qty,
+          clientOrderId,
+          orderType: orderKind,
+          isAccepted: status !== "failed",
+          bookSnapshotId: book.snapshotId,
+          bookKey,
+          bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+          localMatchLatencyMs: order.localMatchLatencyMs,
+          persistLatencyMs: order.persistLatencyMs,
+          totalOrderLatencyMs: order.totalOrderLatencyMs,
+          executionBookSource: executionBook.source,
+          executionBookAgeMs: executionBook.ageMs,
+          executionBookFallbackReason: executionBook.fallbackReason,
+          marketInfo
+        }
+      });
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog(successAuditEvent, { emitUserPayload: false });
+        await this.writeBehaviorLog(successBehaviorLog);
+      });
       this.store.emitUserPayload(user.id, "trade");
       return { order };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Order failed.";
       const serverNow = Date.now();
-      await this.writeAuditLog({
+      const failureAuditEvent: AuditEvent = {
         eventId: this.store.newId("evt"),
         traceId,
         category: "matching",
@@ -1131,31 +1140,33 @@ export class SimulationEngine {
           requestedQty: payload.qty,
           failureReason: message
         }
+      };
+      const failureBehaviorLog = this.createBehaviorLog({
+        user,
+        actionType: "place_order",
+        actionStatus: "failed",
+        traceId,
+        round: currentRound,
+        snapshot,
+        direction: payload.side,
+        entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+        positionNotional: payload.amount,
+        failureReason: message,
+        contextJson: {
+          requestAction: action,
+          requestSide: payload.side,
+          requestAmount: payload.amount,
+          requestQty: payload.qty,
+          clientOrderId,
+          orderType: payload.orderKind ?? "market",
+          limitPrice: payload.limitPrice,
+          failureReason: message
+        }
       });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "place_order",
-          actionStatus: "failed",
-          traceId,
-          round: currentRound,
-          snapshot,
-          direction: payload.side,
-          entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-          positionNotional: payload.amount,
-          failureReason: message,
-          contextJson: {
-            requestAction: action,
-            requestSide: payload.side,
-            requestAmount: payload.amount,
-            requestQty: payload.qty,
-            clientOrderId,
-            orderType: payload.orderKind ?? "market",
-            limitPrice: payload.limitPrice,
-            failureReason: message
-          }
-        })
-      );
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog(failureAuditEvent, { emitUserPayload: false });
+        await this.writeBehaviorLog(failureBehaviorLog);
+      });
       throw error;
     }
   }
@@ -3155,6 +3166,25 @@ export class SimulationEngine {
     this.chainlinkCandlesByInterval["1h"] = aggregateChainlinkBars("1h", thirtySecondBars);
   }
 
+  private refreshChainlinkAggregateBucketFromThirtySecondBar(bar: CandleBar) {
+    for (const interval of ["1m", "5m", "15m", "1h"] as const) {
+      const bucketSize = CHAINLINK_INTERVAL_MS[interval];
+      const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
+      const endTs = startTs + bucketSize;
+      const sourceBars = this.chainlinkCandlesByInterval["30s"].filter(
+        (candidate) => candidate.startTs >= startTs && candidate.startTs < endTs
+      );
+      const [aggregate] = aggregateChainlinkBars(interval, sourceBars);
+      if (!aggregate) {
+        continue;
+      }
+      const existing = this.chainlinkCandlesByInterval[interval].filter((candidate) => candidate.startTs !== startTs);
+      this.chainlinkCandlesByInterval[interval] = [...existing, aggregate]
+        .sort((left, right) => left.startTs - right.startTs)
+        .slice(-CHAINLINK_BAR_LIMITS[interval]);
+    }
+  }
+
   private chainlinkMarketCandleFromBar(bar: CandleBar, origin: MarketCandleRecord["origin"]): MarketCandleRecord {
     const openTs = Math.floor(bar.startTs / CHAINLINK_INTERVAL_MS["30s"]) * CHAINLINK_INTERVAL_MS["30s"];
     return {
@@ -3174,7 +3204,10 @@ export class SimulationEngine {
   }
 
   private queueChainlinkMarketCandle(candle: MarketCandleRecord) {
-    this.pendingChainlinkMarketCandles.set(candle.openTs, candle);
+    const existing = this.pendingChainlinkMarketCandles.get(candle.openTs);
+    if (shouldReplaceChainlinkMarketCandle(existing, candle)) {
+      this.pendingChainlinkMarketCandles.set(candle.openTs, candle);
+    }
     if (this.pendingChainlinkMarketCandles.size >= CHAINLINK_MARKET_CANDLE_FLUSH_SIZE) {
       void this.flushPendingChainlinkMarketCandles();
       return;
@@ -3248,7 +3281,7 @@ export class SimulationEngine {
         -CHAINLINK_BAR_LIMITS["30s"]
       );
     }
-    this.refreshChainlinkAggregatesFromThirtySecondBars();
+    this.refreshChainlinkAggregateBucketFromThirtySecondBar(next30s);
     this.queueChainlinkMarketCandle(this.chainlinkMarketCandleFromBar(next30s, "rtds_30s"));
     const sampleBucketStart = Math.floor(ts / 5000) * 5000;
     const sampleBucketEnd = sampleBucketStart + 5000;
@@ -3284,14 +3317,21 @@ export class SimulationEngine {
       return;
     }
     const latestBar = bars.at(-1);
+    const now = Date.now();
+    if (now - this.lastChainlinkHistorySyncAt < CHAINLINK_HISTORY_CANDLE_SYNC_MIN_MS) {
+      return;
+    }
     const historyKey = `${bars.length}:${latestBar?.startTs ?? 0}:${latestBar?.close ?? 0}`;
     if (this.lastChainlinkHistorySyncKey === historyKey) {
       return;
     }
     this.lastChainlinkHistorySyncKey = historyKey;
+    this.lastChainlinkHistorySyncAt = now;
     const historyCandles = bars.map((bar) => this.chainlinkMarketCandleFromBar(bar, "history_1m_split"));
     this.mergeChainlinkThirtySecondBars(historyCandles.map((candle) => marketCandleToBar(candle)));
-    void this.store.upsertMarketCandles(historyCandles);
+    for (const candle of historyCandles) {
+      this.queueChainlinkMarketCandle(candle);
+    }
   }
 
   private recordCurrentRoundUpPricePoint(round: RoundRecord | undefined, price: number, ts: number) {

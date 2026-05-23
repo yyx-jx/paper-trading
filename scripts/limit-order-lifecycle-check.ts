@@ -192,7 +192,7 @@ function createMemoryStore() {
     seedDefaultUsers: false,
     requireSchemaMigrations: false,
     allowDevSchemaBootstrap: true,
-    expectedSchemaMigrationId: "000005",
+    expectedSchemaMigrationId: "000007",
     pgConnectionTimeoutMs: 1000,
     pgIdleTimeoutMs: 1000,
     pgMaxConnections: 1,

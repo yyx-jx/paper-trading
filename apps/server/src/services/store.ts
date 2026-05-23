@@ -2585,7 +2585,7 @@ export class AppStore {
   }
 
   async upsertMarketCandles(candles: MarketCandleRecord[]) {
-    const validCandles = candles.filter((candle) => this.isValidMarketCandle(candle));
+    const validCandles = this.dedupeMarketCandles(candles.filter((candle) => this.isValidMarketCandle(candle)));
     if (validCandles.length === 0) {
       return;
     }
@@ -3934,6 +3934,31 @@ export class AppStore {
     return `${source}:${symbol}:${interval}`;
   }
 
+  private marketCandleDedupeKey(candle: MarketCandleRecord) {
+    return `${this.marketCandleKey(candle.source, candle.symbol, candle.interval)}:${candle.openTs}`;
+  }
+
+  private shouldReplaceMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
+    if (!existing) {
+      return true;
+    }
+    const incomingPriority = MARKET_CANDLE_PRIORITY[incoming.origin];
+    const existingPriority = MARKET_CANDLE_PRIORITY[existing.origin];
+    return incomingPriority > existingPriority || (incomingPriority === existingPriority && incoming.updatedAt >= existing.updatedAt);
+  }
+
+  private dedupeMarketCandles(candles: MarketCandleRecord[]) {
+    const byKey = new Map<string, MarketCandleRecord>();
+    for (const candle of candles) {
+      const key = this.marketCandleDedupeKey(candle);
+      const existing = byKey.get(key);
+      if (this.shouldReplaceMarketCandle(existing, candle)) {
+        byKey.set(key, candle);
+      }
+    }
+    return [...byKey.values()];
+  }
+
   private isValidMarketCandle(candle: MarketCandleRecord) {
     return (
       candle.source === "chainlink" &&
@@ -3948,19 +3973,24 @@ export class AppStore {
 
   private mergeMarketCandlesIntoMemory(candles: MarketCandleRecord[], now = Date.now()) {
     const threshold = now - MARKET_CANDLE_MEMORY_RETENTION_MS;
+    const grouped = new Map<string, MarketCandleRecord[]>();
     for (const candle of candles) {
       const key = this.marketCandleKey(candle.source, candle.symbol, candle.interval);
+      const group = grouped.get(key);
+      if (group) {
+        group.push(candle);
+      } else {
+        grouped.set(key, [candle]);
+      }
+    }
+    for (const [key, incoming] of grouped) {
       const existingRows = this.marketCandles.get(key) ?? [];
       const byOpenTs = new Map(existingRows.map((row) => [row.openTs, row]));
-      const existing = byOpenTs.get(candle.openTs);
-      const incomingPriority = MARKET_CANDLE_PRIORITY[candle.origin];
-      const existingPriority = existing ? MARKET_CANDLE_PRIORITY[existing.origin] : 0;
-      if (
-        !existing ||
-        incomingPriority > existingPriority ||
-        (incomingPriority === existingPriority && candle.updatedAt >= existing.updatedAt)
-      ) {
-        byOpenTs.set(candle.openTs, { ...candle });
+      for (const candle of incoming) {
+        const existing = byOpenTs.get(candle.openTs);
+        if (this.shouldReplaceMarketCandle(existing, candle)) {
+          byOpenTs.set(candle.openTs, { ...candle });
+        }
       }
       this.marketCandles.set(
         key,
