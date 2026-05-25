@@ -22,7 +22,7 @@ interface TransportMeta {
 }
 
 interface SourceHealth {
-  source: "Binance" | "Chainlink" | "CLOB";
+  source: "Binance" | "Coinbase" | "CLOB";
   state: string;
   sourceEventTs: number;
   serverRecvTs: number;
@@ -31,10 +31,10 @@ interface SourceHealth {
 }
 
 interface TickLike {
-  sources?: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  sources?: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   latencyBreakdown?: {
-    sourceEventAge?: Record<"binance" | "chainlink" | "clob", number>;
-    serverIngressLatency?: Record<"binance" | "chainlink" | "clob", number>;
+    sourceEventAge?: Record<"binance" | "coinbase" | "clob", number>;
+    serverIngressLatency?: Record<"binance" | "coinbase" | "clob", number>;
   };
 }
 
@@ -67,14 +67,14 @@ const clientProcessLatencies: number[] = [];
 const payloadBytes: number[] = [];
 const tickPayloadBytes: number[] = [];
 const fullPayloadBytes: number[] = [];
-const sourceToBackend: Record<"binance" | "chainlink" | "clob", number[]> = {
+const sourceToBackend: Record<"binance" | "coinbase" | "clob", number[]> = {
   binance: [],
-  chainlink: [],
+  coinbase: [],
   clob: []
 };
-const sourceAges: Record<"binance" | "chainlink" | "clob", number[]> = {
+const sourceAges: Record<"binance" | "coinbase" | "clob", number[]> = {
   binance: [],
-  chainlink: [],
+  coinbase: [],
   clob: []
 };
 
@@ -203,7 +203,7 @@ function recordMessage(message: MarketMessage, receivedAt: number, processedAt: 
   if (!sources) {
     return;
   }
-  for (const key of ["binance", "chainlink", "clob"] as const) {
+  for (const key of ["binance", "coinbase", "clob"] as const) {
     const source = sources[key];
     sourceToBackend[key].push(Math.max(source.serverRecvTs - source.sourceEventTs, 0));
     sourceAges[key].push(Math.max(receivedAt - source.normalizedTs - clockOffsetMs, 0));
@@ -250,10 +250,10 @@ function buildResult(startedAt: number, finishedAt: number) {
     fullPayloadBytesP95: percentile(fullPayloadBytes, 95),
     binanceSourceToBackendP95: percentile(sourceToBackend.binance, 95),
     clobSourceToBackendP95: percentile(sourceToBackend.clob, 95),
-    chainlinkSourceToBackendP95: percentile(sourceToBackend.chainlink, 95),
+    coinbaseSourceToBackendP95: percentile(sourceToBackend.coinbase, 95),
     binanceSourceAgeP95: percentile(sourceAges.binance, 95),
     clobSourceAgeP95: percentile(sourceAges.clob, 95),
-    chainlinkSourceAgeP95: percentile(sourceAges.chainlink, 95)
+    coinbaseSourceAgeP95: percentile(sourceAges.coinbase, 95)
   };
 }
 

@@ -1,27 +1,27 @@
 import assert from "node:assert/strict";
-import { buildServerConfig, DEFAULT_CHAINLINK_FALLBACK_RPC_URLS, DEFAULT_CHAINLINK_RPC_URL } from "../apps/server/src/config";
+import { buildServerConfig, DEFAULT_COINBASE_REST_URL, DEFAULT_COINBASE_WS_URL } from "../apps/server/src/config";
 
-const blankRpcConfig = buildServerConfig({
-  CHAINLINK_ENABLED: "true",
-  CHAINLINK_RPC_URL: "",
-  CHAINLINK_FALLBACK_RPC_URLS: " , https://rpc.example/a ,  ,https://rpc.example/b "
+const blankCoinbaseConfig = buildServerConfig({
+  COINBASE_ENABLED: "true",
+  COINBASE_WS_URL: "   ",
+  COINBASE_REST_URL: ""
 });
 
-assert.equal(blankRpcConfig.chainlinkEnabled, true);
-assert.equal(blankRpcConfig.chainlinkRpcUrl, DEFAULT_CHAINLINK_RPC_URL);
-assert.deepEqual(blankRpcConfig.chainlinkFallbackRpcUrls, ["https://rpc.example/a", "https://rpc.example/b"]);
-assert.equal(blankRpcConfig.requireSchemaMigrations, false);
-assert.equal(blankRpcConfig.expectedSchemaMigrationId, "000007");
+assert.equal(blankCoinbaseConfig.coinbaseEnabled, true);
+assert.equal(blankCoinbaseConfig.coinbaseWsUrl, DEFAULT_COINBASE_WS_URL);
+assert.equal(blankCoinbaseConfig.coinbaseRestUrl, DEFAULT_COINBASE_REST_URL);
+assert.equal(blankCoinbaseConfig.requireSchemaMigrations, false);
+assert.equal(blankCoinbaseConfig.expectedSchemaMigrationId, "000007");
 
 const disabledConfig = buildServerConfig({
-  CHAINLINK_ENABLED: "false",
-  CHAINLINK_RPC_URL: "   ",
+  COINBASE_ENABLED: "false",
+  COINBASE_WS_URL: "   ",
   UPSTREAM_PROXY_URL: "   "
 });
 
-assert.equal(disabledConfig.chainlinkEnabled, false);
-assert.equal(disabledConfig.chainlinkRpcUrl, DEFAULT_CHAINLINK_RPC_URL);
-assert.deepEqual(disabledConfig.chainlinkFallbackRpcUrls, DEFAULT_CHAINLINK_FALLBACK_RPC_URLS);
+assert.equal(disabledConfig.coinbaseEnabled, false);
+assert.equal(disabledConfig.coinbaseWsUrl, DEFAULT_COINBASE_WS_URL);
+assert.equal(disabledConfig.coinbaseRestUrl, DEFAULT_COINBASE_REST_URL);
 assert.equal(disabledConfig.upstreamProxyUrl, undefined);
 
 const migrationGuardConfig = buildServerConfig({

@@ -105,7 +105,7 @@ const store = new AppStore({
   databaseUrl: serverConfig.databaseUrl,
   redisUrl: serverConfig.redisUrl,
   persistenceMode: serverConfig.persistenceMode,
-  chainlinkEnabled: serverConfig.chainlinkEnabled,
+  coinbaseEnabled: serverConfig.coinbaseEnabled,
   strictPersistence: serverConfig.strictPersistence,
   seedDefaultUsers: serverConfig.seedDefaultUsers,
   requireSchemaMigrations: serverConfig.requireSchemaMigrations,
@@ -148,18 +148,12 @@ const engine = new SimulationEngine(store, matchingClient, {
   binanceRestPollMs: serverConfig.binanceRestPollMs,
   binanceWsStaleMs: serverConfig.binanceWsStaleMs,
   upstreamProxyUrl: serverConfig.upstreamProxyUrl,
-  chainlinkEnabled: serverConfig.chainlinkEnabled,
-  chainlinkRpcUrl: serverConfig.chainlinkRpcUrl,
-  chainlinkFallbackRpcUrls: serverConfig.chainlinkFallbackRpcUrls,
-  chainlinkRequestTimeoutMs: serverConfig.chainlinkRequestTimeoutMs,
-  chainlinkBtcUsdProxyAddress: serverConfig.chainlinkBtcUsdProxyAddress as `0x${string}`,
-  chainlinkPollMs: serverConfig.chainlinkPollMs,
-  chainlinkRtdsWsUrl: serverConfig.chainlinkRtdsWsUrl,
-  chainlinkRtdsSymbol: serverConfig.chainlinkRtdsSymbol,
-  chainlinkRtdsPingMs: serverConfig.chainlinkRtdsPingMs,
-  chainlinkHistoryUrl: serverConfig.chainlinkHistoryUrl,
-  chainlinkHistoryFeedId: serverConfig.chainlinkHistoryFeedId,
-  chainlinkHistoryPollMs: serverConfig.chainlinkHistoryPollMs,
+  coinbaseEnabled: serverConfig.coinbaseEnabled,
+  coinbaseWsUrl: serverConfig.coinbaseWsUrl,
+  coinbaseRestUrl: serverConfig.coinbaseRestUrl,
+  coinbaseRestPollMs: serverConfig.coinbaseRestPollMs,
+  coinbaseRequestTimeoutMs: serverConfig.coinbaseRequestTimeoutMs,
+  coinbaseWsStaleMs: serverConfig.coinbaseWsStaleMs,
   gammaBaseUrl: serverConfig.gammaBaseUrl,
   clobBaseUrl: serverConfig.clobBaseUrl,
   dataApiBaseUrl: serverConfig.dataApiBaseUrl,
@@ -377,7 +371,7 @@ const logSearchQuerySchema = z.object({
   sequenceFrom: z.coerce.number().optional(),
   sequenceTo: z.coerce.number().optional(),
   logGroup: z.enum(["operation", "settlement", "market_latency", "system_latency", "matching_action"]).optional(),
-  latencySource: z.enum(["binance", "chainlink", "clob", "system"]).optional(),
+  latencySource: z.enum(["binance", "coinbase", "clob", "system"]).optional(),
   connectionState: z.enum(["healthy", "reconnecting", "stale", "degraded", "disabled"]).optional(),
   latencyPhase: z.enum(["backend", "acquire", "publish", "frontend"]).optional(),
   latencyMinMs: z.coerce.number().optional(),
@@ -769,13 +763,13 @@ function deriveAuditLogGroup(log: Pick<Awaited<ReturnType<AppStore["searchAuditL
     return "settlement" as const;
   }
   if (log.category === "latency") {
-    return ["binance", "chainlink", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
+    return ["binance", "coinbase", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
   }
   return "operation" as const;
 }
 
 function deriveLatencySource(moduleName?: string) {
-  if (moduleName === "binance" || moduleName === "chainlink" || moduleName === "clob") {
+  if (moduleName === "binance" || moduleName === "coinbase" || moduleName === "clob") {
     return moduleName;
   }
   return "system";
@@ -1051,7 +1045,7 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
     },
     sources: {
       binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
-      chainlink: stampSourceForTransport(snapshot.sources.chainlink, serverPublishTs),
+      coinbase: stampSourceForTransport(snapshot.sources.coinbase, serverPublishTs),
       clob: stampSourceForTransport(snapshot.sources.clob, serverPublishTs)
     }
   };
@@ -1088,10 +1082,10 @@ function compactSnapshotForTransport(snapshot: MarketSnapshot): MarketSnapshot {
       ...snapshot.binance,
       candlesByInterval: compactCandlesByInterval(snapshot.binance.candlesByInterval)
     },
-    chainlink: {
-      ...snapshot.chainlink,
-      candles5s: snapshot.chainlink.candles5s.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
-      candlesByInterval: compactCandlesByInterval(snapshot.chainlink.candlesByInterval)
+    coinbase: {
+      ...snapshot.coinbase,
+      candles5s: snapshot.coinbase.candles5s.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
+      candlesByInterval: compactCandlesByInterval(snapshot.coinbase.candlesByInterval)
     },
     clob: {
       ...snapshot.clob,
@@ -1129,7 +1123,7 @@ function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: 
 }
 
 function decorateCurrentRoundForTransport(round: RoundRecord | undefined) {
-  const displayRound = engine.withCurrentRoundBinanceOpenReference(engine.withCurrentRoundChainlinkOpenReference(round));
+  const displayRound = engine.withCurrentRoundBinanceOpenReference(engine.withCurrentRoundCoinbaseOpenReference(round));
   return displayRound ? decorateRoundWithSettlementPreview(displayRound) : undefined;
 }
 
@@ -1222,7 +1216,7 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
     serverNow: stamped.serverNow,
     currentPrice: stamped.currentPrice,
     binancePrice: stamped.binancePrice,
-    chainlinkPrice: stamped.chainlinkPrice,
+    coinbasePrice: stamped.coinbasePrice,
     priceToBeat: stamped.priceToBeat,
     displayPriceToBeat: stamped.displayPriceToBeat,
     displayPriceToBeatSource: stamped.displayPriceToBeatSource,
@@ -1238,14 +1232,14 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
       latestTick: stamped.binance.latestTick,
       candleUpdates: latestCandleUpdates(stamped.binance.candlesByInterval)
     },
-    chainlink: {
-      referencePrice: stamped.chainlink.referencePrice,
-      settlementReference: stamped.chainlink.settlementReference,
-      currentRoundOpenReference: stamped.chainlink.currentRoundOpenReference,
-      candleUpdates: latestCandleUpdates(stamped.chainlink.candlesByInterval),
+    coinbase: {
+      referencePrice: stamped.coinbase.referencePrice,
+      settlementReference: stamped.coinbase.settlementReference,
+      currentRoundOpenReference: stamped.coinbase.currentRoundOpenReference,
+      candleUpdates: latestCandleUpdates(stamped.coinbase.candlesByInterval),
       latestTick:
-        stamped.chainlink.referencePrice > 0
-          ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
+        stamped.coinbase.referencePrice > 0
+          ? { ts: stamped.sources.coinbase.normalizedTs || stamped.serverNow, price: stamped.coinbase.referencePrice }
           : undefined
     },
     clob: {
@@ -1873,16 +1867,16 @@ async function safeRoute<T>(handler: () => Promise<T>) {
 
 function warnForLocalMisconfiguration() {
   if (serverConfig.upstreamProxyUrl) {
-    console.warn(`[startup] Using upstream proxy for Binance/Polymarket: ${serverConfig.upstreamProxyUrl}`);
+    console.warn(`[startup] Using upstream proxy for Binance/Coinbase/Polymarket: ${serverConfig.upstreamProxyUrl}`);
   }
-  if (!serverConfig.chainlinkEnabled) {
-    console.warn("[startup] Testing mode: Chainlink disabled. Local success will depend on Binance and Polymarket only.");
+  if (!serverConfig.coinbaseEnabled) {
+    console.warn("[startup] Testing mode: Coinbase disabled. Local success will depend on Binance and Polymarket only.");
     return;
   }
 
   const warnings: string[] = [];
-  if (!serverConfig.chainlinkRtdsWsUrl || !serverConfig.chainlinkRtdsWsUrl.startsWith("wss://")) {
-    warnings.push("CHAINLINK_RTDS_WS_URL must point to the Polymarket RTDS WebSocket.");
+  if (!serverConfig.coinbaseWsUrl || !serverConfig.coinbaseWsUrl.startsWith("wss://")) {
+    warnings.push("COINBASE_WS_URL must point to the Coinbase Advanced Trade WebSocket.");
   }
   if (warnings.length === 0) {
     return;

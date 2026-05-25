@@ -631,12 +631,12 @@ function createEmptyCandleBar(interval: CandleInterval, now: number): CandleBar 
   };
 }
 
-function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): MarketSnapshot {
+function createEmptyMarketSnapshot(symbol: string, coinbaseEnabled: boolean): MarketSnapshot {
   const now = Date.now();
-  const emptySource = (source: "Binance" | "Chainlink" | "CLOB"): SourceHealth => ({
+  const emptySource = (source: "Binance" | "Coinbase" | "CLOB"): SourceHealth => ({
     source,
     symbol,
-    state: source === "Chainlink" && !chainlinkEnabled ? "disabled" : "reconnecting",
+    state: source === "Coinbase" && !coinbaseEnabled ? "disabled" : "reconnecting",
     reconnectCount: 0,
     sourceEventTs: now,
     serverRecvTs: now,
@@ -646,8 +646,8 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     publishLatencyMs: 0,
     frontendLatencyMs: 0,
     message:
-      source === "Chainlink" && !chainlinkEnabled
-        ? "Chainlink is disabled in local testing mode."
+      source === "Coinbase" && !coinbaseEnabled
+        ? "Coinbase is disabled in local testing mode."
         : `Waiting for ${source}.`
   });
   return {
@@ -655,7 +655,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     marketId: "",
     serverNow: now,
     binancePrice: 0,
-    chainlinkPrice: 0,
+    coinbasePrice: 0,
     currentPrice: 0,
     priceToBeat: 0,
     displayPriceToBeat: undefined,
@@ -675,13 +675,13 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       DOWN: 0
     },
     latencyBreakdown: {
-      sourceEventAge: { binance: 0, chainlink: 0, clob: 0 },
-      serverIngressLatency: { binance: 0, chainlink: 0, clob: 0 },
+      sourceEventAge: { binance: 0, coinbase: 0, clob: 0 },
+      serverIngressLatency: { binance: 0, coinbase: 0, clob: 0 },
       serverComputeLatency: 0
     },
     sources: {
       binance: emptySource("Binance"),
-      chainlink: emptySource("Chainlink"),
+      coinbase: emptySource("Coinbase"),
       clob: emptySource("CLOB")
     },
     orderBooks: {
@@ -721,7 +721,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
         "1d": [createEmptyCandleBar("1d", now)]
       }
     },
-    chainlink: {
+    coinbase: {
       referencePrice: 0,
       settlementReference: 0,
       candles5s: [],
@@ -785,7 +785,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       marketSwitchState: "market_not_ready",
       sourceStatusSummary: [
         { source: "Binance", state: "reconnecting" },
-        { source: "Chainlink", state: chainlinkEnabled ? "reconnecting" : "disabled" },
+        { source: "Coinbase", state: coinbaseEnabled ? "reconnecting" : "disabled" },
         { source: "CLOB", state: "reconnecting" }
       ]
     }
@@ -864,7 +864,7 @@ export class AppStore {
     databaseUrl: string;
     redisUrl: string;
     persistenceMode: "external" | "memory";
-    chainlinkEnabled: boolean;
+    coinbaseEnabled: boolean;
     strictPersistence: boolean;
     seedDefaultUsers?: boolean;
     requireSchemaMigrations?: boolean;
@@ -896,7 +896,7 @@ export class AppStore {
     databaseUrl: string;
     redisUrl: string;
     persistenceMode: "external" | "memory";
-    chainlinkEnabled: boolean;
+    coinbaseEnabled: boolean;
     strictPersistence: boolean;
     seedDefaultUsers: boolean;
     requireSchemaMigrations: boolean;
@@ -928,7 +928,7 @@ export class AppStore {
     };
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
-    this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.chainlinkEnabled);
+    this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.coinbaseEnabled);
     this.persistenceHealth = {
       postgres: {
         enabled: config.persistenceMode !== "memory",
@@ -1652,8 +1652,8 @@ export class AppStore {
       settlementTs: round.settlementTs,
       settlementSource: round.settlementSource,
       manualReason: round.manualReason,
-      chainlinkOpenPrice: round.chainlinkOpenPrice,
-      chainlinkClosePrice: round.chainlinkClosePrice
+      coinbaseOpenPrice: round.coinbaseOpenPrice,
+      coinbaseClosePrice: round.coinbaseClosePrice
     });
   }
 
@@ -1860,9 +1860,9 @@ export class AppStore {
         if (filters.logGroup === "matching_action") {
           add("category =", "matching");
         } else if (filters.logGroup === "market_latency") {
-          where.push(`category = 'latency' AND module_name = ANY(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name = ANY(ARRAY['binance','coinbase','clob']::text[])`);
         } else if (filters.logGroup === "system_latency") {
-          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','coinbase','clob']::text[])`);
         } else {
           add("category =", filters.logGroup);
         }
@@ -1915,7 +1915,7 @@ export class AppStore {
       }
       if (filters?.latencySource) {
         if (filters.latencySource === "system") {
-          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','coinbase','clob']::text[])`);
         } else {
           add("module_name =", filters.latencySource);
           where.push(`category = 'latency'`);
@@ -2409,7 +2409,7 @@ export class AppStore {
       return "settlement";
     }
     if (log.category === "latency") {
-      return ["binance", "chainlink", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
+      return ["binance", "coinbase", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
     }
     return "operation";
   }
@@ -2418,7 +2418,7 @@ export class AppStore {
     if (log.category !== "latency") {
       return undefined;
     }
-    return ["binance", "chainlink", "clob"].includes(log.moduleName) ? log.moduleName : "system";
+    return ["binance", "coinbase", "clob"].includes(log.moduleName) ? log.moduleName : "system";
   }
 
   private detailNumber(details: Record<string, unknown> | undefined, key: string) {
@@ -2766,8 +2766,8 @@ export class AppStore {
         round.redeemScheduledAt ?? null,
         round.binanceOpenPrice ?? null,
         round.binanceClosePrice ?? null,
-        round.chainlinkOpenPrice ?? null,
-        round.chainlinkClosePrice ?? null
+        round.coinbaseOpenPrice ?? null,
+        round.coinbaseClosePrice ?? null
       ]
     );
   }
@@ -3256,7 +3256,7 @@ export class AppStore {
         log.binance1mLastClose,
         log.binance5mLastClose,
         log.binance1dLastClose,
-        log.chainlinkPrice,
+        log.coinbasePrice,
         log.priceToBeat,
         log.upPrice,
         log.downPrice,
@@ -3670,7 +3670,7 @@ export class AppStore {
         this.pool.query("SELECT * FROM rounds ORDER BY start_at DESC LIMIT 80"),
         this.pool.query(
           "SELECT * FROM market_candles WHERE source = $1 AND symbol = $2 AND interval = $3 AND open_ts >= $4 ORDER BY open_ts ASC",
-          ["chainlink", this.config.symbol, "30s", Date.now() - MARKET_CANDLE_MEMORY_RETENTION_MS]
+          ["coinbase", this.config.symbol, "30s", Date.now() - MARKET_CANDLE_MEMORY_RETENTION_MS]
         ),
         this.pool.query("SELECT * FROM order_book_snapshots ORDER BY snapshot_ts DESC LIMIT 5000"),
         this.pool.query("SELECT * FROM orders ORDER BY created_at DESC LIMIT 2000"),
@@ -3961,7 +3961,7 @@ export class AppStore {
 
   private isValidMarketCandle(candle: MarketCandleRecord) {
     return (
-      candle.source === "chainlink" &&
+      candle.source === "coinbase" &&
       candle.interval === "30s" &&
       Number.isFinite(candle.openTs) &&
       Number.isFinite(candle.closeTs) &&
@@ -4003,7 +4003,7 @@ export class AppStore {
 
   private rowToMarketCandle(row: Record<string, unknown>): MarketCandleRecord {
     return {
-      source: "chainlink",
+      source: "coinbase",
       symbol: String(row.symbol),
       interval: "30s",
       openTs: Number(row.open_ts),
@@ -4063,8 +4063,8 @@ export class AppStore {
       redeemScheduledAt: numberOrUndefined(row.redeem_scheduled_at),
       binanceOpenPrice: numberOrUndefined(row.binance_open_price),
       binanceClosePrice: numberOrUndefined(row.binance_close_price),
-      chainlinkOpenPrice: numberOrUndefined(row.chainlink_open_price),
-      chainlinkClosePrice: numberOrUndefined(row.chainlink_close_price),
+      coinbaseOpenPrice: numberOrUndefined(row.chainlink_open_price),
+      coinbaseClosePrice: numberOrUndefined(row.chainlink_close_price),
       redeemStartTs: row.redeem_start_ts ? Number(row.redeem_start_ts) : undefined,
       redeemFinishTs: row.redeem_finish_ts ? Number(row.redeem_finish_ts) : undefined,
       manualReason: row.manual_reason ? String(row.manual_reason) : undefined,
@@ -4319,7 +4319,7 @@ export class AppStore {
       binance1mLastClose: Number(row.binance_1m_last_close),
       binance5mLastClose: Number(row.binance_5m_last_close),
       binance1dLastClose: Number(row.binance_1d_last_close),
-      chainlinkPrice: Number(row.chainlink_price),
+      coinbasePrice: Number(row.chainlink_price),
       priceToBeat: Number(row.price_to_beat),
       upPrice: Number(row.up_price),
       downPrice: Number(row.down_price),
@@ -4345,7 +4345,7 @@ export class AppStore {
       redeemFinishTimeMs: row.redeem_finish_time_ms !== null ? Number(row.redeem_finish_time_ms) : undefined,
       sourceStates: parseJson(row.source_states, {
         binance: { source: "Binance", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-        chainlink: { source: "Chainlink", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
+        coinbase: { source: "Coinbase", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
         clob: { source: "CLOB", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 }
       }),
       strategyClusterLabel: row.strategy_cluster_label ? String(row.strategy_cluster_label) : undefined,

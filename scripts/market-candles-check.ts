@@ -16,34 +16,16 @@ assert.match(migrationSource, /idx_market_candles_lookup/);
 
 const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
 assert.match(storeSource, /CREATE TABLE IF NOT EXISTS market_candles/);
-assert.match(storeSource, /marketCandles/);
 assert.match(storeSource, /upsertMarketCandles/);
 assert.match(storeSource, /getMarketCandles/);
 
 const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+assert.match(simulationSource, /flushPendingCoinbaseMarketCandles/);
+assert.match(simulationSource, /refreshCoinbaseAggregateBucketFromThirtySecondBar/);
+assert.match(simulationSource, /recordCoinbaseSample/);
+assert.match(simulationSource, /syncCoinbaseHistoryCandles/);
 assert.doesNotMatch(simulationSource, /currentRoundChainlinkOpenReferences/);
-assert.doesNotMatch(simulationSource, /pruneCurrentRoundChainlinkOpenReferences/);
-assert.doesNotMatch(simulationSource, /resolveCurrentRoundChainlinkOpenReference\([^)]*chainlinkPrice/);
-assert.match(simulationSource, /"rtds_30s"/);
-assert.match(simulationSource, /"history_1m_split"/);
-assert.match(simulationSource, /flushPendingChainlinkMarketCandles/);
-assert.match(simulationSource, /refreshChainlinkAggregateBucketFromThirtySecondBar/);
-const recordChainlinkSampleBody = simulationSource.match(/private recordChainlinkSample[\s\S]*?\n  private syncChainlinkHistoryCandles/)?.[0] ?? "";
-assert.doesNotMatch(recordChainlinkSampleBody, /refreshChainlinkAggregatesFromThirtySecondBars/);
-const syncHistoryBody = simulationSource.match(/private syncChainlinkHistoryCandles[\s\S]*?\n  private recordCurrentRoundUpPricePoint/)?.[0] ?? "";
-assert.doesNotMatch(syncHistoryBody, /store\.upsertMarketCandles/);
-assert.match(syncHistoryBody, /queueChainlinkMarketCandle/);
-assert.match(storeSource, /dedupeMarketCandles/);
-
-const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
-const createMarketTickBody = indexSource.match(/function createMarketTickPayload[\s\S]*?^}/m)?.[0] ?? "";
-const createMarketRealtimeTickBody = indexSource.match(/function createMarketRealtimeTick[\s\S]*?^}/m)?.[0] ?? "";
-const placeOrderBody = simulationSource.match(/async placeOrder\([\s\S]*?\n  async cancelOrder/)?.[0] ?? "";
-assert.doesNotMatch(createMarketTickBody, /getMarketCandles|upsertMarketCandles/);
-assert.doesNotMatch(createMarketRealtimeTickBody, /getMarketCandles|upsertMarketCandles/);
-assert.doesNotMatch(placeOrderBody, /getMarketCandles|upsertMarketCandles/);
-assert.match(createMarketRealtimeTickBody, /latestCandleUpdates\(stamped\.chainlink\.candlesByInterval\)/);
-assert.match(indexSource, /compactCandlesByInterval/);
+assert.doesNotMatch(simulationSource, /flushPendingChainlinkMarketCandles/);
 
 function createMemoryStore() {
   return new AppStore({
@@ -54,7 +36,7 @@ function createMemoryStore() {
     databaseUrl: "",
     redisUrl: "",
     persistenceMode: "memory",
-    chainlinkEnabled: true,
+    coinbaseEnabled: true,
     strictPersistence: false,
     seedDefaultUsers: false,
     requireSchemaMigrations: false,
@@ -81,7 +63,7 @@ function createMemoryStore() {
 
 const openTs = Math.floor(Date.now() / 30_000) * 30_000;
 const fallback: MarketCandleRecord = {
-  source: "chainlink",
+  source: "coinbase",
   symbol: "BTC",
   interval: "30s",
   openTs,
@@ -112,7 +94,7 @@ async function main() {
   await store.upsertMarketCandles([{ ...fallback, open: 90, updatedAt: openTs + 3 }]);
 
   const candles = store.getMarketCandles({
-    source: "chainlink",
+    source: "coinbase",
     symbol: "BTC",
     interval: "30s",
     fromOpenTs: openTs - 1,

@@ -95,7 +95,7 @@ function snapshot(upBook: OrderBookSnapshot, downBook: OrderBookSnapshot, round:
         "1d": []
       }
     },
-    chainlink: {
+    coinbase: {
       referencePrice: 0,
       settlementReference: 0,
       candles5s: [],
@@ -110,7 +110,7 @@ function snapshot(upBook: OrderBookSnapshot, downBook: OrderBookSnapshot, round:
     },
     sources: {
       binance: source("Binance"),
-      chainlink: source("Chainlink"),
+      coinbase: source("Coinbase"),
       clob: source("CLOB")
     },
     uiMeta: {
@@ -187,7 +187,7 @@ function createMemoryStore() {
     databaseUrl: "",
     redisUrl: "",
     persistenceMode: "memory",
-    chainlinkEnabled: false,
+    coinbaseEnabled: false,
     strictPersistence: false,
     seedDefaultUsers: false,
     requireSchemaMigrations: false,

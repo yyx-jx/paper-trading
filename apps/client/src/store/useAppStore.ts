@@ -65,7 +65,7 @@ function fallbackTransportMeta(snapshot: MarketSnapshot): MarketTransportMeta {
   return {
     serverPublishTs: Math.max(
       snapshot.sources.binance.serverPublishTs,
-      snapshot.sources.chainlink.serverPublishTs,
+      snapshot.sources.coinbase.serverPublishTs,
       snapshot.sources.clob.serverPublishTs
     ),
     payloadSeq: 0
@@ -115,7 +115,7 @@ function stampSnapshotReceipt(
     },
     sources: {
       binance: stampSourceReceipt(snapshot.sources.binance, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
-      chainlink: stampSourceReceipt(snapshot.sources.chainlink, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
+      coinbase: stampSourceReceipt(snapshot.sources.coinbase, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
       clob: stampSourceReceipt(snapshot.sources.clob, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs)
     }
   };
@@ -222,7 +222,7 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     serverNow: tick.serverNow,
     currentPrice: tick.currentPrice,
     binancePrice: tick.binancePrice,
-    chainlinkPrice: tick.chainlinkPrice,
+    coinbasePrice: tick.coinbasePrice,
     priceToBeat: tick.priceToBeat,
     displayPriceToBeat: tick.displayPriceToBeat,
     displayPriceToBeatSource: tick.displayPriceToBeatSource,
@@ -240,12 +240,12 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
       latestTick: tick.binance.latestTick,
       candlesByInterval: mergeCandleUpdates(snapshot.binance.candlesByInterval, tick.binance.candleUpdates)
     },
-    chainlink: {
-      ...snapshot.chainlink,
-      referencePrice: tick.chainlink.referencePrice,
-      settlementReference: tick.chainlink.settlementReference,
-      currentRoundOpenReference: tick.chainlink.currentRoundOpenReference,
-      candlesByInterval: mergeCandleUpdates(snapshot.chainlink.candlesByInterval, tick.chainlink.candleUpdates)
+    coinbase: {
+      ...snapshot.coinbase,
+      referencePrice: tick.coinbase.referencePrice,
+      settlementReference: tick.coinbase.settlementReference,
+      currentRoundOpenReference: tick.coinbase.currentRoundOpenReference,
+      candlesByInterval: mergeCandleUpdates(snapshot.coinbase.candlesByInterval, tick.coinbase.candleUpdates)
     },
     clob: {
       ...snapshot.clob,

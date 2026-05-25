@@ -1,4 +1,4 @@
-﻿import { startTransition, useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { startTransition, useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "./i18n";
 
@@ -103,7 +103,7 @@ const LOG_GROUP_OPTIONS: Array<NonNullable<LogSearchQuery["logGroup"]>> = [
   "system_latency",
   "matching_action"
 ];
-const LATENCY_SOURCE_OPTIONS: Array<NonNullable<LogSearchQuery["latencySource"]>> = ["binance", "chainlink", "clob", "system"];
+const LATENCY_SOURCE_OPTIONS: Array<NonNullable<LogSearchQuery["latencySource"]>> = ["binance", "coinbase", "clob", "system"];
 const CONNECTION_STATE_OPTIONS: Array<NonNullable<LogSearchQuery["connectionState"]>> = [
   "healthy",
   "reconnecting",
@@ -1094,7 +1094,7 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
   );
 }
 
-function ChainlinkComparisonChart(props: {
+function CoinbaseComparisonChart(props: {
   bars: CandleBar[];
   referencePrice?: number;
   binancePrice?: number;
@@ -1519,7 +1519,7 @@ function extractMarketPayloadPublishTs(payload?: Pick<MarketPayload, "snapshot" 
   const snapshot = payload.snapshot;
   return Math.max(
     snapshot.sources.binance.serverPublishTs,
-    snapshot.sources.chainlink.serverPublishTs,
+    snapshot.sources.coinbase.serverPublishTs,
     snapshot.sources.clob.serverPublishTs
   );
 }
@@ -1666,7 +1666,7 @@ function isBtcReferencePrice(value?: number): value is number {
 
 function isOfficialPtbSource(source?: string) {
   const normalized = source?.toLowerCase() ?? "";
-  return normalized.includes("chainlink data streams") || normalized.includes("data.chain.link");
+  return normalized.includes("coinbase");
 }
 
 function btcMoneyOrDash(value?: number) {
@@ -3738,14 +3738,14 @@ function TradePageRestored(props: {
   }, []);
   const currentRound = props.currentRound;
   const sourceBinance = snapshot?.sources.binance;
-  const sourceChainlink = snapshot?.sources.chainlink;
+  const sourceCoinbase = snapshot?.sources.coinbase;
   const sourceClob = snapshot?.sources.clob;
   const currentRoundPositions = positions.filter((position) => position.roundId === currentRound?.id);
   const openSidePositions = currentRoundPositions.filter((position) => position.status === "open" && position.side === selectedSide);
   const selectedBinanceBars = snapshot?.binance.candlesByInterval[selectedInterval] ?? [];
-  const selectedChainlinkBars = snapshot?.chainlink.candlesByInterval[selectedInterval] ?? [];
+  const selectedCoinbaseBars = snapshot?.coinbase.candlesByInterval[selectedInterval] ?? [];
   const chartBars = useMemo(() => filterBarsToRecentWindow(selectedBinanceBars), [selectedBinanceBars]);
-  const chainlinkBars = useMemo(() => filterBarsToRecentWindow(selectedChainlinkBars), [selectedChainlinkBars]);
+  const coinbaseBars = useMemo(() => filterBarsToRecentWindow(selectedCoinbaseBars), [selectedCoinbaseBars]);
   const displayPrice = displayPriceForSide(snapshot, selectedSide);
   const upDisplayPrice = displayPriceForSide(snapshot, "UP");
   const downDisplayPrice = displayPriceForSide(snapshot, "DOWN");
@@ -3772,7 +3772,7 @@ function TradePageRestored(props: {
   const orderBookStale = isOrderBookBackendStale(orderBookComponent);
   const orderBookBackendLatency = orderBookBackendLatencyMs(orderBookComponent);
   const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
-  const chainlinkLatency = latencyFor(sourceChainlink, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const coinbaseLatency = latencyFor(sourceCoinbase, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
   const countdownMs =
     typeof props.countdownTargetMs === "number"
       ? Math.max(props.countdownTargetMs - nowMs, 0)
@@ -3882,10 +3882,10 @@ function TradePageRestored(props: {
     ? snapshot.displayPriceToBeat
     : currentRound?.binanceOpenPrice;
   const binancePtbSpread = referenceSpread(snapshot?.binance.spotPrice, binancePtbReference);
-  const chainlinkPtbReference = isBtcReferencePrice(snapshot?.chainlink.currentRoundOpenReference)
-    ? snapshot.chainlink.currentRoundOpenReference
-    : currentRound?.chainlinkOpenPrice;
-  const chainlinkPtbSpread = referenceSpread(snapshot?.chainlink.referencePrice, chainlinkPtbReference);
+  const coinbasePtbReference = isBtcReferencePrice(snapshot?.coinbase.currentRoundOpenReference)
+    ? snapshot.coinbase.currentRoundOpenReference
+    : currentRound?.coinbaseOpenPrice;
+  const coinbasePtbSpread = referenceSpread(snapshot?.coinbase.referencePrice, coinbasePtbReference);
   const commitChartVisibleDraft = () => {
     const nextValue = parseBarCountInput(chartVisibleDraft);
     if (typeof nextValue !== "number") {
@@ -3908,19 +3908,19 @@ function TradePageRestored(props: {
     upPrice: upDisplayPrice,
     downPrice: downDisplayPrice,
     oddsChange,
-    sources: [sourceBinance, sourceChainlink, sourceClob],
+    sources: [sourceBinance, sourceCoinbase, sourceClob],
     clobLatencyMs: clobLatency.marketUpdateAgeMs,
     nowMs
   });
   const marketUpdateAge = Math.max(
     clobLatency.marketUpdateAgeMs,
     btcLatency.marketUpdateAgeMs,
-    chainlinkLatency.marketUpdateAgeMs
+    coinbaseLatency.marketUpdateAgeMs
   );
   const sourceAgeMax = Math.max(
     clobLatency.sourceDataAgeMs,
     btcLatency.sourceDataAgeMs,
-    chainlinkLatency.sourceDataAgeMs
+    coinbaseLatency.sourceDataAgeMs
   );
   const groupedAlerts = [
     { key: "market", label: localLabel(language, "数据源", "Market Data") },
@@ -3944,7 +3944,7 @@ function TradePageRestored(props: {
   const healthRows = [
     { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: localLabel(language, `源 ${Math.round(clobLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(clobLatency.sourceDataAgeMs)}ms / transport ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceClob?.state ?? "stale" },
     { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, `源 ${Math.round(btcLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(btcLatency.sourceDataAgeMs)}ms / transport ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceBinance?.state ?? "stale" },
-    { label: "CL", primary: `${Math.round(chainlinkLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Chainlink 行情", "Chainlink feed"), detail: localLabel(language, `源 ${Math.round(chainlinkLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(chainlinkLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(chainlinkLatency.sourceDataAgeMs)}ms / transport ${Math.round(chainlinkLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceChainlink?.state ?? "stale" },
+    { label: "CB", primary: `${Math.round(coinbaseLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Coinbase 行情", "Coinbase feed"), detail: localLabel(language, `源 ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / transport ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceCoinbase?.state ?? "stale" },
     { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: localLabel(language, "结算轮询", "Settlement poll"), detail: localLabel(language, "正式结果确认", "Final settlement"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
   ];
   const bookStatsFor = (side: TradeSide) => {
@@ -3962,7 +3962,7 @@ function TradePageRestored(props: {
     props.currentRound.status === "Manual";
   const displayPriceToBeat = isBtcReferencePrice(snapshot?.displayPriceToBeat) ? snapshot.displayPriceToBeat : undefined;
   const btcUsdMeta = [
-    `CL ${money(snapshot?.chainlink.referencePrice ?? 0)}`,
+    `CB ${money(snapshot?.coinbase.referencePrice ?? 0)}`,
     displayPriceToBeat
       ? `${ptbDisplayLabel(language, snapshot?.displayPriceToBeatSource)} ${btcMoneyOrDash(displayPriceToBeat)}`
       : undefined
@@ -4039,11 +4039,11 @@ function TradePageRestored(props: {
               <b className={spreadToneClass(binancePtbSpread)}>{spreadDisplayText(binancePtbSpread)}</b>
             </span>
             <span>
-              <i>ChainLink VS PTB</i>
-              <b className={spreadToneClass(chainlinkPtbSpread)}>{spreadDisplayText(chainlinkPtbSpread)}</b>
+              <i>Coinbase VS PTB</i>
+              <b className={spreadToneClass(coinbasePtbSpread)}>{spreadDisplayText(coinbasePtbSpread)}</b>
             </span>
           </strong>
-          <span>B PTB {btcMoneyOrDash(binancePtbReference)} · CL PTB {btcMoneyOrDash(chainlinkPtbReference)}</span>
+          <span>B PTB {btcMoneyOrDash(binancePtbReference)} · CB PTB {btcMoneyOrDash(coinbasePtbReference)}</span>
         </div>
         <div className={`monitor-timer monitor-round-state ${countdownClass}`}>
           <small>{currentRound?.status ?? "--"}</small>
@@ -4095,39 +4095,36 @@ function TradePageRestored(props: {
           </TerminalSection>
 
           <TerminalSection title={t("thisRound")} meta={String(recentOrders.length)}>
-            <div className="terminal-trades">
+            <div className="terminal-current-orders">
               {recentOrders.length === 0 ? (
                 <div className="terminal-empty">{t("noData")}</div>
               ) : (
-                <>
-                  <div className="terminal-trade-head">
-                    <span>Time</span>
-                    <span>{localLabel(language, "交易", "Trade")}</span>
-                    <span>USD</span>
-                    <span>{localLabel(language, "参考价", "Reference")}</span>
-                    <span>Status</span>
-                    <span>Action</span>
-                  </div>
-                  {recentOrders.map((order) => {
-                    const canCancelOrder = order.orderKind === "limit" && order.status === "pending";
-                    const sellablePosition = sellablePositionByBuyOrderId.get(order.id);
-                    const canSellPosition = order.action === "buy" && order.status === "filled" && Boolean(sellablePosition);
-                    const cancelBusy = props.cancelBusyOrderId === order.id;
-                    const sellBusy = Boolean(sellablePosition && props.sellBusyPositionId === sellablePosition.id);
-                    return (
-                      <div className="terminal-trade-row" key={order.id}>
-                        <span>{timeText(order.createdAt).replace(" UTC", "")}</span>
-                        <span className={`terminal-trade-side terminal-trade-side-${order.action}`}>
+                recentOrders.map((order) => {
+                  const canCancelOrder = order.orderKind === "limit" && order.status === "pending";
+                  const sellablePosition = sellablePositionByBuyOrderId.get(order.id);
+                  const canSellPosition = order.action === "buy" && order.status === "filled" && Boolean(sellablePosition);
+                  const cancelBusy = props.cancelBusyOrderId === order.id;
+                  const sellBusy = Boolean(sellablePosition && props.sellBusyPositionId === sellablePosition.id);
+                  const statusLabel = order.status === "filled" ? "OK" : order.status.toUpperCase();
+                  return (
+                    <article className="terminal-current-order-card" key={order.id}>
+                      <div className="terminal-current-order-main">
+                        <span className="terminal-current-order-time">{timeText(order.createdAt).replace(" UTC", "")}</span>
+                        <span className={`terminal-current-order-side terminal-current-order-side-${order.action}`}>
                           <b>{orderTradeLabel(order, language)}</b>
                           <small>{order.side === "UP" ? "▲UP" : "▼DN"}</small>
                         </span>
-                        <span>{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
-                        <span className="terminal-trade-price-block">
-                          <strong className="terminal-trade-price">@{orderReferencePriceText(order, snapshot)}</strong>
-                          <small>{orderPriceQualifier(order, language)}</small>
+                        <span className="terminal-current-order-amount">{money(order.requestedAmountUsdc ?? order.notionalUsdc, 0)}</span>
+                        <span className={`terminal-current-order-status terminal-current-order-status-${order.status}`}>
+                          {statusLabel}
                         </span>
-                        <em>{order.status === "filled" ? "OK" : order.status.toUpperCase()}</em>
-                        <span className="terminal-trade-action">
+                      </div>
+                      <div className="terminal-current-order-meta">
+                        <div className="terminal-current-order-reference">
+                          <strong>@{orderReferencePriceText(order, snapshot)}</strong>
+                          <small>{orderPriceQualifier(order, language)}</small>
+                        </div>
+                        <div className="terminal-current-order-action">
                           {canCancelOrder ? (
                             <button
                               type="button"
@@ -4148,12 +4145,14 @@ function TradePageRestored(props: {
                             >
                               {sellBusy ? t("loading") : localLabel(language, "卖出持仓", "Sell position")}
                             </button>
-                          ) : null}
-                        </span>
+                          ) : (
+                            <span className="terminal-current-order-action-placeholder">--</span>
+                          )}
+                        </div>
                       </div>
-                    );
-                  })}
-                </>
+                    </article>
+                  );
+                })
               )}
             </div>
           </TerminalSection>
@@ -4244,7 +4243,7 @@ function TradePageRestored(props: {
             <div className="terminal-orderbook-expanded">
               <div className="chart-toolbar compact">
                 <b>{localLabel(language, "完整订单簿", "Full Order Book")}</b>
-                <span>{localLabel(language, "实时完整深度，占用 BTC / CL 区域。", "Live full depth in the BTC / CL area.")}</span>
+                <span>{localLabel(language, "实时完整深度，占用 BTC / CB 区域。", "Live full depth in the BTC / CB area.")}</span>
               </div>
               <div className="orderbook-expanded-grid">
                 {(["UP", "DOWN"] as TradeSide[]).map((side) => {
@@ -4277,14 +4276,14 @@ function TradePageRestored(props: {
               </div>
             </div>
           ) : (
-            <div className="terminal-chart-block chainlink">
+            <div className="terminal-chart-block coinbase">
               <div className="chart-toolbar compact">
-                <b>BTC / CL</b>
-                <span>CL-Binance {signedMoney((snapshot?.chainlink.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0))}</span>
+                <b>BTC / CB</b>
+                <span>CB-Binance {signedMoney((snapshot?.coinbase.referencePrice ?? 0) - (snapshot?.binance.spotPrice ?? 0))}</span>
               </div>
-              <ChainlinkComparisonChart
-                bars={chainlinkBars}
-                referencePrice={snapshot?.chainlink.referencePrice ?? 0}
+              <CoinbaseComparisonChart
+                bars={coinbaseBars}
+                referencePrice={snapshot?.coinbase.referencePrice ?? 0}
                 emptyText={t("noData")}
                 visibleCount={props.chartVisibleCount}
                 onVisibleCountChange={props.onChartVisibleCountChange}
@@ -4967,7 +4966,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
   };
   const latencySourceLabel = (value?: string) => {
     if (value === "binance") return "Binance";
-    if (value === "chainlink") return "Chainlink";
+    if (value === "coinbase") return "Coinbase";
     if (value === "clob") return t("polymarketBookClob");
     if (value === "system") return t("system");
     return value ?? "--";

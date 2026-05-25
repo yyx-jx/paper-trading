@@ -10,7 +10,7 @@ const store = new AppStore({
   databaseUrl: "",
   redisUrl: "",
   persistenceMode: "memory",
-  chainlinkEnabled: false,
+  coinbaseEnabled: false,
   strictPersistence: false,
   requireSchemaMigrations: false,
   allowDevSchemaBootstrap: true,

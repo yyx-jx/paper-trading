@@ -24,9 +24,9 @@ export function isOrderBookBackendStale(
 }
 
 export function sourceFreshnessLabelKey(sourceName?: string) {
-  return sourceName?.toLowerCase() === "chainlink" ? "chainlinkFeedAge" : "endToEnd";
+  return sourceName?.toLowerCase() === "coinbase" ? "coinbaseFeedAge" : "endToEnd";
 }
 
 export function sourceFreshnessAlertKey(sourceName?: string) {
-  return sourceName?.toLowerCase() === "chainlink" ? "chainlinkFeedStale" : "latencyOver3s";
+  return sourceName?.toLowerCase() === "coinbase" ? "coinbaseFeedStale" : "latencyOver3s";
 }

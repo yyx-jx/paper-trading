@@ -4,7 +4,7 @@ import type {
   BinanceConnectorState,
   CandlePoint,
   CandleBar,
-  ChainlinkConnectorState,
+  CoinbaseConnectorState,
   ClobMarketInfo,
   DisplayPriceSource,
   FeeBreakdown,
@@ -31,12 +31,11 @@ import type {
   UserRecord
 } from "../domain/types";
 import { BinanceConnector } from "./connectors/binance";
-import { ChainlinkConnector } from "./connectors/chainlink";
+import { CoinbaseConnector } from "./connectors/coinbase";
 import { estimateClobExecution, type ClobExecutionEstimate } from "./clob-execution";
 import { calculateClobFees } from "./clob-fees";
 import { MatchingServiceClient } from "./matching/client";
 import { PolymarketConnector } from "./connectors/polymarket";
-import { PolymarketReferenceResolver } from "./connectors/polymarket-reference";
 import { AppStore } from "./store";
 import { appMetrics } from "./metrics";
 
@@ -64,7 +63,7 @@ const CONSERVATIVE_CLOB_MARKET_INFO: ClobMarketInfo = {
   updatedAt: 0
 };
 const TRADE_CHART_INTERVALS = ["30s", "1m", "5m", "15m", "1h"] as const;
-const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+const COINBASE_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
   "30s": 120,
   "1m": 60,
   "5m": 30,
@@ -91,18 +90,18 @@ function isClientOrderConflict(error: unknown) {
     .some((value) => String(value).includes("idx_orders_user_client_order_id"));
 }
 
-const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
+const COINBASE_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
   "30s": 30_000,
   "1m": 60_000,
   "5m": 5 * 60_000,
   "15m": 15 * 60_000,
   "1h": 60 * 60_000
 };
-const CHAINLINK_MARKET_CANDLE_FLUSH_MS = 5000;
-const CHAINLINK_MARKET_CANDLE_FLUSH_SIZE = 50;
-const CHAINLINK_MARKET_CANDLE_RESTORE_MS = 24 * 60 * 60_000;
-const CHAINLINK_HISTORY_CANDLE_SYNC_MIN_MS = 60_000;
-const CHAINLINK_MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
+const COINBASE_MARKET_CANDLE_FLUSH_MS = 5000;
+const COINBASE_MARKET_CANDLE_FLUSH_SIZE = 50;
+const COINBASE_MARKET_CANDLE_RESTORE_MS = 24 * 60 * 60_000;
+const COINBASE_HISTORY_CANDLE_SYNC_MIN_MS = 60_000;
+const COINBASE_MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
   history_1m_split: 1,
   rtds_30s: 2
 };
@@ -244,7 +243,7 @@ function isBtcReferencePrice(value?: number): value is number {
 
 function isOfficialPtbSource(source?: string) {
   const normalized = source?.toLowerCase() ?? "";
-  return normalized.includes("chainlink data streams") || normalized.includes("data.chain.link");
+  return normalized.includes("coinbase");
 }
 
 const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
@@ -288,7 +287,7 @@ function calculateClobFee(input: {
   return { fee: roundCurrency(result.fee), breakdown: result.breakdown };
 }
 
-function createEmptyChainlinkIntervalBars() {
+function createEmptyCoinbaseIntervalBars() {
   return {
     "30s": [] as CandleBar[],
     "1m": [] as CandleBar[],
@@ -298,8 +297,8 @@ function createEmptyChainlinkIntervalBars() {
   };
 }
 
-function normalizeChainlinkBar(interval: (typeof TRADE_CHART_INTERVALS)[number], bar: CandleBar): CandleBar {
-  const bucketSize = CHAINLINK_INTERVAL_MS[interval];
+function normalizeCoinbaseBar(interval: (typeof TRADE_CHART_INTERVALS)[number], bar: CandleBar): CandleBar {
+  const bucketSize = COINBASE_INTERVAL_MS[interval];
   const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
   return {
     interval,
@@ -313,7 +312,7 @@ function normalizeChainlinkBar(interval: (typeof TRADE_CHART_INTERVALS)[number],
   };
 }
 
-function mergeChainlinkHistoryBars(
+function mergeCoinbaseHistoryBars(
   current: CandleBar[],
   incoming: CandleBar[] | undefined,
   interval: (typeof TRADE_CHART_INTERVALS)[number]
@@ -325,27 +324,27 @@ function mergeChainlinkHistoryBars(
   const barsByStartTs = new Map<number, CandleBar>();
   for (const bar of incoming) {
     if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
-      const normalized = normalizeChainlinkBar(interval, bar);
+      const normalized = normalizeCoinbaseBar(interval, bar);
       barsByStartTs.set(normalized.startTs, normalized);
     }
   }
   for (const bar of current) {
     if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
-      const normalized = normalizeChainlinkBar(interval, bar);
+      const normalized = normalizeCoinbaseBar(interval, bar);
       barsByStartTs.set(normalized.startTs, normalized);
     }
   }
 
   return [...barsByStartTs.values()]
     .sort((left, right) => left.startTs - right.startTs)
-    .slice(-CHAINLINK_BAR_LIMITS[interval]);
+    .slice(-COINBASE_BAR_LIMITS[interval]);
 }
 
-function aggregateChainlinkBars(
+function aggregateCoinbaseBars(
   interval: Exclude<(typeof TRADE_CHART_INTERVALS)[number], "30s">,
   sourceBars: CandleBar[]
 ) {
-  const bucketSize = CHAINLINK_INTERVAL_MS[interval];
+  const bucketSize = COINBASE_INTERVAL_MS[interval];
   const grouped = new Map<number, CandleBar>();
   for (const bar of [...sourceBars].sort((left, right) => left.startTs - right.startTs)) {
     if (!isPositivePrice(bar.close) || !isPositivePrice(bar.high) || !isPositivePrice(bar.low)) {
@@ -373,7 +372,7 @@ function aggregateChainlinkBars(
   }
   return [...grouped.values()]
     .sort((left, right) => left.startTs - right.startTs)
-    .slice(-CHAINLINK_BAR_LIMITS[interval]);
+    .slice(-COINBASE_BAR_LIMITS[interval]);
 }
 
 function marketCandleToBar(candle: MarketCandleRecord): CandleBar {
@@ -389,12 +388,12 @@ function marketCandleToBar(candle: MarketCandleRecord): CandleBar {
   };
 }
 
-function shouldReplaceChainlinkMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
+function shouldReplaceCoinbaseMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
   if (!existing) {
     return true;
   }
-  const existingPriority = CHAINLINK_MARKET_CANDLE_PRIORITY[existing.origin];
-  const incomingPriority = CHAINLINK_MARKET_CANDLE_PRIORITY[incoming.origin];
+  const existingPriority = COINBASE_MARKET_CANDLE_PRIORITY[existing.origin];
+  const incomingPriority = COINBASE_MARKET_CANDLE_PRIORITY[incoming.origin];
   return incomingPriority > existingPriority || (incomingPriority === existingPriority && incoming.updatedAt >= existing.updatedAt);
 }
 
@@ -438,13 +437,13 @@ function utcRangeText(startAt: number, endAt: number) {
   return `${pad2(start.getUTCHours())}:${pad2(start.getUTCMinutes())}-${pad2(end.getUTCHours())}:${pad2(end.getUTCMinutes())} UTC`;
 }
 
-function createDisabledChainlinkState(symbol: string): ChainlinkConnectorState {
+function createDisabledCoinbaseState(symbol: string): CoinbaseConnectorState {
   const now = Date.now();
   return {
     price: 0,
     updatedAt: 0,
     status: {
-      source: "Chainlink",
+      source: "Coinbase",
       symbol,
       state: "disabled",
       reconnectCount: 0,
@@ -455,30 +454,29 @@ function createDisabledChainlinkState(symbol: string): ChainlinkConnectorState {
       acquireLatencyMs: 0,
       publishLatencyMs: 0,
       frontendLatencyMs: 0,
-      message: "Chainlink is disabled in local testing mode."
+      message: "Coinbase is disabled in local testing mode."
     }
   };
 }
 
 export class SimulationEngine {
   private readonly binanceConnector: BinanceConnector;
-  private readonly chainlinkConnector: ChainlinkConnector;
+  private readonly coinbaseConnector: CoinbaseConnector;
   private readonly polymarketConnector: PolymarketConnector;
-  private readonly polymarketReferenceResolver: PolymarketReferenceResolver;
   private binanceState: BinanceConnectorState;
-  private chainlinkState: ChainlinkConnectorState;
-  private chainlinkCandles5s: CandleBar[] = [];
-  private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars();
+  private coinbaseState: CoinbaseConnectorState;
+  private coinbaseCandles5s: CandleBar[] = [];
+  private coinbaseCandlesByInterval = createEmptyCoinbaseIntervalBars();
   private polymarketState: PolymarketConnectorState;
   private currentRoundUpPriceSeries: CandlePoint[] = [];
   private currentRoundUpPriceSeriesRoundId?: string;
   private currentRoundBinanceOpenReferences = new Map<string, number>();
-  private lastChainlinkSampleKey?: string;
-  private lastChainlinkHistorySyncKey?: string;
-  private lastChainlinkHistorySyncAt = 0;
-  private pendingChainlinkMarketCandles = new Map<number, MarketCandleRecord>();
-  private chainlinkMarketCandleFlushTimer?: NodeJS.Timeout;
-  private chainlinkMarketCandleFlushRunning = false;
+  private lastCoinbaseSampleKey?: string;
+  private lastCoinbaseHistorySyncKey?: string;
+  private lastCoinbaseHistorySyncAt = 0;
+  private pendingCoinbaseMarketCandles = new Map<number, MarketCandleRecord>();
+  private coinbaseMarketCandleFlushTimer?: NodeJS.Timeout;
+  private coinbaseMarketCandleFlushRunning = false;
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
   private reconcileRunning = false;
@@ -486,7 +484,7 @@ export class SimulationEngine {
   private snapshotRefreshRunning = false;
   private snapshotRefreshQueued = false;
   private snapshotRefreshQueuedAt?: number;
-  private readonly snapshotRefreshSources = new Set<"binance" | "chainlink" | "clob">();
+  private readonly snapshotRefreshSources = new Set<"binance" | "coinbase" | "clob">();
   private readonly pollLocks = new Set<string>();
   private redeemLocks = new Set<string>();
   private readonly lastLatencyLogAt = new Map<string, number>();
@@ -522,18 +520,12 @@ export class SimulationEngine {
       binanceRestPollMs: number;
       binanceWsStaleMs: number;
       upstreamProxyUrl?: string;
-      chainlinkEnabled: boolean;
-      chainlinkRpcUrl: string;
-      chainlinkFallbackRpcUrls: string[];
-      chainlinkRequestTimeoutMs: number;
-      chainlinkBtcUsdProxyAddress: `0x${string}`;
-      chainlinkPollMs: number;
-      chainlinkRtdsWsUrl: string;
-      chainlinkRtdsSymbol: string;
-      chainlinkRtdsPingMs: number;
-      chainlinkHistoryUrl: string;
-      chainlinkHistoryFeedId: string;
-      chainlinkHistoryPollMs: number;
+      coinbaseEnabled: boolean;
+      coinbaseWsUrl: string;
+      coinbaseRestUrl: string;
+      coinbaseRestPollMs: number;
+      coinbaseRequestTimeoutMs: number;
+      coinbaseWsStaleMs: number;
       gammaBaseUrl: string;
       clobBaseUrl: string;
       dataApiBaseUrl: string;
@@ -562,14 +554,13 @@ export class SimulationEngine {
       wsStaleMs: config.binanceWsStaleMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
-    this.chainlinkConnector = new ChainlinkConnector({
+    this.coinbaseConnector = new CoinbaseConnector({
       symbol: config.symbol,
-      rtdsWsUrl: config.chainlinkRtdsWsUrl,
-      rtdsSymbol: config.chainlinkRtdsSymbol,
-      rtdsPingMs: config.chainlinkRtdsPingMs,
-      historyUrl: config.chainlinkHistoryUrl,
-      historyFeedId: config.chainlinkHistoryFeedId,
-      historyPollMs: config.chainlinkHistoryPollMs,
+      wsUrl: config.coinbaseWsUrl,
+      restUrl: config.coinbaseRestUrl,
+      restPollMs: config.coinbaseRestPollMs,
+      requestTimeoutMs: config.coinbaseRequestTimeoutMs,
+      wsStaleMs: config.coinbaseWsStaleMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.polymarketConnector = new PolymarketConnector({
@@ -588,20 +579,16 @@ export class SimulationEngine {
       tradesPollMs: config.polymarketTradesPollMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
-    this.polymarketReferenceResolver = new PolymarketReferenceResolver({
-      requestTimeoutMs: config.polymarketDiscoveryTimeoutMs,
-      upstreamProxyUrl: config.upstreamProxyUrl
-    });
     this.binanceState = this.binanceConnector.getState();
-    this.chainlinkState = config.chainlinkEnabled
-      ? this.chainlinkConnector.getState()
-      : createDisabledChainlinkState(config.symbol);
+    this.coinbaseState = config.coinbaseEnabled
+      ? this.coinbaseConnector.getState()
+      : createDisabledCoinbaseState(config.symbol);
     this.polymarketState = this.polymarketConnector.getState();
   }
 
   async start() {
-    if (this.config.chainlinkEnabled) {
-      await this.restoreChainlinkMarketCandles();
+    if (this.config.coinbaseEnabled) {
+      await this.restoreCoinbaseMarketCandles();
     }
     this.unsubscribers.push(
       this.binanceConnector.subscribe((state) => {
@@ -613,20 +600,20 @@ export class SimulationEngine {
         this.scheduleSnapshotOnlyRefresh("clob");
       })
     );
-    if (this.config.chainlinkEnabled) {
+    if (this.config.coinbaseEnabled) {
       this.unsubscribers.push(
-        this.chainlinkConnector.subscribe((state) => {
-          this.chainlinkState = state;
-          this.recordChainlinkSample(state.price, state.updatedAt || Date.now());
-          this.syncChainlinkHistoryCandles(state.candlesByInterval);
-          this.scheduleSnapshotOnlyRefresh("chainlink");
+        this.coinbaseConnector.subscribe((state) => {
+          this.coinbaseState = state;
+          this.recordCoinbaseSample(state.price, state.updatedAt || Date.now());
+          this.syncCoinbaseHistoryCandles(state.candlesByInterval);
+          this.scheduleSnapshotOnlyRefresh("coinbase");
         })
       );
     }
 
     this.binanceConnector.start();
-    if (this.config.chainlinkEnabled) {
-      this.chainlinkConnector.start();
+    if (this.config.coinbaseEnabled) {
+      this.coinbaseConnector.start();
     }
     this.polymarketConnector.start();
     this.reconcileTimer = setInterval(
@@ -645,14 +632,14 @@ export class SimulationEngine {
       this.unsubscribers.pop()?.();
     }
     this.binanceConnector.stop();
-    if (this.config.chainlinkEnabled) {
-      this.chainlinkConnector.stop();
+    if (this.config.coinbaseEnabled) {
+      this.coinbaseConnector.stop();
     }
-    if (this.chainlinkMarketCandleFlushTimer) {
-      clearTimeout(this.chainlinkMarketCandleFlushTimer);
-      this.chainlinkMarketCandleFlushTimer = undefined;
+    if (this.coinbaseMarketCandleFlushTimer) {
+      clearTimeout(this.coinbaseMarketCandleFlushTimer);
+      this.coinbaseMarketCandleFlushTimer = undefined;
     }
-    await this.flushPendingChainlinkMarketCandles();
+    await this.flushPendingCoinbaseMarketCandles();
     this.polymarketConnector.stop();
   }
 
@@ -1900,7 +1887,7 @@ export class SimulationEngine {
       binance1mLastClose: candles["1m"].at(-1)?.close ?? 0,
       binance5mLastClose: candles["5m"].at(-1)?.close ?? 0,
       binance1dLastClose: candles["1d"].at(-1)?.close ?? 0,
-      chainlinkPrice: snapshot.chainlink.referencePrice,
+      coinbasePrice: snapshot.coinbase.referencePrice,
       priceToBeat: snapshot.priceToBeat,
       upPrice: snapshot.upPrice,
       downPrice: snapshot.downPrice,
@@ -1928,7 +1915,7 @@ export class SimulationEngine {
       redeemFinishTimeMs: input.redeemFinishTimeMs,
       sourceStates: {
         binance: this.pickSourceState(snapshot.sources.binance),
-        chainlink: this.pickSourceState(snapshot.sources.chainlink),
+        coinbase: this.pickSourceState(snapshot.sources.coinbase),
         clob: this.pickSourceState(snapshot.sources.clob)
       },
       contextJson
@@ -1987,7 +1974,7 @@ export class SimulationEngine {
     }
   }
 
-  private scheduleSnapshotOnlyRefresh(source: "binance" | "chainlink" | "clob") {
+  private scheduleSnapshotOnlyRefresh(source: "binance" | "coinbase" | "clob") {
     this.snapshotRefreshSources.add(source);
     this.snapshotRefreshQueued = true;
     this.snapshotRefreshQueuedAt ??= Date.now();
@@ -2129,41 +2116,41 @@ export class SimulationEngine {
     return { ...round, binanceOpenPrice: reference };
   }
 
-  private resolveCurrentRoundChainlinkOpenReference(round: RoundRecord | undefined, now: number) {
+  private resolveCurrentRoundCoinbaseOpenReference(round: RoundRecord | undefined, now: number) {
     if (!round || round.startAt > now) {
       return undefined;
     }
-    if (isBtcReferencePrice(round.chainlinkOpenPrice)) {
-      return roundNumber(round.chainlinkOpenPrice, 2);
+    if (isBtcReferencePrice(round.coinbaseOpenPrice)) {
+      return roundNumber(round.coinbaseOpenPrice, 2);
     }
-    const bar = this.chainlinkCandlesByInterval?.["30s"]?.find(
+    const bar = this.coinbaseCandlesByInterval?.["30s"]?.find(
       (candidate) => candidate.startTs === round.startAt && isBtcReferencePrice(candidate.open)
     );
     return bar ? roundNumber(bar.open, 2) : undefined;
   }
 
-  private resolveRoundChainlinkCloseReference(round: RoundRecord | undefined, now = Date.now()) {
+  private resolveRoundCoinbaseCloseReference(round: RoundRecord | undefined, now = Date.now()) {
     if (!round || now < round.endAt) {
       return undefined;
     }
-    if (isBtcReferencePrice(round.chainlinkClosePrice)) {
-      return roundNumber(round.chainlinkClosePrice, 2);
+    if (isBtcReferencePrice(round.coinbaseClosePrice)) {
+      return roundNumber(round.coinbaseClosePrice, 2);
     }
-    const bar = this.chainlinkCandlesByInterval?.["30s"]?.find(
+    const bar = this.coinbaseCandlesByInterval?.["30s"]?.find(
       (candidate) => candidate.endTs === round.endAt && isBtcReferencePrice(candidate.close)
     );
     return bar ? roundNumber(bar.close, 2) : undefined;
   }
 
-  withCurrentRoundChainlinkOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
+  withCurrentRoundCoinbaseOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
     if (!round) {
       return round;
     }
-    const reference = this.resolveCurrentRoundChainlinkOpenReference(round, now);
-    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.chainlinkOpenPrice)) {
+    const reference = this.resolveCurrentRoundCoinbaseOpenReference(round, now);
+    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.coinbaseOpenPrice)) {
       return round;
     }
-    return { ...round, chainlinkOpenPrice: reference };
+    return { ...round, coinbaseOpenPrice: reference };
   }
 
   private pruneCurrentRoundBinanceOpenReferences(activeRoundId: string, now: number) {
@@ -2987,8 +2974,8 @@ export class SimulationEngine {
         redeemScheduledAt: existing?.redeemScheduledAt,
         binanceOpenPrice: existing?.binanceOpenPrice,
         binanceClosePrice: existing?.binanceClosePrice,
-        chainlinkOpenPrice: existing?.chainlinkOpenPrice,
-        chainlinkClosePrice: existing?.chainlinkClosePrice,
+        coinbaseOpenPrice: existing?.coinbaseOpenPrice,
+        coinbaseClosePrice: existing?.coinbaseClosePrice,
         redeemStartTs: existing?.redeemStartTs,
         redeemFinishTs: existing?.redeemFinishTs,
         manualReason: existing?.manualReason,
@@ -3029,21 +3016,20 @@ export class SimulationEngine {
         round.binanceClosePrice = roundNumber(this.binanceState.price, 2);
       }
 
-      const chainlinkOpenReference = this.resolveCurrentRoundChainlinkOpenReference(round, now);
-      if (!round.chainlinkOpenPrice && isBtcReferencePrice(chainlinkOpenReference)) {
-        round.chainlinkOpenPrice = chainlinkOpenReference;
+      const coinbaseOpenReference = this.resolveCurrentRoundCoinbaseOpenReference(round, now);
+      if (!round.coinbaseOpenPrice && isBtcReferencePrice(coinbaseOpenReference)) {
+        round.coinbaseOpenPrice = coinbaseOpenReference;
       }
 
-      const chainlinkCloseReference = this.resolveRoundChainlinkCloseReference(round);
-      if (!round.chainlinkClosePrice && isBtcReferencePrice(chainlinkCloseReference)) {
-        round.chainlinkClosePrice = chainlinkCloseReference;
+      const coinbaseCloseReference = this.resolveRoundCoinbaseCloseReference(round);
+      if (!round.coinbaseClosePrice && isBtcReferencePrice(coinbaseCloseReference)) {
+        round.coinbaseClosePrice = coinbaseCloseReference;
       }
 
       if (!round.closingSpotPrice && now >= round.endAt && this.binanceState.price > 0) {
         round.closingSpotPrice = roundNumber(this.binanceState.price, 2);
         round.closingPriceSource = "Gamma";
       }
-      await this.hydrateRoundPolymarketReferencePrices(round, now);
       this.syncPriceToBeatFromPolymarketOpenPrice(round, now);
       this.refreshPreliminarySettlement(round, now);
 
@@ -3136,63 +3122,63 @@ export class SimulationEngine {
     return this.config.gammaPollIntervalMs;
   }
 
-  private async restoreChainlinkMarketCandles(now = Date.now()) {
+  private async restoreCoinbaseMarketCandles(now = Date.now()) {
     const candles = this.store.getMarketCandles({
-      source: "chainlink",
+      source: "coinbase",
       symbol: this.config.symbol,
       interval: "30s",
-      fromOpenTs: now - CHAINLINK_MARKET_CANDLE_RESTORE_MS
+      fromOpenTs: now - COINBASE_MARKET_CANDLE_RESTORE_MS
     });
     if (candles.length === 0) {
       return;
     }
-    this.mergeChainlinkThirtySecondBars(candles.map((candle) => marketCandleToBar(candle)));
+    this.mergeCoinbaseThirtySecondBars(candles.map((candle) => marketCandleToBar(candle)));
   }
 
-  private mergeChainlinkThirtySecondBars(bars: CandleBar[]) {
-    this.chainlinkCandlesByInterval["30s"] = mergeChainlinkHistoryBars(
-      this.chainlinkCandlesByInterval["30s"],
+  private mergeCoinbaseThirtySecondBars(bars: CandleBar[]) {
+    this.coinbaseCandlesByInterval["30s"] = mergeCoinbaseHistoryBars(
+      this.coinbaseCandlesByInterval["30s"],
       bars,
       "30s"
     );
-    this.refreshChainlinkAggregatesFromThirtySecondBars();
+    this.refreshCoinbaseAggregatesFromThirtySecondBars();
   }
 
-  private refreshChainlinkAggregatesFromThirtySecondBars() {
-    const thirtySecondBars = this.chainlinkCandlesByInterval["30s"];
-    this.chainlinkCandlesByInterval["1m"] = aggregateChainlinkBars("1m", thirtySecondBars);
-    this.chainlinkCandlesByInterval["5m"] = aggregateChainlinkBars("5m", thirtySecondBars);
-    this.chainlinkCandlesByInterval["15m"] = aggregateChainlinkBars("15m", thirtySecondBars);
-    this.chainlinkCandlesByInterval["1h"] = aggregateChainlinkBars("1h", thirtySecondBars);
+  private refreshCoinbaseAggregatesFromThirtySecondBars() {
+    const thirtySecondBars = this.coinbaseCandlesByInterval["30s"];
+    this.coinbaseCandlesByInterval["1m"] = aggregateCoinbaseBars("1m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["5m"] = aggregateCoinbaseBars("5m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["15m"] = aggregateCoinbaseBars("15m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["1h"] = aggregateCoinbaseBars("1h", thirtySecondBars);
   }
 
-  private refreshChainlinkAggregateBucketFromThirtySecondBar(bar: CandleBar) {
+  private refreshCoinbaseAggregateBucketFromThirtySecondBar(bar: CandleBar) {
     for (const interval of ["1m", "5m", "15m", "1h"] as const) {
-      const bucketSize = CHAINLINK_INTERVAL_MS[interval];
+      const bucketSize = COINBASE_INTERVAL_MS[interval];
       const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
       const endTs = startTs + bucketSize;
-      const sourceBars = this.chainlinkCandlesByInterval["30s"].filter(
+      const sourceBars = this.coinbaseCandlesByInterval["30s"].filter(
         (candidate) => candidate.startTs >= startTs && candidate.startTs < endTs
       );
-      const [aggregate] = aggregateChainlinkBars(interval, sourceBars);
+      const [aggregate] = aggregateCoinbaseBars(interval, sourceBars);
       if (!aggregate) {
         continue;
       }
-      const existing = this.chainlinkCandlesByInterval[interval].filter((candidate) => candidate.startTs !== startTs);
-      this.chainlinkCandlesByInterval[interval] = [...existing, aggregate]
+      const existing = this.coinbaseCandlesByInterval[interval].filter((candidate) => candidate.startTs !== startTs);
+      this.coinbaseCandlesByInterval[interval] = [...existing, aggregate]
         .sort((left, right) => left.startTs - right.startTs)
-        .slice(-CHAINLINK_BAR_LIMITS[interval]);
+        .slice(-COINBASE_BAR_LIMITS[interval]);
     }
   }
 
-  private chainlinkMarketCandleFromBar(bar: CandleBar, origin: MarketCandleRecord["origin"]): MarketCandleRecord {
-    const openTs = Math.floor(bar.startTs / CHAINLINK_INTERVAL_MS["30s"]) * CHAINLINK_INTERVAL_MS["30s"];
+  private coinbaseMarketCandleFromBar(bar: CandleBar, origin: MarketCandleRecord["origin"]): MarketCandleRecord {
+    const openTs = Math.floor(bar.startTs / COINBASE_INTERVAL_MS["30s"]) * COINBASE_INTERVAL_MS["30s"];
     return {
-      source: "chainlink",
+      source: "coinbase",
       symbol: this.config.symbol,
       interval: "30s",
       openTs,
-      closeTs: openTs + CHAINLINK_INTERVAL_MS["30s"],
+      closeTs: openTs + COINBASE_INTERVAL_MS["30s"],
       open: roundNumber(bar.open, 2),
       high: roundNumber(bar.high, 2),
       low: roundNumber(bar.low, 2),
@@ -3203,62 +3189,62 @@ export class SimulationEngine {
     };
   }
 
-  private queueChainlinkMarketCandle(candle: MarketCandleRecord) {
-    const existing = this.pendingChainlinkMarketCandles.get(candle.openTs);
-    if (shouldReplaceChainlinkMarketCandle(existing, candle)) {
-      this.pendingChainlinkMarketCandles.set(candle.openTs, candle);
+  private queueCoinbaseMarketCandle(candle: MarketCandleRecord) {
+    const existing = this.pendingCoinbaseMarketCandles.get(candle.openTs);
+    if (shouldReplaceCoinbaseMarketCandle(existing, candle)) {
+      this.pendingCoinbaseMarketCandles.set(candle.openTs, candle);
     }
-    if (this.pendingChainlinkMarketCandles.size >= CHAINLINK_MARKET_CANDLE_FLUSH_SIZE) {
-      void this.flushPendingChainlinkMarketCandles();
+    if (this.pendingCoinbaseMarketCandles.size >= COINBASE_MARKET_CANDLE_FLUSH_SIZE) {
+      void this.flushPendingCoinbaseMarketCandles();
       return;
     }
-    if (!this.chainlinkMarketCandleFlushTimer) {
-      this.chainlinkMarketCandleFlushTimer = setTimeout(() => {
-        this.chainlinkMarketCandleFlushTimer = undefined;
-        void this.flushPendingChainlinkMarketCandles();
-      }, CHAINLINK_MARKET_CANDLE_FLUSH_MS);
+    if (!this.coinbaseMarketCandleFlushTimer) {
+      this.coinbaseMarketCandleFlushTimer = setTimeout(() => {
+        this.coinbaseMarketCandleFlushTimer = undefined;
+        void this.flushPendingCoinbaseMarketCandles();
+      }, COINBASE_MARKET_CANDLE_FLUSH_MS);
     }
   }
 
-  private async flushPendingChainlinkMarketCandles() {
-    if (this.chainlinkMarketCandleFlushRunning || this.pendingChainlinkMarketCandles.size === 0) {
+  private async flushPendingCoinbaseMarketCandles() {
+    if (this.coinbaseMarketCandleFlushRunning || this.pendingCoinbaseMarketCandles.size === 0) {
       return;
     }
-    this.chainlinkMarketCandleFlushRunning = true;
-    const batch = [...this.pendingChainlinkMarketCandles.values()];
+    this.coinbaseMarketCandleFlushRunning = true;
+    const batch = [...this.pendingCoinbaseMarketCandles.values()];
     try {
       await this.store.upsertMarketCandles(batch);
       for (const candle of batch) {
-        const current = this.pendingChainlinkMarketCandles.get(candle.openTs);
+        const current = this.pendingCoinbaseMarketCandles.get(candle.openTs);
         if (current && current.updatedAt <= candle.updatedAt) {
-          this.pendingChainlinkMarketCandles.delete(candle.openTs);
+          this.pendingCoinbaseMarketCandles.delete(candle.openTs);
         }
       }
     } catch (error) {
-      console.warn("[simulation] Chainlink market candle flush failed:", error);
+      console.warn("[simulation] Coinbase market candle flush failed:", error);
     } finally {
-      this.chainlinkMarketCandleFlushRunning = false;
-      if (this.pendingChainlinkMarketCandles.size > 0 && !this.chainlinkMarketCandleFlushTimer) {
-        this.chainlinkMarketCandleFlushTimer = setTimeout(() => {
-          this.chainlinkMarketCandleFlushTimer = undefined;
-          void this.flushPendingChainlinkMarketCandles();
-        }, CHAINLINK_MARKET_CANDLE_FLUSH_MS);
+      this.coinbaseMarketCandleFlushRunning = false;
+      if (this.pendingCoinbaseMarketCandles.size > 0 && !this.coinbaseMarketCandleFlushTimer) {
+        this.coinbaseMarketCandleFlushTimer = setTimeout(() => {
+          this.coinbaseMarketCandleFlushTimer = undefined;
+          void this.flushPendingCoinbaseMarketCandles();
+        }, COINBASE_MARKET_CANDLE_FLUSH_MS);
       }
     }
   }
 
-  private recordChainlinkSample(price: number, ts = Date.now()) {
-    if (!this.config.chainlinkEnabled || !Number.isFinite(price) || price <= 0) {
+  private recordCoinbaseSample(price: number, ts = Date.now()) {
+    if (!this.config.coinbaseEnabled || !Number.isFinite(price) || price <= 0) {
       return;
     }
     const sampleKey = `${ts}:${roundNumber(price, 2)}`;
-    if (this.lastChainlinkSampleKey === sampleKey) {
+    if (this.lastCoinbaseSampleKey === sampleKey) {
       return;
     }
-    this.lastChainlinkSampleKey = sampleKey;
-    const bucketStart = Math.floor(ts / CHAINLINK_INTERVAL_MS["30s"]) * CHAINLINK_INTERVAL_MS["30s"];
-    const bucketEnd = bucketStart + CHAINLINK_INTERVAL_MS["30s"];
-    const current30s = this.chainlinkCandlesByInterval["30s"].at(-1);
+    this.lastCoinbaseSampleKey = sampleKey;
+    const bucketStart = Math.floor(ts / COINBASE_INTERVAL_MS["30s"]) * COINBASE_INTERVAL_MS["30s"];
+    const bucketEnd = bucketStart + COINBASE_INTERVAL_MS["30s"];
+    const current30s = this.coinbaseCandlesByInterval["30s"].at(-1);
     let next30s: CandleBar;
     if (current30s && current30s.startTs === bucketStart) {
       current30s.high = roundNumber(Math.max(current30s.high, price), 2);
@@ -3277,15 +3263,15 @@ export class SimulationEngine {
         close: roundNumber(price, 2),
         volume: 1
       };
-      this.chainlinkCandlesByInterval["30s"] = [...this.chainlinkCandlesByInterval["30s"], next30s].slice(
-        -CHAINLINK_BAR_LIMITS["30s"]
+      this.coinbaseCandlesByInterval["30s"] = [...this.coinbaseCandlesByInterval["30s"], next30s].slice(
+        -COINBASE_BAR_LIMITS["30s"]
       );
     }
-    this.refreshChainlinkAggregateBucketFromThirtySecondBar(next30s);
-    this.queueChainlinkMarketCandle(this.chainlinkMarketCandleFromBar(next30s, "rtds_30s"));
+    this.refreshCoinbaseAggregateBucketFromThirtySecondBar(next30s);
+    this.queueCoinbaseMarketCandle(this.coinbaseMarketCandleFromBar(next30s, "rtds_30s"));
     const sampleBucketStart = Math.floor(ts / 5000) * 5000;
     const sampleBucketEnd = sampleBucketStart + 5000;
-    const current = this.chainlinkCandles5s.at(-1);
+    const current = this.coinbaseCandles5s.at(-1);
     if (current && current.startTs === sampleBucketStart) {
       current.high = roundNumber(Math.max(current.high, price), 2);
       current.low = roundNumber(Math.min(current.low, price), 2);
@@ -3293,7 +3279,7 @@ export class SimulationEngine {
       current.volume += 1;
       return;
     }
-    this.chainlinkCandles5s.push({
+    this.coinbaseCandles5s.push({
       interval: "5s",
       startTs: sampleBucketStart,
       endTs: sampleBucketEnd,
@@ -3303,12 +3289,12 @@ export class SimulationEngine {
       close: roundNumber(price, 2),
       volume: 1
     });
-    if (this.chainlinkCandles5s.length > 50) {
-      this.chainlinkCandles5s = this.chainlinkCandles5s.slice(-50);
+    if (this.coinbaseCandles5s.length > 50) {
+      this.coinbaseCandles5s = this.coinbaseCandles5s.slice(-50);
     }
   }
 
-  private syncChainlinkHistoryCandles(candlesByInterval?: ChainlinkConnectorState["candlesByInterval"]) {
+  private syncCoinbaseHistoryCandles(candlesByInterval?: CoinbaseConnectorState["candlesByInterval"]) {
     if (!candlesByInterval) {
       return;
     }
@@ -3318,19 +3304,19 @@ export class SimulationEngine {
     }
     const latestBar = bars.at(-1);
     const now = Date.now();
-    if (now - this.lastChainlinkHistorySyncAt < CHAINLINK_HISTORY_CANDLE_SYNC_MIN_MS) {
+    if (now - this.lastCoinbaseHistorySyncAt < COINBASE_HISTORY_CANDLE_SYNC_MIN_MS) {
       return;
     }
     const historyKey = `${bars.length}:${latestBar?.startTs ?? 0}:${latestBar?.close ?? 0}`;
-    if (this.lastChainlinkHistorySyncKey === historyKey) {
+    if (this.lastCoinbaseHistorySyncKey === historyKey) {
       return;
     }
-    this.lastChainlinkHistorySyncKey = historyKey;
-    this.lastChainlinkHistorySyncAt = now;
-    const historyCandles = bars.map((bar) => this.chainlinkMarketCandleFromBar(bar, "history_1m_split"));
-    this.mergeChainlinkThirtySecondBars(historyCandles.map((candle) => marketCandleToBar(candle)));
+    this.lastCoinbaseHistorySyncKey = historyKey;
+    this.lastCoinbaseHistorySyncAt = now;
+    const historyCandles = bars.map((bar) => this.coinbaseMarketCandleFromBar(bar, "history_1m_split"));
+    this.mergeCoinbaseThirtySecondBars(historyCandles.map((candle) => marketCandleToBar(candle)));
     for (const candle of historyCandles) {
-      this.queueChainlinkMarketCandle(candle);
+      this.queueCoinbaseMarketCandle(candle);
     }
   }
 
@@ -3404,11 +3390,11 @@ export class SimulationEngine {
     });
     const upDisplayPrice = displayPrices.UP;
     const downDisplayPrice = displayPrices.DOWN;
-    const chainlinkPrice =
-      this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
+    const coinbasePrice =
+      this.config.coinbaseEnabled && this.coinbaseState.price > 0 ? roundNumber(this.coinbaseState.price, 2) : 0;
     const binancePrice = this.binanceState.price > 0 ? roundNumber(this.binanceState.price, 2) : 0;
     const currentRoundBinanceOpenReference = this.resolveCurrentRoundBinanceOpenReference(currentRound, now);
-    const currentRoundChainlinkOpenReference = this.resolveCurrentRoundChainlinkOpenReference(currentRound, now);
+    const currentRoundCoinbaseOpenReference = this.resolveCurrentRoundCoinbaseOpenReference(currentRound, now);
     const countdownTargetTs = currentRound
       ? currentRound.startAt > now
         ? currentRound.startAt
@@ -3429,18 +3415,18 @@ export class SimulationEngine {
       const marketInfo = clobMarketInfoFor(matchedMarket);
       const sources = {
         binance: this.normalizeSourceHealth(this.binanceState.status, now),
-        chainlink: this.normalizeSourceHealth(this.chainlinkState.status, now),
+        coinbase: this.normalizeSourceHealth(this.coinbaseState.status, now),
         clob: this.normalizeSourceHealth(this.polymarketState.status, now)
       };
       const latencyBreakdown = {
         sourceEventAge: {
           binance: Math.max(now - sources.binance.sourceEventTs, 0),
-          chainlink: Math.max(now - sources.chainlink.sourceEventTs, 0),
+          coinbase: Math.max(now - sources.coinbase.sourceEventTs, 0),
           clob: Math.max(now - sources.clob.sourceEventTs, 0)
         },
         serverIngressLatency: {
           binance: Math.max(sources.binance.serverRecvTs - sources.binance.sourceEventTs, 0),
-          chainlink: Math.max(sources.chainlink.serverRecvTs - sources.chainlink.sourceEventTs, 0),
+          coinbase: Math.max(sources.coinbase.serverRecvTs - sources.coinbase.sourceEventTs, 0),
           clob: Math.max(sources.clob.serverRecvTs - sources.clob.sourceEventTs, 0)
         },
         serverComputeLatency: Math.max(Date.now() - now, 0)
@@ -3465,8 +3451,8 @@ export class SimulationEngine {
       seriesSlug: currentRound?.seriesSlug ?? matchedMarket?.seriesSlug,
       serverNow: now,
       binancePrice,
-      chainlinkPrice,
-      currentPrice: binancePrice || chainlinkPrice,
+      coinbasePrice,
+      currentPrice: binancePrice || coinbasePrice,
       priceToBeat: officialPriceToBeat ?? 0,
       displayPriceToBeat: officialPriceToBeat ?? fallbackDisplayPriceToBeat,
       displayPriceToBeatSource: officialPriceToBeat
@@ -3501,17 +3487,17 @@ export class SimulationEngine {
         latestTick: this.binanceState.latestTick,
         candlesByInterval
       },
-      chainlink: {
-        referencePrice: chainlinkPrice,
-        settlementReference: currentRound?.settlementPrice ?? chainlinkPrice,
-        currentRoundOpenReference: currentRoundChainlinkOpenReference,
-        candles5s: [...this.chainlinkCandles5s],
+      coinbase: {
+        referencePrice: coinbasePrice,
+        settlementReference: currentRound?.settlementPrice ?? coinbasePrice,
+        currentRoundOpenReference: currentRoundCoinbaseOpenReference,
+        candles5s: [...this.coinbaseCandles5s],
         candlesByInterval: {
-          "30s": [...this.chainlinkCandlesByInterval["30s"]],
-          "1m": [...this.chainlinkCandlesByInterval["1m"]],
-          "5m": [...this.chainlinkCandlesByInterval["5m"]],
-          "15m": [...this.chainlinkCandlesByInterval["15m"]],
-          "1h": [...this.chainlinkCandlesByInterval["1h"]],
+          "30s": [...this.coinbaseCandlesByInterval["30s"]],
+          "1m": [...this.coinbaseCandlesByInterval["1m"]],
+          "5m": [...this.coinbaseCandlesByInterval["5m"]],
+          "15m": [...this.coinbaseCandlesByInterval["15m"]],
+          "1h": [...this.coinbaseCandlesByInterval["1h"]],
           "1d": []
         }
       },
@@ -3545,7 +3531,7 @@ export class SimulationEngine {
         marketSwitchState: this.getMarketSwitchState(currentRound, matchedMarket, now),
         sourceStatusSummary: [
           { source: "Binance", state: this.binanceState.status.state },
-          { source: "Chainlink", state: this.chainlinkState.status.state },
+          { source: "Coinbase", state: this.coinbaseState.status.state },
           { source: "CLOB", state: this.polymarketState.status.state }
         ]
       }
@@ -4408,50 +4394,6 @@ export class SimulationEngine {
     round.priceToBeatCapturedAt = now;
   }
 
-  private async hydrateRoundPolymarketReferencePrices(round: RoundRecord, now: number) {
-    if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isOfficialPtbSource(round.polymarketOpenPriceSource)) {
-      round.polymarketOpenPrice = undefined;
-      round.polymarketOpenPriceSource = undefined;
-    }
-    if (!isBtcReferencePrice(round.polymarketClosePrice) || !isOfficialPtbSource(round.polymarketClosePriceSource)) {
-      round.polymarketClosePrice = undefined;
-      round.polymarketClosePriceSource = undefined;
-    }
-    const liveDetail =
-      this.polymarketState.currentMarket?.slug === round.marketSlug ? this.polymarketState.currentMarket : undefined;
-    const resolutionSource = liveDetail?.resolutionSource ?? round.resolutionSource;
-    const isActiveRound = round.startAt <= now && round.endAt > now;
-    if (!round.polymarketOpenPrice && round.startAt <= now) {
-      let openReference;
-      try {
-        openReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.startAt, {
-          resolutionSource,
-          historyCacheMs: isActiveRound ? 2_000 : undefined
-        });
-      } catch (error) {
-        console.warn(`[simulation] Failed to resolve Chainlink opening reference for ${round.id}:`, error);
-      }
-      if (isBtcReferencePrice(openReference?.price)) {
-        round.polymarketOpenPrice = roundNumber(openReference.price, 2);
-        round.polymarketOpenPriceSource = openReference.source;
-      }
-    }
-    if (!round.polymarketClosePrice && now >= round.endAt) {
-      let closeReference;
-      try {
-        closeReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.endAt, {
-          resolutionSource
-        });
-      } catch (error) {
-        console.warn(`[simulation] Failed to resolve Chainlink closing reference for ${round.id}:`, error);
-      }
-      if (isBtcReferencePrice(closeReference?.price)) {
-        round.polymarketClosePrice = roundNumber(closeReference.price, 2);
-        round.polymarketClosePriceSource = closeReference.source;
-      }
-    }
-  }
-
   private collectRoundPositionUsers(roundId: string) {
     return new Set(
       this.store.positions
@@ -4498,8 +4440,8 @@ export class SimulationEngine {
       round.redeemScheduledAt,
       round.binanceOpenPrice,
       round.binanceClosePrice,
-      round.chainlinkOpenPrice,
-      round.chainlinkClosePrice,
+      round.coinbaseOpenPrice,
+      round.coinbaseClosePrice,
       round.redeemStartTs,
       round.redeemFinishTs,
       round.manualReason,

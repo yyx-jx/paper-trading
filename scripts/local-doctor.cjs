@@ -51,20 +51,12 @@ const effectiveEnv = Object.keys(env).length > 0 ? env : exampleEnv;
 
 const dockerInfo = run("docker info", "docker info");
 const dockerComposePs = run("docker compose ps", "docker compose -f docker-compose.local.yml ps");
-const placeholderPrimary =
-  !effectiveEnv.CHAINLINK_RPC_URL ||
-  effectiveEnv.CHAINLINK_RPC_URL.includes("YOUR_PRIMARY_KEY") ||
-  effectiveEnv.CHAINLINK_RPC_URL.includes("YOUR_ALCHEMY_KEY");
-const placeholderFallback =
-  !effectiveEnv.CHAINLINK_FALLBACK_RPC_URLS ||
-  effectiveEnv.CHAINLINK_FALLBACK_RPC_URLS.includes("YOUR_FALLBACK_KEY") ||
-  effectiveEnv.CHAINLINK_FALLBACK_RPC_URLS.includes("YOUR_INFURA_KEY");
-const preferredPrimary = effectiveEnv.CHAINLINK_RPC_URL?.includes("alchemy.com");
-const preferredFallback = effectiveEnv.CHAINLINK_FALLBACK_RPC_URLS?.includes("infura.io");
 const embeddedMatching = effectiveEnv.EMBEDDED_MATCHING_SERVICE !== "false";
-const chainlinkEnabled = effectiveEnv.CHAINLINK_ENABLED !== "false";
+const coinbaseEnabled = effectiveEnv.COINBASE_ENABLED !== "false";
 const upstreamProxyUrl = effectiveEnv.UPSTREAM_PROXY_URL ?? "";
-const chainlinkPollMs = Number(effectiveEnv.CHAINLINK_POLL_MS ?? 0);
+const coinbaseWsUrl = effectiveEnv.COINBASE_WS_URL ?? "";
+const coinbaseRestUrl = effectiveEnv.COINBASE_REST_URL ?? "";
+const coinbaseRestPollMs = Number(effectiveEnv.COINBASE_REST_POLL_MS ?? 0);
 
 console.log("Local Doctor");
 console.log("============");
@@ -78,19 +70,17 @@ if (!dockerInfo.ok) {
 }
 console.log(
   statusLine(
-    !chainlinkEnabled,
-    "CHAINLINK_ENABLED=false for local Binance + Polymarket testing"
+    !coinbaseEnabled,
+    "COINBASE_ENABLED=false for local Binance + Polymarket testing"
   )
 );
 console.log(statusLine(upstreamProxyUrl === "http://127.0.0.1:7897", "UPSTREAM_PROXY_URL is set to the local proxy (http://127.0.0.1:7897)"));
-if (chainlinkEnabled) {
-  console.log(statusLine(!placeholderPrimary, "CHAINLINK_RPC_URL is using a real endpoint"));
-  console.log(statusLine(!placeholderFallback, "CHAINLINK_FALLBACK_RPC_URLS is using real endpoints"));
-  console.log(statusLine(Boolean(preferredPrimary), "Primary Chainlink RPC is using the recommended Alchemy Free endpoint"));
-  console.log(statusLine(Boolean(preferredFallback), "Fallback Chainlink RPC is using the recommended Infura Free endpoint"));
-  console.log(statusLine(chainlinkPollMs === 5000, "CHAINLINK_POLL_MS is set to the recommended low-cost value (5000ms)"));
+if (coinbaseEnabled) {
+  console.log(statusLine(coinbaseWsUrl === "wss://advanced-trade-ws.coinbase.com", "COINBASE_WS_URL uses the public Coinbase Advanced Trade endpoint"));
+  console.log(statusLine(coinbaseRestUrl === "https://api.exchange.coinbase.com", "COINBASE_REST_URL uses the public Coinbase Exchange REST endpoint"));
+  console.log(statusLine(coinbaseRestPollMs === 5000, "COINBASE_REST_POLL_MS is set to the recommended fallback cadence (5000ms)"));
 } else {
-  console.log("[OK] Chainlink RPC endpoints are optional in local testing mode");
+  console.log("[OK] Coinbase cross-check is optional in local testing mode");
 }
 console.log(statusLine(embeddedMatching, "EMBEDDED_MATCHING_SERVICE=true for local dev"));
 console.log(statusLine(dockerComposePs.ok, "docker compose local file parses and can talk to Docker"));
@@ -106,6 +96,6 @@ console.log("3. npm run dev:server");
 console.log("4. npm run dev");
 console.log("5. Invoke-RestMethod http://127.0.0.1:8787/health");
 
-if (chainlinkEnabled && (placeholderPrimary || placeholderFallback)) {
-  console.log("\nFull real-source local success is currently impossible until you replace the Chainlink RPC placeholders in .env.");
+if (coinbaseEnabled && (!coinbaseWsUrl || !coinbaseRestUrl)) {
+  console.log("\nFull real-source local success is currently impossible until you configure the Coinbase endpoints in .env.");
 }

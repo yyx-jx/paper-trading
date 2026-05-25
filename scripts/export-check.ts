@@ -290,7 +290,7 @@ async function lifecycleStoreChecks() {
     symbol: "BTC",
     databaseUrl: "",
     redisUrl: "",
-    chainlinkEnabled: false
+    coinbaseEnabled: false
   });
   const base = {
     traceId: "trace-life",
