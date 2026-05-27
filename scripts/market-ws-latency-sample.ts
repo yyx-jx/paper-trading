@@ -49,6 +49,7 @@ interface MarketMessage {
 
 const baseUrl = requiredEnv("LOAD_TEST_BASE_URL").replace(/\/+$/, "");
 const durationMs = envInt("LOAD_TEST_SAMPLE_MS", 120_000);
+const clobSourceAgeLimitMs = envInt("LOAD_TEST_CLOB_SOURCE_AGE_LIMIT_MS", 1500);
 const outputPath = process.env.LOAD_TEST_OUTPUT?.trim();
 const tokenFromEnv = process.env.LOAD_TEST_TOKEN?.trim();
 const username = process.env.LOAD_TEST_USERNAME?.trim();
@@ -89,6 +90,10 @@ let firstPayloadSeq = 0;
 let lastPayloadSeq = 0;
 let outOfOrder = 0;
 let clockOffsetMs = 0;
+let clobSourceAgeOverLimitSamples = 0;
+let clobSourceAgeOverLimitStreaks = 0;
+let clobSourceAgeOverLimitStartedAt = 0;
+let clobSourceAgeLongestOverLimitMs = 0;
 
 void main().catch((error) => {
   console.error(error instanceof Error ? error.message : error);
@@ -206,11 +211,16 @@ function recordMessage(message: MarketMessage, receivedAt: number, processedAt: 
   for (const key of ["binance", "coinbase", "clob"] as const) {
     const source = sources[key];
     sourceToBackend[key].push(Math.max(source.serverRecvTs - source.sourceEventTs, 0));
-    sourceAges[key].push(Math.max(receivedAt - source.normalizedTs - clockOffsetMs, 0));
+    const sourceAge = Math.max(receivedAt - source.normalizedTs - clockOffsetMs, 0);
+    sourceAges[key].push(sourceAge);
+    if (key === "clob") {
+      recordClobSourceAgeLimit(sourceAge, receivedAt);
+    }
   }
 }
 
 function buildResult(startedAt: number, finishedAt: number) {
+  finalizeClobSourceAgeLimit(finishedAt);
   return {
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date(finishedAt).toISOString(),
@@ -251,10 +261,50 @@ function buildResult(startedAt: number, finishedAt: number) {
     binanceSourceToBackendP95: percentile(sourceToBackend.binance, 95),
     clobSourceToBackendP95: percentile(sourceToBackend.clob, 95),
     coinbaseSourceToBackendP95: percentile(sourceToBackend.coinbase, 95),
+    binanceSourceAgeP50: percentile(sourceAges.binance, 50),
     binanceSourceAgeP95: percentile(sourceAges.binance, 95),
+    binanceSourceAgeP99: percentile(sourceAges.binance, 99),
+    binanceSourceAgeMax: max(sourceAges.binance),
+    clobSourceAgeP50: percentile(sourceAges.clob, 50),
     clobSourceAgeP95: percentile(sourceAges.clob, 95),
-    coinbaseSourceAgeP95: percentile(sourceAges.coinbase, 95)
+    clobSourceAgeP99: percentile(sourceAges.clob, 99),
+    clobSourceAgeMax: max(sourceAges.clob),
+    clobSourceAgeLimitMs,
+    clobSourceAgeOverLimitSamples,
+    clobSourceAgeOverLimitStreaks,
+    clobSourceAgeLongestOverLimitMs,
+    coinbaseSourceAgeP50: percentile(sourceAges.coinbase, 50),
+    coinbaseSourceAgeP95: percentile(sourceAges.coinbase, 95),
+    coinbaseSourceAgeP99: percentile(sourceAges.coinbase, 99),
+    coinbaseSourceAgeMax: max(sourceAges.coinbase)
   };
+}
+
+function recordClobSourceAgeLimit(sourceAge: number, receivedAt: number) {
+  if (sourceAge <= clobSourceAgeLimitMs) {
+    finalizeClobSourceAgeLimit(receivedAt);
+    return;
+  }
+  clobSourceAgeOverLimitSamples += 1;
+  if (!clobSourceAgeOverLimitStartedAt) {
+    clobSourceAgeOverLimitStartedAt = receivedAt;
+    clobSourceAgeOverLimitStreaks += 1;
+  }
+  clobSourceAgeLongestOverLimitMs = Math.max(
+    clobSourceAgeLongestOverLimitMs,
+    receivedAt - clobSourceAgeOverLimitStartedAt
+  );
+}
+
+function finalizeClobSourceAgeLimit(now: number) {
+  if (!clobSourceAgeOverLimitStartedAt) {
+    return;
+  }
+  clobSourceAgeLongestOverLimitMs = Math.max(
+    clobSourceAgeLongestOverLimitMs,
+    now - clobSourceAgeOverLimitStartedAt
+  );
+  clobSourceAgeOverLimitStartedAt = 0;
 }
 
 async function sampleClockOffset() {

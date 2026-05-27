@@ -57,6 +57,8 @@ const LOG_FILE_TAIL_BYTES = 512 * 1024;
 const MEMORY_GUARD_INTERVAL_MS = 15_000;
 const PERSISTENCE_FAILURE_THRESHOLD = 3;
 const MARKET_CANDLE_MEMORY_RETENTION_MS = 24 * 60 * 60_000;
+const MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS = 1_000;
+const ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS = 1_000;
 const MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
   history_1m_split: 1,
   rtds_30s: 2
@@ -824,6 +826,7 @@ export class AppStore {
   public readonly orders: OrderRecord[] = [];
   public readonly orderLifecycleLogs: OrderLifecycleRecord[] = [];
   public readonly orderBookSnapshots = new Map<string, OrderBookSnapshotRecord>();
+  private readonly pendingOrderBookSnapshotRecords = new Map<string, OrderBookSnapshotRecord>();
   public readonly positions: PositionRecord[] = [];
   private readonly marketCandles = new Map<string, MarketCandleRecord[]>();
   public readonly logs: AuditEvent[] = [];
@@ -839,6 +842,8 @@ export class AppStore {
   private redisEnabled = false;
   private queuedMarketSnapshot?: MarketSnapshot;
   private marketSnapshotPersistRunning = false;
+  private marketSnapshotPersistTimer?: ReturnType<typeof setTimeout>;
+  private lastMarketSnapshotPersistAt = 0;
   private lastRetentionCleanupAt = 0;
   private lastMemoryGuardAt = 0;
   private readonly orderIndexById = new Map<string, number>();
@@ -847,6 +852,10 @@ export class AppStore {
   private readonly pendingUserPayloadIds = new Map<string, UserPayloadScope>();
   private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
+  private orderBookSnapshotFlushRunning = false;
+  private orderBookSnapshotFlushTimer?: ReturnType<typeof setTimeout>;
+  private orderBookSnapshotFlushFailures = 0;
+  private orderBookSnapshotLastFlushMs = 0;
   private memoryProtectionState: MemoryProtectionState = "normal";
   private postgresReconnectTask?: Promise<void>;
   private closed = false;
@@ -1090,6 +1099,15 @@ export class AppStore {
     };
   }
 
+  getOrderBookSnapshotQueueStats() {
+    return {
+      pending: this.pendingOrderBookSnapshotRecords.size,
+      flushing: this.orderBookSnapshotFlushRunning,
+      failures: this.orderBookSnapshotFlushFailures,
+      lastFlushMs: this.orderBookSnapshotLastFlushMs
+    };
+  }
+
   captureTradeMutationSnapshot(): TradeMutationMemorySnapshot {
     return {
       users: [...this.users.entries()].map(([id, user]) => [id, { ...user }]),
@@ -1139,6 +1157,16 @@ export class AppStore {
     this.behaviorLogs.splice(0, this.behaviorLogs.length, ...snapshot.behaviorLogs.map((log) => ({ ...log })));
     this.rebuildHotIndexes();
     this.bumpHistoryRevision();
+  }
+
+  prepareOrderBookSnapshotForOrder(order: OrderRecord) {
+    if (!order.orderBookSnapshot) {
+      return order.orderBookSnapshotRef;
+    }
+    const ref = this.enqueueOrderBookSnapshot(order.orderBookSnapshot);
+    order.orderBookSnapshotRef = ref;
+    order.orderBookSnapshot = undefined;
+    return ref;
   }
 
   assertWritablePersistence(context: string) {
@@ -1574,29 +1602,45 @@ export class AppStore {
       return;
     }
     this.queuedMarketSnapshot = snapshot;
+    if (this.marketSnapshotPersistRunning || this.marketSnapshotPersistTimer) {
+      return;
+    }
+    this.scheduleMarketSnapshotCacheFlush();
+  }
+
+  private scheduleMarketSnapshotCacheFlush(delayMs = 0) {
+    if (this.marketSnapshotPersistTimer) {
+      return;
+    }
+    this.marketSnapshotPersistTimer = setTimeout(() => {
+      this.marketSnapshotPersistTimer = undefined;
+      void this.flushMarketSnapshotCache();
+    }, Math.max(delayMs, 0));
+  }
+
+  private async flushMarketSnapshotCache() {
     if (this.marketSnapshotPersistRunning) {
       return;
     }
     this.marketSnapshotPersistRunning = true;
-    setImmediate(() => {
-      void this.flushMarketSnapshotCache();
-    });
-  }
-
-  private async flushMarketSnapshotCache() {
     try {
-      while (this.queuedMarketSnapshot) {
-        const snapshot = this.queuedMarketSnapshot;
-        this.queuedMarketSnapshot = undefined;
-        await this.persistMarketSnapshotCache(snapshot);
+      const snapshot = this.queuedMarketSnapshot;
+      if (!snapshot) {
+        return;
       }
+      const nextAllowedAt = this.lastMarketSnapshotPersistAt + MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS;
+      const delayMs = nextAllowedAt - Date.now();
+      if (delayMs > 0) {
+        return;
+      }
+      this.queuedMarketSnapshot = undefined;
+      await this.persistMarketSnapshotCache(snapshot);
+      this.lastMarketSnapshotPersistAt = Date.now();
     } finally {
       this.marketSnapshotPersistRunning = false;
       if (this.queuedMarketSnapshot) {
-        this.marketSnapshotPersistRunning = true;
-        setImmediate(() => {
-          void this.flushMarketSnapshotCache();
-        });
+        const nextAllowedAt = this.lastMarketSnapshotPersistAt + MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS;
+        this.scheduleMarketSnapshotCacheFlush(Math.max(nextAllowedAt - Date.now(), 0));
       }
     }
   }
@@ -1606,20 +1650,22 @@ export class AppStore {
       return;
     }
     try {
+      const snapshotJson = JSON.stringify(snapshot);
+      const sourcesJson = JSON.stringify(Object.values(snapshot.sources));
       await Promise.all([
-        this.redis.set(this.snapshotCacheKey, JSON.stringify(snapshot), {
+        this.redis.set(this.snapshotCacheKey, snapshotJson, {
           expiration: {
             type: "EX",
             value: this.config.snapshotRetentionSeconds
           }
         }),
-        this.redis.set(this.sourcesCacheKey, JSON.stringify(Object.values(snapshot.sources)), {
+        this.redis.set(this.sourcesCacheKey, sourcesJson, {
           expiration: {
             type: "EX",
             value: this.config.snapshotRetentionSeconds
           }
         }),
-        this.redis.publish(`market:update:${this.config.symbol}`, JSON.stringify(snapshot))
+        this.redis.publish(`market:update:${this.config.symbol}`, snapshotJson)
       ]);
     } catch (error) {
       this.redisEnabled = false;
@@ -2772,7 +2818,7 @@ export class AppStore {
     );
   }
 
-  async persistOrderBookSnapshot(snapshot: OrderBookSnapshot) {
+  private enqueueOrderBookSnapshot(snapshot: OrderBookSnapshot) {
     const snapshotCopy = cloneOrderBookSnapshot(snapshot);
     const ref = orderBookSnapshotRef(snapshotCopy);
     const existing = this.orderBookSnapshots.get(ref);
@@ -2788,14 +2834,50 @@ export class AppStore {
         createdAt: Date.now()
       };
       this.orderBookSnapshots.set(ref, record);
-      await this.runDb(
-        `
-        INSERT INTO order_book_snapshots (
-          ref, snapshot_id, snapshot_ts, best_bid, best_ask, mid_price, snapshot, created_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT (ref) DO NOTHING
-        `,
-        [
+      this.pendingOrderBookSnapshotRecords.set(ref, record);
+      this.scheduleOrderBookSnapshotFlush();
+    }
+    return ref;
+  }
+
+  async persistOrderBookSnapshot(snapshot: OrderBookSnapshot) {
+    const ref = this.enqueueOrderBookSnapshot(snapshot);
+    await this.flushOrderBookSnapshotQueue();
+    return ref;
+  }
+
+  private scheduleOrderBookSnapshotFlush() {
+    if (this.orderBookSnapshotFlushTimer || this.orderBookSnapshotFlushRunning) {
+      return;
+    }
+    txStorage.exit(() => {
+      this.orderBookSnapshotFlushTimer = setTimeout(() => {
+        this.orderBookSnapshotFlushTimer = undefined;
+        void this.flushOrderBookSnapshotQueue();
+      }, ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS);
+    });
+  }
+
+  private async flushOrderBookSnapshotQueue() {
+    if (this.orderBookSnapshotFlushRunning || this.pendingOrderBookSnapshotRecords.size === 0) {
+      return;
+    }
+    if (!this.postgresEnabled || !this.pool) {
+      return;
+    }
+    this.orderBookSnapshotFlushRunning = true;
+    const startedAt = Date.now();
+    const records = [...this.pendingOrderBookSnapshotRecords.values()];
+    this.pendingOrderBookSnapshotRecords.clear();
+    try {
+      const values: string[] = [];
+      const params: unknown[] = [];
+      records.forEach((record, index) => {
+        const offset = index * 8;
+        values.push(
+          `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8})`
+        );
+        params.push(
           record.ref,
           record.snapshotId,
           record.snapshotTs,
@@ -2804,10 +2886,30 @@ export class AppStore {
           record.midPrice,
           JSON.stringify(record.snapshot),
           record.createdAt
-        ]
+        );
+      });
+      await this.runDb(
+        `
+        INSERT INTO order_book_snapshots (
+          ref, snapshot_id, snapshot_ts, best_bid, best_ask, mid_price, snapshot, created_at
+        ) VALUES ${values.join(",")}
+        ON CONFLICT (ref) DO NOTHING
+        `,
+        params
       );
+      this.orderBookSnapshotLastFlushMs = Date.now() - startedAt;
+    } catch (error) {
+      this.orderBookSnapshotFlushFailures += 1;
+      for (const record of records) {
+        this.pendingOrderBookSnapshotRecords.set(record.ref, record);
+      }
+      console.warn("[store] Background order book snapshot flush failed:", error);
+    } finally {
+      this.orderBookSnapshotFlushRunning = false;
+      if (this.pendingOrderBookSnapshotRecords.size > 0) {
+        this.scheduleOrderBookSnapshotFlush();
+      }
     }
-    return ref;
   }
 
   async persistOrderLifecycle(log: OrderLifecycleRecord) {
@@ -2966,8 +3068,7 @@ export class AppStore {
 
   async persistOrder(order: OrderRecord) {
     if (order.orderBookSnapshot) {
-      order.orderBookSnapshotRef = await this.persistOrderBookSnapshot(order.orderBookSnapshot);
-      order.orderBookSnapshot = undefined;
+      this.prepareOrderBookSnapshotForOrder(order);
     }
     this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
     this.pruneMemoryCaches();

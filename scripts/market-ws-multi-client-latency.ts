@@ -22,6 +22,19 @@ interface TransportMeta {
   droppedForBackpressure?: boolean;
 }
 
+interface SourceHealth {
+  source: "Binance" | "Coinbase" | "CLOB";
+  state: string;
+  sourceEventTs: number;
+  serverRecvTs: number;
+  normalizedTs: number;
+  serverPublishTs: number;
+}
+
+interface TickLike {
+  sources?: Record<"binance" | "coinbase" | "clob", SourceHealth>;
+}
+
 type ClockOffsetSample = {
   rttMs: number;
   offsetMs: number;
@@ -36,6 +49,8 @@ type ClockOffsetResult = {
 interface MarketMessage {
   type: "market" | "market:tick";
   data: {
+    tick?: TickLike;
+    snapshot?: TickLike;
     transportMeta?: TransportMeta;
   };
 }
@@ -56,6 +71,7 @@ type ClientStats = {
   serverQueue: number[];
   broadcastBuild: number[];
   fanout: number[];
+  clobSourceAge: number[];
   payloadBytes: number[];
   pausedRead: boolean;
   droppedFrames: number;
@@ -124,6 +140,7 @@ function createStats(id: number): ClientStats {
     serverQueue: [],
     broadcastBuild: [],
     fanout: [],
+    clobSourceAge: [],
     payloadBytes: [],
     pausedRead: id <= pausedClientCount,
     droppedFrames: 0,
@@ -208,6 +225,11 @@ function recordMessage(stat: ClientStats, raw: WebSocket.RawData, receivedAt: nu
   if (transportMeta.droppedForBackpressure) {
     stat.droppedFrames += 1;
   }
+  const data = parsed.data.tick ?? parsed.data.snapshot;
+  const clobSource = data?.sources?.clob;
+  if (clobSource) {
+    stat.clobSourceAge.push(Math.max(receivedAt - clobSource.normalizedTs - clockOffsetMs, 0));
+  }
 }
 
 function buildResult(startedAt: number, finishedAt: number, stats: ClientStats[], clock: ClockOffsetResult) {
@@ -220,6 +242,8 @@ function buildResult(startedAt: number, finishedAt: number, stats: ClientStats[]
   const serverQueue = stats.flatMap((stat) => stat.serverQueue);
   const broadcastBuild = stats.flatMap((stat) => stat.broadcastBuild);
   const fanout = stats.flatMap((stat) => stat.fanout);
+  const clobSourceAge = stats.flatMap((stat) => stat.clobSourceAge);
+  const activeClobSourceAge = activeStats.flatMap((stat) => stat.clobSourceAge);
   const payloadBytes = stats.flatMap((stat) => stat.payloadBytes);
   const healthRtts = clock.samples.map((sample) => sample.rttMs);
   const clientSummaries = stats.map((stat) => ({
@@ -236,6 +260,8 @@ function buildResult(startedAt: number, finishedAt: number, stats: ClientStats[]
     wsSendStartToClientP95: percentile(stat.wsSendStartToClient, 95),
     payloadBytesP95: percentile(stat.payloadBytes, 95),
     serverQueueP95: percentile(stat.serverQueue, 95),
+    clobSourceAgeP95: percentile(stat.clobSourceAge, 95),
+    clobSourceAgeP99: percentile(stat.clobSourceAge, 99),
     droppedFrames: stat.droppedFrames,
     errors: stat.errors
   }));
@@ -265,6 +291,11 @@ function buildResult(startedAt: number, finishedAt: number, stats: ClientStats[]
     serverQueueP95: percentile(serverQueue, 95),
     broadcastBuildP95: percentile(broadcastBuild, 95),
     broadcastFanoutP50: percentile(fanout, 50),
+    clobSourceAgeP50: percentile(clobSourceAge, 50),
+    clobSourceAgeP95: percentile(clobSourceAge, 95),
+    clobSourceAgeP99: percentile(clobSourceAge, 99),
+    clobSourceAgeMax: max(clobSourceAge),
+    activeClientClobSourceAgeP99: percentile(activeClobSourceAge, 99),
     payloadBytesP95: percentile(payloadBytes, 95),
     droppedFrameSignals: stats.reduce((sum, stat) => sum + stat.droppedFrames, 0),
     worstClientTickServerToClientP99: max(clientSummaries.map((stat) => stat.tickServerToClientP99)),

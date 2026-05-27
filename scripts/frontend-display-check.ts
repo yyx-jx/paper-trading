@@ -32,7 +32,7 @@ const indexHtmlSource = readFileSync("apps/client/src/index.html", "utf8");
 const viteConfigSource = readFileSync("apps/client/vite.config.ts", "utf8");
 const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
 
-assert.equal(packageJson.version, "0.6.0");
+assert.equal(packageJson.version, "0.6.1");
 assert.match(viteConfigSource, /__APP_VERSION__/);
 assert.match(appSource, /const APP_VERSION_LABEL = `v\$\{APP_VERSION\}`/);
 assert.match(appSource, /document\.title = __APP_DISPLAY_TITLE__/);
@@ -64,6 +64,14 @@ assert.match(appSource, /Coinbase 行情/);
 assert.match(appSource, /Coinbase feed/);
 assert.doesNotMatch(appSource, /ChainLink VS PTB/);
 assert.doesNotMatch(appSource, /snapshot\?\.chainlink/);
+assert.match(appSource, /CLOB source age/);
+assert.match(appSource, /WS transport/);
+assert.match(appSource, /Display age/);
+assert.match(appSource, /Page render/);
+assert.match(appSource, /Backend publish queue high/);
+assert.match(appSource, /marketPayloadRejectMs = 6000/);
+assert.match(appSource, /marketStaleMs = 3000/);
+assert.match(appSource, /marketFallbackCooldownMs = 5000/);
 
 assert.match(styleSource, /\.terminal-body \{ flex:1; min-height:0; display:grid; grid-template-columns:430px minmax\(0, 1fr\) 398px; overflow:hidden; \}/);
 assert.match(styleSource, /@media \(max-width: 1500px\) and \(max-height: 940px\) \{[\s\S]*?\.terminal-body \{ grid-template-columns:390px minmax\(0, 1fr\) 360px; \}/);

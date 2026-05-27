@@ -2071,6 +2071,7 @@ async function bootstrap() {
         sampleCount: orderLatencies.length
       },
       jsonl: jsonlStats,
+      orderBookSnapshots: store.getOrderBookSnapshotQueueStats(),
       persistence,
       externalSources: sources.map((source) => ({
         source: source.source,

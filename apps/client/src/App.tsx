@@ -27,6 +27,7 @@ import {
   type MarketPayload,
   type MarketSnapshot,
   type MarketTickPayload,
+  type MarketTransportMeta,
   type OrderAction,
   type OrderLifecycleRecord,
   type OrderRecord,
@@ -835,6 +836,154 @@ function transportAgeMs(receivedAt: number, publishTs: number, clientClockOffset
   return Math.max(receivedAt - publishTs - clientClockOffsetMs, 0);
 }
 
+type LatencyAlertLevel = "info" | "warn" | "danger";
+
+interface LatencySegments {
+  sourceAgeMs?: number;
+  sourceToBackendMs?: number;
+  backendPublishMs?: number;
+  backendQueueMs?: number;
+  wsTransportMs?: number;
+  displayAgeMs?: number;
+  endToEndMs?: number;
+  snapshotBuildAgeMs?: number;
+  broadcastBuildMs?: number;
+  broadcastFanoutSize?: number;
+  coalescedCount?: number;
+  droppedForBackpressure?: boolean;
+}
+
+const LATENCY_THRESHOLDS = {
+  clobSourceWarnMs: 1500,
+  clobSourceDangerMs: 5000,
+  referenceSourceWarnMs: 2000,
+  referenceSourceDangerMs: 5000,
+  wsTransportWarnMs: 1000,
+  wsTransportDangerMs: 3000,
+  pageRenderWarnMs: 100,
+  pageRenderDangerMs: 300,
+  displayAgeWarnMs: 1500,
+  displayAgeDangerMs: 4000,
+  serverQueueWarnMs: 500,
+  serverQueueDangerMs: 1500
+};
+
+function maxDefined(values: Array<number | undefined>) {
+  const finite = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return finite.length > 0 ? Math.max(...finite) : undefined;
+}
+
+function latencyMsText(value?: number) {
+  return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}ms` : "--";
+}
+
+function buildLatencySegments(
+  source: SourceHealth | undefined,
+  transportMeta: MarketTransportMeta | undefined,
+  now: number,
+  clientRecvTs?: number,
+  clientClockOffsetMs = 0
+): LatencySegments {
+  const base: LatencySegments = {
+    backendQueueMs: transportMeta?.serverQueueMs,
+    snapshotBuildAgeMs:
+      typeof transportMeta?.snapshotBuildTs === "number"
+        ? Math.max(transportMeta.serverPublishTs - transportMeta.snapshotBuildTs, 0)
+        : undefined,
+    broadcastBuildMs: transportMeta?.broadcastBuildMs,
+    broadcastFanoutSize: transportMeta?.broadcastFanoutSize,
+    coalescedCount: transportMeta?.coalescedCount,
+    droppedForBackpressure: transportMeta?.droppedForBackpressure
+  };
+  if (!source || source.state === "disabled") {
+    return base;
+  }
+  const receiptTs = source.clientRecvTs ?? clientRecvTs;
+  const sourceToBackendMs = Math.max(source.acquireLatencyMs, source.serverRecvTs - source.sourceEventTs, 0);
+  const backendPublishMs = Math.max(source.publishLatencyMs, source.serverPublishTs - source.serverRecvTs, 0);
+  const wsTransportMs =
+    typeof receiptTs === "number"
+      ? Math.max(receiptTs - source.serverPublishTs - clientClockOffsetMs, 0)
+      : typeof source.frontendLatencyMs === "number"
+        ? Math.max(source.frontendLatencyMs, 0)
+        : undefined;
+  return {
+    ...base,
+    sourceAgeMs: Math.max(now - source.normalizedTs, 0),
+    sourceToBackendMs,
+    backendPublishMs,
+    wsTransportMs,
+    displayAgeMs: typeof receiptTs === "number" ? Math.max(now - receiptTs, 0) : undefined,
+    endToEndMs:
+      typeof wsTransportMs === "number"
+        ? Math.max(source.serverPublishTs - source.sourceEventTs + wsTransportMs, 0)
+        : undefined
+  };
+}
+
+function latencyDetailText(language: Language, segments: LatencySegments) {
+  return localLabel(
+    language,
+    `源 ${latencyMsText(segments.sourceAgeMs)} / 入后端 ${latencyMsText(segments.sourceToBackendMs)} / 发布 ${latencyMsText(segments.backendPublishMs)} / WS ${latencyMsText(segments.wsTransportMs)} / 展示 ${latencyMsText(segments.displayAgeMs)}`,
+    `Source ${latencyMsText(segments.sourceAgeMs)} / ingest ${latencyMsText(segments.sourceToBackendMs)} / publish ${latencyMsText(segments.backendPublishMs)} / WS ${latencyMsText(segments.wsTransportMs)} / display ${latencyMsText(segments.displayAgeMs)}`
+  );
+}
+
+function systemTransportDetailText(language: Language, segments: LatencySegments) {
+  const droppedText = segments.droppedForBackpressure ? localLabel(language, "有丢帧信号", "drop signal") : localLabel(language, "无丢帧", "no drops");
+  return localLabel(
+    language,
+    `队列 ${latencyMsText(segments.backendQueueMs)} / 构建 ${latencyMsText(segments.broadcastBuildMs)} / 合并 ${segments.coalescedCount ?? 0} / fanout ${segments.broadcastFanoutSize ?? "--"} / ${droppedText}`,
+    `queue ${latencyMsText(segments.backendQueueMs)} / build ${latencyMsText(segments.broadcastBuildMs)} / coalesced ${segments.coalescedCount ?? 0} / fanout ${segments.broadcastFanoutSize ?? "--"} / ${droppedText}`
+  );
+}
+
+function latencyAlertLevel(value: number, warnMs: number, dangerMs: number): LatencyAlertLevel | undefined {
+  if (value >= dangerMs) {
+    return "danger";
+  }
+  if (value >= warnMs) {
+    return "warn";
+  }
+  return undefined;
+}
+
+function pushLatencyAlert(
+  alerts: Array<{
+    kind: string;
+    group: "market" | "trading" | "settlement" | "system";
+    level: LatencyAlertLevel;
+    text: string;
+    detail?: string;
+  }>,
+  input: {
+    language: Language;
+    kind: string;
+    group: "market" | "system";
+    value?: number;
+    warnMs: number;
+    dangerMs: number;
+    zhLabel: string;
+    enLabel: string;
+    detail?: string;
+  }
+) {
+  if (typeof input.value !== "number" || !Number.isFinite(input.value)) {
+    return;
+  }
+  const level = latencyAlertLevel(input.value, input.warnMs, input.dangerMs);
+  if (!level) {
+    return;
+  }
+  alerts.push({
+    kind: input.kind,
+    group: input.group,
+    level,
+    text: localLabel(input.language, `${input.zhLabel} ${Math.round(input.value)}ms`, `${input.enLabel} ${Math.round(input.value)}ms`),
+    detail: input.detail
+  });
+}
+
 function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: number, clientClockOffsetMs = 0) {
   if (!source || source.state === "disabled") {
     return {
@@ -929,7 +1078,14 @@ function buildRiskAlerts(input: {
   downPrice: number;
   oddsChange: number;
   sources: Array<SourceHealth | undefined>;
-  clobLatencyMs: number;
+  sourceSegments: {
+    binance: LatencySegments;
+    coinbase: LatencySegments;
+    clob: LatencySegments;
+  };
+  transportSegments: LatencySegments;
+  pageRenderLatencyMs?: number;
+  clobLatencyMs?: number;
   nowMs: number;
 }) {
   // ACK state is intentionally retained in the alert model even when the current UI does not expose a separate button.
@@ -993,7 +1149,99 @@ function buildRiskAlerts(input: {
       });
     }
   }
-  if (input.clobLatencyMs > 1000) {
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "clob_source_age",
+    group: "market",
+    value: input.sourceSegments.clob.sourceAgeMs,
+    warnMs: LATENCY_THRESHOLDS.clobSourceWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.clobSourceDangerMs,
+    zhLabel: "CLOB 源年龄过高",
+    enLabel: "CLOB source age high",
+    detail: latencyDetailText(input.language, input.sourceSegments.clob)
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "binance_source_age",
+    group: "market",
+    value: input.sourceSegments.binance.sourceAgeMs,
+    warnMs: LATENCY_THRESHOLDS.referenceSourceWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.referenceSourceDangerMs,
+    zhLabel: "Binance 源年龄过高",
+    enLabel: "Binance source age high",
+    detail: latencyDetailText(input.language, input.sourceSegments.binance)
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "coinbase_source_age",
+    group: "market",
+    value: input.sourceSegments.coinbase.sourceAgeMs,
+    warnMs: LATENCY_THRESHOLDS.referenceSourceWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.referenceSourceDangerMs,
+    zhLabel: "Coinbase 源年龄过高",
+    enLabel: "Coinbase source age high",
+    detail: latencyDetailText(input.language, input.sourceSegments.coinbase)
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "ws_transport_lag",
+    group: "system",
+    value: maxDefined([
+      input.sourceSegments.binance.wsTransportMs,
+      input.sourceSegments.coinbase.wsTransportMs,
+      input.sourceSegments.clob.wsTransportMs
+    ]),
+    warnMs: LATENCY_THRESHOLDS.wsTransportWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.wsTransportDangerMs,
+    zhLabel: "WS 传输延迟过高",
+    enLabel: "WS transport high",
+    detail: systemTransportDetailText(input.language, input.transportSegments)
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "display_age_lag",
+    group: "system",
+    value: maxDefined([
+      input.sourceSegments.binance.displayAgeMs,
+      input.sourceSegments.coinbase.displayAgeMs,
+      input.sourceSegments.clob.displayAgeMs
+    ]),
+    warnMs: LATENCY_THRESHOLDS.displayAgeWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.displayAgeDangerMs,
+    zhLabel: "页面展示年龄过高",
+    enLabel: "Display age high"
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "page_render_lag",
+    group: "system",
+    value: input.pageRenderLatencyMs,
+    warnMs: LATENCY_THRESHOLDS.pageRenderWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.pageRenderDangerMs,
+    zhLabel: "页面提交过慢",
+    enLabel: "Page render slow"
+  });
+  pushLatencyAlert(alerts, {
+    language: input.language,
+    kind: "server_queue_lag",
+    group: "system",
+    value: input.transportSegments.backendQueueMs,
+    warnMs: LATENCY_THRESHOLDS.serverQueueWarnMs,
+    dangerMs: LATENCY_THRESHOLDS.serverQueueDangerMs,
+    zhLabel: "后端发布队列过高",
+    enLabel: "Backend publish queue high",
+    detail: systemTransportDetailText(input.language, input.transportSegments)
+  });
+  if (input.transportSegments.droppedForBackpressure) {
+    alerts.push({
+      kind: "ws_backpressure_drop",
+      group: "system",
+      level: "danger",
+      text: localLabel(input.language, "WS backpressure 出现丢帧信号", "WS backpressure drop signal"),
+      detail: systemTransportDetailText(input.language, input.transportSegments)
+    });
+  }
+  if (typeof input.clobLatencyMs === "number" && input.clobLatencyMs > 1000) {
     alerts.push({
       kind: "high_lag",
       group: "system",
@@ -2231,37 +2479,37 @@ function LoginScreen(props: {
 function App() {
   const { i18n } = useTranslation();
   const language = (i18n.language as Language) ?? "zh-CN";
-  const {
-    token,
-    me,
-    viewedUserId,
-    viewedUser,
-    currentPage,
-    currentRound,
-    history,
-    operatedHistory,
-    settlementPreview,
-    snapshot,
-    profile,
-    positions,
-    orders,
-    orderLifecycles,
-    logs,
-    lastOrderLatencyMs,
-    lastMarketRecvTs,
-    setAuth,
-    setUser,
-    setViewedUserTarget,
-    clearAuth,
-    setCurrentPage,
-    setBootstrap,
-    setMarketPayload,
-    setMarketTickPayload,
-    markMarketRenderCommit,
-    setUserPayload,
-    setUserTradePayload,
-    setLastOrderLatencyMs
-  } = useAppStore();
+  const token = useAppStore((state) => state.token);
+  const me = useAppStore((state) => state.me);
+  const viewedUserId = useAppStore((state) => state.viewedUserId);
+  const viewedUser = useAppStore((state) => state.viewedUser);
+  const currentPage = useAppStore((state) => state.currentPage);
+  const currentRound = useAppStore((state) => state.currentRound);
+  const history = useAppStore((state) => state.history);
+  const operatedHistory = useAppStore((state) => state.operatedHistory);
+  const settlementPreview = useAppStore((state) => state.settlementPreview);
+  const snapshot = useAppStore((state) => state.snapshot);
+  const profile = useAppStore((state) => state.profile);
+  const positions = useAppStore((state) => state.positions);
+  const orders = useAppStore((state) => state.orders);
+  const orderLifecycles = useAppStore((state) => state.orderLifecycles);
+  const logs = useAppStore((state) => state.logs);
+  const lastOrderLatencyMs = useAppStore((state) => state.lastOrderLatencyMs);
+  const lastMarketRecvTs = useAppStore((state) => state.lastMarketRecvTs);
+  const lastMarketRenderLatencyMs = useAppStore((state) => state.lastMarketRenderLatencyMs);
+  const lastMarketTransportMeta = useAppStore((state) => state.lastMarketTransportMeta);
+  const setAuth = useAppStore((state) => state.setAuth);
+  const setUser = useAppStore((state) => state.setUser);
+  const setViewedUserTarget = useAppStore((state) => state.setViewedUserTarget);
+  const clearAuth = useAppStore((state) => state.clearAuth);
+  const setCurrentPage = useAppStore((state) => state.setCurrentPage);
+  const setBootstrap = useAppStore((state) => state.setBootstrap);
+  const setMarketPayload = useAppStore((state) => state.setMarketPayload);
+  const setMarketTickPayload = useAppStore((state) => state.setMarketTickPayload);
+  const markMarketRenderCommit = useAppStore((state) => state.markMarketRenderCommit);
+  const setUserPayload = useAppStore((state) => state.setUserPayload);
+  const setUserTradePayload = useAppStore((state) => state.setUserTradePayload);
+  const setLastOrderLatencyMs = useAppStore((state) => state.setLastOrderLatencyMs);
   const [bootstrapping, setBootstrapping] = useState(false);
   const [error, setError] = useState<string>();
   const [orderAmount, setOrderAmount] = useState("150");
@@ -2292,6 +2540,11 @@ function App() {
       ? snapshot.uiMeta.countdownTargetTs + clientClockOffsetMsRef.current
       : currentRound?.endAt;
   const countdownText = formatCountdown(countdownTargetMs, nowMs);
+  const countdownRemainingMs = typeof countdownTargetMs === "number" ? countdownTargetMs - nowMs : undefined;
+  const nowRefreshIntervalMs =
+    typeof countdownRemainingMs === "number" && countdownRemainingMs > 0 && countdownRemainingMs <= 30_000
+      ? 250
+      : 1000;
   const headerTitle = roundTitleText(currentRound, language, snapshot?.uiMeta.marketTitle ?? t("refreshHint"));
   const canOpenUserManagement = Boolean(me?.permissionCodes.includes("users:list"));
   const canSelectViewUser = Boolean(me && (me.role === "Admin" || me.role === "Senior Tester" || me.role === "Test Engineer"));
@@ -2360,9 +2613,9 @@ function App() {
   }, [token, me, refreshVisibleViewUsers]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    const timer = window.setInterval(() => setNowMs(Date.now()), nowRefreshIntervalMs);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [nowRefreshIntervalMs]);
 
   useEffect(() => {
     if (!token) {
@@ -2452,10 +2705,10 @@ function App() {
     let lastMarketFallbackAt = 0;
     let lastUserFallbackAt = 0;
     const reconnectDelayMs = 1000;
-    const marketPayloadRejectMs = 4000;
-    const marketStaleMs = 1500;
-    const marketReconnectStaleMs = 4000;
-    const marketFallbackCooldownMs = 1500;
+    const marketPayloadRejectMs = 6000;
+    const marketStaleMs = 3000;
+    const marketReconnectStaleMs = 6000;
+    const marketFallbackCooldownMs = 5000;
     const userFallbackCooldownMs = 5000;
     let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
     let marketTickFrame: number | undefined;
@@ -2829,7 +3082,7 @@ function App() {
           scheduleUserReconnect();
         }
       }
-    }, 250);
+    }, 1000);
 
     return () => {
       disposed = true;
@@ -3207,6 +3460,8 @@ function App() {
             chartVisibleCount={chartVisibleCount}
             lastOrderLatencyMs={lastOrderLatencyMs}
             lastMarketRecvTs={lastMarketRecvTs}
+            lastMarketRenderLatencyMs={lastMarketRenderLatencyMs}
+            lastMarketTransportMeta={lastMarketTransportMeta}
             clientClockOffsetMs={clientClockOffsetMsRef.current}
             countdownTargetMs={countdownTargetMs}
             realtimeLabel={realtimeLabel}
@@ -3683,6 +3938,8 @@ function TradePageRestored(props: {
   chartVisibleCount: number;
   lastOrderLatencyMs?: number;
   lastMarketRecvTs?: number;
+  lastMarketRenderLatencyMs?: number;
+  lastMarketTransportMeta?: MarketTransportMeta;
   clientClockOffsetMs: number;
   countdownTargetMs?: number;
   realtimeLabel: string;
@@ -3740,8 +3997,14 @@ function TradePageRestored(props: {
   const sourceBinance = snapshot?.sources.binance;
   const sourceCoinbase = snapshot?.sources.coinbase;
   const sourceClob = snapshot?.sources.clob;
-  const currentRoundPositions = positions.filter((position) => position.roundId === currentRound?.id);
-  const openSidePositions = currentRoundPositions.filter((position) => position.status === "open" && position.side === selectedSide);
+  const currentRoundPositions = useMemo(
+    () => positions.filter((position) => position.roundId === currentRound?.id),
+    [positions, currentRound?.id]
+  );
+  const openSidePositions = useMemo(
+    () => currentRoundPositions.filter((position) => position.status === "open" && position.side === selectedSide),
+    [currentRoundPositions, selectedSide]
+  );
   const selectedBinanceBars = snapshot?.binance.candlesByInterval[selectedInterval] ?? [];
   const selectedCoinbaseBars = snapshot?.coinbase.candlesByInterval[selectedInterval] ?? [];
   const chartBars = useMemo(() => filterBarsToRecentWindow(selectedBinanceBars), [selectedBinanceBars]);
@@ -3773,6 +4036,10 @@ function TradePageRestored(props: {
   const orderBookBackendLatency = orderBookBackendLatencyMs(orderBookComponent);
   const btcLatency = latencyFor(sourceBinance, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
   const coinbaseLatency = latencyFor(sourceCoinbase, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const clobSegments = buildLatencySegments(sourceClob, props.lastMarketTransportMeta, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const btcSegments = buildLatencySegments(sourceBinance, props.lastMarketTransportMeta, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const coinbaseSegments = buildLatencySegments(sourceCoinbase, props.lastMarketTransportMeta, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
+  const transportSegments = buildLatencySegments(undefined, props.lastMarketTransportMeta, nowMs, props.lastMarketRecvTs, props.clientClockOffsetMs);
   const countdownMs =
     typeof props.countdownTargetMs === "number"
       ? Math.max(props.countdownTargetMs - nowMs, 0)
@@ -3788,18 +4055,21 @@ function TradePageRestored(props: {
         )
       : undefined;
   const tradeBlockReason = balanceWarning ?? limitPriceError;
-  const openPositionsBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord[]>>(
-    (accumulator, side) => {
-      accumulator[side] = currentRoundPositions.filter(
-        (position) =>
-          position.side === side &&
-          position.status === "open" &&
-          position.displayStatus !== "settled" &&
-          position.displayStatus !== "sold"
-      );
-      return accumulator;
-    },
-    { UP: [], DOWN: [] }
+  const openPositionsBySide = useMemo(
+    () => (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord[]>>(
+      (accumulator, side) => {
+        accumulator[side] = currentRoundPositions.filter(
+          (position) =>
+            position.side === side &&
+            position.status === "open" &&
+            position.displayStatus !== "settled" &&
+            position.displayStatus !== "sold"
+        );
+        return accumulator;
+      },
+      { UP: [], DOWN: [] }
+    ),
+    [currentRoundPositions]
   );
   const oppositeSide = selectedSide === "UP" ? "DOWN" : "UP";
   const tradeAvailability = buildTradeAvailability({
@@ -3819,22 +4089,28 @@ function TradePageRestored(props: {
   });
   const canTrade = props.orderAction === "buy" ? tradeAvailability.canBuy : tradeAvailability.canSell;
   const executeBlockReason = props.orderAction === "buy" ? tradeAvailability.buyReason : tradeAvailability.sellReason;
-  const recentOrders = [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
-    .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
-    .slice(0, 16);
-  const sellablePositionByBuyOrderId = new Map(
-    currentRoundPositions
-      .filter(
-        (position) =>
-          position.buyOrderId &&
-          position.status === "open" &&
-          position.displayStatus !== "settled" &&
-          position.displayStatus !== "sold" &&
-          position.qty > 0
-      )
-      .map((position) => [position.buyOrderId!, position])
+  const recentOrders = useMemo(
+    () => [...orders.filter((order) => isCurrentRoundOrder(order, currentRound))]
+      .sort((left, right) => sortOrdersForTradingPage(left, right, currentRound))
+      .slice(0, 16),
+    [orders, currentRound]
   );
-  const positionCards = (["UP", "DOWN"] as TradeSide[]).map((side) => {
+  const sellablePositionByBuyOrderId = useMemo(
+    () => new Map(
+      currentRoundPositions
+        .filter(
+          (position) =>
+            position.buyOrderId &&
+            position.status === "open" &&
+            position.displayStatus !== "settled" &&
+            position.displayStatus !== "sold" &&
+            position.qty > 0
+        )
+        .map((position) => [position.buyOrderId!, position])
+    ),
+    [currentRoundPositions]
+  );
+  const positionCards = useMemo(() => (["UP", "DOWN"] as TradeSide[]).map((side) => {
     const sidePositions = openPositionsBySide[side];
     const qty = sidePositions.reduce((sum, position) => sum + position.qty, 0);
     const value = sidePositions.reduce(
@@ -3854,19 +4130,25 @@ function TradePageRestored(props: {
       pnlSummary,
       hasOpenPositions: sidePositions.some((position) => position.displayStatus === "open")
     };
-  });
-  const recentRounds: Array<RoundRecord & { settlementPreview?: SettlementPreview; userPnl?: number }> = [
-    ...(currentRound ? [{ ...currentRound, userPnl: 0 }] : []),
-    ...props.history.filter((round) => round.id !== currentRound?.id)
-  ]
-    .map((round) => ({
-      ...round,
-      settlementPreview:
-        round.settlementPreview ??
-        (props.settlementPreview?.roundId === round.id ? props.settlementPreview : undefined)
-    }))
-    .slice(0, 10);
-  const closedRounds = props.history.filter((round) => Boolean(round.settledSide || round.redeemFinishTs || round.status === "Closed"));
+  }), [openPositionsBySide]);
+  const recentRounds: Array<RoundRecord & { settlementPreview?: SettlementPreview; userPnl?: number }> = useMemo(
+    () => [
+      ...(currentRound ? [{ ...currentRound, userPnl: 0 }] : []),
+      ...props.history.filter((round) => round.id !== currentRound?.id)
+    ]
+      .map((round) => ({
+        ...round,
+        settlementPreview:
+          round.settlementPreview ??
+          (props.settlementPreview?.roundId === round.id ? props.settlementPreview : undefined)
+      }))
+      .slice(0, 10),
+    [currentRound, props.history, props.settlementPreview]
+  );
+  const closedRounds = useMemo(
+    () => props.history.filter((round) => Boolean(round.settledSide || round.redeemFinishTs || round.status === "Closed")),
+    [props.history]
+  );
   const wins = closedRounds.filter((round) => round.userPnl > 0).length;
   const losses = closedRounds.filter((round) => round.userPnl < 0).length;
   const recentOneHourPnl = closedRounds
@@ -3909,7 +4191,13 @@ function TradePageRestored(props: {
     downPrice: downDisplayPrice,
     oddsChange,
     sources: [sourceBinance, sourceCoinbase, sourceClob],
-    clobLatencyMs: clobLatency.marketUpdateAgeMs,
+    sourceSegments: {
+      binance: btcSegments,
+      coinbase: coinbaseSegments,
+      clob: clobSegments
+    },
+    transportSegments,
+    pageRenderLatencyMs: props.lastMarketRenderLatencyMs,
     nowMs
   });
   const marketUpdateAge = Math.max(
@@ -3917,22 +4205,28 @@ function TradePageRestored(props: {
     btcLatency.marketUpdateAgeMs,
     coinbaseLatency.marketUpdateAgeMs
   );
-  const sourceAgeMax = Math.max(
-    clobLatency.sourceDataAgeMs,
-    btcLatency.sourceDataAgeMs,
-    coinbaseLatency.sourceDataAgeMs
-  );
+  const sourceAgeMax = maxDefined([clobSegments.sourceAgeMs, btcSegments.sourceAgeMs, coinbaseSegments.sourceAgeMs]);
   const groupedAlerts = [
     { key: "market", label: localLabel(language, "数据源", "Market Data") },
     { key: "trading", label: localLabel(language, "交易风险", "Trading Risk") },
     { key: "settlement", label: localLabel(language, "结算风险", "Settlement Risk") },
     { key: "system", label: localLabel(language, "系统延迟", "System Delay") }
   ].map((group) => ({ ...group, items: riskAlerts.filter((alert) => alert.group === group.key) })).filter((group) => group.items.length > 0);
-  const latencyRows = [
+  const legacyLatencyRows = [
     { label: localLabel(language, "最新推送年龄", "Market update age"), value: marketUpdateAge },
     { label: localLabel(language, "最旧源数据", "Oldest source age"), value: sourceAgeMax },
     { label: localLabel(language, "后端计算", "Backend compute"), value: snapshot?.latencyBreakdown.serverComputeLatency },
     { label: localLabel(language, "推送前端", "Frontend transport"), value: snapshot?.latencyBreakdown.clientTransportLatency }
+  ];
+  void legacyLatencyRows;
+  const latencyRows = [
+    { label: localLabel(language, "CLOB 源年龄", "CLOB source age"), value: clobSegments.sourceAgeMs },
+    { label: localLabel(language, "最旧源年龄", "Oldest source age"), value: sourceAgeMax },
+    { label: localLabel(language, "WS 传输", "WS transport"), value: maxDefined([clobSegments.wsTransportMs, btcSegments.wsTransportMs, coinbaseSegments.wsTransportMs]) },
+    { label: localLabel(language, "页面展示年龄", "Display age"), value: maxDefined([clobSegments.displayAgeMs, btcSegments.displayAgeMs, coinbaseSegments.displayAgeMs]) },
+    { label: localLabel(language, "后端队列", "Backend queue"), value: transportSegments.backendQueueMs },
+    { label: localLabel(language, "页面提交", "Page render"), value: props.lastMarketRenderLatencyMs },
+    { label: localLabel(language, "市场推送年龄", "Market update age"), value: marketUpdateAge }
   ];
   const topLatency = [...latencyRows].sort((left, right) => (right.value ?? -1) - (left.value ?? -1))[0];
   const selectedSummary = snapshot?.clob.bestBidAskSummary[selectedSide];
@@ -3941,11 +4235,63 @@ function TradePageRestored(props: {
       ? tokenPriceText(selectedSummary.bestAsk - selectedSummary.bestBid)
       : "--";
   const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : localLabel(language, "不可用", "Unavailable");
-  const healthRows = [
+  const legacyHealthRows = [
     { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: localLabel(language, `源 ${Math.round(clobLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(clobLatency.sourceDataAgeMs)}ms / transport ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceClob?.state ?? "stale" },
     { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, `源 ${Math.round(btcLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(btcLatency.sourceDataAgeMs)}ms / transport ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceBinance?.state ?? "stale" },
     { label: "CB", primary: `${Math.round(coinbaseLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Coinbase 行情", "Coinbase feed"), detail: localLabel(language, `源 ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / transport ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceCoinbase?.state ?? "stale" },
     { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: localLabel(language, "结算轮询", "Settlement poll"), detail: localLabel(language, "正式结果确认", "Final settlement"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
+  ];
+  void legacyHealthRows;
+  const wsTransportMax = maxDefined([clobSegments.wsTransportMs, btcSegments.wsTransportMs, coinbaseSegments.wsTransportMs]);
+  const systemTransportTone =
+    transportSegments.droppedForBackpressure ||
+    (transportSegments.backendQueueMs ?? 0) >= LATENCY_THRESHOLDS.serverQueueWarnMs ||
+    (wsTransportMax ?? 0) >= LATENCY_THRESHOLDS.wsTransportWarnMs
+      ? "degraded"
+      : "healthy";
+  const healthRows = [
+    {
+      label: "CLOB",
+      primary: latencyMsText(clobSegments.sourceAgeMs),
+      secondary: clobComponentSummary(sourceClob, language),
+      detail: latencyDetailText(language, clobSegments),
+      tone: sourceClob?.state ?? "stale"
+    },
+    {
+      label: "BTC",
+      primary: latencyMsText(btcSegments.sourceAgeMs),
+      secondary: localLabel(language, "Binance 行情", "Binance feed"),
+      detail: latencyDetailText(language, btcSegments),
+      tone: sourceBinance?.state ?? "stale"
+    },
+    {
+      label: "CB",
+      primary: latencyMsText(coinbaseSegments.sourceAgeMs),
+      secondary: localLabel(language, "Coinbase 行情", "Coinbase feed"),
+      detail: latencyDetailText(language, coinbaseSegments),
+      tone: sourceCoinbase?.state ?? "stale"
+    },
+    {
+      label: "WS",
+      primary: latencyMsText(wsTransportMax),
+      secondary: localLabel(language, "后端到页面", "Backend to page"),
+      detail: systemTransportDetailText(language, transportSegments),
+      tone: systemTransportTone
+    },
+    {
+      label: "Render",
+      primary: latencyMsText(props.lastMarketRenderLatencyMs),
+      secondary: localLabel(language, "页面提交", "Page commit"),
+      detail: localLabel(language, `展示年龄 ${latencyMsText(maxDefined([clobSegments.displayAgeMs, btcSegments.displayAgeMs, coinbaseSegments.displayAgeMs]))}`, `display age ${latencyMsText(maxDefined([clobSegments.displayAgeMs, btcSegments.displayAgeMs, coinbaseSegments.displayAgeMs]))}`),
+      tone: (props.lastMarketRenderLatencyMs ?? 0) >= LATENCY_THRESHOLDS.pageRenderWarnMs ? "degraded" : "healthy"
+    },
+    {
+      label: "Gamma",
+      primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--",
+      secondary: localLabel(language, "结算轮询", "Settlement poll"),
+      detail: localLabel(language, "正式结果确认", "Final settlement"),
+      tone: currentRound?.status === "Manual" ? "manual" : "healthy"
+    }
   ];
   const bookStatsFor = (side: TradeSide) => {
     const book = snapshot?.orderBooks[side];

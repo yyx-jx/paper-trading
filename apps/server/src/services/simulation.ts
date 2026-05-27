@@ -42,6 +42,8 @@ import { appMetrics } from "./metrics";
 const LATENCY_LOG_INTERVAL_MS = 15000;
 const REDEEM_DELAY_MS = 2000;
 const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.9;
+const GAMMA_SETTLED_WIN_PRICE_THRESHOLD = 0.995;
+const GAMMA_SETTLED_LOSE_PRICE_THRESHOLD = 1 - GAMMA_SETTLED_WIN_PRICE_THRESHOLD;
 const QTY_EPSILON = 0.0001;
 const FIVE_MINUTE_MS = 5 * 60_000;
 const EXECUTION_BOOK_FRESHNESS_FLOOR_MS = 5000;
@@ -72,6 +74,15 @@ const COINBASE_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number
 };
 
 type TradeLogTask = () => Promise<void>;
+type TradePersistSegmentName =
+  | "persistOrderBookSnapshot"
+  | "persistOrder"
+  | "persistPosition"
+  | "persistUser"
+  | "persistOrderLifecycle"
+  | "commitAndOverhead"
+  | "transactionTotal";
+type TradePersistSegments = Partial<Record<TradePersistSegmentName, number>>;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -231,8 +242,8 @@ function isMarketResolved(detail: PolymarketMarketDetail): boolean {
   if (detail.winningOutcome) return true;
   if (detail.closed) {
     const [up, down] = detail.outcomePrices;
-    if (up === 1 && down === 0) return true;
-    if (up === 0 && down === 1) return true;
+    if (up >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && down <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return true;
+    if (down >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && up <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return true;
   }
   return false;
 }
@@ -755,6 +766,21 @@ export class SimulationEngine {
     }
   }
 
+  private async measureTradePersistSegment<T>(
+    segments: TradePersistSegments | undefined,
+    name: TradePersistSegmentName,
+    handler: () => Promise<T> | T
+  ) {
+    const startedAt = Date.now();
+    try {
+      return await handler();
+    } finally {
+      if (segments) {
+        segments[name] = (segments[name] ?? 0) + Math.max(Date.now() - startedAt, 0);
+      }
+    }
+  }
+
   async placeOrder(
     user: UserRecord,
     payload: {
@@ -927,9 +953,14 @@ export class SimulationEngine {
         createdAt: Date.now()
       };
 
+      const tradePersistSegments: TradePersistSegments = {};
       try {
+        const transactionStartedAt = Date.now();
         await this.runTradeWriteTransaction(async () => {
           const persistStartTs = Date.now();
+          await this.measureTradePersistSegment(tradePersistSegments, "persistOrderBookSnapshot", () => {
+            this.store.prepareOrderBookSnapshotForOrder(order);
+          });
           if (status === "pending") {
             if (action === "buy") {
               const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
@@ -941,8 +972,10 @@ export class SimulationEngine {
               order.frozenQty = frozenQty;
             }
             await Promise.all([
-              this.store.persistOrder(order),
-              ...(action === "buy" ? [this.store.persistUser(user)] : [])
+              this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order)),
+              ...(action === "buy"
+                ? [this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user))]
+                : [])
             ]);
           } else if (status === "filled" && estimate.avgPrice) {
             await this.applyFilledOrder(
@@ -952,17 +985,23 @@ export class SimulationEngine {
               estimate,
               payload.positionIds,
               payload.exitType ?? "manual_sell",
-              false
+              false,
+              tradePersistSegments
             );
             if (order.action === "buy") {
-              await this.recordBuyLifecycle(user, currentRound, order, snapshot);
+              await this.recordBuyLifecycle(user, currentRound, order, snapshot, tradePersistSegments);
             }
           } else {
-            await this.store.persistOrder(order);
+            await this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order));
           }
           order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
           order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
         });
+        tradePersistSegments.transactionTotal = Math.max(Date.now() - transactionStartedAt, 0);
+        const measuredSegmentTotal = Object.entries(tradePersistSegments)
+          .filter(([name]) => name !== "transactionTotal" && name !== "commitAndOverhead")
+          .reduce((sum, [, value]) => sum + (value ?? 0), 0);
+        tradePersistSegments.commitAndOverhead = Math.max(tradePersistSegments.transactionTotal - measuredSegmentTotal, 0);
       } catch (writeError) {
         if (clientOrderId && isClientOrderConflict(writeError)) {
           const existingOrderAfterConflict =
@@ -1028,6 +1067,7 @@ export class SimulationEngine {
           localMatchLatencyMs: order.localMatchLatencyMs,
           persistLatencyMs: order.persistLatencyMs,
           totalOrderLatencyMs: order.totalOrderLatencyMs,
+          tradePersistSegments,
           executionBookSource: executionBook.source,
           executionBookAgeMs: executionBook.ageMs,
           executionBookFallbackReason: executionBook.fallbackReason,
@@ -1080,6 +1120,7 @@ export class SimulationEngine {
           localMatchLatencyMs: order.localMatchLatencyMs,
           persistLatencyMs: order.persistLatencyMs,
           totalOrderLatencyMs: order.totalOrderLatencyMs,
+          tradePersistSegments,
           executionBookSource: executionBook.source,
           executionBookAgeMs: executionBook.ageMs,
           executionBookFallbackReason: executionBook.fallbackReason,
@@ -2442,7 +2483,8 @@ export class SimulationEngine {
     estimate: ClobExecutionEstimate,
     positionIds?: string[],
     exitType: Exclude<OrderLifecycleExitType, "settlement" | "mixed"> = "manual_sell",
-    emitUserPayload = true
+    emitUserPayload = true,
+    tradePersistSegments?: TradePersistSegments
   ) {
     order.status = "filled";
     order.lifecycleStatus = "filled";
@@ -2480,9 +2522,9 @@ export class SimulationEngine {
         order.actualFee ?? 0
       );
       await Promise.all([
-        this.store.persistPosition(position),
-        this.store.persistUser(user),
-        this.store.persistOrder(order)
+        this.measureTradePersistSegment(tradePersistSegments, "persistPosition", () => this.store.persistPosition(position)),
+        this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user)),
+        this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order))
       ]);
       if (emitUserPayload) {
         this.store.emitUserPayload(user.id, "trade");
@@ -2550,10 +2592,12 @@ export class SimulationEngine {
     user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
     await Promise.all([
-      ...changedPositions.map((position) => this.store.persistPosition(position)),
-      this.store.persistUser(user),
-      this.store.persistOrder(order),
-      this.store.applyLifecycleExit({
+      ...changedPositions.map((position) =>
+        this.measureTradePersistSegment(tradePersistSegments, "persistPosition", () => this.store.persistPosition(position))
+      ),
+      this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user)),
+      this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order)),
+      this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () => this.store.applyLifecycleExit({
         userId: user.id,
         roundId: round.id,
         side: order.side,
@@ -2562,7 +2606,7 @@ export class SimulationEngine {
         exitTokenPrice: order.avgFillPrice,
         exitFee: order.actualFee ?? 0,
         buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
-      })
+      }))
     ]);
     if (emitUserPayload) {
       this.store.emitUserPayload(user.id, "trade");
@@ -2573,7 +2617,8 @@ export class SimulationEngine {
     user: UserRecord,
     round: RoundRecord,
     order: OrderRecord,
-    snapshot: MarketSnapshot
+    snapshot: MarketSnapshot,
+    tradePersistSegments?: TradePersistSegments
   ) {
     if (order.action !== "buy" || order.resultType !== "all_filled" || order.filledQty <= QTY_EPSILON) {
       return;
@@ -2586,7 +2631,7 @@ export class SimulationEngine {
           ? snapshot.currentPrice
           : undefined;
     const btcOpenPriceToBeat = round.priceToBeat > 0 ? round.priceToBeat : snapshot.priceToBeat || undefined;
-    await this.store.persistOrderLifecycle({
+    await this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () => this.store.persistOrderLifecycle({
       id: `ol_${order.id}`,
       buyOrderId: order.id,
       traceId: order.traceId,
@@ -2619,7 +2664,7 @@ export class SimulationEngine {
       feeCurrency: order.feeCurrency,
       createdAt: now,
       updatedAt: now
-    });
+    }));
   }
 
   private async processPendingOrders() {
@@ -4110,8 +4155,8 @@ export class SimulationEngine {
 
   private resolveExactOutcomeSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
     const [upPrice, downPrice] = detail.outcomePrices;
-    if (upPrice === 1 && downPrice === 0) return "UP";
-    if (downPrice === 1 && upPrice === 0) return "DOWN";
+    if (upPrice >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && downPrice <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return "UP";
+    if (downPrice >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && upPrice <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return "DOWN";
     return undefined;
   }
 

@@ -55,6 +55,14 @@ const placeOrderBody = simulationSource.match(/async placeOrder\([\s\S]*?\n  asy
 assert.doesNotMatch(createMarketTickBody, /getMarketCandles|upsertMarketCandles/);
 assert.doesNotMatch(createMarketRealtimeTickBody, /getMarketCandles|upsertMarketCandles/);
 assert.doesNotMatch(placeOrderBody, /getMarketCandles|upsertMarketCandles/);
+assert.match(storeSource, /prepareOrderBookSnapshotForOrder\(order: OrderRecord\)/);
+assert.match(storeSource, /private async flushOrderBookSnapshotQueue\(\)/);
+assert.match(simulationSource, /tradePersistSegments/);
+assert.match(placeOrderBody, /persistOrderBookSnapshot/);
+assert.match(placeOrderBody, /persistOrder/);
+assert.match(simulationSource, /persistPosition/);
+assert.match(simulationSource, /persistUser/);
+assert.match(simulationSource, /persistOrderLifecycle/);
 assert.match(indexSource, /engine\.withCurrentRoundCoinbaseOpenReference\(round\)/);
 assert.match(createMarketRealtimeTickBody, /latestCandleUpdates\(stamped\.coinbase\.candlesByInterval\)/);
 
