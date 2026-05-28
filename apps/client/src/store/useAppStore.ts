@@ -43,7 +43,6 @@ interface AppState {
   lastMarketRenderLatencyMs?: number;
   lastMarketPayloadSeq?: number;
   lastMarketServerPublishTs?: number;
-  lastMarketTransportMeta?: MarketTransportMeta;
   settlementPreview?: SettlementPreview;
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
@@ -317,7 +316,6 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: undefined,
       lastMarketPayloadSeq: undefined,
       lastMarketServerPublishTs: undefined,
-      lastMarketTransportMeta: undefined,
       settlementPreview: undefined,
       currentPage: "trade"
     });
@@ -345,7 +343,6 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: 0,
       lastMarketPayloadSeq: transportMeta.payloadSeq,
       lastMarketServerPublishTs: transportMeta.serverPublishTs,
-      lastMarketTransportMeta: transportMeta,
       settlementPreview: data.settlementPreview
     });
   },
@@ -369,7 +366,6 @@ export const useAppStore = create<AppState>((set) => ({
         lastMarketRenderLatencyMs: 0,
         lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
         lastMarketServerPublishTs: transportMeta.serverPublishTs,
-        lastMarketTransportMeta: transportMeta,
         settlementPreview: data.settlementPreview
       };
     });
@@ -395,7 +391,6 @@ export const useAppStore = create<AppState>((set) => ({
         lastMarketRenderLatencyMs: 0,
         lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
         lastMarketServerPublishTs: transportMeta.serverPublishTs,
-        lastMarketTransportMeta: transportMeta,
         settlementPreview: data.settlementPreview ?? state.settlementPreview
       };
     });
