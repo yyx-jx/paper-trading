@@ -678,6 +678,17 @@ export class SimulationEngine {
         message: round.manualReason ?? "Gamma polling timed out."
       };
     }
+    if (round.status === "AdminReviewed" && round.settledSide) {
+      return {
+        roundId: round.id,
+        state: "confirmed",
+        side: round.settledSide,
+        price: round.settlementPrice,
+        source: "Admin",
+        detectedAt: round.settlementReceivedAt ?? round.settlementTs,
+        message: `Admin reviewed ${round.settledSide}.`
+      };
+    }
     return this.getPreliminarySettlements().get(round.id) ?? this.createPreliminarySettlementPreview(round, Date.now());
   }
 
@@ -742,6 +753,171 @@ export class SimulationEngine {
     }
     this.scheduleReconcile();
     return round;
+  }
+
+  async adminReviewRound(actor: UserRecord, input: { roundId: string; side: TradeSide; reason?: string }) {
+    const round = this.store.getRoundById(input.roundId);
+    if (!round) {
+      throw new Error("Round was not found.");
+    }
+    if (round.status !== "Manual") {
+      throw new Error("Only rounds in Manual status can be admin-reviewed.");
+    }
+    if (round.redeemFinishTs) {
+      throw new Error("Round is already closed.");
+    }
+    const now = Date.now();
+    round.settledSide = input.side;
+    round.polymarketSettlementPrice = input.side === "UP" ? 1 : 0;
+    round.polymarketSettlementStatus = "admin_review";
+    round.settlementPrice = round.polymarketSettlementPrice;
+    round.settlementTs = now;
+    round.settlementReceivedAt = now;
+    round.settlementSource = "Admin";
+    round.status = "AdminReviewed";
+    round.acceptingOrders = false;
+    round.manualReason = input.reason || `Admin review entered by ${actor.username}.`;
+    this.getPreliminarySettlements().delete(round.id);
+    await this.store.upsertRound(round);
+    await this.writeAuditLog({
+      eventId: this.store.newId("evt"),
+      traceId: this.store.newTraceId(),
+      category: "settlement",
+      actionType: "admin_review",
+      actionStatus: "success",
+      userId: actor.id,
+      role: actor.role,
+      pageName: "profile.analytics",
+      moduleName: "settlement.admin_review",
+      symbol: round.symbol,
+      roundId: round.id,
+      serverRecvTs: now,
+      serverPublishTs: now,
+      backendLatencyMs: 0,
+      resultCode: "ADMIN_REVIEW_CONFIRMED",
+      resultMessage: `Admin review confirmed ${input.side}.`,
+      details: {
+        roundId: round.id,
+        marketId: round.marketId,
+        marketSlug: round.marketSlug,
+        settlementSide: input.side,
+        settlementPrice: round.settlementPrice,
+        reason: input.reason
+      }
+    });
+    for (const userId of this.collectRoundPositionUsers(round.id)) {
+      this.store.emitUserPayload(userId);
+    }
+    this.scheduleReconcile();
+    return round;
+  }
+
+  async redeemUserPositions(user: UserRecord, input: { roundId: string }) {
+    const round = this.store.getRoundById(input.roundId);
+    if (!round) {
+      throw new Error("Round was not found.");
+    }
+    if (round.status !== "AdminReviewed") {
+      throw new Error("Only AdminReviewed rounds can be individually settled.");
+    }
+    if (!round.settledSide) {
+      throw new Error("Round has no settled side.");
+    }
+    const settledSide = round.settledSide;
+    const closedAt = Date.now();
+    let redeemedCount = 0;
+
+    const positions = this.store.positions.filter(
+      (position) => position.roundId === round.id && position.userId === user.id && position.status === "open"
+    );
+
+    await this.store.withTransaction(async () => {
+      for (const position of positions) {
+        const snapshot = this.captureActionSnapshot();
+        const isWinner = position.side === settledSide;
+        const redeemAmount = isWinner ? position.qty : 0;
+        const realizedPnl = redeemAmount - position.notionalSpent;
+        const settlementResult = isWinner ? "win" : "loss";
+        const claimed = await this.store.claimRedeemLedger({
+          roundId: round.id,
+          userId: user.id,
+          positionId: position.id,
+          redeemAmountUsdc: redeemAmount,
+          realizedPnlUsdc: roundNumber(realizedPnl, 2),
+          settlementResult,
+          createdAtMs: closedAt,
+          details: {
+            side: position.side,
+            settledSide,
+            marketId: round.marketId,
+            marketSlug: round.marketSlug
+          }
+        });
+        if (!claimed) {
+          continue;
+        }
+
+        user.availableUsdc = roundNumber(user.availableUsdc + redeemAmount, 2);
+        position.realizedPnl = roundNumber(position.realizedPnl + realizedPnl, 2);
+        position.unrealizedPnl = 0;
+        position.costBasisUsdc = 0;
+        position.markPnlUsdc = 0;
+        position.executablePnlUsdc = 0;
+        position.status = "closed";
+        position.closedAt = closedAt;
+        position.currentMark = isWinner ? 1 : 0;
+        position.currentBid = undefined;
+        position.currentAsk = undefined;
+        position.currentMid = undefined;
+        position.sourceLatencyMs = undefined;
+        position.lockedQty = 0;
+        position.currentValue = redeemAmount;
+        position.settlementResult = settlementResult;
+        await this.store.persistUser(user);
+        await this.store.persistPosition(position);
+        await this.store.settleOpenOrderLifecycles({
+          userId: user.id,
+          roundId: round.id,
+          side: position.side,
+          settlementResult: position.settlementResult,
+          settlementDirection: settledSide,
+          settlementTimeMs: round.settlementTs ?? closedAt,
+          exitTokenPrice: isWinner ? 1 : 0
+        });
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId: this.store.newTraceId(),
+          category: "settlement",
+          actionType: "redeem_position",
+          actionStatus: "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "profile.analytics",
+          moduleName: "settlement.user_redeem",
+          symbol: round.symbol,
+          roundId: round.id,
+          serverRecvTs: closedAt,
+          serverPublishTs: closedAt,
+          backendLatencyMs: 0,
+          resultCode: "POSITION_SETTLED",
+          resultMessage: `Position ${position.id} settled as ${position.settlementResult}.`,
+          details: {
+            roundId: round.id,
+            marketId: round.marketId,
+            marketSlug: round.marketSlug,
+            positionId: position.id,
+            settledSide,
+            redeemAmountUsdc: redeemAmount,
+            realizedPnlUsdc: roundNumber(realizedPnl, 2),
+            settlementResult
+          }
+        });
+        redeemedCount += 1;
+      }
+    });
+
+    this.store.emitUserPayload(user.id);
+    return { redeemedCount };
   }
 
   private getPreliminarySettlements() {
@@ -3667,7 +3843,7 @@ export class SimulationEngine {
   }
 
   private computeRoundStatus(round: RoundRecord, now: number): RoundStatus {
-    if (round.status === "Closed" || round.status === "Manual") {
+    if (round.status === "Closed" || round.status === "Manual" || round.status === "AdminReviewed") {
       return round.status;
     }
     if (round.redeemFinishTs) {
@@ -3697,7 +3873,7 @@ export class SimulationEngine {
   }
 
   private async pollSettlement(round: RoundRecord, now: number) {
-    if (round.settledSide || round.redeemFinishTs || round.status === "Closed" || round.status === "Manual") {
+    if (round.settledSide || round.redeemFinishTs || round.status === "Closed" || round.status === "Manual" || round.status === "AdminReviewed") {
       this.gammaOutcomeConfirmations.delete(round.id);
       return;
     }
@@ -3891,7 +4067,7 @@ export class SimulationEngine {
   }
 
   private scheduleRedeem(round: RoundRecord, now: number) {
-    if (!round.settledSide || round.redeemFinishTs || round.status === "Closed") {
+    if (!round.settledSide || round.redeemFinishTs || round.status === "Closed" || round.status === "AdminReviewed") {
       return;
     }
     const start = round.redeemStartTs ?? round.settlementReceivedAt ?? round.settlementTs ?? now;

@@ -25,7 +25,8 @@ export type RoundStatus =
   | "Settled"
   | "Redeeming"
   | "Closed"
-  | "Manual";
+  | "Manual"
+  | "AdminReviewed";
 export type MarketSwitchState = "active" | "prefetching_next" | "next_ready" | "market_not_ready";
 
 export interface PublicUser {
@@ -129,7 +130,7 @@ export interface SettlementPreview {
   state: "preliminary" | "confirmed" | "manual";
   side?: TradeSide;
   price?: number;
-  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase";
+  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase" | "Admin";
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
@@ -1042,6 +1043,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     });
+  },
+  adminReviewRound(token: string, roundId: string, input: { side: TradeSide; reason?: string }) {
+    return request<RoundRecord>(`/api/rounds/${roundId}/admin-review`, token, {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  },
+  settleMyPositions(token: string, roundId: string) {
+    return request<{ redeemedCount: number }>(`/api/rounds/${roundId}/settle-my-positions`, token, {
+      method: "POST"
+    });
+  },
+  getUnsettledRounds(token: string) {
+    return request<RoundRecord[]>("/api/rounds/unsettled", token);
   },
   getOperatedHistory(token: string, limit = 500, viewUserId?: string) {
     return request<HistoryRound[]>(`/api/profile/rounds/operated${buildQuery({ limit, viewUserId })}`, token);

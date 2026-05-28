@@ -54,7 +54,8 @@ export type RoundStatus =
   | "Settled"
   | "Redeeming"
   | "Closed"
-  | "Manual";
+  | "Manual"
+  | "AdminReviewed";
 export type MarketSwitchState = "active" | "prefetching_next" | "next_ready" | "market_not_ready";
 export type ConnectionState = "healthy" | "reconnecting" | "stale" | "degraded" | "disabled";
 export type LogCategory = "operation" | "matching" | "settlement" | "latency";
@@ -192,7 +193,7 @@ export interface SettlementPreview {
   state: "preliminary" | "confirmed" | "manual";
   side?: TradeSide;
   price?: number;
-  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase";
+  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase" | "Admin";
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
@@ -496,9 +497,9 @@ export interface RoundRecord {
   settledSide?: TradeSide;
   settlementPrice?: number;
   settlementTs?: number;
-  settlementSource?: "Polymarket" | "Gamma" | "Coinbase" | "CLOB";
+  settlementSource?: "Polymarket" | "Gamma" | "Coinbase" | "CLOB" | "Admin";
   polymarketSettlementPrice?: number;
-  polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual";
+  polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual" | "admin_review";
   polymarketOpenPrice?: number;
   polymarketClosePrice?: number;
   polymarketOpenPriceSource?: string;

@@ -362,7 +362,7 @@ const logSearchQuerySchema = z.object({
   resultCode: z.string().optional(),
   direction: z.enum(["UP", "DOWN"]).optional(),
   roundStatus: z
-    .enum(["Trading", "Frozen", "Settling", "Polling", "Settled", "Redeeming", "Closed", "Manual"])
+    .enum(["Trading", "Frozen", "Settling", "Polling", "Settled", "Redeeming", "Closed", "Manual", "AdminReviewed"])
     .optional(),
   settlementResult: z.enum(["win", "loss", "sold"]).optional(),
   bookKey: z.string().optional(),
@@ -2763,6 +2763,52 @@ async function bootstrap() {
           })
         )
       );
+    })
+  );
+
+  app.post("/api/rounds/:id/admin-review", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      if (user.role !== "Admin") {
+        throw new Error("Only Admin can review rounds.");
+      }
+      const params = request.params as { id: string };
+      const parsed = manualSettlementSchema.parse(request.body);
+      return decorateRoundWithSettlementPreview(
+        await store.withTransaction(() =>
+          engine.adminReviewRound(user, {
+            roundId: params.id,
+            side: parsed.side,
+            reason: parsed.reason
+          })
+        )
+      );
+    })
+  );
+
+  app.post("/api/rounds/:id/settle-my-positions", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      if (user.role === "Tester") {
+        throw new Error("Tester accounts cannot settle positions.");
+      }
+      const params = request.params as { id: string };
+      return store.withTransaction(() =>
+        engine.redeemUserPositions(user, { roundId: params.id })
+      );
+    })
+  );
+
+  app.get("/api/rounds/unsettled", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      if (user.role === "Tester") {
+        throw new Error("Tester accounts cannot view unsettled rounds.");
+      }
+      const rounds = store.rounds.filter(
+        (round) => round.status === "Manual" || round.status === "AdminReviewed"
+      );
+      return rounds.map((round) => decorateRoundWithSettlementPreview(round));
     })
   );
 
