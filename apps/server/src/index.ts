@@ -140,6 +140,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   freezeWindowMs: serverConfig.freezeWindowMs,
   pollDelayMs: serverConfig.pollDelayMs,
   gammaPollIntervalMs: serverConfig.gammaPollIntervalMs,
+  gammaMaxPolls: serverConfig.gammaMaxPolls,
   binanceRestUrl: serverConfig.binanceRestUrl,
   binanceFallbackRestUrl: serverConfig.binanceFallbackRestUrl,
   binanceFallbackRestPollMs: serverConfig.binanceFallbackRestPollMs,
@@ -305,7 +306,7 @@ const quickSideSchema = z.object({
   clientSendTs: z.number().optional()
 });
 
-const manualSettlementSchema = z.object({
+const settlementActionSchema = z.object({
   side: z.enum(["UP", "DOWN"]),
   price: z.number().nonnegative().optional(),
   reason: z.string().trim().max(300).optional()
@@ -2745,35 +2746,14 @@ async function bootstrap() {
     })
   );
 
-  app.post("/api/rounds/:id/manual-settlement", async (request) =>
-    safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      if (user.role === "Tester") {
-        throw new Error("Tester accounts cannot enter manual settlement.");
-      }
-      const params = request.params as { id: string };
-      const parsed = manualSettlementSchema.parse(request.body);
-      return decorateRoundWithSettlementPreview(
-        await store.withTransaction(() =>
-          engine.manualSettleRound(user, {
-            roundId: params.id,
-            side: parsed.side,
-            price: parsed.price,
-            reason: parsed.reason
-          })
-        )
-      );
-    })
-  );
-
-  app.post("/api/rounds/:id/admin-review", async (request) =>
+app.post("/api/rounds/:id/admin-review", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       if (user.role !== "Admin") {
         throw new Error("Only Admin can review rounds.");
       }
       const params = request.params as { id: string };
-      const parsed = manualSettlementSchema.parse(request.body);
+      const parsed = settlementActionSchema.parse(request.body);
       return decorateRoundWithSettlementPreview(
         await store.withTransaction(() =>
           engine.adminReviewRound(user, {
@@ -2789,9 +2769,6 @@ async function bootstrap() {
   app.post("/api/rounds/:id/settle-my-positions", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
-      if (user.role === "Tester") {
-        throw new Error("Tester accounts cannot settle positions.");
-      }
       const params = request.params as { id: string };
       return store.withTransaction(() =>
         engine.redeemUserPositions(user, { roundId: params.id })
@@ -2802,12 +2779,39 @@ async function bootstrap() {
   app.get("/api/rounds/unsettled", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
-      if (user.role === "Tester") {
-        throw new Error("Tester accounts cannot view unsettled rounds.");
-      }
+      const now = Date.now();
+      // 从 store.rounds 中找 Manual/AdminReviewed 轮次
+      const unsettledStatuses = new Set(["Manual", "AdminReviewed"]);
       const rounds = store.rounds.filter(
-        (round) => round.status === "Manual" || round.status === "AdminReviewed"
+        (round) =>
+          unsettledStatuses.has(round.status) &&
+          now >= round.endAt + 10 * 60 * 1000
       );
+      // 再从当前用户的开放持仓中找需要结算的轮次
+      const openPositionRoundIds = new Set(
+        store.positions
+          .filter((p) => p.userId === user.id && p.status === "open" && p.roundId)
+          .map((p) => p.roundId)
+      );
+      const existingRoundIds = new Set(rounds.map((r) => r.id));
+      for (const roundId of openPositionRoundIds) {
+        if (!existingRoundIds.has(roundId)) {
+          const round = await store.findRoundOrFallback(roundId);
+          if (round) {
+            rounds.push(round);
+            existingRoundIds.add(roundId);
+          }
+        }
+      }
+      // Manual 排最前，AdminReviewed 按最近结算时间倒序（刚审核的排最前），其余按结束时间
+      rounds.sort((a, b) => {
+        if (a.status === "Manual" && b.status !== "Manual") return -1;
+        if (b.status === "Manual" && a.status !== "Manual") return 1;
+        if (a.status === "AdminReviewed" && b.status === "AdminReviewed") {
+          return (b.settlementTs ?? b.endAt) - (a.settlementTs ?? a.endAt);
+        }
+        return (b.endAt ?? 0) - (a.endAt ?? 0);
+      });
       return rounds.map((round) => decorateRoundWithSettlementPreview(round));
     })
   );

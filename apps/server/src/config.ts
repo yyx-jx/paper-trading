@@ -98,6 +98,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     serverHeapWarnMb: Number(env.SERVER_HEAP_WARN_MB ?? 768),
     serverHeapProtectMb: Number(env.SERVER_HEAP_PROTECT_MB ?? 1024),
     gammaPollIntervalMs: Number(env.GAMMA_POLL_INTERVAL_MS ?? 1000),
+    gammaMaxPolls: Number(env.GAMMA_MAX_POLLS ?? 60),
     logRetentionMs: Number(env.LOG_RETENTION_MS ?? 300000),
     snapshotRetentionSeconds: Number(env.REDIS_SNAPSHOT_TTL_SECONDS ?? 300),
     persistenceMode: persistenceModeEnv(env.PERSISTENCE_MODE),

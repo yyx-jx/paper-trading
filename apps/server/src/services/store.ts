@@ -1725,6 +1725,32 @@ export class AppStore {
     return this.rounds.find((round) => round.id === roundId);
   }
 
+  async findRoundOrFallback(roundId: string) {
+    const round = this.getRoundById(roundId);
+    if (round) return round;
+    // 内存中没有，尝试从数据库查真实数据
+    if (this.postgresEnabled && this.pool) {
+      try {
+        const result = await this.pool.query(
+          "SELECT * FROM rounds WHERE id = $1",
+          [roundId]
+        );
+        if (result.rows.length > 0) {
+          const round = this.rowToRound(result.rows[0]);
+          // 加回内存队列，让 processRounds 能处理超时等后续逻辑
+          this.rounds.push(round);
+          this.rounds.sort((left, right) => right.startAt - left.startAt);
+          return round;
+        }
+      } catch {
+        // 数据库查询失败则用回退
+      }
+    }
+    const position = this.positions.find((p) => p.roundId === roundId);
+    const order = this.orders.find((o) => o.roundId === roundId && o.userId === position?.userId);
+    return this.createOperatedFallbackRound(roundId, order, position);
+  }
+
   getHistory(limit = 10, userId?: string) {
     const sorted = [...this.rounds]
       .filter((round) => isFiveMinuteRound(round) && round.startAt <= Date.now())
@@ -3768,7 +3794,20 @@ export class AppStore {
         behaviorRows
       ] = await Promise.all([
         this.pool.query("SELECT * FROM users ORDER BY created_at ASC"),
-        this.pool.query("SELECT * FROM rounds ORDER BY start_at DESC LIMIT 80"),
+        this.pool
+          .query("SELECT * FROM rounds WHERE status IN ('Manual','AdminReviewed') ORDER BY start_at DESC")
+          .then(async (r: { rows: Record<string, unknown>[] }) => {
+            if (r.rows.length < 80) {
+              const all = await this.pool!.query("SELECT * FROM rounds ORDER BY start_at DESC LIMIT 80");
+              const existingIds = new Set<string>(r.rows.map((row) => String(row.id)));
+              for (const row of all.rows) {
+                if (!existingIds.has(String(row.id))) {
+                  r.rows.push(row);
+                }
+              }
+            }
+            return r;
+          }),
         this.pool.query(
           "SELECT * FROM market_candles WHERE source = $1 AND symbol = $2 AND interval = $3 AND open_ts >= $4 ORDER BY open_ts ASC",
           ["coinbase", this.config.symbol, "30s", Date.now() - MARKET_CANDLE_MEMORY_RETENTION_MS]

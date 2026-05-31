@@ -67,8 +67,7 @@ export function mapApiError(error: unknown, fallbackMessage = "Unexpected server
     message.includes("confirmation does not match") ||
     message.includes("invalid") ||
     message.includes("insufficient") ||
-    message.includes("require ") ||
-    message.includes("cannot enter manual settlement")
+    message.includes("require ")
   ) {
     return new ApiError(422, message, "TRADE_CONFLICT");
   }

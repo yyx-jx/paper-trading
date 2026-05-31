@@ -2796,6 +2796,19 @@ button:disabled:hover {
   justify-content: flex-end;
   padding-top: 4px;
 }
+.settlement-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+.settlement-pagination span {
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 60px;
+  text-align: center;
+}
 .settlement-error {
   font-size: 13px;
   color: var(--red);
@@ -2803,6 +2816,16 @@ button:disabled:hover {
   border-radius: 10px;
   background: rgba(255,122,103,0.08);
   border: 1px solid rgba(255,122,103,0.2);
+}
+.settlement-cooldown {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--amber);
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: rgba(242,187,79,0.1);
+  border: 1px solid rgba(242,187,79,0.25);
+  text-align: center;
 }
 .settlement-round-list {
   flex: 1;

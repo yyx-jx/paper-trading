@@ -1038,12 +1038,6 @@ export const api = {
   getHistory(token: string, limit = 60, viewUserId?: string) {
     return request<HistoryRound[]>(`/api/rounds/history${buildQuery({ limit, viewUserId })}`, token);
   },
-  manualSettleRound(token: string, roundId: string, input: { side: TradeSide; price?: number; reason?: string }) {
-    return request<RoundRecord>(`/api/rounds/${roundId}/manual-settlement`, token, {
-      method: "POST",
-      body: JSON.stringify(input)
-    });
-  },
   adminReviewRound(token: string, roundId: string, input: { side: TradeSide; reason?: string }) {
     return request<RoundRecord>(`/api/rounds/${roundId}/admin-review`, token, {
       method: "POST",

@@ -2288,6 +2288,8 @@ function App() {
   const [unsettledLoading, setUnsettledLoading] = useState(false);
   const [settlementCardState, setSettlementCardState] = useState<Record<string, "idle" | "loading" | "success" | "error">>({});
   const [settlementError, setSettlementError] = useState<string>();
+  const [settlementPage, setSettlementPage] = useState(0);
+  const SETTLEMENT_PAGE_SIZE = 10;
   const [viewUserId, setViewUserId] = useState<string>();
   const [visibleViewUsers, setVisibleViewUsers] = useState<PublicUser[]>([]);
   const cancellingOrderIdsRef = useRef(new Set<string>());
@@ -3050,49 +3052,6 @@ function App() {
     }
   };
 
-  const handleManualSettle = async (roundId: string, side: TradeSide) => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    try {
-      setError(undefined);
-      await api.manualSettleRound(token, roundId, {
-        side,
-        reason: `Manual settlement entered from ${me?.username ?? "client"}`
-      });
-      const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getCurrentRound(token, effectiveViewUserId),
-        api.getHistory(token, 60, effectiveViewUserId),
-        api.getProfile(token, effectiveViewUserId),
-        api.getPositions(token, effectiveViewUserId),
-        api.getOrders(token, effectiveViewUserId),
-        api.getOrderLifecycles(token, effectiveViewUserId),
-        api.getLogs(token, effectiveViewUserId)
-      ]);
-      setMarketPayload({
-        viewedUserId: roundData.viewedUserId ?? effectiveViewUserId ?? me.id,
-        currentRound: roundData.currentRound,
-        history: nextHistory,
-        snapshot: roundData.snapshot,
-        settlementPreview: roundData.settlementPreview,
-        transportMeta: roundData.transportMeta
-      }, Date.now(), clientClockOffsetMsRef.current);
-      setUserPayload({
-        viewedUserId: effectiveViewUserId ?? me.id,
-        viewedUser: currentViewedUser ?? me,
-        profile: nextProfile,
-        positions: nextPositions,
-        orders: nextOrders,
-        orderLifecycles: nextOrderLifecycles,
-        logs: nextLogs
-      });
-    } catch (manualError) {
-      const message = manualError instanceof Error ? manualError.message : "Manual settlement failed.";
-      if (!isManualSettlementPermissionError(message)) {
-        setError(message);
-      }
-    }
-  };
 
   const handleOpenSettlementDialog = async () => {
     if (!token || !me) {
@@ -3100,6 +3059,8 @@ function App() {
     }
     setSettlementDialog(true);
     setSettlementError(undefined);
+    setSettlementCardState({});
+    setSettlementPage(0);
     setUnsettledLoading(true);
     try {
       const rounds = await api.getUnsettledRounds(token);
@@ -3118,9 +3079,14 @@ function App() {
     setSettlementCardState((prev) => ({ ...prev, [roundId]: "loading" }));
     try {
       await api.adminReviewRound(token, roundId, { side, reason: `Admin review by ${me.username}` });
-      setSettlementCardState((prev) => ({ ...prev, [roundId]: "success" }));
       const rounds = await api.getUnsettledRounds(token);
       setUnsettledRounds(rounds);
+      setSettlementPage(0);
+      setSettlementCardState((prev) => {
+        const next = { ...prev };
+        delete next[roundId];
+        return next;
+      });
     } catch (err) {
       setSettlementCardState((prev) => ({ ...prev, [roundId]: "error" }));
       setSettlementError(err instanceof Error ? err.message : "Admin review failed.");
@@ -3128,13 +3094,12 @@ function App() {
   };
 
   const handleSettleMyPositions = async (roundId: string) => {
-    if (!token || !me || me.role === "Tester") {
+    if (!token || !me) {
       return;
     }
     setSettlementCardState((prev) => ({ ...prev, [roundId]: "loading" }));
     try {
       await api.settleMyPositions(token, roundId);
-      setSettlementCardState((prev) => ({ ...prev, [roundId]: "success" }));
       const [nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
         api.getProfile(token, effectiveViewUserId),
         api.getPositions(token, effectiveViewUserId),
@@ -3291,7 +3256,6 @@ function App() {
             sellFeedback={sellFeedback}
             canPlaceOrder={isViewingSelf && me.permissionCodes.includes("trade:order")}
             canSell={isViewingSelf && me.permissionCodes.includes("trade:sell")}
-            canManualSettle={isViewingSelf && me.role !== "Tester"}
             onAmountChange={setOrderAmount}
             onQtyChange={setOrderQty}
             onLimitPriceChange={setLimitPrice}
@@ -3306,7 +3270,6 @@ function App() {
             onSell={handleSell}
             onCancel={handleCancelOrder}
             onTimeline={handleOpenTimeline}
-            onManualSettle={handleManualSettle}
             onNavigate={setCurrentPage}
             onLanguageChange={handleLanguageChange}
             onLogout={clearAuth}
@@ -3414,94 +3377,145 @@ function App() {
                 <div className="check-icon">&#10003;</div>
                 <span>{localLabel(language, "暂无待结算轮次", "No unsettled rounds")}</span>
               </div>
-            ) : (
-              <div className="settlement-round-list">
-                {unsettledRounds.map((round) => {
-                  const cardState = settlementCardState[round.id] ?? "idle";
-                  const isAdmin = me?.role === "Admin";
-                  const isManual = round.status === "Manual";
-                  const isAdminReviewed = round.status === "AdminReviewed";
-                  const settledSide = round.settledSide;
-                  return (
-                    <div key={round.id} className="settlement-round-card">
-                      <div className="card-top">
-                        <span className="round-id">Round #{round.id.slice(-4)}</span>
-                        <span
-                          className="round-status-badge"
-                          style={{
-                            background: isManual ? "rgba(240,160,32,0.15)" : "rgba(64,144,240,0.15)",
-                            color: isManual ? "var(--A)" : "var(--B)"
-                          }}
-                        >
-                          &#9679; {round.status}
-                        </span>
-                        <span className="round-time">{new Date(round.endAt).toISOString().slice(0, 16).replace("T", " ")}</span>
-                      </div>
-                      <div className="card-body">
-                        {isManual && isAdmin ? (
-                          <div className="settlement-actions">
-                            <span style={{ fontSize: 13, color: "var(--muted)" }}>
-                              {localLabel(language, "设定结算结果:", "Set result:")}
-                            </span>
-                            <button
-                              className={`settle-direction-btn up${settledSide === "UP" ? " selected" : ""}`}
-                              disabled={cardState === "loading"}
-                              onClick={() => handleAdminReview(round.id, "UP")}
-                            >
-                              UP &#9650;
-                            </button>
-                            <button
-                              className={`settle-direction-btn down${settledSide === "DOWN" ? " selected" : ""}`}
-                              disabled={cardState === "loading"}
-                              onClick={() => handleAdminReview(round.id, "DOWN")}
-                            >
-                              DOWN &#9660;
-                            </button>
-                          </div>
-                        ) : isManual && !isAdmin ? (
-                          <div className="settlement-waiting">
-                            &#9203; {localLabel(language, "等待管理员设定结算结果", "Waiting for Admin to set result")}
-                          </div>
-                        ) : null}
-                        {isAdminReviewed ? (
-                          <>
-                            <div className={`result-display ${settledSide === "UP" ? "up" : "down"}`}>
-                              {localLabel(language, "结算结果:", "Result:")} {settledSide}
-                              {settledSide === "UP" ? " ▲" : " ▼"}
-                              <span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 8 }}>
-                                ({localLabel(language, "Admin 设定", "Admin set")})
+            ) : (() => {
+                const totalPages = Math.max(1, Math.ceil(unsettledRounds.length / SETTLEMENT_PAGE_SIZE));
+                const pageRounds = unsettledRounds.slice(
+                  settlementPage * SETTLEMENT_PAGE_SIZE,
+                  (settlementPage + 1) * SETTLEMENT_PAGE_SIZE
+                );
+                return (
+                  <>
+                    <div className="settlement-round-list">
+                      {pageRounds.map((round) => {
+                        const cardState = settlementCardState[round.id] ?? "idle";
+                        const isAdmin = me?.role === "Admin";
+                        const isManual = round.status === "Manual";
+                        const isAdminReviewed = round.status === "AdminReviewed";
+                        const settledSide = round.settledSide;
+                        const roundPositions = positions.filter(p => p.roundId === round.id);
+                        const hasOpenPosition = roundPositions.some(p => p.status === "open");
+                        const hasAnyPosition = roundPositions.length > 0;
+                        return (
+                          <div key={round.id} className="settlement-round-card">
+                            <div className="card-top">
+                              <span className="round-id">Round #{round.id.slice(-4)}</span>
+                              <span
+                                className="round-status-badge"
+                                style={{
+                                  background: isManual ? "rgba(240,160,32,0.15)" : "rgba(64,144,240,0.15)",
+                                  color: isManual ? "var(--A)" : "var(--B)"
+                                }}
+                              >
+                                &#9679; {round.status}
                               </span>
+                              <span className="round-time">{new Date(round.endAt).toISOString().slice(0, 16).replace("T", " ")}</span>
                             </div>
-                            <div className="settlement-actions">
-                              {cardState === "success" ? (
-                                <button className="settle-my-btn done" disabled>
-                                  &#10003; {localLabel(language, "已结算", "Settled")}
-                                </button>
-                              ) : (
-                                <button
-                                  className="settle-my-btn"
-                                  disabled={cardState === "loading"}
-                                  onClick={() => handleSettleMyPositions(round.id)}
-                                >
-                                  {cardState === "loading"
-                                    ? localLabel(language, "结算中...", "Settling...")
-                                    : localLabel(language, "结算我的持仓", "Settle My Positions")}
-                                </button>
-                              )}
+                            <div className="card-body">
+                              {isManual && isAdmin ? (
+                                <div className="settlement-actions">
+                                  <span style={{ fontSize: 13, color: "var(--muted)" }}>
+                                    {localLabel(language, "设定结算结果:", "Set result:")}
+                                  </span>
+                                  <button
+                                    className={`settle-direction-btn up${settledSide === "UP" ? " selected" : ""}`}
+                                                                        disabled={cardState === "loading"}
+                                    onClick={() => handleAdminReview(round.id, "UP")}
+                                  >
+                                    UP &#9650;
+                                  </button>
+                                  <button
+                                    className={`settle-direction-btn down${settledSide === "DOWN" ? " selected" : ""}`}
+                                                                        disabled={cardState === "loading"}
+                                    onClick={() => handleAdminReview(round.id, "DOWN")}
+                                  >
+                                    DOWN &#9660;
+                                  </button>
+                                </div>
+                              ) : isManual && !isAdmin ? (
+                                <div className="settlement-waiting">
+                                  &#9203; {localLabel(language, "等待管理员设定结算结果", "Waiting for Admin to set result")}
+                                </div>
+                              ) : null}
+                              {isAdminReviewed && settledSide ? (
+                                <>
+                                  <div className={`result-display ${settledSide === "UP" ? "up" : "down"}`}>
+                                    {localLabel(language, "结算结果:", "Result:")} {settledSide}
+                                    {settledSide === "UP" ? " ▲" : " ▼"}
+                                    <span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 8 }}>
+                                      ({localLabel(language, "Admin 设定", "Admin set")})
+                                    </span>
+                                  </div>
+                                  <div className="settlement-actions">
+                                    {!hasAnyPosition ? null : !hasOpenPosition ? (
+                                      <button className="settle-my-btn done" disabled>
+                                        &#10003; {localLabel(language, "已结算", "Settled")}
+                                      </button>
+                                    ) : (
+                                      <button
+                                        className="settle-my-btn"
+                                                                            disabled={cardState === "loading"}
+                                        onClick={() => handleSettleMyPositions(round.id)}
+                                      >
+                                        {cardState === "loading"
+                                          ? localLabel(language, "结算中...", "Settling...")
+                                          : localLabel(language, "结算我的持仓", "Settle My Positions")}
+                                      </button>
+                                    )}
+                                  </div>
+                                </>
+                              ) : null}
+                              {settledSide && !isManual && !isAdminReviewed ? (
+                                <>
+                                  <div className={`result-display ${settledSide === "UP" ? "up" : "down"}`}>
+                                    {localLabel(language, "结算结果:", "Result:")} {settledSide}
+                                    {settledSide === "UP" ? " ▲" : " ▼"}
+                                  </div>
+                                  <div className="settlement-waiting" style={{ marginTop: 8 }}>
+                                    &#9203; {localLabel(language, "系统自动结算中...", "Auto-settling...")}
+                                  </div>
+                                </>
+                              ) : null}
+                              {!isManual && !settledSide ? (
+                                <div className="settlement-waiting">
+                                  &#9203; {round.status === "Closed"
+                                    ? localLabel(language, "该轮次已关闭，存在未结算仓位，请联系管理员处理", "Round closed with unsettled positions, contact Admin")
+                                    : round.status === "Polling" || round.status === "Settling"
+                                      ? localLabel(language, "系统正在自动结算中，请稍候...", "Auto-settling in progress, please wait...")
+                                      : localLabel(language, "等待管理员处理", "Waiting for Admin processing")}
+                                </div>
+                              ) : null}
+                              {cardState === "error" ? (
+                                <span style={{ fontSize: 12, color: "var(--red)" }}>
+                                  {localLabel(language, "操作失败，请重试", "Failed, please retry")}
+                                </span>
+                              ) : null}
                             </div>
-                          </>
-                        ) : null}
-                        {cardState === "error" ? (
-                          <span style={{ fontSize: 12, color: "var(--red)" }}>
-                            {localLabel(language, "操作失败，请重试", "Failed, please retry")}
-                          </span>
-                        ) : null}
-                      </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
-              </div>
-            )}
+                    {totalPages > 1 ? (
+                      <div className="settlement-pagination">
+                        <button
+                          className="compact-button"
+                          disabled={settlementPage <= 0}
+                          onClick={() => setSettlementPage((p) => Math.max(0, p - 1))}
+                        >
+                          {localLabel(language, "上一页", "Prev")}
+                        </button>
+                        <span>{settlementPage + 1} / {totalPages}</span>
+                        <button
+                          className="compact-button"
+                          disabled={settlementPage >= totalPages - 1}
+                          onClick={() => setSettlementPage((p) => Math.min(totalPages - 1, p + 1))}
+                        >
+                          {localLabel(language, "下一页", "Next")}
+                        </button>
+                      </div>
+                    ) : null}
+                  </>
+                );
+              })()}
             <div className="settlement-dialog-footer">
               <button className="secondary-button" onClick={() => setSettlementDialog(false)}>
                 {localLabel(language, "关闭", "Close")}
@@ -3849,10 +3863,6 @@ function analyticsRowAnalysis(result: AnalyticsResult, language: Language): { te
   };
 }
 
-function isManualSettlementPermissionError(message: string) {
-  return /manual settlement/i.test(message) && /(tester|cannot|forbidden|not allow|not permitted|unauthorized)/i.test(message);
-}
-
 function isClobDepthFailure(order: OrderRecord) {
   return typeof order.failureReason === "string" && /insufficient CLOB depth/i.test(order.failureReason);
 }
@@ -3894,7 +3904,6 @@ function TradePageRestored(props: {
   sellFeedback?: { positionId?: string; message: string };
   canPlaceOrder: boolean;
   canSell: boolean;
-  canManualSettle: boolean;
   onAmountChange: (value: string) => void;
   onQtyChange: (value: string) => void;
   onLimitPriceChange: (value: string) => void;
@@ -3909,7 +3918,6 @@ function TradePageRestored(props: {
   onSell: (positionId: string) => Promise<void>;
   onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
-  onManualSettle: (roundId: string, side: TradeSide) => Promise<void>;
   onNavigate: (page: "trade" | "home" | "profile" | "logs") => void;
   onLanguageChange: (language: Language) => Promise<void>;
   onLogout: () => void;
@@ -4151,10 +4159,6 @@ function TradePageRestored(props: {
     return { book, totalBidQty, totalAskQty, obi };
   };
   const orderBookTotals = { UP: bookStatsFor("UP"), DOWN: bookStatsFor("DOWN") };
-  const canManualSettle =
-    props.canManualSettle &&
-    props.currentRound &&
-    props.currentRound.status === "Manual";
   const displayPriceToBeat = isBtcReferencePrice(snapshot?.displayPriceToBeat) ? snapshot.displayPriceToBeat : undefined;
   const btcUsdMeta = [
     `CB ${money(snapshot?.coinbase.referencePrice ?? 0)}`,
@@ -4597,13 +4601,6 @@ function TradePageRestored(props: {
                 <div className="inline-warning-banner compact-feedback" role="status">
                   <strong>{t("orderBookStaleTitle")}</strong>
                   <span>{t("orderBookStaleWarning")} {typeof orderBookBackendLatency === "number" ? `${Math.round(orderBookBackendLatency)}ms` : ""}</span>
-                </div>
-              ) : null}
-              {canManualSettle ? (
-                <div className="manual-settle">
-                  <span>{localLabel(language, "人工复核", "Manual Review")}</span>
-                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "UP")}>Settle UP</button>
-                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "DOWN")}>Settle DN</button>
                 </div>
               ) : null}
             </div>

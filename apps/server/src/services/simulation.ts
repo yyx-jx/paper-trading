@@ -523,6 +523,7 @@ export class SimulationEngine {
       freezeWindowMs: number;
       pollDelayMs: number;
       gammaPollIntervalMs: number;
+      gammaMaxPolls: number;
       binanceRestUrl: string;
       binanceFallbackRestUrl: string;
       binanceFallbackRestPollMs: number;
@@ -699,63 +700,7 @@ export class SimulationEngine {
       .sort((left, right) => (right.detectedAt ?? 0) - (left.detectedAt ?? 0))[0];
   }
 
-  async manualSettleRound(actor: UserRecord, input: { roundId: string; side: TradeSide; price?: number; reason?: string }) {
-    const round = this.store.getRoundById(input.roundId);
-    if (!round) {
-      throw new Error("Round was not found.");
-    }
-    if (round.status === "Closed" || round.redeemFinishTs) {
-      throw new Error("Round is already closed.");
-    }
-    const now = Date.now();
-    round.settledSide = input.side;
-    round.polymarketSettlementPrice = typeof input.price === "number" ? input.price : input.side === "UP" ? 1 : 0;
-    round.polymarketSettlementStatus = "manual";
-    round.settlementPrice = round.polymarketSettlementPrice;
-    round.settlementTs = now;
-    round.settlementReceivedAt = now;
-    round.settlementSource = "Gamma";
-    round.status = "Settled";
-    round.acceptingOrders = false;
-    round.manualReason = input.reason || `Manual settlement entered by ${actor.username}.`;
-    round.redeemStartTs = now;
-    round.redeemScheduledAt = now + REDEEM_DELAY_MS;
-    this.getPreliminarySettlements().delete(round.id);
-    await this.store.upsertRound(round);
-    await this.writeAuditLog({
-      eventId: this.store.newId("evt"),
-      traceId: this.store.newTraceId(),
-      category: "settlement",
-      actionType: "manual_settlement",
-      actionStatus: "success",
-      userId: actor.id,
-      role: actor.role,
-      pageName: "trade.main",
-      moduleName: "settlement.manual",
-      symbol: round.symbol,
-      roundId: round.id,
-      serverRecvTs: now,
-      serverPublishTs: now,
-      backendLatencyMs: 0,
-      resultCode: "MANUAL_SETTLEMENT_CONFIRMED",
-      resultMessage: `Manual settlement confirmed ${input.side}.`,
-      details: {
-        roundId: round.id,
-        marketId: round.marketId,
-        marketSlug: round.marketSlug,
-        settlementSide: input.side,
-        settlementPrice: round.settlementPrice,
-        reason: input.reason
-      }
-    });
-    for (const userId of this.collectRoundPositionUsers(round.id)) {
-      this.store.emitUserPayload(userId);
-    }
-    this.scheduleReconcile();
-    return round;
-  }
-
-  async adminReviewRound(actor: UserRecord, input: { roundId: string; side: TradeSide; reason?: string }) {
+async adminReviewRound(actor: UserRecord, input: { roundId: string; side: TradeSide; reason?: string }) {
     const round = this.store.getRoundById(input.roundId);
     if (!round) {
       throw new Error("Round was not found.");
@@ -3216,7 +3161,7 @@ export class SimulationEngine {
     const now = Date.now();
     const changedUsers = new Set<string>();
     const rounds = [...this.store.rounds]
-      .filter((round) => round.endAt >= now - 2 * 60 * 60 * 1000)
+      .filter((round) => round.endAt >= now - 2 * 60 * 60 * 1000 || round.status === "Polling" || round.status === "Settling")
       .sort((left, right) => left.startAt - right.startAt);
 
     for (const round of rounds) {
@@ -3897,6 +3842,17 @@ export class SimulationEngine {
 
     try {
       const detail = await this.fetchBestGammaSettlementDetail(round, now);
+      // 超时检查：无论是否有数据都要检查，避免轮次卡在 Polling
+      const gammaTimeoutMs = this.config.gammaMaxPolls * this.config.gammaPollIntervalMs;
+      if (
+        !round.settledSide &&
+        now >= round.endAt + gammaTimeoutMs
+      ) {
+        round.status = "Manual";
+        round.manualReason = `Gamma polling timed out after ${Math.round(gammaTimeoutMs / 1000)}s.`;
+        round.acceptingOrders = false;
+        void this.writeSettlementDiagnostic(round, "GAMMA_POLL_EXHAUSTED", `Gamma polling exhausted after ${Math.round(gammaTimeoutMs / 1000)}s.`);
+      }
       if (!detail) {
         return;
       }
@@ -3908,8 +3864,18 @@ export class SimulationEngine {
           await this.writeSettlementLog(round, "success", settlement.message);
         }
       }
-      // If not yet settled, keep polling indefinitely until result comes in.
     } catch (error) {
+      // 捕获异常时也要检查超时
+      const catchTimeoutMs = this.config.gammaMaxPolls * this.config.gammaPollIntervalMs;
+      if (
+        !round.settledSide &&
+        now >= round.endAt + catchTimeoutMs
+      ) {
+        round.status = "Manual";
+        round.manualReason = `Gamma polling timed out after ${Math.round(catchTimeoutMs / 1000)}s.`;
+        round.acceptingOrders = false;
+        void this.writeSettlementDiagnostic(round, "GAMMA_POLL_EXHAUSTED", `Gamma polling exhausted after ${Math.round(catchTimeoutMs / 1000)}s.`);
+      }
       await this.writeAuditLog({
         eventId: this.store.newId("evt"),
         traceId: this.store.newTraceId(),
@@ -4618,7 +4584,7 @@ export class SimulationEngine {
   private collectRoundPositionUsers(roundId: string) {
     return new Set(
       this.store.positions
-        .filter((position) => position.roundId === roundId)
+        .filter((position) => position.roundId === roundId && position.status === "open")
         .map((position) => position.userId)
     );
   }
