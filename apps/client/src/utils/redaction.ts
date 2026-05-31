@@ -4,8 +4,8 @@ const IPV4_WITH_OPTIONAL_PORT_PATTERN =
 
 export function redactNetworkAddresses(value: unknown) {
   return String(value ?? "")
-    .replace(URL_PATTERN, "[服务地址]")
-    .replace(IPV4_WITH_OPTIONAL_PORT_PATTERN, "[服务地址]");
+    .replace(URL_PATTERN, "[service address]")
+    .replace(IPV4_WITH_OPTIONAL_PORT_PATTERN, "[service address]");
 }
 
 export function safeErrorMessage(error: unknown, fallback: string) {

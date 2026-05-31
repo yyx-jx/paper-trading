@@ -17,6 +17,33 @@ import { createClient } from "redis";
 import { ROLE_PERMISSIONS, normalizeRolePermissions } from "../auth/permissions";
 import { hashPassword, isBcryptHash, verifyPassword } from "../auth/password";
 import { AsyncJsonlWriter } from "./log-writer";
+import {
+  detailString,
+  hasUnsupportedBehaviorSearchFilter,
+  matchesAuditSearch,
+  matchesBehaviorSearch,
+  normalizeSearchLimit,
+  resolveBehaviorSearchUserIds
+} from "./store/log-search";
+import {
+  dedupeMarketCandles,
+  isValidMarketCandle,
+  marketCandleKey,
+  mergeMarketCandlesIntoMemory
+} from "./store/market-candles";
+import { cloneOrderBookSnapshot, orderBookSnapshotRef } from "./store/order-book-snapshots";
+import { buildProfileOverview } from "./store/profile";
+import {
+  rowToAuditEvent,
+  rowToBehaviorLog,
+  rowToMarketCandle,
+  rowToOrder,
+  rowToOrderBookSnapshotRecord,
+  rowToOrderLifecycle,
+  rowToPosition,
+  rowToRound
+} from "./store/row-mappers";
+import { SCHEMA_SQL } from "./store/schema";
 import type {
   AuditEvent,
   AuditLogQuery,
@@ -59,10 +86,6 @@ const PERSISTENCE_FAILURE_THRESHOLD = 3;
 const MARKET_CANDLE_MEMORY_RETENTION_MS = 24 * 60 * 60_000;
 const MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS = 1_000;
 const ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS = 1_000;
-const MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
-  history_1m_split: 1,
-  rtds_30s: 2
-};
 const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
@@ -91,23 +114,6 @@ function isFiveMinuteRound(round: RoundRecord) {
   return round.endAt > round.startAt && round.endAt - round.startAt === FIVE_MINUTE_ROUND_MS;
 }
 
-function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
-  return {
-    snapshotId: snapshot.snapshotId,
-    snapshotTs: snapshot.snapshotTs,
-    bestBid: snapshot.bestBid,
-    bestAsk: snapshot.bestAsk,
-    midPrice: snapshot.midPrice,
-    bids: snapshot.bids.map((level) => ({ ...level })),
-    asks: snapshot.asks.map((level) => ({ ...level }))
-  };
-}
-
-function orderBookSnapshotRef(snapshot: OrderBookSnapshot) {
-  const normalized = cloneOrderBookSnapshot(snapshot);
-  return `obs_${createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 32)}`;
-}
-
 function parseBtcFiveMinuteSlugStart(value?: string) {
   const match = value?.toLowerCase().match(/^btc-updown-5m-(\d+)$/);
   if (!match) {
@@ -124,10 +130,6 @@ function inferFiveMinuteWindow(input: { roundId: string; marketSlug?: string; fa
     startAt,
     endAt: startAt + FIVE_MINUTE_ROUND_MS
   };
-}
-
-function sanitizePolymarketBtcReference(price?: number) {
-  return typeof price === "number" && Number.isFinite(price) && price > 1000 ? price : undefined;
 }
 
 function readUtf8Tail(filePath: string, maxBytes: number) {
@@ -168,447 +170,6 @@ function readJsonlTail<T>(filePath: string, maxBytes: number, guard: (value: unk
     })
     .filter(guard);
 }
-
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  username TEXT UNIQUE NOT NULL,
-  password TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  role TEXT NOT NULL,
-  language TEXT NOT NULL,
-  permission_codes JSONB NOT NULL,
-  available_usdc DOUBLE PRECISION NOT NULL,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  senior_tester_id TEXT,
-  disabled_at BIGINT,
-  disabled_by TEXT,
-  manager_user_id TEXT,
-  permission_level TEXT NOT NULL DEFAULT 'Standard',
-  failed_login_count INTEGER NOT NULL DEFAULT 0,
-  locked_until BIGINT,
-  password_changed_at BIGINT,
-  last_login_at BIGINT,
-  must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
-  data_version INTEGER NOT NULL DEFAULT 1,
-  created_at BIGINT NOT NULL,
-  updated_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS rounds (
-  id TEXT PRIMARY KEY,
-  market_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  event_id TEXT,
-  market_slug TEXT,
-  event_slug TEXT,
-  condition_id TEXT,
-  series_slug TEXT,
-  up_token_id TEXT,
-  down_token_id TEXT,
-  title TEXT,
-  resolution_source TEXT,
-  start_at BIGINT NOT NULL,
-  end_at BIGINT NOT NULL,
-  price_to_beat DOUBLE PRECISION NOT NULL,
-  price_to_beat_source TEXT,
-  price_to_beat_captured_at BIGINT,
-  status TEXT NOT NULL,
-  poll_count INTEGER NOT NULL,
-  poll_start_at BIGINT,
-  last_poll_at BIGINT,
-  closing_spot_price DOUBLE PRECISION,
-  settled_side TEXT,
-  settlement_price DOUBLE PRECISION,
-  settlement_ts BIGINT,
-  redeem_start_ts BIGINT,
-  redeem_finish_ts BIGINT,
-  manual_reason TEXT,
-  accepting_orders BOOLEAN,
-  closing_price_source TEXT,
-  settlement_source TEXT,
-  polymarket_settlement_price DOUBLE PRECISION,
-  polymarket_settlement_status TEXT,
-  polymarket_open_price DOUBLE PRECISION,
-  polymarket_close_price DOUBLE PRECISION,
-  polymarket_open_price_source TEXT,
-  polymarket_close_price_source TEXT,
-  settlement_received_at BIGINT,
-  redeem_scheduled_at BIGINT,
-  binance_open_price DOUBLE PRECISION,
-  binance_close_price DOUBLE PRECISION,
-  chainlink_open_price DOUBLE PRECISION,
-  chainlink_close_price DOUBLE PRECISION
-);
-
-CREATE TABLE IF NOT EXISTS market_candles (
-  source TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  interval TEXT NOT NULL,
-  open_ts BIGINT NOT NULL,
-  close_ts BIGINT NOT NULL,
-  open DOUBLE PRECISION NOT NULL,
-  high DOUBLE PRECISION NOT NULL,
-  low DOUBLE PRECISION NOT NULL,
-  close DOUBLE PRECISION NOT NULL,
-  volume DOUBLE PRECISION NOT NULL DEFAULT 0,
-  origin TEXT NOT NULL,
-  updated_at BIGINT NOT NULL,
-  PRIMARY KEY (source, symbol, interval, open_ts),
-  CHECK (open_ts % 30000 = 0),
-  CHECK (close_ts = open_ts + 30000)
-);
-
-CREATE INDEX IF NOT EXISTS idx_market_candles_lookup
-  ON market_candles(source, symbol, interval, open_ts DESC);
-
-CREATE TABLE IF NOT EXISTS order_book_snapshots (
-  ref TEXT PRIMARY KEY,
-  snapshot_id TEXT NOT NULL,
-  snapshot_ts BIGINT NOT NULL,
-  best_bid DOUBLE PRECISION NOT NULL,
-  best_ask DOUBLE PRECISION NOT NULL,
-  mid_price DOUBLE PRECISION NOT NULL,
-  snapshot JSONB NOT NULL,
-  created_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY,
-  trace_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  market_id TEXT NOT NULL,
-  order_kind TEXT,
-  time_in_force TEXT,
-  limit_price DOUBLE PRECISION,
-  lifecycle_status TEXT,
-  result_type TEXT,
-  token_id TEXT,
-  book_key TEXT,
-  book_hash TEXT,
-  requested_amount_usdc DOUBLE PRECISION,
-  requested_qty DOUBLE PRECISION,
-  frozen_usdc DOUBLE PRECISION,
-  frozen_qty DOUBLE PRECISION,
-  fills JSONB,
-  estimated_fee DOUBLE PRECISION,
-  actual_fee DOUBLE PRECISION,
-  fee_breakdown JSONB,
-  fee_currency TEXT,
-  source_latency_ms DOUBLE PRECISION,
-  market_slug TEXT,
-  order_book_snapshot_ref TEXT,
-  order_book_snapshot JSONB,
-  action TEXT NOT NULL,
-  side TEXT NOT NULL,
-  status TEXT NOT NULL,
-  notional_usdc DOUBLE PRECISION NOT NULL,
-  expected_qty DOUBLE PRECISION NOT NULL,
-  filled_qty DOUBLE PRECISION NOT NULL,
-  unfilled_qty DOUBLE PRECISION NOT NULL,
-  avg_fill_price DOUBLE PRECISION,
-  best_bid DOUBLE PRECISION NOT NULL,
-  best_ask DOUBLE PRECISION NOT NULL,
-  mid_price DOUBLE PRECISION NOT NULL,
-  book_snapshot_ts BIGINT NOT NULL,
-  partial_filled BOOLEAN NOT NULL,
-  slippage_bps DOUBLE PRECISION,
-  match_latency_ms DOUBLE PRECISION NOT NULL,
-  book_acquire_latency_ms DOUBLE PRECISION,
-  local_match_latency_ms DOUBLE PRECISION,
-  persist_latency_ms DOUBLE PRECISION,
-  total_order_latency_ms DOUBLE PRECISION,
-  failure_reason TEXT,
-  client_order_id TEXT,
-  client_send_ts BIGINT,
-  server_recv_ts BIGINT NOT NULL,
-  server_publish_ts BIGINT NOT NULL,
-  created_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS order_lifecycle_logs (
-  id TEXT PRIMARY KEY,
-  buy_order_id TEXT UNIQUE NOT NULL,
-  trace_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  tester_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  asset_class TEXT NOT NULL,
-  market_id TEXT NOT NULL,
-  market_slug TEXT,
-  direction TEXT NOT NULL,
-  order_timestamp_ms BIGINT NOT NULL,
-  entry_token_price DOUBLE PRECISION,
-  btc_trade_price DOUBLE PRECISION,
-  btc_open_price_to_beat DOUBLE PRECISION,
-  delta_btc DOUBLE PRECISION,
-  volume_token_qty DOUBLE PRECISION NOT NULL,
-  remaining_token_qty DOUBLE PRECISION NOT NULL,
-  closed_token_qty DOUBLE PRECISION NOT NULL,
-  position_notional DOUBLE PRECISION NOT NULL,
-  exit_type TEXT,
-  exit_token_price DOUBLE PRECISION,
-  exit_notional DOUBLE PRECISION NOT NULL,
-  settlement_result TEXT,
-  order_book_snapshot_ref TEXT,
-  actual_fill_price DOUBLE PRECISION,
-  slippage_bps DOUBLE PRECISION,
-  match_latency_ms DOUBLE PRECISION NOT NULL,
-  settlement_time_ms BIGINT,
-  settlement_direction TEXT,
-  entry_fee DOUBLE PRECISION,
-  exit_fee DOUBLE PRECISION,
-  fee_currency TEXT,
-  created_at BIGINT NOT NULL,
-  updated_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS positions (
-  id TEXT PRIMARY KEY,
-  buy_order_id TEXT,
-  user_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  side TEXT NOT NULL,
-  qty DOUBLE PRECISION NOT NULL,
-  locked_qty DOUBLE PRECISION,
-  average_entry DOUBLE PRECISION NOT NULL,
-  notional_spent DOUBLE PRECISION NOT NULL,
-  current_mark DOUBLE PRECISION NOT NULL,
-  current_bid DOUBLE PRECISION,
-  current_ask DOUBLE PRECISION,
-  current_mid DOUBLE PRECISION,
-  current_value DOUBLE PRECISION,
-  source_latency_ms DOUBLE PRECISION,
-  unrealized_pnl DOUBLE PRECISION NOT NULL,
-  realized_pnl DOUBLE PRECISION NOT NULL,
-  entry_fee_usdc DOUBLE PRECISION,
-  exit_fee_usdc DOUBLE PRECISION,
-  total_fee_usdc DOUBLE PRECISION,
-  cost_basis_usdc DOUBLE PRECISION,
-  mark_pnl_usdc DOUBLE PRECISION,
-  executable_pnl_usdc DOUBLE PRECISION,
-  data_version INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL,
-  opened_at BIGINT NOT NULL,
-  closed_at BIGINT,
-  settlement_result TEXT
-);
-
-CREATE TABLE IF NOT EXISTS audit_events (
-  event_id TEXT PRIMARY KEY,
-  trace_id TEXT NOT NULL,
-  category TEXT NOT NULL,
-  action_type TEXT NOT NULL,
-  action_status TEXT NOT NULL,
-  user_id TEXT,
-  role TEXT,
-  page_name TEXT NOT NULL,
-  module_name TEXT NOT NULL,
-  symbol TEXT,
-  round_id TEXT,
-  result_code TEXT NOT NULL,
-  result_message TEXT NOT NULL,
-  client_send_ts BIGINT,
-  server_recv_ts BIGINT NOT NULL,
-  engine_start_ts BIGINT,
-  engine_finish_ts BIGINT,
-  server_publish_ts BIGINT NOT NULL,
-  backend_latency_ms DOUBLE PRECISION NOT NULL,
-  frontend_latency_ms DOUBLE PRECISION,
-  details JSONB
-);
-
-CREATE TABLE IF NOT EXISTS behavior_action_logs (
-  log_id TEXT PRIMARY KEY,
-  timestamp_ms BIGINT NOT NULL,
-  asset_class TEXT NOT NULL,
-  action_type TEXT NOT NULL,
-  action_status TEXT NOT NULL,
-  round_id TEXT,
-  direction TEXT,
-  entry_odds DOUBLE PRECISION,
-  delta_clob DOUBLE PRECISION NOT NULL,
-  volume_clob DOUBLE PRECISION NOT NULL,
-  position_notional DOUBLE PRECISION,
-  exit_type TEXT,
-  exit_odds DOUBLE PRECISION,
-  settlement_result TEXT,
-  tester_id_anon TEXT NOT NULL,
-  trace_id TEXT,
-  order_id TEXT,
-  market_id TEXT,
-  market_slug TEXT,
-  round_status TEXT,
-  countdown_ms BIGINT,
-  binance_spot_price DOUBLE PRECISION NOT NULL,
-  binance_1m_last_close DOUBLE PRECISION NOT NULL,
-  binance_5m_last_close DOUBLE PRECISION NOT NULL,
-  binance_1d_last_close DOUBLE PRECISION NOT NULL,
-  chainlink_price DOUBLE PRECISION NOT NULL,
-  price_to_beat DOUBLE PRECISION NOT NULL,
-  up_price DOUBLE PRECISION NOT NULL,
-  down_price DOUBLE PRECISION NOT NULL,
-  up_book_top5 JSONB NOT NULL,
-  down_book_top5 JSONB NOT NULL,
-  recent_trades_top20 JSONB NOT NULL,
-  book_snapshot_entry JSONB NOT NULL,
-  actual_fill_price DOUBLE PRECISION,
-  slippage_bps DOUBLE PRECISION,
-  partial_filled BOOLEAN,
-  unfilled_qty DOUBLE PRECISION,
-  execution_latency_ms DOUBLE PRECISION,
-  settlement_direction TEXT,
-  settlement_time_ms BIGINT,
-  gamma_poll_count INTEGER,
-  redeem_finish_time_ms BIGINT,
-  source_states JSONB NOT NULL,
-  strategy_cluster_label TEXT,
-  market_regime_label TEXT,
-  quality_grade TEXT,
-  context_json JSONB
-);
-
-CREATE TABLE IF NOT EXISTS export_audit_logs (
-  export_id TEXT PRIMARY KEY,
-  actor_user_id TEXT NOT NULL,
-  actor_role TEXT NOT NULL,
-  export_type TEXT NOT NULL,
-  format TEXT NOT NULL,
-  scope JSONB NOT NULL,
-  record_count INTEGER NOT NULL,
-  filtered_d_grade_count INTEGER NOT NULL,
-  missing_quality_count INTEGER NOT NULL,
-  file_sha256 TEXT NOT NULL,
-  created_at_ms BIGINT NOT NULL,
-  details JSONB
-);
-
-CREATE TABLE IF NOT EXISTS redeem_ledger (
-  id TEXT PRIMARY KEY,
-  round_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  position_id TEXT NOT NULL,
-  redeem_amount_usdc DOUBLE PRECISION NOT NULL,
-  realized_pnl_usdc DOUBLE PRECISION NOT NULL,
-  settlement_result TEXT NOT NULL,
-  created_at_ms BIGINT NOT NULL,
-  details JSONB,
-  UNIQUE (round_id, user_id, position_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_rounds_start_at ON rounds(start_at DESC);
-CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_ts ON order_book_snapshots(snapshot_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_client_order_id ON orders(user_id, client_order_id) WHERE client_order_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_order_lifecycle_user_time ON order_lifecycle_logs(user_id, order_timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_order_lifecycle_round ON order_lifecycle_logs(round_id, direction, order_timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_positions_user_opened ON positions(user_id, opened_at DESC);
-CREATE INDEX IF NOT EXISTS idx_positions_buy_order_id ON positions(buy_order_id);
-CREATE INDEX IF NOT EXISTS idx_audit_events_user_recv ON audit_events(user_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_round_recv ON audit_events(round_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_category_action_recv ON audit_events(category, action_type, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_trace_recv ON audit_events(trace_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_module_recv ON audit_events(module_name, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_latency_recv ON audit_events(category, module_name, backend_latency_ms, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_order_id ON audit_events((details->>'orderId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_position_id ON audit_events((details->>'positionId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_market_id ON audit_events((details->>'marketId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_market_slug ON audit_events((details->>'marketSlug'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_connection_state ON audit_events((details->>'connectionState'), server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_timestamp ON behavior_action_logs(timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_user_round ON behavior_action_logs(tester_id_anon, round_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_market_time ON behavior_action_logs(market_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_trace_time ON behavior_action_logs(trace_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_order_time ON behavior_action_logs(order_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_action_time ON behavior_action_logs(action_type, action_status, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_round_status_time ON behavior_action_logs(round_status, timestamp_ms DESC);
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS senior_tester_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_by TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_user_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_level TEXT NOT NULL DEFAULT 'Standard';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT;
-UPDATE users SET updated_at = created_at WHERE updated_at IS NULL;
-UPDATE users SET manager_user_id = senior_tester_id WHERE manager_user_id IS NULL AND senior_tester_id IS NOT NULL;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS buy_order_id TEXT;
-CREATE INDEX IF NOT EXISTS idx_users_senior_tester ON users(senior_tester_id);
-CREATE INDEX IF NOT EXISTS idx_users_manager_user ON users(manager_user_id);
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_status TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_open_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_close_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_open_price_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_close_price_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_received_at BIGINT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS redeem_scheduled_at BIGINT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_open_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_close_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS chainlink_open_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS chainlink_close_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_captured_at BIGINT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_kind TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS time_in_force TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS limit_price DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS lifecycle_status TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS result_type TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS token_id TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_key TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_hash TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS requested_amount_usdc DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS requested_qty DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_usdc DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_qty DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fills JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS estimated_fee DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS actual_fee DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_breakdown JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_currency TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS market_slug TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_book_snapshot_ref TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_book_snapshot JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_acquire_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS local_match_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS persist_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_order_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS locked_qty DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_bid DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_ask DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_mid DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_value DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS total_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS cost_basis_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS mark_pnl_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS executable_pnl_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS entry_fee DOUBLE PRECISION;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS exit_fee DOUBLE PRECISION;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS fee_currency TEXT;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE behavior_action_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-CREATE INDEX IF NOT EXISTS idx_export_audit_logs_actor_created ON export_audit_logs(actor_user_id, created_at_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_redeem_ledger_round_user ON redeem_ledger(round_id, user_id);
-`;
 
 const LOG_DIR = path.resolve(process.cwd(), "data/logs");
 const LOG_FILE = path.join(LOG_DIR, "audit-events.jsonl");
@@ -845,10 +406,15 @@ export class AppStore {
   private marketSnapshotPersistTimer?: ReturnType<typeof setTimeout>;
   private lastMarketSnapshotPersistAt = 0;
   private lastRetentionCleanupAt = 0;
+  private retentionCleanupRunning = false;
   private lastMemoryGuardAt = 0;
   private readonly orderIndexById = new Map<string, number>();
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
+  private ordersByUserId = new Map<string, OrderRecord[]>();
+  private positionsByUserId = new Map<string, PositionRecord[]>();
+  private orderLifecyclesByUserId = new Map<string, OrderLifecycleRecord[]>();
+  private operatedRoundIdsByUserId = new Map<string, Set<string>>();
   private readonly pendingUserPayloadIds = new Map<string, UserPayloadScope>();
   private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
@@ -1272,13 +838,99 @@ export class AppStore {
     records.push(record);
   }
 
+  private removeUserIndexedRecord<T extends { id: string }>(recordsByUserId: Map<string, T[]>, record: T & { userId: string }) {
+    const records = recordsByUserId.get(record.userId);
+    if (!records) {
+      return;
+    }
+    const next = records.filter((item) => item.id !== record.id);
+    if (next.length > 0) {
+      recordsByUserId.set(record.userId, next);
+    } else {
+      recordsByUserId.delete(record.userId);
+    }
+  }
+
+  private upsertUserIndexedRecord<T extends { id: string; userId: string }>(recordsByUserId: Map<string, T[]>, record: T) {
+    const records = recordsByUserId.get(record.userId) ?? [];
+    const index = records.findIndex((item) => item.id === record.id);
+    if (index >= 0) {
+      records[index] = record;
+    } else {
+      records.push(record);
+    }
+    recordsByUserId.set(record.userId, records);
+  }
+
+  private rememberOperatedRound(userId: string, roundId?: string) {
+    if (!roundId) {
+      return;
+    }
+    const roundIds = this.operatedRoundIdsByUserId.get(userId) ?? new Set<string>();
+    roundIds.add(roundId);
+    this.operatedRoundIdsByUserId.set(userId, roundIds);
+  }
+
+  private upsertOrderInMemory(order: OrderRecord) {
+    const previousIndex = this.orderIndexById.get(order.id);
+    const previous = typeof previousIndex === "number" ? this.orders[previousIndex] : undefined;
+    if (previous && previous.userId !== order.userId) {
+      this.removeUserIndexedRecord(this.ordersByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    this.upsertUserIndexedRecord(this.ordersByUserId, order);
+    this.rememberOperatedRound(order.userId, order.roundId);
+  }
+
+  private upsertPositionInMemory(position: PositionRecord) {
+    const previousIndex = this.positionIndexById.get(position.id);
+    const previous = typeof previousIndex === "number" ? this.positions[previousIndex] : undefined;
+    if (previous && previous.userId !== position.userId) {
+      this.removeUserIndexedRecord(this.positionsByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.positions, this.positionIndexById, position);
+    this.upsertUserIndexedRecord(this.positionsByUserId, position);
+    this.rememberOperatedRound(position.userId, position.roundId);
+  }
+
+  private upsertOrderLifecycleInMemory(log: OrderLifecycleRecord) {
+    const previousIndex = this.orderLifecycleIndexById.get(log.id);
+    const previous = typeof previousIndex === "number" ? this.orderLifecycleLogs[previousIndex] : undefined;
+    if (previous && previous.userId !== log.userId) {
+      this.removeUserIndexedRecord(this.orderLifecyclesByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.orderLifecycleLogs, this.orderLifecycleIndexById, log);
+    this.upsertUserIndexedRecord(this.orderLifecyclesByUserId, log);
+    this.rememberOperatedRound(log.userId, log.roundId);
+  }
+
   private rebuildHotIndexes() {
+    this.ordersByUserId ??= new Map<string, OrderRecord[]>();
+    this.positionsByUserId ??= new Map<string, PositionRecord[]>();
+    this.orderLifecyclesByUserId ??= new Map<string, OrderLifecycleRecord[]>();
+    this.operatedRoundIdsByUserId ??= new Map<string, Set<string>>();
     this.orderIndexById.clear();
     this.positionIndexById.clear();
     this.orderLifecycleIndexById.clear();
-    this.orders.forEach((order, index) => this.orderIndexById.set(order.id, index));
-    this.positions.forEach((position, index) => this.positionIndexById.set(position.id, index));
-    this.orderLifecycleLogs.forEach((log, index) => this.orderLifecycleIndexById.set(log.id, index));
+    this.ordersByUserId.clear();
+    this.positionsByUserId.clear();
+    this.orderLifecyclesByUserId.clear();
+    this.operatedRoundIdsByUserId.clear();
+    this.orders.forEach((order, index) => {
+      this.orderIndexById.set(order.id, index);
+      this.upsertUserIndexedRecord(this.ordersByUserId, order);
+      this.rememberOperatedRound(order.userId, order.roundId);
+    });
+    this.positions.forEach((position, index) => {
+      this.positionIndexById.set(position.id, index);
+      this.upsertUserIndexedRecord(this.positionsByUserId, position);
+      this.rememberOperatedRound(position.userId, position.roundId);
+    });
+    this.orderLifecycleLogs.forEach((log, index) => {
+      this.orderLifecycleIndexById.set(log.id, index);
+      this.upsertUserIndexedRecord(this.orderLifecyclesByUserId, log);
+      this.rememberOperatedRound(log.userId, log.roundId);
+    });
   }
 
   private trimArrayByCreatedAt<T>(
@@ -1737,28 +1389,21 @@ export class AppStore {
   }
 
   getOperatedHistory(limit = 500, userId: string) {
-    const operatedRoundIds = new Set<string>();
     const orderByRoundId = new Map<string, OrderRecord>();
     const positionByRoundId = new Map<string, PositionRecord>();
-    for (const order of this.orders) {
-      if (order.userId === userId) {
-        operatedRoundIds.add(order.roundId);
-        if (!orderByRoundId.has(order.roundId)) {
-          orderByRoundId.set(order.roundId, order);
-        }
+    for (const order of this.ordersByUserId.get(userId) ?? []) {
+      if (!orderByRoundId.has(order.roundId)) {
+        orderByRoundId.set(order.roundId, order);
       }
     }
-    for (const position of this.positions) {
-      if (position.userId === userId) {
-        operatedRoundIds.add(position.roundId);
-        if (!positionByRoundId.has(position.roundId)) {
-          positionByRoundId.set(position.roundId, position);
-        }
+    for (const position of this.positionsByUserId.get(userId) ?? []) {
+      if (!positionByRoundId.has(position.roundId)) {
+        positionByRoundId.set(position.roundId, position);
       }
     }
 
     const roundById = new Map(this.rounds.map((round) => [round.id, round]));
-    return [...operatedRoundIds]
+    return [...(this.operatedRoundIdsByUserId.get(userId) ?? new Set<string>())]
       .map((roundId) => roundById.get(roundId) ?? this.createOperatedFallbackRound(roundId, orderByRoundId.get(roundId), positionByRoundId.get(roundId)))
       .filter(
         (round): round is RoundRecord =>
@@ -1773,8 +1418,7 @@ export class AppStore {
   }
 
   getPositions(userId: string) {
-    return this.positions
-      .filter((position) => position.userId === userId)
+    return [...(this.positionsByUserId.get(userId) ?? [])]
       .sort((left, right) => right.openedAt - left.openedAt)
       .map((position) => this.decoratePosition(position));
   }
@@ -1785,15 +1429,13 @@ export class AppStore {
   }
 
   getOrders(userId: string) {
-    return this.orders
-      .filter((order) => order.userId === userId)
+    return [...(this.ordersByUserId.get(userId) ?? [])]
       .sort((left, right) => right.createdAt - left.createdAt)
       .map((order) => this.sanitizeOrder(order));
   }
 
   getRecentTradeOrders(userId: string, limit = 50) {
-    return this.orders
-      .filter((order) => order.userId === userId)
+    return [...(this.ordersByUserId.get(userId) ?? [])]
       .sort((left, right) => right.createdAt - left.createdAt)
       .slice(0, Math.max(1, Math.floor(limit)))
       .map((order) => this.sanitizeOrder(order));
@@ -1824,8 +1466,8 @@ export class AppStore {
     if (!row) {
       return undefined;
     }
-    const order = this.rowToOrder(row);
-    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    const order = rowToOrder(row);
+    this.upsertOrderInMemory(order);
     this.pruneMemoryCaches();
     return order;
   }
@@ -1864,7 +1506,7 @@ export class AppStore {
   }
 
   async searchAuditLogs(filters?: LogSearchQuery, options?: { limit?: number; offset?: number }) {
-    const limit = this.normalizeSearchLimit(options?.limit);
+    const limit = normalizeSearchLimit(options?.limit);
     const offset = Math.max(0, Math.floor(options?.offset ?? 0));
     if (filters?.userIds && filters.userIds.length === 0) {
       return [] as AuditEvent[];
@@ -1997,26 +1639,26 @@ export class AppStore {
           `,
           values as never[]
         );
-        return rows.rows.map((row) => this.rowToAuditEvent(row));
+        return rows.rows.map((row) => rowToAuditEvent(row));
       } catch (error) {
         console.warn("[store] PostgreSQL audit search failed, falling back to memory:", error);
       }
     }
 
     return this.logs
-      .filter((log) => this.matchesAuditSearch(log, filters))
+      .filter((log) => matchesAuditSearch(log, filters))
       .sort((left, right) => right.serverRecvTs - left.serverRecvTs || right.eventId.localeCompare(left.eventId))
       .slice(offset, offset + limit);
   }
 
   async searchBehaviorLogs(filters?: LogSearchQuery, options?: { limit?: number; offset?: number }) {
-    const limit = this.normalizeSearchLimit(options?.limit);
+    const limit = normalizeSearchLimit(options?.limit);
     const offset = Math.max(0, Math.floor(options?.offset ?? 0));
-    const effectiveUserIds = this.resolveBehaviorSearchUserIds(filters);
+    const effectiveUserIds = resolveBehaviorSearchUserIds(filters, this.users.values());
     if (effectiveUserIds && effectiveUserIds.length === 0) {
       return [] as BehaviorActionLog[];
     }
-    if (this.hasUnsupportedBehaviorSearchFilter(filters)) {
+    if (hasUnsupportedBehaviorSearchFilter(filters)) {
       return [] as BehaviorActionLog[];
     }
 
@@ -2081,14 +1723,14 @@ export class AppStore {
           `,
           values as never[]
         );
-        return rows.rows.map((row) => this.rowToBehaviorLog(row));
+        return rows.rows.map((row) => rowToBehaviorLog(row));
       } catch (error) {
         console.warn("[store] PostgreSQL training log search failed, falling back to memory:", error);
       }
     }
 
     return this.behaviorLogs
-      .filter((log) => this.matchesBehaviorSearch(log, filters, effectiveUserIds))
+      .filter((log) => matchesBehaviorSearch(log, filters, effectiveUserIds, (userId) => this.anonymizeUserId(userId)))
       .sort((left, right) => right.timestampMs - left.timestampMs || right.logId.localeCompare(left.logId))
       .slice(offset, offset + limit);
   }
@@ -2126,10 +1768,10 @@ export class AppStore {
         if (filters?.resultCode && log.resultCode !== filters.resultCode) {
           return false;
         }
-        if (filters?.orderId && this.detailString(log.details, "orderId") !== filters.orderId) {
+        if (filters?.orderId && detailString(log.details, "orderId") !== filters.orderId) {
           return false;
         }
-        if (filters?.positionId && this.detailString(log.details, "positionId") !== filters.positionId) {
+        if (filters?.positionId && detailString(log.details, "positionId") !== filters.positionId) {
           return false;
         }
         return true;
@@ -2191,12 +1833,12 @@ export class AppStore {
     const allBehaviorLogs = this.getBehaviorLogs();
     const positionId =
       allAuditEvents
-        .filter((event) => event.traceId === order.traceId || this.detailString(event.details, "orderId") === order.id)
-        .map((event) => this.detailString(event.details, "positionId"))
+        .filter((event) => event.traceId === order.traceId || detailString(event.details, "orderId") === order.id)
+        .map((event) => detailString(event.details, "positionId"))
         .find(Boolean) ??
       allBehaviorLogs
         .filter((log) => log.traceId === order.traceId || log.orderId === order.id)
-        .map((log) => this.detailString(log.contextJson, "positionId"))
+        .map((log) => detailString(log.contextJson, "positionId"))
         .find(Boolean);
     const rawPosition = positionId
       ? this.positions.find((item) => item.id === positionId)
@@ -2207,15 +1849,15 @@ export class AppStore {
     const auditEvents = allAuditEvents.filter((event) => {
       return (
         event.traceId === order.traceId ||
-        this.detailString(event.details, "orderId") === order.id ||
-        Boolean(positionId && this.detailString(event.details, "positionId") === positionId)
+        detailString(event.details, "orderId") === order.id ||
+        Boolean(positionId && detailString(event.details, "positionId") === positionId)
       );
     });
     const behaviorLogs = allBehaviorLogs.filter((log) => {
       return (
         log.traceId === order.traceId ||
         log.orderId === order.id ||
-        Boolean(positionId && this.detailString(log.contextJson, "positionId") === positionId)
+        Boolean(positionId && detailString(log.contextJson, "positionId") === positionId)
       );
     });
 
@@ -2228,60 +1870,7 @@ export class AppStore {
   }
 
   getProfile(userId: string): ProfileOverview {
-    const user = this.users.get(userId);
-    if (!user) {
-      return {
-        totalEquity: 0,
-        availableUsdc: 0,
-        positionValue: 0,
-        realizedPnlToday: 0,
-        unrealizedPnl: 0,
-        winRate: 0,
-        roundsParticipatedTotal: 0,
-        roundsParticipatedToday: 0
-      };
-    }
-
-    const positions = this.getPositions(userId);
-    const livePositions = positions.filter((position) => position.displayStatus === "open");
-    const positionValue = livePositions.reduce((sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark), 0);
-
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const todayTs = todayStart.getTime();
-
-    const realizedPnlToday = positions
-      .filter((position) => (position.closedAt ?? position.openedAt) >= todayTs)
-      .reduce((sum, position) => sum + position.realizedPnl, 0);
-    const unrealizedPnl = livePositions.reduce((sum, position) => sum + position.unrealizedPnl, 0);
-    const settledPositions = positions.filter(
-      (position) =>
-        position.status === "closed" &&
-        (position.settlementResult === "win" || position.settlementResult === "loss")
-    );
-    const wins = settledPositions.filter((position) => position.settlementResult === "win").length;
-    const userOrders = this.getOrders(userId);
-    const roundsParticipatedTotal = new Set([
-      ...positions.map((position) => position.roundId),
-      ...userOrders.map((order) => order.roundId)
-    ]).size;
-    const roundsParticipatedToday = new Set([
-      ...positions
-        .filter((position) => position.openedAt >= todayTs || (position.closedAt ?? 0) >= todayTs)
-        .map((position) => position.roundId),
-      ...userOrders.filter((order) => order.createdAt >= todayTs).map((order) => order.roundId)
-    ]).size;
-
-    return {
-      totalEquity: Number((user.availableUsdc + positionValue).toFixed(2)),
-      availableUsdc: Number(user.availableUsdc.toFixed(2)),
-      positionValue: Number(positionValue.toFixed(2)),
-      realizedPnlToday: Number(realizedPnlToday.toFixed(2)),
-      unrealizedPnl: Number(unrealizedPnl.toFixed(2)),
-      winRate: settledPositions.length > 0 ? wins / settledPositions.length : 0,
-      roundsParticipatedTotal,
-      roundsParticipatedToday
-    };
+    return buildProfileOverview(this.users.get(userId), this.getPositions(userId), this.getOrders(userId));
   }
 
   emitUserPayload(userId: string, scope: UserPayloadScope = "full") {
@@ -2337,247 +1926,6 @@ export class AppStore {
     };
   }
 
-  private detailString(details: Record<string, unknown> | undefined, key: string) {
-    const value = details?.[key];
-    return typeof value === "string" || typeof value === "number" ? String(value) : undefined;
-  }
-
-  private normalizeSearchLimit(limit?: number) {
-    return Math.max(1, Math.min(Math.floor(limit ?? 100), 501));
-  }
-
-  private matchesAuditSearch(log: AuditEvent, filters?: LogSearchQuery) {
-    if (typeof filters?.from === "number" && log.serverRecvTs < filters.from) {
-      return false;
-    }
-    if (typeof filters?.to === "number" && log.serverRecvTs > filters.to) {
-      return false;
-    }
-    if (filters?.userId && log.userId !== filters.userId) {
-      return false;
-    }
-    if (filters?.userIds && !filters.userIds.includes(log.userId ?? "")) {
-      return false;
-    }
-    if (filters?.role && log.role !== filters.role) {
-      return false;
-    }
-    if (filters?.category && log.category !== filters.category) {
-      return false;
-    }
-    if (filters?.actionType && log.actionType !== filters.actionType) {
-      return false;
-    }
-    if (filters?.actionStatus && log.actionStatus !== filters.actionStatus) {
-      return false;
-    }
-    if (filters?.moduleName && log.moduleName !== filters.moduleName) {
-      return false;
-    }
-    if (filters?.pageName && log.pageName !== filters.pageName) {
-      return false;
-    }
-    if (filters?.symbol && log.symbol !== filters.symbol) {
-      return false;
-    }
-    if (filters?.roundId && log.roundId !== filters.roundId) {
-      return false;
-    }
-    if (filters?.traceId && log.traceId !== filters.traceId) {
-      return false;
-    }
-    if (filters?.resultCode && log.resultCode !== filters.resultCode) {
-      return false;
-    }
-    if (filters?.orderId && this.detailString(log.details, "orderId") !== filters.orderId) {
-      return false;
-    }
-    if (filters?.positionId && this.detailString(log.details, "positionId") !== filters.positionId) {
-      return false;
-    }
-    if (filters?.marketId && this.detailString(log.details, "marketId") !== filters.marketId) {
-      return false;
-    }
-    if (filters?.marketSlug && this.detailString(log.details, "marketSlug") !== filters.marketSlug) {
-      return false;
-    }
-    const direction = this.detailString(log.details, "direction") ?? this.detailString(log.details, "side");
-    if (filters?.direction && direction !== filters.direction) {
-      return false;
-    }
-    if (filters?.roundStatus && this.detailString(log.details, "roundStatus") !== filters.roundStatus) {
-      return false;
-    }
-    if (
-      filters?.settlementResult &&
-      this.detailString(log.details, "settlementResult") !== filters.settlementResult
-    ) {
-      return false;
-    }
-    if (filters?.matchingLogKind === "engine") {
-      return false;
-    }
-    if (filters?.bookKey || filters?.bookSide || filters?.eventType || filters?.sequenceFrom || filters?.sequenceTo) {
-      return false;
-    }
-    if (filters?.logGroup && this.auditLogGroup(log) !== filters.logGroup) {
-      return false;
-    }
-    if (filters?.matchingLogKind === "action" && log.category !== "matching") {
-      return false;
-    }
-    if (filters?.latencySource && this.auditLatencySource(log) !== filters.latencySource) {
-      return false;
-    }
-    if (filters?.connectionState && this.detailString(log.details, "connectionState") !== filters.connectionState) {
-      return false;
-    }
-    if (typeof filters?.latencyMinMs === "number" || typeof filters?.latencyMaxMs === "number") {
-      const latency = this.auditLatencyValue(log, filters.latencyPhase);
-      if (typeof latency !== "number") {
-        return false;
-      }
-      if (typeof filters.latencyMinMs === "number" && latency < filters.latencyMinMs) {
-        return false;
-      }
-      if (typeof filters.latencyMaxMs === "number" && latency > filters.latencyMaxMs) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private auditLogGroup(log: AuditEvent) {
-    if (log.category === "matching") {
-      return "matching_action";
-    }
-    if (log.category === "settlement") {
-      return "settlement";
-    }
-    if (log.category === "latency") {
-      return ["binance", "coinbase", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
-    }
-    return "operation";
-  }
-
-  private auditLatencySource(log: AuditEvent) {
-    if (log.category !== "latency") {
-      return undefined;
-    }
-    return ["binance", "coinbase", "clob"].includes(log.moduleName) ? log.moduleName : "system";
-  }
-
-  private detailNumber(details: Record<string, unknown> | undefined, key: string) {
-    const value = details?.[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-    if (typeof value === "string" && Number.isFinite(Number(value))) {
-      return Number(value);
-    }
-    return undefined;
-  }
-
-  private auditLatencyValue(log: AuditEvent, phase?: LogSearchQuery["latencyPhase"]) {
-    if (phase === "acquire") {
-      return this.detailNumber(log.details, "acquireLatencyMs");
-    }
-    if (phase === "publish") {
-      return this.detailNumber(log.details, "publishLatencyMs");
-    }
-    if (phase === "frontend") {
-      return log.frontendLatencyMs ?? this.detailNumber(log.details, "frontendLatencyMs");
-    }
-    return log.backendLatencyMs;
-  }
-
-  private resolveBehaviorSearchUserIds(filters?: LogSearchQuery) {
-    if (filters?.userId) {
-      const user = this.getUserById(filters.userId);
-      if (filters.role && user?.role !== filters.role) {
-        return [] as string[];
-      }
-      return [filters.userId];
-    }
-    const baseIds = filters?.userIds;
-    if (!filters?.role) {
-      return baseIds;
-    }
-    const roleIds = new Set(
-      [...this.users.values()].filter((user) => user.role === filters.role).map((user) => user.id)
-    );
-    return baseIds ? baseIds.filter((userId) => roleIds.has(userId)) : [...roleIds];
-  }
-
-  private hasUnsupportedBehaviorSearchFilter(filters?: LogSearchQuery) {
-    return Boolean(
-      filters?.category ||
-        filters?.moduleName ||
-        filters?.pageName ||
-        filters?.symbol ||
-        filters?.positionId ||
-        filters?.resultCode ||
-        filters?.bookKey ||
-        filters?.bookSide ||
-        filters?.eventType ||
-        filters?.logGroup ||
-        filters?.latencySource ||
-        filters?.connectionState ||
-        filters?.latencyPhase ||
-        typeof filters?.latencyMinMs === "number" ||
-        typeof filters?.latencyMaxMs === "number" ||
-        filters?.matchingLogKind ||
-        typeof filters?.sequenceFrom === "number" ||
-        typeof filters?.sequenceTo === "number"
-    );
-  }
-
-  private matchesBehaviorSearch(log: BehaviorActionLog, filters?: LogSearchQuery, userIds?: string[]) {
-    if (typeof filters?.from === "number" && log.timestampMs < filters.from) {
-      return false;
-    }
-    if (typeof filters?.to === "number" && log.timestampMs > filters.to) {
-      return false;
-    }
-    if (userIds?.length) {
-      const allowedAnonIds = new Set(userIds.map((userId) => this.anonymizeUserId(userId)));
-      if (!allowedAnonIds.has(log.testerIdAnon)) {
-        return false;
-      }
-    }
-    if (filters?.roundId && log.roundId !== filters.roundId) {
-      return false;
-    }
-    if (filters?.actionType && log.actionType !== filters.actionType) {
-      return false;
-    }
-    if (filters?.actionStatus && log.actionStatus !== filters.actionStatus) {
-      return false;
-    }
-    if (filters?.traceId && log.traceId !== filters.traceId) {
-      return false;
-    }
-    if (filters?.orderId && log.orderId !== filters.orderId) {
-      return false;
-    }
-    if (filters?.marketId && log.marketId !== filters.marketId) {
-      return false;
-    }
-    if (filters?.marketSlug && log.marketSlug !== filters.marketSlug) {
-      return false;
-    }
-    if (filters?.direction && log.direction !== filters.direction) {
-      return false;
-    }
-    if (filters?.roundStatus && log.roundStatus !== filters.roundStatus) {
-      return false;
-    }
-    if (filters?.settlementResult && log.settlementResult !== filters.settlementResult) {
-      return false;
-    }
-    return true;
-  }
-
   private createOperatedFallbackRound(roundId: string, order?: OrderRecord, position?: PositionRecord): RoundRecord | undefined {
     if (!order && !position) {
       return undefined;
@@ -2631,11 +1979,11 @@ export class AppStore {
   }
 
   async upsertMarketCandles(candles: MarketCandleRecord[]) {
-    const validCandles = this.dedupeMarketCandles(candles.filter((candle) => this.isValidMarketCandle(candle)));
+    const validCandles = dedupeMarketCandles(candles.filter((candle) => isValidMarketCandle(candle)));
     if (validCandles.length === 0) {
       return;
     }
-    this.mergeMarketCandlesIntoMemory(validCandles);
+    mergeMarketCandlesIntoMemory(this.marketCandles, validCandles, MARKET_CANDLE_MEMORY_RETENTION_MS);
     if (!this.postgresEnabled || !this.pool) {
       return;
     }
@@ -2683,7 +2031,7 @@ export class AppStore {
   }
 
   getMarketCandles(query: MarketCandleQuery) {
-    const key = this.marketCandleKey(query.source, query.symbol, query.interval);
+    const key = marketCandleKey(query.source, query.symbol, query.interval);
     const rows = this.marketCandles.get(key) ?? [];
     const filtered = rows.filter(
       (candle) =>
@@ -2913,7 +2261,7 @@ export class AppStore {
   }
 
   async persistOrderLifecycle(log: OrderLifecycleRecord) {
-    this.upsertIndexedRecord(this.orderLifecycleLogs, this.orderLifecycleIndexById, log);
+    this.upsertOrderLifecycleInMemory(log);
     this.pruneMemoryCaches();
     this.bumpHistoryRevision();
 
@@ -3070,7 +2418,7 @@ export class AppStore {
     if (order.orderBookSnapshot) {
       this.prepareOrderBookSnapshotForOrder(order);
     }
-    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    this.upsertOrderInMemory(order);
     this.pruneMemoryCaches();
     this.bumpHistoryRevision();
 
@@ -3179,7 +2527,7 @@ export class AppStore {
   }
 
   async persistPosition(position: PositionRecord) {
-    this.upsertIndexedRecord(this.positions, this.positionIndexById, position);
+    this.upsertPositionInMemory(position);
     this.pruneMemoryCaches();
     this.bumpHistoryRevision();
 
@@ -3294,7 +2642,7 @@ export class AppStore {
         JSON.stringify(event.details ?? {})
       ]
     );
-    await this.cleanupRetentionIfDue(event.serverRecvTs);
+    this.cleanupRetentionIfDue(event.serverRecvTs);
     if (event.userId && options?.emitUserPayload !== false) {
       this.emitUserPayload(event.userId, options?.payloadScope ?? "full");
     }
@@ -3817,26 +3165,30 @@ export class AppStore {
         });
       }
 
-      this.rounds.splice(0, this.rounds.length, ...roundRows.rows.map((row) => this.rowToRound(row)));
+      this.rounds.splice(0, this.rounds.length, ...roundRows.rows.map((row) => rowToRound(row)));
       this.marketCandles.clear();
-      this.mergeMarketCandlesIntoMemory(marketCandleRows.rows.map((row) => this.rowToMarketCandle(row)));
+      mergeMarketCandlesIntoMemory(
+        this.marketCandles,
+        marketCandleRows.rows.map((row) => rowToMarketCandle(row)),
+        MARKET_CANDLE_MEMORY_RETENTION_MS
+      );
       this.orderBookSnapshots.clear();
       for (const row of snapshotRows.rows) {
-        const snapshotRecord = this.rowToOrderBookSnapshotRecord(row);
+        const snapshotRecord = rowToOrderBookSnapshotRecord(row);
         this.orderBookSnapshots.set(snapshotRecord.ref, snapshotRecord);
       }
-      this.orders.splice(0, this.orders.length, ...orderRows.rows.map((row) => this.rowToOrder(row)));
+      this.orders.splice(0, this.orders.length, ...orderRows.rows.map((row) => rowToOrder(row)));
       this.orderLifecycleLogs.splice(
         0,
         this.orderLifecycleLogs.length,
-        ...lifecycleRows.rows.map((row) => this.rowToOrderLifecycle(row))
+        ...lifecycleRows.rows.map((row) => rowToOrderLifecycle(row))
       );
-      this.positions.splice(0, this.positions.length, ...positionRows.rows.map((row) => this.rowToPosition(row)));
-      this.logs.splice(0, this.logs.length, ...logRows.rows.map((row) => this.rowToAuditEvent(row)));
+      this.positions.splice(0, this.positions.length, ...positionRows.rows.map((row) => rowToPosition(row)));
+      this.logs.splice(0, this.logs.length, ...logRows.rows.map((row) => rowToAuditEvent(row)));
       this.behaviorLogs.splice(
         0,
         this.behaviorLogs.length,
-        ...behaviorRows.rows.map((row) => this.rowToBehaviorLog(row))
+        ...behaviorRows.rows.map((row) => rowToBehaviorLog(row))
       );
       this.rebuildHotIndexes();
       await this.rebuildLegacyOpenPositionLotsFromLifecycle();
@@ -3989,7 +3341,7 @@ export class AppStore {
     }
   }
 
-  private async cleanupRetentionIfDue(now = Date.now()) {
+  private cleanupRetentionIfDue(now = Date.now()) {
     if (now - this.lastMemoryGuardAt >= MEMORY_GUARD_INTERVAL_MS) {
       this.lastMemoryGuardAt = now;
       this.updateMemoryProtectionState();
@@ -3997,9 +3349,14 @@ export class AppStore {
         this.pruneMemoryCaches(now);
       }
     }
-    if (now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
+    if (!this.retentionCleanupRunning && now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
       this.lastRetentionCleanupAt = now;
-      await this.cleanupRetention(now);
+      this.retentionCleanupRunning = true;
+      void this.cleanupRetention(now)
+        .catch((error) => console.warn("[store] Log retention cleanup failed:", error))
+        .finally(() => {
+          this.retentionCleanupRunning = false;
+        });
     }
   }
 
@@ -4029,431 +3386,6 @@ export class AppStore {
         )
     ).filter((event) => event.serverRecvTs >= threshold);
     await this.auditLogWriter.rewrite(filtered);
-  }
-
-  private marketCandleKey(source: MarketCandleRecord["source"], symbol: string, interval: MarketCandleRecord["interval"]) {
-    return `${source}:${symbol}:${interval}`;
-  }
-
-  private marketCandleDedupeKey(candle: MarketCandleRecord) {
-    return `${this.marketCandleKey(candle.source, candle.symbol, candle.interval)}:${candle.openTs}`;
-  }
-
-  private shouldReplaceMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
-    if (!existing) {
-      return true;
-    }
-    const incomingPriority = MARKET_CANDLE_PRIORITY[incoming.origin];
-    const existingPriority = MARKET_CANDLE_PRIORITY[existing.origin];
-    return incomingPriority > existingPriority || (incomingPriority === existingPriority && incoming.updatedAt >= existing.updatedAt);
-  }
-
-  private dedupeMarketCandles(candles: MarketCandleRecord[]) {
-    const byKey = new Map<string, MarketCandleRecord>();
-    for (const candle of candles) {
-      const key = this.marketCandleDedupeKey(candle);
-      const existing = byKey.get(key);
-      if (this.shouldReplaceMarketCandle(existing, candle)) {
-        byKey.set(key, candle);
-      }
-    }
-    return [...byKey.values()];
-  }
-
-  private isValidMarketCandle(candle: MarketCandleRecord) {
-    return (
-      candle.source === "coinbase" &&
-      candle.interval === "30s" &&
-      Number.isFinite(candle.openTs) &&
-      Number.isFinite(candle.closeTs) &&
-      candle.openTs % 30_000 === 0 &&
-      candle.closeTs === candle.openTs + 30_000 &&
-      [candle.open, candle.high, candle.low, candle.close].every((value) => Number.isFinite(value) && value > 0)
-    );
-  }
-
-  private mergeMarketCandlesIntoMemory(candles: MarketCandleRecord[], now = Date.now()) {
-    const threshold = now - MARKET_CANDLE_MEMORY_RETENTION_MS;
-    const grouped = new Map<string, MarketCandleRecord[]>();
-    for (const candle of candles) {
-      const key = this.marketCandleKey(candle.source, candle.symbol, candle.interval);
-      const group = grouped.get(key);
-      if (group) {
-        group.push(candle);
-      } else {
-        grouped.set(key, [candle]);
-      }
-    }
-    for (const [key, incoming] of grouped) {
-      const existingRows = this.marketCandles.get(key) ?? [];
-      const byOpenTs = new Map(existingRows.map((row) => [row.openTs, row]));
-      for (const candle of incoming) {
-        const existing = byOpenTs.get(candle.openTs);
-        if (this.shouldReplaceMarketCandle(existing, candle)) {
-          byOpenTs.set(candle.openTs, { ...candle });
-        }
-      }
-      this.marketCandles.set(
-        key,
-        [...byOpenTs.values()]
-          .filter((row) => row.openTs >= threshold)
-          .sort((left, right) => left.openTs - right.openTs)
-      );
-    }
-  }
-
-  private rowToMarketCandle(row: Record<string, unknown>): MarketCandleRecord {
-    return {
-      source: "coinbase",
-      symbol: String(row.symbol),
-      interval: "30s",
-      openTs: Number(row.open_ts),
-      closeTs: Number(row.close_ts),
-      open: Number(row.open),
-      high: Number(row.high),
-      low: Number(row.low),
-      close: Number(row.close),
-      volume: Number(row.volume ?? 0),
-      origin: String(row.origin) === "rtds_30s" ? "rtds_30s" : "history_1m_split",
-      updatedAt: Number(row.updated_at)
-    };
-  }
-
-  private rowToRound(row: Record<string, unknown>): RoundRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    const polymarketOpenPrice = sanitizePolymarketBtcReference(numberOrUndefined(row.polymarket_open_price));
-    const polymarketClosePrice = sanitizePolymarketBtcReference(numberOrUndefined(row.polymarket_close_price));
-    return {
-      id: String(row.id),
-      marketId: String(row.market_id),
-      symbol: String(row.symbol),
-      eventId: row.event_id ? String(row.event_id) : undefined,
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      eventSlug: row.event_slug ? String(row.event_slug) : undefined,
-      conditionId: row.condition_id ? String(row.condition_id) : undefined,
-      seriesSlug: row.series_slug ? String(row.series_slug) : undefined,
-      upTokenId: row.up_token_id ? String(row.up_token_id) : undefined,
-      downTokenId: row.down_token_id ? String(row.down_token_id) : undefined,
-      title: row.title ? String(row.title) : undefined,
-      resolutionSource: row.resolution_source ? String(row.resolution_source) : undefined,
-      startAt: Number(row.start_at),
-      endAt: Number(row.end_at),
-      priceToBeat: Number(row.price_to_beat),
-      priceToBeatSource: row.price_to_beat_source ? String(row.price_to_beat_source) : undefined,
-      priceToBeatCapturedAt: row.price_to_beat_captured_at ? Number(row.price_to_beat_captured_at) : undefined,
-      status: String(row.status) as RoundStatus,
-      pollCount: Number(row.poll_count),
-      pollStartAt: row.poll_start_at ? Number(row.poll_start_at) : undefined,
-      lastPollAt: row.last_poll_at ? Number(row.last_poll_at) : undefined,
-      closingSpotPrice: row.closing_spot_price !== null ? Number(row.closing_spot_price) : undefined,
-      settledSide: row.settled_side ? (String(row.settled_side) as RoundRecord["settledSide"]) : undefined,
-      settlementPrice: row.settlement_price !== null ? Number(row.settlement_price) : undefined,
-      settlementTs: row.settlement_ts ? Number(row.settlement_ts) : undefined,
-      settlementSource: row.settlement_source ? (String(row.settlement_source) as RoundRecord["settlementSource"]) : undefined,
-      polymarketSettlementPrice: numberOrUndefined(row.polymarket_settlement_price),
-      polymarketSettlementStatus: row.polymarket_settlement_status
-        ? (String(row.polymarket_settlement_status) as RoundRecord["polymarketSettlementStatus"])
-        : undefined,
-      polymarketOpenPrice,
-      polymarketClosePrice,
-      polymarketOpenPriceSource:
-        polymarketOpenPrice && row.polymarket_open_price_source ? String(row.polymarket_open_price_source) : undefined,
-      polymarketClosePriceSource:
-        polymarketClosePrice && row.polymarket_close_price_source ? String(row.polymarket_close_price_source) : undefined,
-      settlementReceivedAt: numberOrUndefined(row.settlement_received_at),
-      redeemScheduledAt: numberOrUndefined(row.redeem_scheduled_at),
-      binanceOpenPrice: numberOrUndefined(row.binance_open_price),
-      binanceClosePrice: numberOrUndefined(row.binance_close_price),
-      coinbaseOpenPrice: numberOrUndefined(row.chainlink_open_price),
-      coinbaseClosePrice: numberOrUndefined(row.chainlink_close_price),
-      redeemStartTs: row.redeem_start_ts ? Number(row.redeem_start_ts) : undefined,
-      redeemFinishTs: row.redeem_finish_ts ? Number(row.redeem_finish_ts) : undefined,
-      manualReason: row.manual_reason ? String(row.manual_reason) : undefined,
-      acceptingOrders: row.accepting_orders !== null ? Boolean(row.accepting_orders) : undefined,
-      closingPriceSource: row.closing_price_source
-        ? (String(row.closing_price_source) as RoundRecord["closingPriceSource"])
-        : undefined
-    };
-  }
-
-  private rowToOrderBookSnapshotRecord(row: Record<string, unknown>): OrderBookSnapshotRecord {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-    const snapshot = parseJson<OrderBookSnapshot>(row.snapshot, {
-      snapshotId: String(row.snapshot_id),
-      snapshotTs: Number(row.snapshot_ts),
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      bids: [],
-      asks: []
-    });
-    return {
-      ref: String(row.ref),
-      snapshotId: String(row.snapshot_id),
-      snapshotTs: Number(row.snapshot_ts),
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      snapshot: cloneOrderBookSnapshot(snapshot),
-      createdAt: Number(row.created_at)
-    };
-  }
-
-  private rowToOrderLifecycle(row: Record<string, unknown>): OrderLifecycleRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      buyOrderId: String(row.buy_order_id),
-      traceId: String(row.trace_id),
-      userId: String(row.user_id),
-      testerId: String(row.tester_id),
-      roundId: String(row.round_id),
-      symbol: String(row.symbol),
-      assetClass: "BTC",
-      marketId: String(row.market_id),
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      direction: row.direction as TradeSide,
-      orderTimestampMs: Number(row.order_timestamp_ms),
-      entryTokenPrice: numberOrUndefined(row.entry_token_price),
-      btcTradePrice: numberOrUndefined(row.btc_trade_price),
-      btcOpenPriceToBeat: numberOrUndefined(row.btc_open_price_to_beat),
-      deltaBtc: numberOrUndefined(row.delta_btc),
-      volumeTokenQty: Number(row.volume_token_qty),
-      remainingTokenQty: Number(row.remaining_token_qty),
-      closedTokenQty: Number(row.closed_token_qty),
-      positionNotional: Number(row.position_notional),
-      exitType: row.exit_type ? (String(row.exit_type) as OrderLifecycleExitType) : undefined,
-      exitTokenPrice: numberOrUndefined(row.exit_token_price),
-      exitNotional: Number(row.exit_notional),
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as OrderLifecycleRecord["settlementResult"])
-        : undefined,
-      orderBookSnapshotRef: row.order_book_snapshot_ref ? String(row.order_book_snapshot_ref) : undefined,
-      actualFillPrice: numberOrUndefined(row.actual_fill_price),
-      slippageBps: numberOrUndefined(row.slippage_bps),
-      matchLatencyMs: Number(row.match_latency_ms),
-      settlementTimeMs: numberOrUndefined(row.settlement_time_ms),
-      settlementDirection: row.settlement_direction ? (String(row.settlement_direction) as TradeSide) : undefined,
-      entryFee: numberOrUndefined(row.entry_fee),
-      exitFee: numberOrUndefined(row.exit_fee),
-      feeCurrency: row.fee_currency ? "USD" : undefined,
-      createdAt: Number(row.created_at),
-      updatedAt: Number(row.updated_at)
-    };
-  }
-
-  private rowToOrder(row: Record<string, unknown>): OrderRecord {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      traceId: String(row.trace_id),
-      userId: String(row.user_id),
-      roundId: String(row.round_id),
-      symbol: String(row.symbol),
-      marketId: String(row.market_id),
-      action: row.action as OrderRecord["action"],
-      side: row.side as OrderRecord["side"],
-      status: row.status as OrderRecord["status"],
-      orderKind: row.order_kind ? (String(row.order_kind) as OrderRecord["orderKind"]) : undefined,
-      timeInForce: row.time_in_force ? (String(row.time_in_force) as OrderRecord["timeInForce"]) : undefined,
-      limitPrice: numberOrUndefined(row.limit_price),
-      lifecycleStatus: row.lifecycle_status ? (String(row.lifecycle_status) as OrderRecord["lifecycleStatus"]) : undefined,
-      resultType: row.result_type ? (String(row.result_type) as OrderRecord["resultType"]) : undefined,
-      tokenId: row.token_id ? String(row.token_id) : undefined,
-      bookKey: row.book_key ? String(row.book_key) : undefined,
-      bookHash: row.book_hash ? String(row.book_hash) : undefined,
-      requestedAmountUsdc: numberOrUndefined(row.requested_amount_usdc),
-      requestedQty: numberOrUndefined(row.requested_qty),
-      frozenUsdc: numberOrUndefined(row.frozen_usdc),
-      frozenQty: numberOrUndefined(row.frozen_qty),
-      fills: parseJson(row.fills, []),
-      estimatedFee: numberOrUndefined(row.estimated_fee),
-      actualFee: numberOrUndefined(row.actual_fee),
-      feeBreakdown: parseJson(row.fee_breakdown, undefined),
-      feeCurrency: row.fee_currency ? "USD" : undefined,
-      sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      orderBookSnapshotRef: row.order_book_snapshot_ref ? String(row.order_book_snapshot_ref) : undefined,
-      orderBookSnapshot: parseJson<OrderBookSnapshot | undefined>(row.order_book_snapshot, undefined),
-      notionalUsdc: Number(row.notional_usdc),
-      expectedQty: Number(row.expected_qty),
-      filledQty: Number(row.filled_qty),
-      unfilledQty: Number(row.unfilled_qty),
-      avgFillPrice: row.avg_fill_price !== null ? Number(row.avg_fill_price) : undefined,
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      bookSnapshotTs: Number(row.book_snapshot_ts),
-      partialFilled: Boolean(row.partial_filled),
-      slippageBps: row.slippage_bps !== null ? Number(row.slippage_bps) : undefined,
-      matchLatencyMs: Number(row.match_latency_ms),
-      bookAcquireLatencyMs: numberOrUndefined(row.book_acquire_latency_ms),
-      localMatchLatencyMs: numberOrUndefined(row.local_match_latency_ms),
-      persistLatencyMs: numberOrUndefined(row.persist_latency_ms),
-      totalOrderLatencyMs: numberOrUndefined(row.total_order_latency_ms),
-      failureReason: row.failure_reason ? String(row.failure_reason) : undefined,
-      clientOrderId: row.client_order_id ? String(row.client_order_id) : undefined,
-      clientSendTs: row.client_send_ts ? Number(row.client_send_ts) : undefined,
-      serverRecvTs: Number(row.server_recv_ts),
-      serverPublishTs: Number(row.server_publish_ts),
-      createdAt: Number(row.created_at)
-    };
-  }
-
-  private rowToPosition(row: Record<string, unknown>): PositionRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      buyOrderId: row.buy_order_id ? String(row.buy_order_id) : undefined,
-      userId: String(row.user_id),
-      roundId: String(row.round_id),
-      side: row.side as PositionRecord["side"],
-      qty: Number(row.qty),
-      lockedQty: numberOrUndefined(row.locked_qty),
-      averageEntry: Number(row.average_entry),
-      notionalSpent: Number(row.notional_spent),
-      currentMark: Number(row.current_mark),
-      currentBid: numberOrUndefined(row.current_bid),
-      currentAsk: numberOrUndefined(row.current_ask),
-      currentMid: numberOrUndefined(row.current_mid),
-      currentValue: numberOrUndefined(row.current_value),
-      sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
-      unrealizedPnl: Number(row.unrealized_pnl),
-      realizedPnl: Number(row.realized_pnl),
-      entryFeeUsdc: numberOrUndefined(row.entry_fee_usdc),
-      exitFeeUsdc: numberOrUndefined(row.exit_fee_usdc),
-      totalFeeUsdc: numberOrUndefined(row.total_fee_usdc),
-      costBasisUsdc: numberOrUndefined(row.cost_basis_usdc) ?? Number(row.notional_spent),
-      markPnlUsdc: numberOrUndefined(row.mark_pnl_usdc),
-      executablePnlUsdc: numberOrUndefined(row.executable_pnl_usdc),
-      status: row.status as PositionRecord["status"],
-      openedAt: Number(row.opened_at),
-      closedAt: row.closed_at ? Number(row.closed_at) : undefined,
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as PositionRecord["settlementResult"])
-        : undefined
-    };
-  }
-
-  private rowToAuditEvent(row: Record<string, unknown>): AuditEvent {
-    return {
-      eventId: String(row.event_id),
-      traceId: String(row.trace_id),
-      category: row.category as AuditEvent["category"],
-      actionType: String(row.action_type),
-      actionStatus: row.action_status as AuditEvent["actionStatus"],
-      userId: row.user_id ? String(row.user_id) : undefined,
-      role: row.role ? (String(row.role) as Role) : undefined,
-      pageName: String(row.page_name),
-      moduleName: String(row.module_name),
-      symbol: row.symbol ? String(row.symbol) : undefined,
-      roundId: row.round_id ? String(row.round_id) : undefined,
-      resultCode: String(row.result_code),
-      resultMessage: String(row.result_message),
-      clientSendTs: row.client_send_ts ? Number(row.client_send_ts) : undefined,
-      serverRecvTs: Number(row.server_recv_ts),
-      engineStartTs: row.engine_start_ts ? Number(row.engine_start_ts) : undefined,
-      engineFinishTs: row.engine_finish_ts ? Number(row.engine_finish_ts) : undefined,
-      serverPublishTs: Number(row.server_publish_ts),
-      backendLatencyMs: Number(row.backend_latency_ms),
-      frontendLatencyMs: row.frontend_latency_ms !== null ? Number(row.frontend_latency_ms) : undefined,
-      details: (row.details as Record<string, unknown> | null) ?? undefined
-    };
-  }
-
-  private rowToBehaviorLog(row: Record<string, unknown>): BehaviorActionLog {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-
-    return {
-      logId: String(row.log_id),
-      timestampMs: Number(row.timestamp_ms),
-      assetClass: "BTC_5M_UPDOWN",
-      actionType: String(row.action_type),
-      actionStatus: row.action_status as BehaviorActionLog["actionStatus"],
-      roundId: row.round_id ? String(row.round_id) : undefined,
-      direction: row.direction ? (String(row.direction) as BehaviorActionLog["direction"]) : undefined,
-      entryOdds: row.entry_odds !== null ? Number(row.entry_odds) : undefined,
-      deltaClob: Number(row.delta_clob),
-      volumeClob: Number(row.volume_clob),
-      positionNotional: row.position_notional !== null ? Number(row.position_notional) : undefined,
-      exitType: row.exit_type ? String(row.exit_type) : undefined,
-      exitOdds: row.exit_odds !== null ? Number(row.exit_odds) : undefined,
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as BehaviorActionLog["settlementResult"])
-        : undefined,
-      testerIdAnon: String(row.tester_id_anon),
-      traceId: row.trace_id ? String(row.trace_id) : undefined,
-      orderId: row.order_id ? String(row.order_id) : undefined,
-      marketId: row.market_id ? String(row.market_id) : undefined,
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      roundStatus: row.round_status ? (String(row.round_status) as RoundStatus) : undefined,
-      countdownMs: row.countdown_ms !== null ? Number(row.countdown_ms) : undefined,
-      binanceSpotPrice: Number(row.binance_spot_price),
-      binance1mLastClose: Number(row.binance_1m_last_close),
-      binance5mLastClose: Number(row.binance_5m_last_close),
-      binance1dLastClose: Number(row.binance_1d_last_close),
-      coinbasePrice: Number(row.chainlink_price),
-      priceToBeat: Number(row.price_to_beat),
-      upPrice: Number(row.up_price),
-      downPrice: Number(row.down_price),
-      upBookTop5: parseJson(row.up_book_top5, []),
-      downBookTop5: parseJson(row.down_book_top5, []),
-      recentTradesTop20: parseJson(row.recent_trades_top20, []),
-      bookSnapshotEntry: parseJson(row.book_snapshot_entry, {
-        snapshotId: "",
-        snapshotTs: 0,
-        topBids: [],
-        topAsks: []
-      }),
-      actualFillPrice: row.actual_fill_price !== null ? Number(row.actual_fill_price) : undefined,
-      slippageBps: row.slippage_bps !== null ? Number(row.slippage_bps) : undefined,
-      partialFilled: row.partial_filled !== null ? Boolean(row.partial_filled) : undefined,
-      unfilledQty: row.unfilled_qty !== null ? Number(row.unfilled_qty) : undefined,
-      executionLatencyMs: row.execution_latency_ms !== null ? Number(row.execution_latency_ms) : undefined,
-      settlementDirection: row.settlement_direction
-        ? (String(row.settlement_direction) as TradeSide)
-        : undefined,
-      settlementTimeMs: row.settlement_time_ms !== null ? Number(row.settlement_time_ms) : undefined,
-      gammaPollCount: row.gamma_poll_count !== null ? Number(row.gamma_poll_count) : undefined,
-      redeemFinishTimeMs: row.redeem_finish_time_ms !== null ? Number(row.redeem_finish_time_ms) : undefined,
-      sourceStates: parseJson(row.source_states, {
-        binance: { source: "Binance", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-        coinbase: { source: "Coinbase", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-        clob: { source: "CLOB", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 }
-      }),
-      strategyClusterLabel: row.strategy_cluster_label ? String(row.strategy_cluster_label) : undefined,
-      marketRegimeLabel: row.market_regime_label ? String(row.market_regime_label) : undefined,
-      qualityGrade: row.quality_grade ? String(row.quality_grade) : undefined,
-      contextJson: parseJson(row.context_json, {})
-    };
   }
 
   private async queryDb(query: string, params: unknown[]): Promise<QueryResult> {

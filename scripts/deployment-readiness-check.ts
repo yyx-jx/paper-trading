@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { assertProductionDeploymentBaseline, readText } from "./deployment-assertions";
+import { readStoreServiceSource } from "./source-contracts";
 
 assertProductionDeploymentBaseline();
 
 const packageJson = readText("package.json");
 const indexSource = readText("apps/server/src/index.ts");
 const metricsSource = readText("apps/server/src/services/metrics.ts");
-const storeSource = readText("apps/server/src/services/store.ts");
+const storeSource = readStoreServiceSource();
 const deploymentDoc = readText("docs/deployment-production.md");
 const envExample = readText(".env.example");
 

@@ -16,12 +16,16 @@ const excludedNames = new Set([
   "data",
   "backups",
   "release",
+  "paper_deploy_final"
+]);
+const excludedPrefixes = [
   "deploy/windows-production",
   "deploy/windows-production-archive",
   "deploy/windows-production-portable",
   "deploy/windows-test",
-  "paper_deploy_final"
-]);
+  "deploy/windows-test-",
+  "deploy/windows-test-setup-"
+];
 const excludedSuffixes = [".rar", ".zip", ".docx", ".log", ".pid"];
 const includedTopLevel = new Set([
   "apps",
@@ -51,6 +55,13 @@ function shouldCopy(src) {
   const first = rel.split("/")[0];
   if (!includedTopLevel.has(first)) return false;
   if (excludedNames.has(rel) || excludedNames.has(first)) return false;
+  if (
+    excludedPrefixes.some(
+      (prefix) => rel === prefix || rel.startsWith(`${prefix}/`) || rel.startsWith(prefix)
+    )
+  ) {
+    return false;
+  }
   if (rel === ".env" || rel.startsWith(".env.")) {
     return rel === ".env.example" || rel === ".env.production.example";
   }

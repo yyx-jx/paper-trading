@@ -1767,8 +1767,8 @@ button:disabled:hover {
 .stability-meter { display:flex; gap:5px; padding:2px 8px 4px; } .stability-meter span { flex:1; height:4px; border-radius:2px; background:var(--b3); } .stability-meter span.on { background:var(--G); }
 .risk-alerts { display:grid; gap:6px; padding:7px 8px 9px; } .risk-alerts>span { color:var(--t1); font-size:11px; } .risk-alert-group { min-width:0; display:grid; gap:4px; } .risk-alert-group header { min-height:17px; display:flex; align-items:center; justify-content:space-between; color:var(--t1); font-size:10px; text-transform:uppercase; } .risk-alert-group header b { color:var(--A); font-size:10px; } .risk-alert-group header em { min-width:18px; border:1px solid var(--bd); border-radius:999px; color:var(--t2); font-size:9px; font-style:normal; text-align:center; } .risk-alert { display:grid; grid-template-columns:minmax(0,1fr); gap:2px; border:1px solid var(--bd); border-radius:3px; padding:5px 7px; text-align:left; background:var(--b2); color:var(--t0); font-size:10.5px; line-height:1.16; } .risk-alert span { min-width:0; overflow:visible; text-overflow:clip; white-space:normal; overflow-wrap:anywhere; } .risk-alert em { flex-shrink:0; font-style:normal; font-size:9px; color:var(--t2); max-width:none; text-align:left; white-space:normal; line-height:1.14; } .risk-alert.warn { border-color:#e8a02035; color:var(--A); } .risk-alert.danger { border-color:#f0306040; color:var(--R); background:#150610; } .risk-alert.info { border-color:#4090f040; color:var(--B); }
 .terminal-order { display:grid; gap:5px; padding:6px 8px; align-content:start; }
-.order-odds, .terminal-segment, .quick-row, .manual-settle { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
-.order-odds button, .terminal-segment button, .amount-grid button, .quick-row button, .manual-settle button { min-width:0; border:1px solid var(--bd); border-radius:3px; background:var(--b2); color:var(--t0); padding:5px 6px; font-size:12px; line-height:1.12; overflow:hidden; }
+.order-odds, .terminal-segment, .quick-row { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+.order-odds button, .terminal-segment button, .amount-grid button, .quick-row button { min-width:0; border:1px solid var(--bd); border-radius:3px; background:var(--b2); color:var(--t0); padding:5px 6px; font-size:12px; line-height:1.12; overflow:hidden; }
 .order-odds button { min-height:52px; display:grid; grid-template-columns:1fr auto; grid-template-rows:auto 1fr; align-items:center; gap:3px 8px; padding:6px 8px; text-align:left; }
 .order-odds button span { font-size:13px; font-weight:800; letter-spacing:0; }
 .order-odds button b { justify-self:end; font-size:22px; line-height:1; font-weight:800; font-variant-numeric:tabular-nums; }
@@ -1801,7 +1801,6 @@ button:disabled:hover {
 .order-meta { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:4px; color:var(--t1); font-size:10px; line-height:1.15; }
 .order-meta span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .execute { min-height:40px; border:1px solid; border-radius:4px; font-weight:900; font-size:16px; letter-spacing:0; }
-.manual-settle { grid-template-columns:auto 1fr 1fr; align-items:center; border-top:1px solid var(--bd); padding-top:4px; } .manual-settle span { color:var(--A); font-size:12px; }
 .strategy-list { display:grid; gap:5px; padding:9px 8px 7px; } .strategy-list div { display:grid; grid-template-columns:76px 1fr; gap:7px; border:1px solid var(--bd); border-radius:3px; background:var(--b2); padding:6px 7px; } .strategy-list span { color:var(--t1); font-size:10px; } .strategy-list b { color:var(--t0); font-weight:500; font-size:12px; line-height:1.2; }
 .inline-warning-banner.compact-feedback { margin-top:3px; padding:8px 10px; }
 .inline-warning-banner.compact-feedback strong { font-size:12px; }
@@ -1888,12 +1887,11 @@ button:disabled:hover {
   .risk-alert em { font-size:8.5px; }
 
   .terminal-order { gap:4px; padding:5px 7px; }
-  .order-odds, .terminal-segment, .quick-row, .manual-settle { gap:4px; }
+  .order-odds, .terminal-segment, .quick-row { gap:4px; }
   .order-odds button,
   .terminal-segment button,
   .amount-grid button,
-  .quick-row button,
-  .manual-settle button { padding:4px 5px; font-size:11px; }
+  .quick-row button { padding:4px 5px; font-size:11px; }
   .order-odds button { min-height:46px; gap:2px 6px; padding:5px 7px; }
   .order-odds button span { font-size:12px; }
   .order-odds button b { font-size:19px; }
@@ -2474,6 +2472,42 @@ button:disabled:hover {
   display:grid;
   gap:8px;
   min-height:0;
+}
+.analytics-panel-heading {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:7px 9px;
+  border:1px solid var(--bd);
+  border-radius:4px;
+  background:var(--b1);
+}
+.analytics-panel-heading div {
+  display:grid;
+  gap:3px;
+}
+.analytics-panel-heading b {
+  color:var(--t0);
+  font-size:13px;
+  font-weight:800;
+  text-transform:uppercase;
+}
+.analytics-panel-heading span {
+  color:var(--t2);
+  font-size:11px;
+}
+.manual-settlement-queue .analytics-table-wrap table {
+  min-width:980px;
+}
+.manual-settlement-queue td strong,
+.manual-settlement-queue td small {
+  display:block;
+}
+.manual-settlement-queue td small {
+  margin-top:3px;
+  color:var(--t2);
+  font-size:11px;
 }
 .analytics-table-wrap {
   overflow-x:auto;

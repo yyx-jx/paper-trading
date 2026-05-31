@@ -83,7 +83,8 @@ export const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
     "data:export:include-d",
     "quality:review",
     "strategy:config",
-    "market:config"
+    "market:config",
+    "settlement:manual"
   ]
 };
 

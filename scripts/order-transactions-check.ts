@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readSimulationServiceSource, readStoreServiceSource } from "./source-contracts";
 
 function assertIncludes(source: string, needle: string, label: string) {
   assert.ok(source.includes(needle), `${label} missing: ${needle}`);
@@ -12,13 +12,9 @@ function assertInOrder(source: string, first: string, second: string, label: str
   assert.ok(secondIndex > firstIndex, `${label} missing second marker after first: ${second}`);
 }
 
-function readSource(path: string) {
-  return readFileSync(path, "utf8");
-}
-
 function testStaticTransactionContracts() {
-  const storeSource = readSource("apps/server/src/services/store.ts");
-  const simulationSource = readSource("apps/server/src/services/simulation.ts");
+  const storeSource = readStoreServiceSource();
+  const simulationSource = readSimulationServiceSource();
 
   assertIncludes(storeSource, "captureTradeMutationSnapshot()", "store trade memory snapshot");
   assertIncludes(storeSource, "restoreTradeMutationSnapshot(snapshot: TradeMutationMemorySnapshot)", "store trade memory restore");
@@ -26,6 +22,11 @@ function testStaticTransactionContracts() {
   assertIncludes(storeSource, "async withTransaction<T>(handler: () => Promise<T>)", "store transaction helper");
   assertIncludes(storeSource, "prepareOrderBookSnapshotForOrder(order: OrderRecord)", "store async order book snapshot preparation");
   assertIncludes(storeSource, "private async flushOrderBookSnapshotQueue()", "store background order book snapshot flush");
+  assertIncludes(
+    storeSource,
+    "this.upsertIndexedRecord(this.orders, this.orderIndexById, order);",
+    "order hot index upsert must use generic record helper"
+  );
 
   assertIncludes(simulationSource, "private async runTradeWriteTransaction<T>", "simulation trade write helper");
   assertIncludes(simulationSource, "type TradePersistSegments", "simulation trade persist segment type");
@@ -140,9 +141,35 @@ async function testMemorySnapshotRestoresOrderState() {
   assert.deepEqual(store.behaviorLogs.map((log) => log.logId), ["beh-1"]);
 }
 
+async function testOrderHotIndexUpsertDoesNotRecurse() {
+  const { AppStore } = (await import("../apps/server/src/services/store")) as {
+    AppStore: new (...args: never[]) => unknown;
+  };
+  const store = Object.create(AppStore.prototype) as Record<string, unknown> & {
+    orders: Array<Record<string, unknown>>;
+    orderIndexById: Map<string, number>;
+    ordersByUserId: Map<string, Array<Record<string, unknown>>>;
+    operatedRoundIdsByUserId: Map<string, Set<string>>;
+    upsertOrderInMemory: (order: Record<string, unknown>) => void;
+  };
+
+  store.orders = [];
+  store.orderIndexById = new Map();
+  store.ordersByUserId = new Map();
+  store.operatedRoundIdsByUserId = new Map();
+
+  store.upsertOrderInMemory({ id: "ord-1", userId: "u1", roundId: "round-1", createdAt: 1 });
+
+  assert.equal(store.orders.length, 1);
+  assert.equal(store.orderIndexById.get("ord-1"), 0);
+  assert.equal(store.ordersByUserId.get("u1")?.length, 1);
+  assert.equal(store.operatedRoundIdsByUserId.get("u1")?.has("round-1"), true);
+}
+
 async function main() {
   testStaticTransactionContracts();
   await testMemorySnapshotRestoresOrderState();
+  await testOrderHotIndexUpsertDoesNotRecurse();
   console.log("order-transactions-check ok");
 }
 

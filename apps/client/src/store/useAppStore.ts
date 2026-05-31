@@ -3,6 +3,7 @@ import type {
   AuditEvent,
   BootstrapPayload,
   HistoryRound,
+  MarketHistoryPatchPayload,
   MarketPayload,
   MarketRealtimeTick,
   MarketTickPayload,
@@ -43,6 +44,7 @@ interface AppState {
   lastMarketRenderLatencyMs?: number;
   lastMarketPayloadSeq?: number;
   lastMarketServerPublishTs?: number;
+  lastHistoryRevision?: number;
   settlementPreview?: SettlementPreview;
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
@@ -52,6 +54,7 @@ interface AppState {
   setBootstrap: (data: BootstrapPayload) => void;
   setMarketPayload: (data: MarketPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
   setMarketTickPayload: (data: MarketTickPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
+  setMarketHistoryPatch: (data: MarketHistoryPatchPayload) => boolean;
   markMarketRenderCommit: (clientRecvTs?: number) => void;
   setUserPayload: (data: UserPayload) => void;
   setUserTradePayload: (data: UserTradePayload) => void;
@@ -316,6 +319,7 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: undefined,
       lastMarketPayloadSeq: undefined,
       lastMarketServerPublishTs: undefined,
+      lastHistoryRevision: undefined,
       settlementPreview: undefined,
       currentPage: "trade"
     });
@@ -343,6 +347,7 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: 0,
       lastMarketPayloadSeq: transportMeta.payloadSeq,
       lastMarketServerPublishTs: transportMeta.serverPublishTs,
+      lastHistoryRevision: data.historyRevision,
       settlementPreview: data.settlementPreview
     });
   },
@@ -357,15 +362,20 @@ export const useAppStore = create<AppState>((set) => ({
         return state;
       }
       accepted = true;
+      const usePayloadHistory =
+        typeof data.historyRevision !== "number" ||
+        typeof state.lastHistoryRevision !== "number" ||
+        data.historyRevision >= state.lastHistoryRevision;
       return {
         currentRound: data.currentRound,
-        history: data.history,
+        history: usePayloadHistory ? data.history : state.history,
         snapshot: stampSnapshotReceipt(data.snapshot, clientRecvTs, transportMeta, clientClockOffsetMs),
         lastMarketRecvTs: clientRecvTs,
         lastMarketRenderCommitTs: clientRecvTs,
         lastMarketRenderLatencyMs: 0,
         lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
         lastMarketServerPublishTs: transportMeta.serverPublishTs,
+        lastHistoryRevision: usePayloadHistory ? data.historyRevision ?? state.lastHistoryRevision : state.lastHistoryRevision,
         settlementPreview: data.settlementPreview
       };
     });
@@ -390,8 +400,24 @@ export const useAppStore = create<AppState>((set) => ({
         lastMarketRenderCommitTs: clientRecvTs,
         lastMarketRenderLatencyMs: 0,
         lastMarketPayloadSeq: transportMeta.payloadSeq || state.lastMarketPayloadSeq,
-        lastMarketServerPublishTs: transportMeta.serverPublishTs,
-        settlementPreview: data.settlementPreview ?? state.settlementPreview
+        lastMarketServerPublishTs: transportMeta.serverPublishTs
+      };
+    });
+    return accepted;
+  },
+  setMarketHistoryPatch: (data) => {
+    let accepted = false;
+    set((state) => {
+      if (!shouldAcceptViewedPayload(state, data.viewedUserId)) {
+        return state;
+      }
+      if (typeof state.lastHistoryRevision === "number" && data.historyRevision < state.lastHistoryRevision) {
+        return state;
+      }
+      accepted = true;
+      return {
+        history: data.history,
+        lastHistoryRevision: data.historyRevision
       };
     });
     return accepted;

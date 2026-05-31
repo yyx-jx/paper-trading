@@ -192,7 +192,7 @@ function createMemoryStore() {
     seedDefaultUsers: false,
     requireSchemaMigrations: false,
     allowDevSchemaBootstrap: true,
-    expectedSchemaMigrationId: "000007",
+    expectedSchemaMigrationId: "000008",
     pgConnectionTimeoutMs: 1000,
     pgIdleTimeoutMs: 1000,
     pgMaxConnections: 1,
@@ -247,12 +247,15 @@ function createFixture(input?: {
     persistUser: async (nextUser: UserRecord) => {
       store.users.set(nextUser.id, nextUser);
     },
-    persistOrder: async (order: OrderRecord) => {
+    prepareOrderBookSnapshotForOrder: (order: OrderRecord) => {
       if (order.orderBookSnapshot) {
         order.orderBookSnapshotRef = `obs-${order.orderBookSnapshot.snapshotId}`;
         store.orderBookSnapshots.set(order.orderBookSnapshotRef, order.orderBookSnapshot);
         order.orderBookSnapshot = undefined;
       }
+      return order.orderBookSnapshotRef;
+    },
+    persistOrder: async (order: OrderRecord) => {
       const index = store.orders.findIndex((item) => item.id === order.id);
       if (index >= 0) {
         store.orders[index] = order;

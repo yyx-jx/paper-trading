@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 const serverTypesSource = readFileSync("apps/server/src/domain/types.ts", "utf8");
 const clientTypesSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
 const serverIndexSource = readFileSync("apps/server/src/index.ts", "utf8");
+const marketPayloadSource = readFileSync("apps/server/src/payloads/market.ts", "utf8");
 const clientStoreSource = readFileSync("apps/client/src/store/useAppStore.ts", "utf8");
 
 function extractInterface(source: string, name: string) {
@@ -22,13 +23,20 @@ function extractFunction(source: string, name: string) {
 
 const serverTickType = extractInterface(serverTypesSource, "MarketRealtimeTick");
 const clientTickType = extractInterface(clientTypesSource, "MarketRealtimeTick");
-const createTickPayload = extractFunction(serverIndexSource, "createMarketRealtimeTick");
+const serverTickPayloadType = extractInterface(serverTypesSource, "MarketTickPayload");
+const clientTickPayloadType = extractInterface(clientTypesSource, "MarketTickPayload");
+const createTickPayload = extractFunction(marketPayloadSource, "createMarketRealtimeTick");
+const createMarketTickPayload = marketPayloadSource.match(/const createMarketTickPayload[\s\S]*?const createMarketHistoryPatchPayload/)?.[0] ?? "";
+assert.ok(createMarketTickPayload, "Missing createMarketTickPayload");
 const mergeRealtimeTick = extractFunction(clientStoreSource, "mergeRealtimeTick");
 
 assert.doesNotMatch(serverTickType, /\borderBooks\b/, "Server MarketRealtimeTick must not carry full orderBooks.");
 assert.doesNotMatch(clientTickType, /\borderBooks\b/, "Client MarketRealtimeTick must not carry full orderBooks.");
 assert.doesNotMatch(createTickPayload, /\borderBooks\s*:/, "createMarketRealtimeTick must not serialize full orderBooks.");
 assert.doesNotMatch(mergeRealtimeTick, /tick\.orderBooks/, "mergeRealtimeTick must preserve full order books from snapshots.");
+assert.doesNotMatch(serverTickPayloadType, /settlementPreview/, "Server MarketTickPayload must not carry result signals.");
+assert.doesNotMatch(clientTickPayloadType, /settlementPreview/, "Client MarketTickPayload must not carry result signals.");
+assert.doesNotMatch(createMarketTickPayload, /settlementPreview/, "market:tick must not compute settlementPreview.");
 assert.match(serverTickType, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
 assert.match(clientTickType, /candleUpdates\?: Partial<Record<CandleInterval, CandleBar>>/);
 assert.match(serverTickType, /topLevels\?: Record<TradeSide, \{ bids: BookLevel\[]; asks: BookLevel\[] \}>/);
@@ -47,6 +55,8 @@ assert.match(serverIndexSource, /type MarketBroadcastFrame =/);
 assert.match(serverIndexSource, /const marketBroadcastClients = new Set<MarketBroadcastClient>\(\)/);
 assert.match(serverIndexSource, /function createMarketBroadcastFrame/);
 assert.match(serverIndexSource, /JSON\.stringify\(\{ type: "market:tick", data \}\)/);
+assert.match(serverIndexSource, /JSON\.stringify\(\{ type: "market:history-patch", data \}\)/);
+assert.match(clientStoreSource, /setMarketHistoryPatch/);
 assert.match(serverIndexSource, /function broadcastMarketTickFrame/);
 assert.match(serverIndexSource, /marketBroadcastClients\.size/);
 assert.match(serverIndexSource, /client\.socket\.bufferedAmount > 0/);

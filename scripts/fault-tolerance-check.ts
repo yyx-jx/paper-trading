@@ -17,7 +17,7 @@ function createStore(overrides: Partial<ConstructorParameters<typeof AppStore>[0
     strictPersistence: true,
     requireSchemaMigrations: true,
     allowDevSchemaBootstrap: false,
-    expectedSchemaMigrationId: "000007",
+    expectedSchemaMigrationId: "000008",
     pgConnectionTimeoutMs: 25,
     pgIdleTimeoutMs: 25,
     pgMaxConnections: 1,
@@ -75,7 +75,7 @@ async function assertSchemaGuardFails() {
               ? { rows: [{ exists: true }], rowCount: 1 }
               : { rows: [], rowCount: 0 }
         }),
-      /Required migration 000007 is not applied/
+      /Required migration 000008 is not applied/
     );
   } finally {
     await Promise.all([missingStore.close(), outdatedStore.close()]);

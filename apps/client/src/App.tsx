@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "./i18n";
 
@@ -13,7 +13,6 @@ import {
   type AuditEvent,
   type BehaviorActionLog,
   type CandlePoint,
-  type BulkCreateUserInput,
   type BulkCreateUsersResult,
   type BulkCreateUsersPreviewResult,
   type CandleBar,
@@ -24,9 +23,7 @@ import {
   type LogSearchQuery,
   type LogSystem,
   type MarketTrade,
-  type MarketPayload,
   type MarketSnapshot,
-  type MarketTickPayload,
   type OrderAction,
   type OrderLifecycleRecord,
   type OrderRecord,
@@ -42,9 +39,7 @@ import {
   type TradeSide,
   type TradeTimeline,
   type UnifiedLogRow,
-  type UpdateUserInput,
-  type UserPayload,
-  type UserTradePayload
+  type UpdateUserInput
 } from "./utils/api";
 import {
   isOrderBookBackendStale,
@@ -55,6 +50,33 @@ import { FieldChip } from "./components/FieldChip";
 import { PersonalHomePage } from "./features/profile/PersonalHomePage";
 import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
 import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
+import { useOrderActions } from "./features/trade/useOrderActions";
+import { useMarketSocket } from "./features/market/useMarketSocket";
+import { useUserSocket } from "./features/user/useUserSocket";
+import { ManualSettlementQueue } from "./features/settlement/ManualSettlementQueue";
+import {
+  ACTION_STATUS_OPTIONS,
+  CONNECTION_STATE_OPTIONS,
+  DEFAULT_LOG_FACETS,
+  LANGUAGE_OPTIONS,
+  LATENCY_PHASE_OPTIONS,
+  LATENCY_SOURCE_OPTIONS,
+  LOG_EXPORT_SYSTEMS,
+  LOG_GROUP_OPTIONS,
+  MATCHING_EVENT_OPTIONS,
+  MATCHING_KIND_OPTIONS,
+  ROLE_OPTIONS
+} from "./features/logs/logConfig";
+import {
+  initialRealtimeStatus,
+  realtimeStatusDetail,
+  realtimeStatusLabel,
+  realtimeStatusTone,
+  transitionRealtimeChannel,
+  type RealtimeChannel,
+  type RealtimeChannelStatus,
+  type RealtimeStatus
+} from "./features/realtime/status";
 import { useAppStore } from "./store/useAppStore";
 import {
   filterRowsByAnalyticsDate,
@@ -62,7 +84,7 @@ import {
   type AnalyticsDateFilter,
   type AnalyticsDateQueryError
 } from "./utils/analyticsDateFilter";
-import { dateTimeText, decimal, localLabel, money, signedMoney, timeText, tokenPriceText, tradeDisplayPriceText, utcParts } from "./utils/format";
+import { dateTimeText, decimal, money, signedMoney, timeText, tokenPriceText, tradeDisplayPriceText, utcParts } from "./utils/format";
 import { redactNetworkAddresses } from "./utils/redaction";
 
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
@@ -92,110 +114,6 @@ declare global {
 const compactPercent = (value = 0) => `${(value * 100).toFixed(1)}%`;
 const jsonPreview = (value: unknown) => redactNetworkAddresses(JSON.stringify(value ?? {}, null, 2));
 const exportFileName = () => `paper-trading-export-${new Date().toISOString().slice(0, 10)}.zip`;
-const LOG_EXPORT_SYSTEMS: Array<Exclude<LogSystem, "all">> = ["audit", "training", "matching"];
-const ROLE_OPTIONS: Role[] = ["Tester", "Senior Tester", "Test Engineer", "Admin"];
-const LANGUAGE_OPTIONS: Language[] = ["zh-CN", "en-US"];
-const ACTION_STATUS_OPTIONS: Array<NonNullable<LogSearchQuery["actionStatus"]>> = ["success", "failed", "timeout"];
-const LOG_GROUP_OPTIONS: Array<NonNullable<LogSearchQuery["logGroup"]>> = [
-  "operation",
-  "settlement",
-  "market_latency",
-  "system_latency",
-  "matching_action"
-];
-const LATENCY_SOURCE_OPTIONS: Array<NonNullable<LogSearchQuery["latencySource"]>> = ["binance", "coinbase", "clob", "system"];
-const CONNECTION_STATE_OPTIONS: Array<NonNullable<LogSearchQuery["connectionState"]>> = [
-  "healthy",
-  "reconnecting",
-  "stale",
-  "degraded",
-  "disabled"
-];
-const LATENCY_PHASE_OPTIONS: Array<NonNullable<LogSearchQuery["latencyPhase"]>> = ["backend", "acquire", "publish", "frontend"];
-const MATCHING_KIND_OPTIONS: Array<NonNullable<LogSearchQuery["matchingLogKind"]>> = ["action", "engine"];
-const MATCHING_EVENT_OPTIONS: Array<NonNullable<LogSearchQuery["eventType"]>> = [
-  "external_book_synced",
-  "order_executed",
-  "order_cancelled"
-];
-const DEFAULT_LOG_FACETS: LogFacets = {
-  audit: {
-    categories: ["operation", "matching", "settlement", "latency"],
-    actionTypes: [
-      "login",
-      "switch_language",
-      "place_order",
-      "cancel_order",
-      "sell_position",
-      "close_side",
-      "reverse_side",
-      "limit_order_triggered",
-      "limit_order_failed",
-      "capture_price_to_beat",
-      "poll_settlement",
-      "settlement_confirmed",
-      "redeem_position",
-      "round_closed",
-      "market_latency",
-      "user.create",
-      "user.bulkCreate",
-      "user.disable",
-      "user.enable",
-      "user.resetPassword",
-      "user.balance.set",
-      "user.changePassword"
-    ],
-    fields: [
-      "eventId",
-      "traceId",
-      "category",
-      "actionType",
-      "actionStatus",
-      "userId",
-      "role",
-      "pageName",
-      "moduleName",
-      "roundId",
-      "resultCode",
-      "details"
-    ],
-    logGroups: LOG_GROUP_OPTIONS,
-    latencySources: LATENCY_SOURCE_OPTIONS,
-    connectionStates: CONNECTION_STATE_OPTIONS,
-    latencyPhases: LATENCY_PHASE_OPTIONS
-  },
-  training: {
-    actionTypes: [
-      "place_order",
-      "cancel_order",
-      "sell_position",
-      "close_side",
-      "reverse_side",
-      "limit_order_triggered",
-      "limit_order_failed",
-      "redeem_position"
-    ],
-    fields: [
-      "logId",
-      "timestampMs",
-      "actionType",
-      "actionStatus",
-      "testerIdAnon",
-      "roundId",
-      "direction",
-      "orderId",
-      "marketId",
-      "bookSnapshotEntry",
-      "sourceStates",
-      "contextJson"
-    ]
-  },
-  matching: {
-    eventTypes: MATCHING_EVENT_OPTIONS,
-    fields: ["eventId", "bookKey", "roundId", "marketId", "bookSide", "sequence", "eventType", "orderId", "traceId", "payload"],
-    kinds: MATCHING_KIND_OPTIONS
-  }
-};
 
 async function saveBlobWithDesktopFallback(blob: Blob, defaultFileName: string) {
   const desktopSave = window.paperTradingDesktop?.saveFile;
@@ -236,156 +154,6 @@ function numberOrUndefined(value: string) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function splitDelimitedLine(line: string, delimiter: "," | "\t") {
-  const cells: string[] = [];
-  let current = "";
-  let quoted = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    const next = line[index + 1];
-    if (char === '"' && quoted && next === '"') {
-      current += '"';
-      index += 1;
-      continue;
-    }
-    if (char === '"') {
-      quoted = !quoted;
-      continue;
-    }
-    if (char === delimiter && !quoted) {
-      cells.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  cells.push(current.trim());
-  return cells;
-}
-
-interface ParsedBulkUserRow extends BulkCreateUserInput {
-  rowNumber: number;
-  errors: string[];
-}
-
-function parseBulkUserText(text: string, existingUsers: PublicUser[], language: Language) {
-  const errors: string[] = [];
-  const normalized = text.replace(/^\uFEFF/, "").trim();
-  if (!normalized) {
-    return {
-      rows: [] as ParsedBulkUserRow[],
-      validUsers: [] as BulkCreateUserInput[],
-      errors: [t("importOrPasteCsvTsvContentFirst")]
-    };
-  }
-
-  const lines = normalized.split(/\r?\n/).filter((line) => line.trim());
-  const delimiter = (lines[0].split("\t").length > lines[0].split(",").length ? "\t" : ",") as "," | "\t";
-  const headers = splitDelimitedLine(lines[0], delimiter).map((header) => header.trim());
-  const headerMap = new Map(headers.map((header, index) => [header.toLowerCase(), index]));
-  for (const header of ["username", "password"]) {
-    if (!headerMap.has(header)) {
-      errors.push(t("missingRequiredHeader", { header: header }));
-    }
-  }
-
-  const existingNames = new Set(existingUsers.map((user) => user.username));
-  const seniorLookup = new Map(
-    existingUsers
-      .filter((user) => (user.role === "Senior Tester" || user.role === "Test Engineer") && user.isActive)
-      .flatMap((user) => [
-        [user.id, user.id],
-        [user.username, user.id]
-      ])
-  );
-  const seen = new Set<string>();
-  const rows: ParsedBulkUserRow[] = [];
-
-  const readValue = (values: string[], key: string) => {
-    const index = headerMap.get(key.toLowerCase());
-    return typeof index === "number" ? values[index]?.trim() ?? "" : "";
-  };
-
-  for (let lineIndex = 1; lineIndex < lines.length; lineIndex += 1) {
-    const values = splitDelimitedLine(lines[lineIndex], delimiter);
-    const rowNumber = lineIndex + 1;
-    const rowErrors: string[] = [];
-    const username = readValue(values, "username");
-    const password = readValue(values, "password");
-    const displayName = readValue(values, "displayName") || username;
-    const roleText = readValue(values, "role") || "Tester";
-    const languageText = readValue(values, "language") || "zh-CN";
-    const seniorInput = readValue(values, "seniorTesterId");
-    const availableUsdcText = readValue(values, "availableUsdc");
-
-    if (!username) {
-      rowErrors.push(t("usernameIsRequired"));
-    }
-    if (!password) {
-      rowErrors.push(t("passwordIsRequired"));
-    }
-    if (username && seen.has(username)) {
-      rowErrors.push(t("duplicateUsernameInThisBatch"));
-    }
-    if (username) {
-      seen.add(username);
-    }
-    if (username && existingNames.has(username)) {
-      rowErrors.push(t("usernameAlreadyExists"));
-    }
-    if (!ROLE_OPTIONS.includes(roleText as Role)) {
-      rowErrors.push(t("roleIsInvalid"));
-    }
-    if (!LANGUAGE_OPTIONS.includes(languageText as Language)) {
-      rowErrors.push(t("languageIsInvalid"));
-    }
-
-    const role = ROLE_OPTIONS.includes(roleText as Role) ? (roleText as Role) : "Tester";
-    const rowLanguage = LANGUAGE_OPTIONS.includes(languageText as Language) ? (languageText as Language) : "zh-CN";
-    const seniorTesterId = seniorInput ? seniorLookup.get(seniorInput) : undefined;
-    if (seniorInput && role !== "Tester") {
-      rowErrors.push(t("seniortesteridOnlyAppliesToTester"));
-    }
-    if (seniorInput && role === "Tester" && !seniorTesterId) {
-      rowErrors.push(
-        localLabel(
-          language,
-          "seniorTesterId 必须是有效的组管理员 ID 或用户名。",
-          "seniorTesterId must be a valid group manager ID or username."
-        )
-      );
-    }
-
-    const availableUsdc = availableUsdcText ? Number(availableUsdcText) : undefined;
-    if (availableUsdcText && (!Number.isFinite(availableUsdc) || Number(availableUsdc) < 0)) {
-      rowErrors.push(t("availableusdcMustBeANonNegativeNumber"));
-    }
-
-    rows.push({
-      rowNumber,
-      username,
-      password,
-      displayName,
-      role,
-      language: rowLanguage,
-      seniorTesterId: role === "Tester" ? seniorTesterId : undefined,
-      availableUsdc,
-      errors: rowErrors
-    });
-  }
-
-  const validUsers =
-    errors.length === 0 && rows.every((row) => row.errors.length === 0)
-      ? rows.map(({ rowNumber: _rowNumber, errors: _errors, ...row }) => row)
-      : [];
-
-  return {
-    rows,
-    validUsers,
-    errors
-  };
-}
-
 const CHART_COUNT_OPTIONS = [10, 20, 30, 50, 100];
 const TRADE_INTERVAL_OPTIONS = ["30s", "1m", "5m", "15m", "1h"] as const satisfies readonly CandleInterval[];
 const chartTimeText = (value?: number) => {
@@ -413,15 +181,13 @@ function datedRoundTimeRangeText(round: Pick<RoundRecord, "startAt" | "endAt">) 
 
 function roundTitleText(
   round: Pick<RoundRecord, "symbol" | "startAt" | "endAt"> | undefined,
-  language: Language,
+  _language: Language,
   fallback?: string
 ) {
   if (!round) {
     return fallback ?? "--";
   }
-  return language === "zh-CN"
-    ? `${round.symbol} 5 分钟轮次 ${roundTimeRangeText(round)}`
-    : `${round.symbol} 5-Min Round ${roundTimeRangeText(round)}`;
+  return t("roundFiveMinuteTitle", { symbol: round.symbol, timeRange: roundTimeRangeText(round) });
 }
 
 function normalizeChartBars(bars: CandleBar[]) {
@@ -559,13 +325,13 @@ function countdownTone(countdownMs: number) {
 
 function activeRoundTradeBlockReason(round: RoundRecord | undefined, nowMs: number, language: Language) {
   if (!round || nowMs < round.startAt || nowMs >= round.endAt) {
-    return localLabel(language, "当前没有可交易轮次。", "No active tradable round.");
+    return t("uiNoActiveTradableRound94c14d76");
   }
   if (round.status !== "Trading") {
-    return localLabel(language, `当前轮次状态为 ${round.status}。`, `Current round is ${round.status}.`);
+    return t("uiCurrentRoundIsValue133dcca9", { p0: round.status });
   }
   if (round.endAt - nowMs <= 10_000) {
-    return localLabel(language, "当前轮次进入最后 10 秒冻结窗口。", "The round entered the final 10-second freeze window.");
+    return t("uiTheRoundEnteredTheFinal102ed81789");
   }
   return undefined;
 }
@@ -592,24 +358,24 @@ function buildTradeAvailability(input: {
   const hasOpenSidePositions = input.openSidePositions.some((position) => position.qty > 0);
   const buyReason =
     roundBlockReason ??
-    (!input.canPlaceOrder ? localLabel(input.language, "当前用户没有下单权限。", "Current user cannot place orders.") : undefined) ??
-    (input.acceptingOrders === false ? localLabel(input.language, "当前市场不接受新买入订单。", "The market is not accepting new buy orders.") : undefined) ??
-    (!selectedAskAvailable ? localLabel(input.language, "当前方向没有可买入盘口。", "No ask depth is available for this side.") : undefined) ??
+    (!input.canPlaceOrder ? t("uiCurrentUserCannotPlaceOrders400362fe") : undefined) ??
+    (input.acceptingOrders === false ? t("uiTheMarketIsNotAcceptingNew6192c8ae") : undefined) ??
+    (!selectedAskAvailable ? t("uiNoAskDepthIsAvailableFor0dab8698") : undefined) ??
     input.tradeBlockReason;
   const sellReason =
     roundBlockReason ??
-    (!input.canSell ? localLabel(input.language, "当前用户没有卖出权限。", "Current user cannot sell.") : undefined) ??
-    (!hasOpenSidePositions ? localLabel(input.language, "当前方向没有可卖持仓。", "No open position on this side.") : undefined) ??
-    (!selectedBidAvailable ? localLabel(input.language, "当前方向没有可卖出盘口。", "No bid depth is available for this side.") : undefined) ??
+    (!input.canSell ? t("uiCurrentUserCannotSelldc4068e3") : undefined) ??
+    (!hasOpenSidePositions ? t("uiNoOpenPositionOnThisSide9c5685d4") : undefined) ??
+    (!selectedBidAvailable ? t("uiNoBidDepthIsAvailableFor43981024") : undefined) ??
     (input.orderAction === "sell" && input.parsedQty <= 0
-      ? localLabel(input.language, "请输入有效卖出数量。", "Enter a valid sell quantity.")
+      ? t("uiEnterAValidSellQuantity91bdc477")
       : undefined) ??
     input.tradeBlockReason;
   const reverseReason =
     sellReason ??
-    (!input.canPlaceOrder ? localLabel(input.language, "当前用户没有反向买入权限。", "Current user cannot place the reverse buy order.") : undefined) ??
-    (input.acceptingOrders === false ? localLabel(input.language, "当前市场不接受反向买入订单。", "The market is not accepting the reverse buy order.") : undefined) ??
-    (!oppositeAskAvailable ? localLabel(input.language, "反方向没有可买入盘口。", "No ask depth is available for the reverse side.") : undefined);
+    (!input.canPlaceOrder ? t("uiCurrentUserCannotPlaceTheReverseb15aabb6") : undefined) ??
+    (input.acceptingOrders === false ? t("uiTheMarketIsNotAcceptingThebb3b03fd") : undefined) ??
+    (!oppositeAskAvailable ? t("uiNoAskDepthIsAvailableFor0d45282f") : undefined);
   return {
     canBuy: !buyReason,
     canSell: !sellReason,
@@ -710,22 +476,22 @@ function orderReferencePriceText(order: OrderRecord, snapshot?: MarketSnapshot) 
 }
 
 function orderTradeLabel(order: OrderRecord, language: Language) {
-  const actionLabel = localLabel(language, order.action === "buy" ? "买入" : "卖出", order.action === "buy" ? "Buy" : "Sell");
+  const actionLabel = (order.action === "buy" ? t("buy") : t("sell"));
   const sideLabel = order.side === "UP" ? "UP" : "DOWN";
   return `${actionLabel} ${sideLabel}`;
 }
 
 function orderPriceQualifier(order: OrderRecord, language: Language) {
   if (order.status === "filled") {
-    return localLabel(language, "成交价 · 不含 fee", "Fill · excl. fee");
+    return t("uiFillExclFee8feb86d7");
   }
   if (order.orderKind === "limit" && order.status === "pending") {
-    return localLabel(language, "挂单价", "Limit price");
+    return t("uiLimitPrice795eca5e");
   }
   if (typeof order.limitPrice === "number" && order.limitPrice > 0) {
-    return localLabel(language, "限价", "Limit");
+    return t("uiLimit0295355c");
   }
-  return localLabel(language, "最新成交 / 展示价", "Latest trade / display");
+  return t("uiLatestTradeDisplayf79d82d5");
 }
 
 function OrderExecutionCell({ order, language }: { order: OrderRecord; language: Language }) {
@@ -753,50 +519,50 @@ function auditStatusTone(status: AuditEvent["actionStatus"]) {
   return "negative";
 }
 
-const AUDIT_ACTION_LABELS: Record<string, string> = {
-  login: "登录",
-  switch_language: "切换语言",
-  place_order: "提交订单",
-  cancel_order: "撤销订单",
-  sell_position: "卖出持仓",
-  close_side: "平仓方向",
-  reverse_side: "一键反手",
-  limit_order_triggered: "限价单触发",
-  limit_order_failed: "限价单失败",
-  capture_price_to_beat: "记录 PTB",
-  poll_settlement: "轮询结算",
-  settlement_confirmed: "确认结算",
-  manual_settlement: "手动结算",
-  redeem_position: "持仓兑付",
-  round_closed: "轮次关闭",
-  market_latency: "行情延迟",
-  user_create: "创建用户",
-  user_disable: "停用用户",
-  user_enable: "启用用户",
-  user_reset_password: "重置密码",
-  user_changePassword: "修改密码",
-  "user.changePassword": "修改密码",
-  "user.resetPassword": "重置密码",
-  "user.balance.set": "设置余额"
+const AUDIT_ACTION_LABEL_KEYS: Record<string, string> = {
+  login: "auditActionLogin",
+  switch_language: "auditActionSwitchLanguage",
+  place_order: "auditActionPlaceOrder",
+  cancel_order: "auditActionCancelOrder",
+  sell_position: "auditActionSellPosition",
+  close_side: "auditActionCloseSide",
+  reverse_side: "auditActionReverseSide",
+  limit_order_triggered: "auditActionLimitOrderTriggered",
+  limit_order_failed: "auditActionLimitOrderFailed",
+  capture_price_to_beat: "auditActionCapturePriceToBeat",
+  poll_settlement: "auditActionPollSettlement",
+  settlement_confirmed: "auditActionSettlementConfirmed",
+  manual_settlement: "auditActionManualSettlement",
+  redeem_position: "auditActionRedeemPosition",
+  round_closed: "auditActionRoundClosed",
+  market_latency: "auditActionMarketLatency",
+  user_create: "auditActionCreateUser",
+  user_disable: "auditActionDisableUser",
+  user_enable: "auditActionEnableUser",
+  user_reset_password: "auditActionResetPassword",
+  user_changePassword: "auditActionChangePassword",
+  "user.changePassword": "auditActionChangePassword",
+  "user.resetPassword": "auditActionResetPassword",
+  "user.balance.set": "auditActionSetBalance"
 };
 
-const AUDIT_CATEGORY_LABELS: Record<string, string> = {
-  operation: "操作",
-  matching: "撮合",
-  settlement: "结算",
-  latency: "延迟"
+const AUDIT_CATEGORY_LABEL_KEYS: Record<string, string> = {
+  operation: "auditCategoryOperation",
+  matching: "auditCategoryMatching",
+  settlement: "auditCategorySettlement",
+  latency: "auditCategoryLatency"
 };
 
 function auditActionLabel(actionType: string | undefined, _language: Language) {
   if (!actionType) return "--";
-  const label = AUDIT_ACTION_LABELS[actionType];
-  return label ? label : actionType;
+  const key = AUDIT_ACTION_LABEL_KEYS[actionType];
+  return key ? t(key) : actionType;
 }
 
 function auditCategoryLabel(category: string | undefined, _language: Language) {
   if (!category) return "--";
-  const label = AUDIT_CATEGORY_LABELS[category];
-  return label ? label : category;
+  const key = AUDIT_CATEGORY_LABEL_KEYS[category];
+  return key ? t(key) : category;
 }
 
 function actionTone(action: string) {
@@ -879,32 +645,28 @@ function sourceComponent(source: SourceHealth | undefined, key: string) {
 }
 
 function componentStateLabel(state: SourceHealth["state"] | undefined, language: Language) {
-  if (!state) return localLabel(language, "未知", "unknown");
-  const zh: Record<SourceHealth["state"], string> = {
-    healthy: "正常",
-    degraded: "降级",
-    reconnecting: "重连",
-    stale: "过期",
-    disabled: "停用"
+  if (!state) return t("uiUnknown30b090da");
+  const keys: Record<SourceHealth["state"], string> = {
+    healthy: "sourceStateHealthy",
+    degraded: "sourceStateDegraded",
+    reconnecting: "sourceStateReconnecting",
+    stale: "sourceStateStale",
+    disabled: "sourceStateDisabled"
   };
-  return language === "zh-CN" ? zh[state] : state;
+  return t(keys[state]);
 }
 
 function clobComponentSummary(source: SourceHealth | undefined, language: Language) {
   const orderBook = sourceComponent(source, "orderBook");
   const marketWs = sourceComponent(source, "marketWs");
   const trades = sourceComponent(source, "trades");
-  const orderBookText = localLabel(
-    language,
-    `盘口${componentStateLabel(orderBook?.state, language)}`,
-    `Book ${componentStateLabel(orderBook?.state, language)}`
-  );
+  const orderBookText = t("uiBookValue5849f7a2", { p0: componentStateLabel(orderBook?.state, language) });
   const secondaryIssues = [
     marketWs && marketWs.state !== "healthy"
-      ? localLabel(language, `WS ${componentStateLabel(marketWs.state, language)}`, `WS ${componentStateLabel(marketWs.state, language)}`)
+      ? t("uiWSValuebd6fad9d", { p0: componentStateLabel(marketWs.state, language) })
       : undefined,
     trades && trades.state !== "healthy"
-      ? localLabel(language, `成交 ${componentStateLabel(trades.state, language)}`, `Trades ${componentStateLabel(trades.state, language)}`)
+      ? t("uiTradesValuee89ae62d", { p0: componentStateLabel(trades.state, language) })
       : undefined
   ].filter(Boolean);
   return secondaryIssues.length > 0 ? `${orderBookText} / ${secondaryIssues.join(" / ")}` : orderBookText;
@@ -945,16 +707,16 @@ function buildRiskAlerts(input: {
       kind: "frozen",
       group: "trading",
       level: "danger",
-      text: localLabel(input.language, "封盘中：下单按钮禁用", "Trading frozen: order buttons disabled"),
-      detail: localLabel(input.language, "当前轮次进入最后 10 秒冻结窗口。", "The round entered the final 10-second freeze window.")
+      text: t("uiTradingFrozenOrderButtonsDisabled44a1885e"),
+      detail: t("uiTheRoundEnteredTheFinal102ed81789")
     });
   } else if (input.countdownMs > 0 && input.countdownMs < 30_000) {
     alerts.push({
       kind: "freeze_warning",
       group: "trading",
       level: "warn",
-      text: localLabel(input.language, "封盘预警：剩余不足 30 秒", "Freeze warning: under 30s"),
-      detail: localLabel(input.language, "请留意最后阶段的流动性和撤单窗口。", "Watch liquidity and cancellation windows in the final stage.")
+      text: t("freezeWarningUnder30s"),
+      detail: t("uiWatchLiquidityAndCancellationWindowsIna8d652f4")
     });
   }
   if (Math.abs(input.oddsChange) > 0.05) {
@@ -962,11 +724,7 @@ function buildRiskAlerts(input: {
       kind: "odds_jump",
       group: "market",
       level: "warn",
-      text: localLabel(
-        input.language,
-        `价格急变 ${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`,
-        `Price jumped ${input.oddsChange >= 0 ? "+" : ""}${decimal(input.oddsChange, 4)}`
-      )
+      text: t("uiPriceJumpedValueValue674015a5", { p0: input.oddsChange >= 0 ? "+" : "", p1: decimal(input.oddsChange, 4) })
     });
   }
   if (input.upPrice > 0.97 || input.downPrice > 0.97) {
@@ -974,12 +732,8 @@ function buildRiskAlerts(input: {
       kind: "pre_settle",
       group: "settlement",
       level: "info",
-      text: localLabel(
-        input.language,
-        `预结算信号：${input.upPrice > input.downPrice ? "UP" : "DOWN"}`,
-        `Pre-settle signal: ${input.upPrice > input.downPrice ? "UP" : "DOWN"}`
-      ),
-      detail: localLabel(input.language, "仅用于展示，不会提前改余额和仓位。", "Display only; balances and positions stay unchanged.")
+      text: t("uiPreSettleSignalValue3930617a", { p0: input.upPrice > input.downPrice ? "UP" : "DOWN" }),
+      detail: t("uiDisplayOnlyBalancesAndPositionsStayffdf6b7d")
     });
   }
   for (const source of input.sources) {
@@ -988,7 +742,7 @@ function buildRiskAlerts(input: {
         kind: `source_${source.source}`,
         group: "market",
         level: "danger",
-        text: localLabel(input.language, `${source.source} 数据中断`, `${source.source} data interrupted`),
+        text: t("uiValueDataInterruptedd1f85f00", { p0: source.source }),
         detail: redactNetworkAddresses(source.message)
       });
     }
@@ -998,7 +752,7 @@ function buildRiskAlerts(input: {
       kind: "high_lag",
       group: "system",
       level: "warn",
-      text: localLabel(input.language, `CLOB 行情过旧 ${Math.round(input.clobLatencyMs)}ms`, `CLOB market stale ${Math.round(input.clobLatencyMs)}ms`)
+      text: t("uiCLOBMarketStaleValueMs9441175b", { p0: Math.round(input.clobLatencyMs) })
     });
   }
   return alerts;
@@ -1013,12 +767,12 @@ function buildStrategyHints(input: {
 }) {
   const momentum =
     Math.abs(input.oddsChange) > 0.03
-      ? localLabel(input.language, input.oddsChange > 0 ? "UP 动量 强" : "DOWN 动量 强", input.oddsChange > 0 ? "UP momentum strong" : "DOWN momentum strong")
+      ? (input.oddsChange > 0 ? t("uiUPMomentumStrong9ebcb4ae") : t("uiDOWNMomentumStrongf1f1e59a"))
       : t("momentumNeutral");
   return [
-    { label: localLabel(input.language, "节奏", "Momentum"), value: `${momentum} (${input.oddsChange >= 0 ? "+" : ""}${tokenPriceText(Math.abs(input.oddsChange), 1)})` },
+    { label: t("uiMomentum8206fa0a"), value: `${momentum} (${input.oddsChange >= 0 ? "+" : ""}${tokenPriceText(Math.abs(input.oddsChange), 1)})` },
     {
-      label: localLabel(input.language, "双边 ASK", "Two-side ask"),
+      label: t("uiTwoSideAskb5478767"),
       value: `${tokenPriceText(input.doubleSideCost, 1)} (${decimal(Math.max(input.doubleSideCost - 1, 0) * 100, 1)}%)`
     }
   ];
@@ -1049,8 +803,8 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
   if (!summary) {
     return (
       <div className="terminal-odds-strip empty">
-        <span>{localLabel(props.language, "HT UP · 本轮", "HT UP · This Round")}</span>
-        <em>{localLabel(props.language, "等待本轮价格点", "Waiting for this-round price points")}</em>
+        <span>{t("uiHTUPThisRounddbdace32")}</span>
+        <em>{t("uiWaitingForThisRoundPricePointsd7620794")}</em>
       </div>
     );
   }
@@ -1078,7 +832,7 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
   const lastY = yForPrice(summary.latest);
   return (
     <div className="terminal-odds-strip">
-      <span>{localLabel(props.language, "HT UP · 本轮", "HT UP · This Round")}</span>
+      <span>{t("uiHTUPThisRounddbdace32")}</span>
       <b>{tokenPriceText(summary.latest, 1)}</b>
       <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
         <path className="mini-grid" d={`M0,11.5 H${width} M0,22 H${width} M0,32.5 H${width}`} />
@@ -1087,8 +841,8 @@ function OddsMiniChart(props: { series: CandlePoint[]; language: Language }) {
         <circle className="mini-last" cx={lastX} cy={lastY} r="2.7" />
       </svg>
       <div className="mini-values">
-        <span className="mini-value-row high"><i>{localLabel(props.language, "最高", "High")}</i><b>{tokenPriceText(summary.high, 1)}</b></span>
-        <span className="mini-value-row low"><i>{localLabel(props.language, "最低", "Low")}</i><b>{tokenPriceText(summary.low, 1)}</b></span>
+        <span className="mini-value-row high"><i>{t("uiHighf320ca9d")}</i><b>{tokenPriceText(summary.high, 1)}</b></span>
+        <span className="mini-value-row low"><i>{t("uiLow85296bfa")}</i><b>{tokenPriceText(summary.low, 1)}</b></span>
       </div>
     </div>
   );
@@ -1173,7 +927,7 @@ function recentRoundOutcome(input: {
   if (!roundHasEnded(round, nowMs)) {
     return {
       className: "live",
-      label: localLabel(language, "进行中", "LIVE")
+      label: t("uiLIVE9e10d574")
     };
   }
   const confirmedSide =
@@ -1188,7 +942,7 @@ function recentRoundOutcome(input: {
   if (round.status === "Manual" || preview?.state === "manual") {
     return {
       className: "manual",
-      label: localLabel(language, "复核", "REV")
+      label: t("uiREVa7f3ebf2")
     };
   }
   const preliminarySide = preview?.state === "preliminary" && preview.side ? preview.side : preliminarySideFromRound(round);
@@ -1201,12 +955,12 @@ function recentRoundOutcome(input: {
   if (preview?.confidence === "conflict") {
     return {
       className: "conflict",
-      label: localLabel(language, "冲突", "CON")
+      label: t("uiCON5b6e4814")
     };
   }
   return {
     className: "pending",
-    label: localLabel(language, "等待", "WAIT")
+    label: t("uiWAIT60658fa1")
   };
 }
 
@@ -1401,8 +1155,8 @@ function CompactEquityCurve(props: { points: EquityCurvePoint[]; minValue: numbe
             <rect width="310" height="96" rx="12" />
             <text x="12" y="22">{hoverPoint.datedLabel}</text>
             <text x="12" y="42">{hoverPoint.marketSlug ?? hoverPoint.roundId}</text>
-            <text x="12" y="64">{`单轮盈亏: ${signedMoney(hoverPoint.roundPnl)}`}</text>
-            <text x="12" y="84">{`累计收益: ${signedMoney(hoverPoint.cumulativeEquity)}`}</text>
+            <text x="12" y="64">{t("singleRoundPnlLabel", { value: signedMoney(hoverPoint.roundPnl) })}</text>
+            <text x="12" y="84">{t("cumulativeReturnLabel", { value: signedMoney(hoverPoint.cumulativeEquity) })}</text>
           </g>
         </g>
       ) : null}
@@ -1509,144 +1263,6 @@ function buildGroupedOrders(history: HistoryRound[], orders: OrderRecord[]): Rou
     .sort((left, right) => (right.startAt ?? 0) - (left.startAt ?? 0));
 }
 
-function extractMarketPayloadPublishTs(payload?: Pick<MarketPayload, "snapshot" | "transportMeta">) {
-  if (!payload?.snapshot) {
-    return 0;
-  }
-  if (payload.transportMeta?.serverPublishTs) {
-    return payload.transportMeta.serverPublishTs;
-  }
-  const snapshot = payload.snapshot;
-  return Math.max(
-    snapshot.sources.binance.serverPublishTs,
-    snapshot.sources.coinbase.serverPublishTs,
-    snapshot.sources.clob.serverPublishTs
-  );
-}
-
-type RealtimeChannel = "market" | "user";
-type RealtimeChannelState = "connecting" | "live" | "reconnecting" | "fallback" | "offline";
-
-interface RealtimeChannelStatus {
-  state: RealtimeChannelState;
-  lastMessageAt?: number;
-  fallbackAt?: number;
-  reconnects: number;
-  stateChangedAt: number;
-  livePayloads: number;
-  consecutiveFailures: number;
-  lastError?: string;
-}
-
-type RealtimeStatus = Record<RealtimeChannel, RealtimeChannelStatus>;
-
-const REALTIME_STATUS_MIN_HOLD_MS = 1500;
-const REALTIME_FAILURES_BEFORE_DEGRADE = 2;
-const MARKET_LIVE_RECOVERY_PAYLOADS = 2;
-const USER_LIVE_RECOVERY_PAYLOADS = 1;
-
-const initialRealtimeStatus = (): RealtimeStatus => ({
-  market: { state: "connecting", reconnects: 0, stateChangedAt: Date.now(), livePayloads: 0, consecutiveFailures: 0 },
-  user: { state: "connecting", reconnects: 0, stateChangedAt: Date.now(), livePayloads: 0, consecutiveFailures: 0 }
-});
-
-function transitionRealtimeChannel(
-  current: RealtimeChannelStatus,
-  patch: Partial<RealtimeChannelStatus>,
-  options: { now?: number; force?: boolean; failure?: boolean; recoverPayloads?: number } = {}
-): RealtimeChannelStatus {
-  const now = options.now ?? Date.now();
-  const currentStateChangedAt = current.stateChangedAt || now;
-  let next: RealtimeChannelStatus = {
-    ...current,
-    ...patch,
-    stateChangedAt: currentStateChangedAt,
-    livePayloads: patch.livePayloads ?? current.livePayloads ?? 0,
-    consecutiveFailures: patch.consecutiveFailures ?? current.consecutiveFailures ?? 0
-  };
-
-  if (options.failure) {
-    next = {
-      ...next,
-      livePayloads: 0,
-      consecutiveFailures: (current.consecutiveFailures ?? 0) + 1
-    };
-  }
-
-  if (patch.state === "live") {
-    const livePayloads = (current.state === "live" ? current.livePayloads : current.livePayloads + 1) || 1;
-    next = {
-      ...next,
-      livePayloads,
-      consecutiveFailures: 0
-    };
-    const requiredPayloads = options.recoverPayloads ?? 1;
-    if (current.state !== "live" && livePayloads < requiredPayloads && !options.force) {
-      return {
-        ...next,
-        state: current.state,
-        stateChangedAt: currentStateChangedAt
-      };
-    }
-  }
-
-  if (
-    current.state === "live" &&
-    patch.state &&
-    patch.state !== "live" &&
-    !options.force &&
-    (next.consecutiveFailures < REALTIME_FAILURES_BEFORE_DEGRADE || now - currentStateChangedAt < REALTIME_STATUS_MIN_HOLD_MS)
-  ) {
-    return {
-      ...next,
-      state: "live",
-      stateChangedAt: currentStateChangedAt
-    };
-  }
-
-  if (patch.state && patch.state !== current.state) {
-    next.stateChangedAt = now;
-  }
-  return next;
-}
-
-function realtimeStatusLabel(status: RealtimeStatus, language: Language) {
-  const states = [status.market.state, status.user.state];
-  if (states.includes("offline")) {
-    return localLabel(language, "后端离线", "Backend offline");
-  }
-  if (states.includes("fallback")) {
-    return localLabel(language, "兜底刷新中", "Fallback refresh");
-  }
-  if (states.includes("reconnecting") || states.includes("connecting")) {
-    return localLabel(language, "重连中", "Reconnecting");
-  }
-  return localLabel(language, "实时连接中", "Live");
-}
-
-function realtimeStatusTone(status: RealtimeStatus) {
-  const states = [status.market.state, status.user.state];
-  if (states.includes("offline")) {
-    return "offline";
-  }
-  if (states.includes("fallback")) {
-    return "fallback";
-  }
-  if (states.includes("reconnecting") || states.includes("connecting")) {
-    return "reconnecting";
-  }
-  return "live";
-}
-
-function realtimeStatusDetail(status: RealtimeStatus, nowMs: number, language: Language) {
-  const ageText = (at?: number) => (at ? `${Math.max(0, Math.round((nowMs - at) / 1000))}s` : "--");
-  return localLabel(
-    language,
-    `行情 ${ageText(status.market.lastMessageAt)} / 用户 ${ageText(status.user.lastMessageAt)}`,
-    `Market ${ageText(status.market.lastMessageAt)} / User ${ageText(status.user.lastMessageAt)}`
-  );
-}
-
 function sourceTone(state?: SourceHealth["state"]) {
   if (state === "healthy") {
     return "positive";
@@ -1695,7 +1311,7 @@ function spreadDisplayText(spread?: number) {
 
 function ptbDisplayLabel(language: Language, source?: MarketSnapshot["displayPriceToBeatSource"]) {
   if (source === "binance_open_fallback") {
-    return localLabel(language, "PTB (币安开盘)", "PTB (Binance open)");
+    return t("uiPTBBinanceOpenf6c19fc9");
   }
   return "PTB";
 }
@@ -2257,6 +1873,7 @@ function App() {
     setBootstrap,
     setMarketPayload,
     setMarketTickPayload,
+    setMarketHistoryPatch,
     markMarketRenderCommit,
     setUserPayload,
     setUserTradePayload,
@@ -2274,18 +1891,12 @@ function App() {
   const [chartVisibleCount, setChartVisibleCount] = useState(60);
   const [nowMs, setNowMs] = useState(Date.now());
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>(() => initialRealtimeStatus());
-  const [tradeBusy, setTradeBusy] = useState(false);
-  const [quickBusy, setQuickBusy] = useState(false);
-  const [cancelBusyOrderId, setCancelBusyOrderId] = useState<string>();
-  const [sellBusyPositionId, setSellBusyPositionId] = useState<string>();
-  const [sellFeedback, setSellFeedback] = useState<{ positionId?: string; message: string }>();
   const [timeline, setTimeline] = useState<TradeTimeline>();
   const [timelineBusyOrderId, setTimelineBusyOrderId] = useState<string>();
   const [roundLogDialog, setRoundLogDialog] = useState<RoundLogDialogState>();
   const [roundLogBusyRoundId, setRoundLogBusyRoundId] = useState<string>();
   const [viewUserId, setViewUserId] = useState<string>();
   const [visibleViewUsers, setVisibleViewUsers] = useState<PublicUser[]>([]);
-  const cancellingOrderIdsRef = useRef(new Set<string>());
   const clientClockOffsetMsRef = useRef(0);
   const countdownTargetMs =
     typeof snapshot?.uiMeta.countdownTargetTs === "number"
@@ -2301,6 +1912,36 @@ function App() {
     visibleViewUsers.find((user) => user.id === effectiveViewUserId) ??
     me;
   const isViewingSelf = !effectiveViewUserId || effectiveViewUserId === me?.id;
+  const {
+    tradeBusy,
+    quickBusy,
+    cancelBusyOrderId,
+    sellBusyPositionId,
+    sellFeedback,
+    pendingOrderClientId,
+    ensureViewingSelfForMutation,
+    handlePlaceOrder,
+    handleCloseSide,
+    handleReverseSide,
+    handleCancelOrder,
+    handleSell
+  } = useOrderActions({
+    token,
+    me,
+    isViewingSelf,
+    language,
+    profile,
+    orderAmount,
+    orderQty,
+    limitPrice,
+    orderAction,
+    selectedSide,
+    orderKind,
+    setSelectedSide,
+    setError,
+    setUserTradePayload,
+    setLastOrderLatencyMs
+  });
 
   useEffect(() => {
     setChartVisibleCount(defaultVisibleCountForInterval(selectedInterval));
@@ -2429,429 +2070,29 @@ function App() {
     };
   }, [token, effectiveViewUserId, clearAuth, i18n, setBootstrap]);
 
-  useEffect(() => {
-    if (!token || !me) {
-      setRealtimeStatus(initialRealtimeStatus());
-      return;
-    }
+  useMarketSocket({
+    token,
+    meId: me?.id,
+    activeViewUserId: effectiveViewUserId,
+    clientClockOffsetMsRef,
+    setRealtimeStatus,
+    updateRealtimeChannel,
+    setMarketPayload,
+    setMarketTickPayload,
+    setMarketHistoryPatch,
+    markMarketRenderCommit
+  });
 
-    const activeMe = me;
-    const activeViewUserId = effectiveViewUserId ?? activeMe.id;
-    const activeViewedUser = currentViewedUser ?? activeMe;
-    setRealtimeStatus(initialRealtimeStatus());
-    let disposed = false;
-    let marketSocket: WebSocket | undefined;
-    let userSocket: WebSocket | undefined;
-    let marketReconnectTimer: number | undefined;
-    let userReconnectTimer: number | undefined;
-    let marketWatchdogTimer: number | undefined;
-    let lastMarketMessageAt = Date.now();
-    let lastUserMessageAt = Date.now();
-    let refreshingMarket = false;
-    let refreshingUser = false;
-    let lastMarketFallbackAt = 0;
-    let lastUserFallbackAt = 0;
-    const reconnectDelayMs = 1000;
-    const marketPayloadRejectMs = 4000;
-    const marketStaleMs = 1500;
-    const marketReconnectStaleMs = 4000;
-    const marketFallbackCooldownMs = 1500;
-    const userFallbackCooldownMs = 5000;
-    let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
-    let marketTickFrame: number | undefined;
-
-    const markMarketActivity = (receivedAt = Date.now()) => {
-      lastMarketMessageAt = receivedAt;
-      updateRealtimeChannel(
-        "market",
-        { state: "live", lastMessageAt: receivedAt, lastError: undefined },
-        { now: receivedAt, recoverPayloads: MARKET_LIVE_RECOVERY_PAYLOADS }
-      );
-    };
-
-    const markUserActivity = (receivedAt = Date.now()) => {
-      lastUserMessageAt = receivedAt;
-      updateRealtimeChannel(
-        "user",
-        { state: "live", lastMessageAt: receivedAt, lastError: undefined },
-        { now: receivedAt, recoverPayloads: USER_LIVE_RECOVERY_PAYLOADS }
-      );
-    };
-
-    const markMarketRendered = (receivedAt: number) => {
-      window.requestAnimationFrame(() => {
-        if (!disposed) {
-          markMarketRenderCommit(receivedAt);
-        }
-      });
-    };
-
-    const refreshMarketSnapshot = async () => {
-      if (disposed || refreshingMarket) {
-        return;
-      }
-      refreshingMarket = true;
-      lastMarketFallbackAt = Date.now();
-      updateRealtimeChannel("market", { state: "fallback", fallbackAt: lastMarketFallbackAt }, { now: lastMarketFallbackAt, failure: true });
-      try {
-        const roundData = await api.getCurrentRound(token, activeViewUserId);
-        if (!disposed) {
-          const receivedAt = Date.now();
-          const payload = {
-            viewedUserId: roundData.viewedUserId ?? activeViewUserId,
-            currentRound: roundData.currentRound,
-            history: useAppStore.getState().history,
-            snapshot: roundData.snapshot,
-            settlementPreview: roundData.settlementPreview,
-            transportMeta: roundData.transportMeta
-          };
-          if (setMarketPayload(payload, receivedAt, clientClockOffsetMsRef.current)) {
-            markMarketActivity(receivedAt);
-            markMarketRendered(receivedAt);
-          } else {
-            updateRealtimeChannel(
-              "market",
-              { state: marketSocket?.readyState === WebSocket.OPEN ? "live" : "fallback" },
-              { now: receivedAt, recoverPayloads: MARKET_LIVE_RECOVERY_PAYLOADS }
-            );
-          }
-        }
-      } catch (refreshError) {
-        updateRealtimeChannel("market", {
-          state: "offline",
-          lastError: refreshError instanceof Error ? redactNetworkAddresses(refreshError.message) : "Market refresh failed."
-        }, { failure: true });
-      } finally {
-        refreshingMarket = false;
-      }
-    };
-
-    const refreshUserSnapshot = async () => {
-      if (disposed || refreshingUser) {
-        return;
-      }
-      refreshingUser = true;
-      lastUserFallbackAt = Date.now();
-      updateRealtimeChannel("user", { state: "fallback", fallbackAt: lastUserFallbackAt }, { now: lastUserFallbackAt, failure: true });
-      try {
-        const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-          api.getProfile(token, activeViewUserId),
-          api.getOperatedHistory(token, 200, activeViewUserId),
-          api.getPositions(token, activeViewUserId),
-          api.getOrders(token, activeViewUserId),
-          api.getOrderLifecycles(token, activeViewUserId),
-          api.getLogs(token, activeViewUserId)
-        ]);
-        if (!disposed) {
-          const receivedAt = Date.now();
-          setUserPayload({
-            viewedUserId: activeViewUserId,
-            viewedUser: activeViewedUser,
-            profile: nextProfile,
-            operatedHistory: nextOperatedHistory,
-            positions: nextPositions,
-            orders: nextOrders,
-            orderLifecycles: nextOrderLifecycles,
-            logs: nextLogs
-          });
-          markUserActivity(receivedAt);
-        }
-      } catch (refreshError) {
-        updateRealtimeChannel("user", {
-          state: "offline",
-          lastError: refreshError instanceof Error ? redactNetworkAddresses(refreshError.message) : "User refresh failed."
-        }, { failure: true });
-      } finally {
-        refreshingUser = false;
-      }
-    };
-
-    const scheduleMarketReconnect = () => {
-      if (disposed || typeof marketReconnectTimer === "number") {
-        return;
-      }
-      setRealtimeStatus((current) => ({
-        ...current,
-        market: transitionRealtimeChannel(current.market, {
-          state: "reconnecting",
-          reconnects: current.market.reconnects + 1
-        }, { failure: true })
-      }));
-      marketReconnectTimer = window.setTimeout(() => {
-        marketReconnectTimer = undefined;
-        void connectMarketSocket();
-      }, reconnectDelayMs);
-    };
-
-    const scheduleUserReconnect = () => {
-      if (disposed || typeof userReconnectTimer === "number") {
-        return;
-      }
-      setRealtimeStatus((current) => ({
-        ...current,
-        user: transitionRealtimeChannel(current.user, {
-          state: "reconnecting",
-          reconnects: current.user.reconnects + 1
-        }, { failure: true })
-      }));
-      userReconnectTimer = window.setTimeout(() => {
-        userReconnectTimer = undefined;
-        void connectUserSocket();
-      }, reconnectDelayMs);
-    };
-
-    const connectMarketSocket = async () => {
-      if (disposed) {
-        return;
-      }
-      marketSocket?.close();
-      updateRealtimeChannel("market", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/market", token, activeViewUserId);
-      try {
-        const ticket = await api.createWsTicket(token, "market", activeViewUserId);
-        wsUrl = api.createWsTicketUrl("/ws/market", ticket.ticket);
-      } catch {
-        wsUrl = api.createWsUrl("/ws/market", token, activeViewUserId);
-      }
-      if (disposed) {
-        return;
-      }
-      const socket = new WebSocket(wsUrl);
-      marketSocket = socket;
-      socket.onopen = () => {
-        updateRealtimeChannel("market", { state: "connecting", lastError: undefined });
-      };
-      socket.onmessage = (event) => {
-        const receivedAt = Date.now();
-        let parsed: {
-          type: "market" | "market:tick";
-          data: MarketPayload | MarketTickPayload;
-        };
-        try {
-          parsed = JSON.parse(event.data) as {
-            type: "market" | "market:tick";
-            data: MarketPayload | MarketTickPayload;
-          };
-        } catch (parseError) {
-          updateRealtimeChannel("market", {
-            lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid market message."
-          });
-          return;
-        }
-        if (parsed.type === "market") {
-          const data = parsed.data as MarketPayload;
-          const publishTs = extractMarketPayloadPublishTs(data);
-          const payloadAgeMs =
-            publishTs > 0 ? transportAgeMs(receivedAt, publishTs, clientClockOffsetMsRef.current) : 0;
-          if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
-            void refreshMarketSnapshot();
-            if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
-              socket.close();
-            }
-            return;
-          }
-          if (setMarketPayload(data, receivedAt, clientClockOffsetMsRef.current)) {
-            markMarketActivity(receivedAt);
-            markMarketRendered(receivedAt);
-          }
-          return;
-        }
-        if (parsed.type === "market:tick") {
-          pendingMarketTick = { data: parsed.data as MarketTickPayload, receivedAt };
-          if (typeof marketTickFrame !== "number") {
-            marketTickFrame = window.requestAnimationFrame(() => {
-              marketTickFrame = undefined;
-              const pending = pendingMarketTick;
-              pendingMarketTick = undefined;
-              if (!pending || disposed) {
-                return;
-              }
-              const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
-              const payloadAgeMs =
-                publishTs > 0 ? transportAgeMs(pending.receivedAt, publishTs, clientClockOffsetMsRef.current) : 0;
-              if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
-                if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
-                  socket.close();
-                }
-                return;
-              }
-              if (setMarketTickPayload(pending.data, pending.receivedAt, clientClockOffsetMsRef.current)) {
-                markMarketActivity(pending.receivedAt);
-                markMarketRenderCommit(pending.receivedAt);
-              }
-            });
-          }
-        }
-      };
-      socket.onerror = () => {
-        updateRealtimeChannel("market", { state: "reconnecting", lastError: "Market stream error." }, { failure: true });
-        socket.close();
-      };
-      socket.onclose = () => {
-        if (marketSocket === socket) {
-          marketSocket = undefined;
-        }
-        scheduleMarketReconnect();
-      };
-    };
-
-    const connectUserSocket = async () => {
-      if (disposed) {
-        return;
-      }
-      userSocket?.close();
-      updateRealtimeChannel("user", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId);
-      try {
-        const ticket = await api.createWsTicket(token, "user", activeViewUserId);
-        wsUrl = api.createWsTicketUrl("/ws/user", ticket.ticket);
-      } catch {
-        wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId);
-      }
-      if (disposed) {
-        return;
-      }
-      const socket = new WebSocket(wsUrl);
-      userSocket = socket;
-      socket.onopen = () => {
-        updateRealtimeChannel("user", { state: "connecting", lastError: undefined });
-      };
-      socket.onmessage = (event) => {
-        const receivedAt = Date.now();
-        const processingStartedAt = performance.now();
-        let parsed: {
-          type: "user" | "user:trade";
-          data: UserPayload | UserTradePayload;
-        };
-        try {
-          parsed = JSON.parse(event.data) as {
-            type: "user" | "user:trade";
-            data: UserPayload | UserTradePayload;
-          };
-        } catch (parseError) {
-          updateRealtimeChannel("user", {
-            lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid user message."
-          });
-          return;
-        }
-        const payloadBytes = typeof event.data === "string" ? event.data.length : 0;
-        const warnSlowUserMessage = () => {
-          const elapsedMs = Math.round(performance.now() - processingStartedAt);
-          if (elapsedMs > 50 || payloadBytes > 200_000) {
-            console.warn(`[ws:user] processed type=${parsed.type} bytes=${payloadBytes} elapsedMs=${elapsedMs}`);
-          }
-        };
-        if (parsed.type === "user" || parsed.type === "user:trade") {
-          window.requestAnimationFrame(() => {
-            if (disposed) {
-              return;
-            }
-            startTransition(() => {
-              if (parsed.type === "user:trade") {
-                setUserTradePayload(parsed.data as UserTradePayload);
-              } else {
-                setUserPayload(parsed.data as UserPayload);
-              }
-              markUserActivity(receivedAt);
-              warnSlowUserMessage();
-            });
-          });
-        }
-      };
-      socket.onerror = () => {
-        updateRealtimeChannel("user", { state: "reconnecting", lastError: "User stream error." }, { failure: true });
-        socket.close();
-      };
-      socket.onclose = () => {
-        if (userSocket === socket) {
-          userSocket = undefined;
-        }
-        scheduleUserReconnect();
-      };
-    };
-
-    const handleForegroundRecovery = () => {
-      if (disposed) {
-        return;
-      }
-      const now = Date.now();
-      const marketIdleMs = now - lastMarketMessageAt;
-      if (!marketSocket || marketSocket.readyState !== WebSocket.OPEN) {
-        void refreshMarketSnapshot();
-        scheduleMarketReconnect();
-      } else if (marketIdleMs > marketStaleMs) {
-        void refreshMarketSnapshot();
-      }
-      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
-        void refreshUserSnapshot();
-        scheduleUserReconnect();
-      }
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        handleForegroundRecovery();
-      }
-    };
-
-    void connectMarketSocket();
-    void connectUserSocket();
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("focus", handleForegroundRecovery);
-    window.addEventListener("pageshow", handleForegroundRecovery);
-    marketWatchdogTimer = window.setInterval(() => {
-      if (disposed) {
-        return;
-      }
-      const now = Date.now();
-      const socket = marketSocket;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        if (now - lastMarketFallbackAt > marketFallbackCooldownMs) {
-          void refreshMarketSnapshot();
-        }
-        if (!socket || socket.readyState === WebSocket.CLOSED) {
-          scheduleMarketReconnect();
-        }
-      } else {
-        const idleMs = now - lastMarketMessageAt;
-        if (socket.readyState === WebSocket.OPEN && idleMs > marketStaleMs && now - lastMarketFallbackAt > marketFallbackCooldownMs) {
-          void refreshMarketSnapshot();
-        }
-        if (socket.readyState === WebSocket.OPEN && idleMs > marketReconnectStaleMs) {
-          socket.close();
-        }
-      }
-      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
-        if (now - lastUserFallbackAt > userFallbackCooldownMs) {
-          void refreshUserSnapshot();
-        }
-        if (!userSocket || userSocket.readyState === WebSocket.CLOSED) {
-          scheduleUserReconnect();
-        }
-      }
-    }, 250);
-
-    return () => {
-      disposed = true;
-      if (typeof marketReconnectTimer === "number") {
-        window.clearTimeout(marketReconnectTimer);
-      }
-      if (typeof userReconnectTimer === "number") {
-        window.clearTimeout(userReconnectTimer);
-      }
-      if (typeof marketWatchdogTimer === "number") {
-        window.clearInterval(marketWatchdogTimer);
-      }
-      if (typeof marketTickFrame === "number") {
-        window.cancelAnimationFrame(marketTickFrame);
-      }
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("focus", handleForegroundRecovery);
-      window.removeEventListener("pageshow", handleForegroundRecovery);
-      marketSocket?.close();
-      userSocket?.close();
-    };
-  }, [token, me, effectiveViewUserId, currentViewedUser?.id, setMarketPayload, setMarketTickPayload, markMarketRenderCommit, setUserPayload, setUserTradePayload, updateRealtimeChannel]);
+  useUserSocket({
+    token,
+    me,
+    activeViewUserId: effectiveViewUserId,
+    activeViewedUser: currentViewedUser,
+    setRealtimeStatus,
+    updateRealtimeChannel,
+    setUserPayload,
+    setUserTradePayload
+  });
 
   const handleLogin = async (username: string, password: string) => {
     setError(undefined);
@@ -2873,118 +2114,6 @@ function App() {
       setUser(updated);
     } catch (languageError) {
       setError(languageError instanceof Error ? languageError.message : "Language update failed.");
-    }
-  };
-
-  const ensureViewingSelfForMutation = () => {
-    if (isViewingSelf) {
-      return true;
-    }
-    setError(localLabel(language, "当前正在查看其他用户，交易操作已锁定。", "Trading actions are locked while viewing another user."));
-    return false;
-  };
-
-  const handlePlaceOrder = async () => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    const limitPriceCents = orderKind === "limit" ? parseLimitPriceCentsInput(limitPrice) : undefined;
-    if (orderKind === "limit" && typeof limitPriceCents !== "number") {
-      setError(localLabel(language, "限价单只支持 1-99 美分的整数价格。", "Limit orders only support whole-cent prices from 1 to 99."));
-      return;
-    }
-    try {
-      setTradeBusy(true);
-      setError(undefined);
-      const result = await api.placeOrder(token, {
-        action: orderAction,
-        side: selectedSide,
-        orderKind,
-        amount: orderAction === "buy" ? Number(orderAmount) : undefined,
-        qty: orderAction === "sell" ? Number(orderQty) : undefined,
-        limitPrice: orderKind === "limit" ? limitPriceCents! / 100 : undefined
-      });
-      if (result.tradePatch) {
-        setUserTradePayload(result.tradePatch);
-      }
-      setLastOrderLatencyMs(result.order.totalOrderLatencyMs ?? result.order.matchLatencyMs);
-    } catch (placeOrderError) {
-      const message = placeOrderError instanceof Error ? placeOrderError.message : "Order failed.";
-      if (message.includes("Insufficient virtual balance")) {
-        setError(
-          localLabel(
-            language,
-            `可用余额不足：本单需冻结 ${money(Number(orderAmount || 0))}，当前可用 ${money(profile?.availableUsdc ?? 0)}。`,
-            `Insufficient available balance: this order would freeze ${money(Number(orderAmount || 0))}, current available is ${money(profile?.availableUsdc ?? 0)}.`
-          )
-        );
-      } else {
-        setError(message);
-      }
-    } finally {
-      setTradeBusy(false);
-    }
-  };
-
-  const handleCloseSide = async (side = selectedSide) => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    try {
-      setQuickBusy(true);
-      setError(undefined);
-      const result = await api.closeSide(token, side);
-      if (result.tradePatch) {
-        setUserTradePayload(result.tradePatch);
-      }
-      setLastOrderLatencyMs(result.matchLatencyMs);
-    } catch (closeError) {
-      setError(closeError instanceof Error ? closeError.message : "Close side failed.");
-    } finally {
-      setQuickBusy(false);
-    }
-  };
-
-  const handleReverseSide = async () => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    try {
-      setQuickBusy(true);
-      setError(undefined);
-      const result = await api.reverseSide(token, selectedSide);
-      if (result.tradePatch) {
-        setUserTradePayload(result.tradePatch);
-      }
-      setSelectedSide(result.reverseSide);
-      setLastOrderLatencyMs(result.reverseOrder.matchLatencyMs);
-    } catch (reverseError) {
-      setError(reverseError instanceof Error ? reverseError.message : "Reverse side failed.");
-    } finally {
-      setQuickBusy(false);
-    }
-  };
-
-  const handleCancelOrder = async (orderId: string) => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    if (cancellingOrderIdsRef.current.has(orderId)) {
-      return;
-    }
-    cancellingOrderIdsRef.current.add(orderId);
-    setCancelBusyOrderId(orderId);
-    try {
-      setError(undefined);
-      const result = await api.cancelOrder(token, orderId);
-      if (result.tradePatch) {
-        setUserTradePayload(result.tradePatch);
-      }
-    } catch (cancelError) {
-      setError(cancelError instanceof Error ? cancelError.message : "Cancel failed.");
-    } finally {
-      cancellingOrderIdsRef.current.delete(orderId);
-      setCancelBusyOrderId(undefined);
     }
   };
 
@@ -3023,70 +2152,36 @@ function App() {
     }
   };
 
-  const handleSell = async (positionId: string) => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
+  const refreshAfterManualSettlement = async () => {
+    if (!token || !me) {
       return;
     }
-    try {
-      setSellBusyPositionId(positionId);
-      setSellFeedback(undefined);
-      setError(undefined);
-      const result = await api.sellPosition(token, positionId);
-      if (result.tradePatch) {
-        setUserTradePayload(result.tradePatch);
-      }
-      setLastOrderLatencyMs(result.order.totalOrderLatencyMs ?? result.order.matchLatencyMs);
-    } catch (sellError) {
-      const message = sellError instanceof Error ? sellError.message : "Sell failed.";
-      setError(message);
-      setSellFeedback({ positionId, message });
-    } finally {
-      setSellBusyPositionId(undefined);
-    }
-  };
-
-  const handleManualSettle = async (roundId: string, side: TradeSide) => {
-    if (!token || !me || !ensureViewingSelfForMutation()) {
-      return;
-    }
-    try {
-      setError(undefined);
-      await api.manualSettleRound(token, roundId, {
-        side,
-        reason: `Manual settlement entered from ${me?.username ?? "client"}`
-      });
-      const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-        api.getCurrentRound(token, effectiveViewUserId),
-        api.getHistory(token, 60, effectiveViewUserId),
-        api.getProfile(token, effectiveViewUserId),
-        api.getPositions(token, effectiveViewUserId),
-        api.getOrders(token, effectiveViewUserId),
-        api.getOrderLifecycles(token, effectiveViewUserId),
-        api.getLogs(token, effectiveViewUserId)
-      ]);
-      setMarketPayload({
-        viewedUserId: roundData.viewedUserId ?? effectiveViewUserId ?? me.id,
-        currentRound: roundData.currentRound,
-        history: nextHistory,
-        snapshot: roundData.snapshot,
-        settlementPreview: roundData.settlementPreview,
-        transportMeta: roundData.transportMeta
-      }, Date.now(), clientClockOffsetMsRef.current);
-      setUserPayload({
-        viewedUserId: effectiveViewUserId ?? me.id,
-        viewedUser: currentViewedUser ?? me,
-        profile: nextProfile,
-        positions: nextPositions,
-        orders: nextOrders,
-        orderLifecycles: nextOrderLifecycles,
-        logs: nextLogs
-      });
-    } catch (manualError) {
-      const message = manualError instanceof Error ? manualError.message : "Manual settlement failed.";
-      if (!isManualSettlementPermissionError(message)) {
-        setError(message);
-      }
-    }
+    const [roundData, nextHistory, nextProfile, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
+      api.getCurrentRound(token, effectiveViewUserId),
+      api.getHistory(token, 60, effectiveViewUserId),
+      api.getProfile(token, effectiveViewUserId),
+      api.getPositions(token, effectiveViewUserId),
+      api.getOrders(token, effectiveViewUserId),
+      api.getOrderLifecycles(token, effectiveViewUserId),
+      api.getLogs(token, effectiveViewUserId)
+    ]);
+    setMarketPayload({
+      viewedUserId: roundData.viewedUserId ?? effectiveViewUserId ?? me.id,
+      currentRound: roundData.currentRound,
+      history: nextHistory,
+      snapshot: roundData.snapshot,
+      settlementPreview: roundData.settlementPreview,
+      transportMeta: roundData.transportMeta
+    }, Date.now(), clientClockOffsetMsRef.current);
+    setUserPayload({
+      viewedUserId: effectiveViewUserId ?? me.id,
+      viewedUser: currentViewedUser ?? me,
+      profile: nextProfile,
+      positions: nextPositions,
+      orders: nextOrders,
+      orderLifecycles: nextOrderLifecycles,
+      logs: nextLogs
+    });
   };
 
   const realtimeLabel = realtimeStatusLabel(realtimeStatus, language);
@@ -3127,7 +2222,7 @@ function App() {
             <strong>{countdownText}</strong>
           </div>
           <div className={`status-pill realtime-pill ${realtimeTone}`}>
-            <span>{localLabel(language, "实时", "Realtime")}</span>
+            <span>{t("uiRealtimed6257476")}</span>
             <strong>{realtimeLabel}</strong>
           </div>
         </div>
@@ -3135,7 +2230,7 @@ function App() {
         <div className="topbar-actions">
           {canSelectViewUser ? (
             <label className="view-user-control">
-              <span>{localLabel(language, "查看", "View")}</span>
+              <span>{t("uiViewb481c5fe")}</span>
               <select value={effectiveViewUserId ?? me.id} onChange={(event) => handleViewUserChange(event.target.value)}>
                 {visibleViewUsers.map((user) => (
                   <option key={user.id} value={user.id}>
@@ -3148,7 +2243,7 @@ function App() {
           {!isViewingSelf && currentViewedUser ? (
             <div className="view-user-chip">
               <strong>{currentViewedUser.displayName || currentViewedUser.username}</strong>
-              <span>{localLabel(language, "只读", "Read only")}</span>
+              <span>{t("uiReadOnly3f760b7f")}</span>
             </div>
           ) : null}
           <nav className="page-tabs">
@@ -3219,11 +2314,11 @@ function App() {
             orderKind={orderKind}
             tradeBusy={tradeBusy}
             quickBusy={quickBusy}
+            pendingOrderClientId={pendingOrderClientId}
             sellBusyPositionId={sellBusyPositionId}
             sellFeedback={sellFeedback}
             canPlaceOrder={isViewingSelf && me.permissionCodes.includes("trade:order")}
             canSell={isViewingSelf && me.permissionCodes.includes("trade:sell")}
-            canManualSettle={isViewingSelf && me.role !== "Tester"}
             onAmountChange={setOrderAmount}
             onQtyChange={setOrderQty}
             onLimitPriceChange={setLimitPrice}
@@ -3238,7 +2333,6 @@ function App() {
             onSell={handleSell}
             onCancel={handleCancelOrder}
             onTimeline={handleOpenTimeline}
-            onManualSettle={handleManualSettle}
             onNavigate={setCurrentPage}
             onLanguageChange={handleLanguageChange}
             onLogout={clearAuth}
@@ -3300,6 +2394,8 @@ function App() {
             timelineBusyOrderId={timelineBusyOrderId}
             selectedRoundLogId={roundLogDialog?.item.roundId}
             roundLogBusyRoundId={roundLogBusyRoundId}
+            canManualSettle={me.role === "Admin" && me.permissionCodes.includes("settlement:manual")}
+            onManualSettlementComplete={refreshAfterManualSettlement}
           />
         ) : (
           <LogSearchPage
@@ -3585,77 +2681,73 @@ function analyticsRoundLabel(roundStartAt?: number) {
   return roundStartAt ? `HT-${dateTimeText(roundStartAt)}` : "HT--";
 }
 
-function analyticsPeriodLabel(period: AnalyticsPeriod, language: Language) {
-  const labels: Record<AnalyticsPeriod, { zh: string; en: string }> = {
-    all: { zh: "全部", en: "All" },
-    year: { zh: "年", en: "Year" },
-    month: { zh: "月", en: "Month" },
-    week: { zh: "周", en: "Week" },
-    day: { zh: "日", en: "Day" },
-    trades: { zh: "交易", en: "Trades" }
+function analyticsPeriodLabel(period: AnalyticsPeriod, _language: Language) {
+  const labels: Record<AnalyticsPeriod, string> = {
+    all: "all",
+    year: "uiYearf0aa55a9",
+    month: "uiMonth63bb45a9",
+    week: "uiWeek401ffc0f",
+    day: "uiDay26f5a9c1",
+    trades: "uiTradese772f691"
   };
-  return localLabel(language, labels[period].zh, labels[period].en);
+  return t(labels[period]);
 }
 
-function analyticsDateQueryErrorLabel(error: AnalyticsDateQueryError, language: Language) {
-  const labels: Record<AnalyticsDateQueryError, { zh: string; en: string }> = {
-    year: { zh: "年查询格式必须为 YYYY。", en: "Year query must use YYYY." },
-    month: { zh: "月查询格式必须为 YYYY-MM。", en: "Month query must use YYYY-MM." },
-    day: { zh: "日查询格式必须为 YYYY-MM-DD。", en: "Day query must use YYYY-MM-DD." }
+function analyticsDateQueryErrorLabel(error: AnalyticsDateQueryError, _language: Language) {
+  const labels: Record<AnalyticsDateQueryError, string> = {
+    year: "uiYearQueryMustUseYYYY1c737c52",
+    month: "uiMonthQueryMustUseYYYYMM329dbe3f",
+    day: "uiDayQueryMustUseYYYYMMDDc9ef9c54"
   };
-  return localLabel(language, labels[error].zh, labels[error].en);
+  return t(labels[error]);
 }
 
-function analyticsResultLabel(result: AnalyticsResult, language: Language) {
-  const labels: Record<AnalyticsResult, { zh: string; en: string }> = {
-    WIN: { zh: "盈利", en: "Win" },
-    LOSE: { zh: "亏损", en: "Loss" },
-    SOLD: { zh: "已卖出", en: "Sold" },
-    OPEN: { zh: "持仓中", en: "Open" },
-    UNFILLED: { zh: "未成交", en: "Unfilled" }
+function analyticsResultLabel(result: AnalyticsResult, _language: Language) {
+  const labels: Record<AnalyticsResult, string> = {
+    WIN: "uiWin91a0fd19",
+    LOSE: "uiLoss75805320",
+    SOLD: "uiSolda25a1efa",
+    OPEN: "uiOpen1f841e78",
+    UNFILLED: "uiUnfilled431c6a2e"
   };
-  return localLabel(language, labels[result].zh, labels[result].en);
+  return t(labels[result]);
 }
 
 function analyticsSettlementLabel(state: AnalyticsSettlementState, language: Language) {
   return state === "SETTLED"
-    ? localLabel(language, "已结算", "Settled")
-    : localLabel(language, "未结算", "Unsettled");
+    ? t("uiSettled3f248bb9")
+    : t("uiUnsettledec860135");
 }
 
 function analyticsRowAnalysis(result: AnalyticsResult, language: Language): { text: string; tone: AnalyticsTone } {
   if (result === "WIN") {
     return {
       tone: "positive",
-      text: localLabel(language, "本轮兑现盈利，入场价格与结算方向匹配。", "Profit was realized; entry price aligned with the settled side.")
+      text: t("uiProfitWasRealizedEntryPriceAlignedadf7fffc")
     };
   }
   if (result === "LOSE") {
     return {
       tone: "negative",
-      text: localLabel(language, "方向未兑现，复盘入场价和封盘前风险。", "The side did not resolve; review entry price and late-round risk.")
+      text: t("uiTheSideDidNotResolveReview471c0db2")
     };
   }
   if (result === "SOLD") {
     return {
       tone: "warning",
-      text: localLabel(language, "提前退出，关注退出纪律和滑点。", "Exited before settlement; check exit discipline and slippage.")
+      text: t("uiExitedBeforeSettlementCheckExitDiscipline0b506909")
     };
   }
   if (result === "UNFILLED") {
     return {
       tone: "warning",
-      text: localLabel(language, "盘口深度不足，订单没有形成有效仓位。", "Book depth was insufficient; the order did not form a position.")
+      text: t("uiBookDepthWasInsufficientTheOrderdf938091")
     };
   }
   return {
     tone: "neutral",
-    text: localLabel(language, "仍在生命周期中，先观察结算结果。", "Still in its lifecycle; wait for the settlement result.")
+    text: t("uiStillInItsLifecycleWaitForae544a7c")
   };
-}
-
-function isManualSettlementPermissionError(message: string) {
-  return /manual settlement/i.test(message) && /(tester|cannot|forbidden|not allow|not permitted|unauthorized)/i.test(message);
 }
 
 function isClobDepthFailure(order: OrderRecord) {
@@ -3695,11 +2787,11 @@ function TradePageRestored(props: {
   orderKind: PaperOrderKind;
   tradeBusy: boolean;
   quickBusy: boolean;
+  pendingOrderClientId?: string;
   sellBusyPositionId?: string;
   sellFeedback?: { positionId?: string; message: string };
   canPlaceOrder: boolean;
   canSell: boolean;
-  canManualSettle: boolean;
   onAmountChange: (value: string) => void;
   onQtyChange: (value: string) => void;
   onLimitPriceChange: (value: string) => void;
@@ -3714,7 +2806,6 @@ function TradePageRestored(props: {
   onSell: (positionId: string) => Promise<void>;
   onCancel: (orderId: string) => Promise<void>;
   onTimeline: (orderId: string) => Promise<void>;
-  onManualSettle: (roundId: string, side: TradeSide) => Promise<void>;
   onNavigate: (page: "trade" | "home" | "profile" | "logs") => void;
   onLanguageChange: (language: Language) => Promise<void>;
   onLogout: () => void;
@@ -3754,7 +2845,7 @@ function TradePageRestored(props: {
   const parsedLimitPriceCents = parseLimitPriceCentsInput(props.limitPrice);
   const limitPriceError =
     props.orderKind === "limit" && typeof parsedLimitPriceCents !== "number"
-      ? localLabel(language, "限价只支持 1-99 的整数美分。", "Limit price must be a whole cent from 1 to 99.")
+      ? t("uiLimitPriceMustBeAWholea2031356")
       : undefined;
   const limitTokenPrice = typeof parsedLimitPriceCents === "number" ? parsedLimitPriceCents / 100 : undefined;
   const estimatedPrice = props.orderKind === "limit" ? limitTokenPrice ?? 0 : displayPrice;
@@ -3781,11 +2872,7 @@ function TradePageRestored(props: {
   const acceptingOrders = Boolean(snapshot?.uiMeta.acceptingOrders);
   const balanceWarning =
     props.orderAction === "buy" && parsedAmount + (estimatedFee ?? 0) > (profile?.availableUsdc ?? 0) + 0.0001
-      ? localLabel(
-          language,
-          `可用余额不足：本单需冻结 ${money(parsedAmount + (estimatedFee ?? 0))}，当前可用 ${money(profile?.availableUsdc ?? 0)}。`,
-          `Insufficient available balance: this order would freeze ${money(parsedAmount + (estimatedFee ?? 0))}, current available is ${money(profile?.availableUsdc ?? 0)}.`
-        )
+      ? t("uiInsufficientAvailableBalanceThisOrderWould6c2e619d", { p0: money(parsedAmount + (estimatedFee ?? 0)), p1: money(profile?.availableUsdc ?? 0) })
       : undefined;
   const tradeBlockReason = balanceWarning ?? limitPriceError;
   const openPositionsBySide = (["UP", "DOWN"] as TradeSide[]).reduce<Record<TradeSide, PositionRecord[]>>(
@@ -3889,7 +2976,7 @@ function TradePageRestored(props: {
   const commitChartVisibleDraft = () => {
     const nextValue = parseBarCountInput(chartVisibleDraft);
     if (typeof nextValue !== "number") {
-      setChartVisibleError(localLabel(language, "请输入 10-200 的整数。", "Enter a whole number from 10 to 200."));
+      setChartVisibleError(t("uiEnterAWholeNumberFrom107463c881"));
       return;
     }
     setChartVisibleError(undefined);
@@ -3923,16 +3010,16 @@ function TradePageRestored(props: {
     coinbaseLatency.sourceDataAgeMs
   );
   const groupedAlerts = [
-    { key: "market", label: localLabel(language, "数据源", "Market Data") },
-    { key: "trading", label: localLabel(language, "交易风险", "Trading Risk") },
-    { key: "settlement", label: localLabel(language, "结算风险", "Settlement Risk") },
-    { key: "system", label: localLabel(language, "系统延迟", "System Delay") }
+    { key: "market", label: t("uiMarketDatab5219cab") },
+    { key: "trading", label: t("uiTradingRiskc096896a") },
+    { key: "settlement", label: t("uiSettlementRiskfd276a2b") },
+    { key: "system", label: t("uiSystemDelayeeffe398") }
   ].map((group) => ({ ...group, items: riskAlerts.filter((alert) => alert.group === group.key) })).filter((group) => group.items.length > 0);
   const latencyRows = [
-    { label: localLabel(language, "最新推送年龄", "Market update age"), value: marketUpdateAge },
-    { label: localLabel(language, "最旧源数据", "Oldest source age"), value: sourceAgeMax },
-    { label: localLabel(language, "后端计算", "Backend compute"), value: snapshot?.latencyBreakdown.serverComputeLatency },
-    { label: localLabel(language, "推送前端", "Frontend transport"), value: snapshot?.latencyBreakdown.clientTransportLatency }
+    { label: t("uiMarketUpdateAgebf535c1f"), value: marketUpdateAge },
+    { label: t("uiOldestSourceAge44acef60"), value: sourceAgeMax },
+    { label: t("uiBackendCompute74f83d9a"), value: snapshot?.latencyBreakdown.serverComputeLatency },
+    { label: t("uiFrontendTransport3df4869f"), value: snapshot?.latencyBreakdown.clientTransportLatency }
   ];
   const topLatency = [...latencyRows].sort((left, right) => (right.value ?? -1) - (left.value ?? -1))[0];
   const selectedSummary = snapshot?.clob.bestBidAskSummary[selectedSide];
@@ -3940,12 +3027,12 @@ function TradePageRestored(props: {
     selectedSummary && selectedSummary.bestAsk > 0 && selectedSummary.bestBid > 0
       ? tokenPriceText(selectedSummary.bestAsk - selectedSummary.bestBid)
       : "--";
-  const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : localLabel(language, "不可用", "Unavailable");
+  const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : t("uiUnavailable250f247d");
   const healthRows = [
-    { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: localLabel(language, `源 ${Math.round(clobLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(clobLatency.sourceDataAgeMs)}ms / transport ${Math.round(clobLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceClob?.state ?? "stale" },
-    { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Binance 行情", "Binance feed"), detail: localLabel(language, `源 ${Math.round(btcLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(btcLatency.sourceDataAgeMs)}ms / transport ${Math.round(btcLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceBinance?.state ?? "stale" },
-    { label: "CB", primary: `${Math.round(coinbaseLatency.marketUpdateAgeMs)}ms`, secondary: localLabel(language, "Coinbase 行情", "Coinbase feed"), detail: localLabel(language, `源 ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / 传输 ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`, `Source ${Math.round(coinbaseLatency.sourceDataAgeMs)}ms / transport ${Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0)}ms`), tone: sourceCoinbase?.state ?? "stale" },
-    { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: localLabel(language, "结算轮询", "Settlement poll"), detail: localLabel(language, "正式结果确认", "Final settlement"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
+    { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: t("uiSourceValueMsTransportValueMsf08f9752", { p0: Math.round(clobLatency.sourceDataAgeMs), p1: Math.round(clobLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceClob?.state ?? "stale" },
+    { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: t("uiBinanceFeed2936ce51"), detail: t("uiSourceValueMsTransportValueMsf08f9752", { p0: Math.round(btcLatency.sourceDataAgeMs), p1: Math.round(btcLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceBinance?.state ?? "stale" },
+    { label: "CB", primary: `${Math.round(coinbaseLatency.marketUpdateAgeMs)}ms`, secondary: t("uiCoinbaseFeedb41e66a7"), detail: t("uiSourceValueMsTransportValueMsf2978cd9", { p0: Math.round(coinbaseLatency.sourceDataAgeMs), p1: Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceCoinbase?.state ?? "stale" },
+    { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: t("uiSettlementPollf8a550bd"), detail: t("uiFinalSettlement004ceaa1"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
   ];
   const bookStatsFor = (side: TradeSide) => {
     const book = snapshot?.orderBooks[side];
@@ -3956,10 +3043,6 @@ function TradePageRestored(props: {
     return { book, totalBidQty, totalAskQty, obi };
   };
   const orderBookTotals = { UP: bookStatsFor("UP"), DOWN: bookStatsFor("DOWN") };
-  const canManualSettle =
-    props.canManualSettle &&
-    props.currentRound &&
-    props.currentRound.status === "Manual";
   const displayPriceToBeat = isBtcReferencePrice(snapshot?.displayPriceToBeat) ? snapshot.displayPriceToBeat : undefined;
   const btcUsdMeta = [
     `CB ${money(snapshot?.coinbase.referencePrice ?? 0)}`,
@@ -3976,10 +3059,10 @@ function TradePageRestored(props: {
           <small className="terminal-version">{APP_VERSION_LABEL}</small>
         </div>
         <div className="terminal-top-nav">
-          <button className={props.currentPage === "trade" ? "active" : ""} onClick={() => props.onNavigate("trade")}>{localLabel(language, "交易", "Trade")}</button>
-          <button className={props.currentPage === "home" ? "active" : ""} onClick={() => props.onNavigate("home")}>{localLabel(language, "主页", "Home")}</button>
-          <button className={props.currentPage === "profile" ? "active" : ""} onClick={() => props.onNavigate("profile")}>{localLabel(language, "分析", "Analytics")}</button>
-          <button className={props.currentPage === "logs" ? "active" : ""} onClick={() => props.onNavigate("logs")}>{localLabel(language, "日志", "Logs")}</button>
+          <button className={props.currentPage === "trade" ? "active" : ""} onClick={() => props.onNavigate("trade")}>{t("trade")}</button>
+          <button className={props.currentPage === "home" ? "active" : ""} onClick={() => props.onNavigate("home")}>{t("home")}</button>
+          <button className={props.currentPage === "profile" ? "active" : ""} onClick={() => props.onNavigate("profile")}>{t("profile")}</button>
+          <button className={props.currentPage === "logs" ? "active" : ""} onClick={() => props.onNavigate("logs")}>{t("auditSearch")}</button>
         </div>
         <div className="terminal-top-mid">
           <span>BTC @{money(snapshot?.binance.spotPrice ?? 0, 2)}</span>
@@ -3991,11 +3074,11 @@ function TradePageRestored(props: {
           <span>{currentRound ? roundTimeRangeText(currentRound) : "--"}</span>
         </div>
         <div className="terminal-top-right">
-          <span>{localLabel(language, "总", "EQ")} {money(profile?.totalEquity ?? 0)}</span>
-          <span className="terminal-green">{localLabel(language, "可用", "AVL")} {money(profile?.availableUsdc ?? 0)}</span>
+          <span>{t("uiEQ2583d76f")} {money(profile?.totalEquity ?? 0)}</span>
+          <span className="terminal-green">{t("uiAVLc9c82dcd")} {money(profile?.availableUsdc ?? 0)}</span>
           {!props.isViewingSelf && props.viewedUser ? (
             <span className="terminal-readonly-badge">
-              {props.viewedUser.displayName || props.viewedUser.username} · {localLabel(language, "只读", "Read only")}
+              {props.viewedUser.displayName || props.viewedUser.username} · {t("uiReadOnly3f760b7f")}
             </span>
           ) : null}
           <span className="terminal-user-badge">
@@ -4012,27 +3095,27 @@ function TradePageRestored(props: {
 
       <div className="terminal-monitor">
         <div className="monitor-cell hot monitor-analytics">
-          <small>{localLabel(language, "HT 变化", "HT Move")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tradeDisplayPriceText(Math.abs(oddsChange))}</b></small>
+          <small>{t("uiHTMove27a027f4")} <b>{oddsChange >= 0 ? "↑" : "↓"} {tradeDisplayPriceText(Math.abs(oddsChange))}</b></small>
           <strong>{tradeDisplayPriceText(upDisplayPrice)}</strong>
-          <span>DN {tradeDisplayPriceText(downDisplayPrice)} · {localLabel(language, "双边 ASK", "Two-side ask")} {tradeDisplayPriceText(doubleSideCost)}</span>
+          <span>DN {tradeDisplayPriceText(downDisplayPrice)} · {t("uiTwoSideAskb5478767")} {tradeDisplayPriceText(doubleSideCost)}</span>
         </div>
         <div className="monitor-cell monitor-latency-breakdown">
-          <small>{localLabel(language, "延迟拆分", "Latency Split")}</small>
+          <small>{t("uiLatencySplit08e91cc3")}</small>
           <strong>{topLatency?.label ?? "--"} {typeof topLatency?.value === "number" ? `${Math.round(topLatency.value)}ms` : "--"}</strong>
           <div className="latency-mini-list">
             {latencyRows.map((row) => <span key={row.label}>{row.label}: {typeof row.value === "number" ? `${Math.round(row.value)}ms` : "--"}</span>)}
           </div>
         </div>
         <div className="monitor-cell compact monitor-balance">
-          <small>{localLabel(language, "资产", "Assets")}</small>
+          <small>{t("uiAssets42b9f464")}</small>
           <strong>
-            <span><i>{localLabel(language, "总资产", "Total")}</i>{money(profile?.totalEquity ?? 0)}</span>
-            <span><i>{localLabel(language, "可用", "Available")}</i>{money(profile?.availableUsdc ?? 0)}</span>
+            <span><i>{t("uiTotalda091ab8")}</i>{money(profile?.totalEquity ?? 0)}</span>
+            <span><i>{t("uiAvailablee21a3cf6")}</i>{money(profile?.availableUsdc ?? 0)}</span>
           </strong>
-          <span>{localLabel(language, "浮动", "Unreal")} {signedMoney(profile?.unrealizedPnl ?? 0)}</span>
+          <span>{t("uiUnreala70318be")} {signedMoney(profile?.unrealizedPnl ?? 0)}</span>
         </div>
         <div className="monitor-cell monitor-reference-spreads">
-          <small>{localLabel(language, "基准价差", "Reference Spread")}</small>
+          <small>{t("uiReferenceSpread7f406f4d")}</small>
           <strong>
             <span>
               <i>BINANCE VS PTB</i>
@@ -4064,9 +3147,9 @@ function TradePageRestored(props: {
                   </div>
                   <strong>{money(card.value)}</strong>
                   <em className="position-token-meta">
-                    <span>{localLabel(language, "持仓均价(含买入费)", "Avg position cost (incl. entry fee)")} {tokenPriceText(card.averageEntry)}</span>
+                    <span>{t("uiAvgPositionCostInclEntryFee30e6c149")} {tokenPriceText(card.averageEntry)}</span>
                     <span className={card.pnl >= 0 ? "terminal-green" : "terminal-red"}>
-                      {localLabel(language, card.pnl >= 0 ? "浮盈" : "浮亏", card.pnl >= 0 ? "PnL +" : "PnL -")} {signedMoney(card.pnl)}
+                      {(card.pnl >= 0 ? t("uiPnL7f1596bc") : t("uiPnL5f0b0267"))} {signedMoney(card.pnl)}
                     </span>
                   </em>
                   <PositionPnlBreakdown
@@ -4086,7 +3169,7 @@ function TradePageRestored(props: {
                       }}
                       disabled={!props.canSell || props.quickBusy}
                     >
-                      {props.quickBusy ? t("loading") : localLabel(language, "平仓", "Close side")}
+                      {props.quickBusy ? t("loading") : t("uiCloseSide6ff81aa0")}
                     </button>
                   ) : null}
                 </div>
@@ -4141,9 +3224,9 @@ function TradePageRestored(props: {
                               className="terminal-order-action-button terminal-sell-position-button"
                               disabled={sellBusy}
                               onClick={() => props.onSell(sellablePosition.id)}
-                              title={localLabel(language, "卖出该订单持仓", "Sell this order lot")}
+                              title={t("uiSellThisOrderLot5c8b2937")}
                             >
-                              {sellBusy ? t("loading") : localLabel(language, "卖出持仓", "Sell position")}
+                              {sellBusy ? t("loading") : t("uiSellPosition72403b28")}
                             </button>
                           ) : (
                             <span className="terminal-current-order-action-placeholder">--</span>
@@ -4160,9 +3243,9 @@ function TradePageRestored(props: {
           <TerminalSection title={t("today")} meta={t("stats")}>
             <div className="terminal-stat-grid">
               <div><small>PnL</small><b>{signedMoney(profile?.realizedPnlToday ?? 0)}</b></div>
-              <div><small>{localLabel(language, "胜率", "Win Rate")}</small><b>{wins + losses > 0 ? compactPercent(wins / (wins + losses)) : "—"}</b></div>
-              <div><small>{localLabel(language, "笔数", "Trades")}</small><b>{`${wins}W/${losses}L`}</b></div>
-              <div><small>{localLabel(language, "近 1H", "Last 1H")}</small><b>{signedMoney(recentOneHourPnl)}</b></div>
+              <div><small>{t("winRate")}</small><b>{wins + losses > 0 ? compactPercent(wins / (wins + losses)) : "—"}</b></div>
+              <div><small>{t("uiTrades938dd9be")}</small><b>{`${wins}W/${losses}L`}</b></div>
+              <div><small>{t("uiLast1H97a93afe")}</small><b>{signedMoney(recentOneHourPnl)}</b></div>
             </div>
             <div className="terminal-round-dots">
               {recentRounds.map((round) => {
@@ -4170,9 +3253,9 @@ function TradePageRestored(props: {
                 const outcome = recentRoundOutcome({ round, nowMs, language });
                 const title = [
                   round.id,
-                  `${localLabel(language, "状态", "Status")}: ${round.status}`,
-                  `${localLabel(language, "结果", "Result")}: ${round.settledSide ?? (preview?.state === "preliminary" && preview.side ? `PRE-${preview.side}` : preview?.side) ?? "--"}`,
-                  `${localLabel(language, "收盘时间", "Close Time")}: ${dateTimeText(round.endAt)}`,
+                  `${t("status")}: ${round.status}`,
+                  `${t("result")}: ${round.settledSide ?? (preview?.state === "preliminary" && preview.side ? `PRE-${preview.side}` : preview?.side) ?? "--"}`,
+                  `${t("uiCloseTime13605431")}: ${dateTimeText(round.endAt)}`,
                   isOfficialPtbSource(round.priceToBeatSource) ? `PTB: ${btcMoneyOrDash(round.priceToBeat)}` : undefined,
                   `Gamma: ${round.settlementSource ?? (preview?.state === "preliminary" ? "pending" : "Gamma")}`,
                   preview?.tokenSide ? `Token: ${preview.tokenSide} (${tokenPriceText(preview.tokenSide === "UP" ? preview.upPrice : preview.downPrice)})` : undefined,
@@ -4242,8 +3325,8 @@ function TradePageRestored(props: {
           {orderBookExpanded ? (
             <div className="terminal-orderbook-expanded">
               <div className="chart-toolbar compact">
-                <b>{localLabel(language, "完整订单簿", "Full Order Book")}</b>
-                <span>{localLabel(language, "实时完整深度，占用 BTC / CB 区域。", "Live full depth in the BTC / CB area.")}</span>
+                <b>{t("uiFullOrderBookb29712bb")}</b>
+                <span>{t("uiLiveFullDepthInTheBTC99243afb")}</span>
               </div>
               <div className="orderbook-expanded-grid">
                 {(["UP", "DOWN"] as TradeSide[]).map((side) => {
@@ -4252,23 +3335,23 @@ function TradePageRestored(props: {
                     <section className="expanded-book" key={side}>
                       <header>
                         <strong>{side}</strong>
-                        <span>{localLabel(language, "买一/卖一", "Bid/Ask")} {tokenPriceText(book?.bestBid ?? 0)} / {tokenPriceText(book?.bestAsk ?? 0)}</span>
+                        <span>{t("uiBidAsk3e52dad0")} {tokenPriceText(book?.bestBid ?? 0)} / {tokenPriceText(book?.bestAsk ?? 0)}</span>
                         <span className={`obi-pill ${obi >= 0 ? "up" : "down"}`}>OBI {decimal(obi, 3)}</span>
                       </header>
                       <div className="book-table-pair">
                         <div>
-                          <b>{localLabel(language, "买盘", "Bids")}</b>
+                          <b>{t("uiBidsf24a2fa4")}</b>
                           {(book?.bids ?? []).map((level, index) => <span key={`${side}-bid-${index}`}><em>{tokenPriceText(level.price)}</em><strong>{decimal(level.qty, 3)}</strong></span>)}
                         </div>
                         <div>
-                          <b>{localLabel(language, "卖盘", "Asks")}</b>
+                          <b>{t("uiAsks08cdf28f")}</b>
                           {(book?.asks ?? []).map((level, index) => <span key={`${side}-ask-${index}`}><em>{tokenPriceText(level.price)}</em><strong>{decimal(level.qty, 3)}</strong></span>)}
                         </div>
                       </div>
                       <footer>
-                        <span>{localLabel(language, "买盘量", "Bid Qty")} {decimal(totalBidQty, 3)}</span>
-                        <span>{localLabel(language, "卖盘量", "Ask Qty")} {decimal(totalAskQty, 3)}</span>
-                        <span>{localLabel(language, "更新时间", "Updated")} {timeText(book?.snapshotTs)}</span>
+                        <span>{t("uiBidQty8f0f3e82")} {decimal(totalBidQty, 3)}</span>
+                        <span>{t("uiAskQty00a5837a")} {decimal(totalAskQty, 3)}</span>
+                        <span>{t("uiUpdated8505907f")} {timeText(book?.snapshotTs)}</span>
                       </footer>
                     </section>
                   );
@@ -4305,7 +3388,7 @@ function TradePageRestored(props: {
                   <small>
                     BTC {side} Book
                     <button type="button" onClick={() => setOrderBookExpanded((value) => !value)}>
-                      {orderBookExpanded ? localLabel(language, "收起", "Hide") : localLabel(language, "展开", "Open")}
+                      {orderBookExpanded ? t("uiHide0be8b81a") : t("uiOpen11c00628")}
                     </button>
                   </small>
                   <div className="terminal-depth-bar"><span style={{ width: `${width}%` }} /></div>
@@ -4346,8 +3429,8 @@ function TradePageRestored(props: {
           <TerminalSection title="BTC/USD" meta={btcUsdMeta}>
             <div className="terminal-order">
               <div className="order-odds">
-                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{tradeDisplayPriceText(upDisplayPrice)}</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
-                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}><span>▼ DOWN</span><b>{tradeDisplayPriceText(downDisplayPrice)}</b><em>{localLabel(language, "最新成交 / 展示价", "Latest trade / display")}</em></button>
+                <button className={selectedSide === "UP" ? "active up" : "up"} onClick={() => props.onSelectSide("UP")}><span>▲ UP</span><b>{tradeDisplayPriceText(upDisplayPrice)}</b><em>{t("uiLatestTradeDisplayf79d82d5")}</em></button>
+                <button className={selectedSide === "DOWN" ? "active down" : "down"} onClick={() => props.onSelectSide("DOWN")}><span>▼ DOWN</span><b>{tradeDisplayPriceText(downDisplayPrice)}</b><em>{t("uiLatestTradeDisplayf79d82d5")}</em></button>
               </div>
               <div className="terminal-segment action-segment">
                 {(["buy", "sell"] as OrderAction[]).map((action) => <button key={action} className={props.orderAction === action ? "on" : ""} onClick={() => props.onOrderActionChange(action)}>{action === "buy" ? "BUY / ENTER" : "SELL / EXIT"}</button>)}
@@ -4367,7 +3450,7 @@ function TradePageRestored(props: {
               </label>
               {props.orderKind === "limit" ? (
                 <label className={`terminal-input ${limitPriceError ? "error" : ""}`}>
-                  <span>{localLabel(language, "限价 (¢)", "Limit (¢)")}</span>
+                  <span>{t("uiLimitb69c76f3")}</span>
                   <input
                     aria-invalid={Boolean(limitPriceError)}
                     type="number"
@@ -4381,34 +3464,33 @@ function TradePageRestored(props: {
                 </label>
               ) : null}
               <div className="terminal-price-note">
-                <span>{localLabel(language, "展示价", "Display")}</span>
+                <span>{t("uiDisplay86019eb3")}</span>
                 <b>{tradeDisplayPriceText(displayPrice)}</b>
-                <span>{localLabel(language, "价差", "Spread")} {spreadText}</span>
+                <span>{t("slippageHint")} {spreadText}</span>
               </div>
               <div className="order-meta">
-                <span>{localLabel(language, "手续费", "Fee")} {estimatedOrderFee}</span>
+                <span>{t("uiFee11903579")} {estimatedOrderFee}</span>
                 <span>{t("available")}: {money(profile?.availableUsdc ?? 0)}</span>
                 <span>{t("estimatedQty")}: {decimal(estimatedQty, 4)}</span>
               </div>
               <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} title={executeBlockReason} onClick={props.onPlaceOrder}>
                 {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `BUY ${selectedSide}` : `SELL ${selectedSide}`}
               </button>
+              {props.pendingOrderClientId ? (
+                <div className="inline-info-banner compact-feedback" role="status">
+                  <strong>{t("uiOrderSubmitteda80277a1")}</strong>
+                  <span>{props.pendingOrderClientId.slice(0, 8)}</span>
+                </div>
+              ) : null}
               <div className="quick-row">
-                <button disabled={!tradeAvailability.canCloseSide || props.quickBusy} title={tradeAvailability.closeSideReason} onClick={() => props.onCloseSide()}>{localLabel(language, "平仓", "Exit")} {selectedSide}</button>
-                <button disabled={!tradeAvailability.canReverseSide || props.quickBusy} title={tradeAvailability.reverseReason} onClick={props.onReverseSide}>{localLabel(language, "反手", "Reverse")}</button>
+                <button disabled={!tradeAvailability.canCloseSide || props.quickBusy} title={tradeAvailability.closeSideReason} onClick={() => props.onCloseSide()}>{t("uiExit082fe47a")} {selectedSide}</button>
+                <button disabled={!tradeAvailability.canReverseSide || props.quickBusy} title={tradeAvailability.reverseReason} onClick={props.onReverseSide}>{t("reverseSide")}</button>
               </div>
               {balanceWarning ? <div className="inline-error-banner compact-feedback">{balanceWarning}</div> : null}
               {orderBookStale ? (
                 <div className="inline-warning-banner compact-feedback" role="status">
                   <strong>{t("orderBookStaleTitle")}</strong>
                   <span>{t("orderBookStaleWarning")} {typeof orderBookBackendLatency === "number" ? `${Math.round(orderBookBackendLatency)}ms` : ""}</span>
-                </div>
-              ) : null}
-              {canManualSettle ? (
-                <div className="manual-settle">
-                  <span>{localLabel(language, "人工复核", "Manual Review")}</span>
-                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "UP")}>Settle UP</button>
-                  <button onClick={() => currentRound && props.onManualSettle(currentRound.id, "DOWN")}>Settle DN</button>
                 </div>
               ) : null}
             </div>
@@ -4447,6 +3529,8 @@ function AnalyticsPage(props: {
   timelineBusyOrderId?: string;
   selectedRoundLogId?: string;
   roundLogBusyRoundId?: string;
+  canManualSettle: boolean;
+  onManualSettlementComplete: () => Promise<void>;
 }) {
   const { t, language } = props;
   type AnalyticsResultFilter = "ALL" | AnalyticsResult;
@@ -4526,64 +3610,71 @@ function AnalyticsPage(props: {
     <section className="analytics-terminal-page">
       <div className="analytics-headband">
         <div className="analytics-head-copy">
-          <b>{localLabel(language, "交易分析", "Analytics")}</b>
-          <span>{localLabel(language, "按 UTC 展示 BTC 模拟盘交易生命周期", "BTC paper trading lifecycle shown in UTC")}</span>
+          <b>{t("uiAnalytics2f2530c0")}</b>
+          <span>{t("uiBTCPaperTradingLifecycleShownIn86c22f48")}</span>
         </div>
         <div className="analytics-head-meta">
-          <span>{filteredRows.length} {localLabel(language, "条记录", "rows")}</span>
-          <span>{summary.trades} {localLabel(language, "已结算", "settled")}</span>
+          <span>{filteredRows.length} {t("uiRows308a8de9")}</span>
+          <span>{summary.trades} {t("uiSettled3226da2e")}</span>
           <span>{summary.wins}W / {summary.losses}L</span>
         </div>
       </div>
 
       <div className="analytics-summary">
         <div className="analytics-card">
-          <span>{localLabel(language, "总盈亏", "Total PnL")}</span>
+          <span>{t("totalPnl")}</span>
           <strong>{signedMoney(summary.totalPnl)}</strong>
           <small>
-            {localLabel(language, "总资产", "Total equity")} {money(props.profile?.totalEquity ?? 0)}
+            {t("uiTotalEquity7ef16a8b")} {money(props.profile?.totalEquity ?? 0)}
             {" · "}
-            {localLabel(language, "可用", "Available")} {money(props.profile?.availableUsdc ?? 0)}
+            {t("uiAvailablee21a3cf6")} {money(props.profile?.availableUsdc ?? 0)}
           </small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "胜率", "Win Rate")}</span>
+          <span>{t("winRate")}</span>
           <strong>{summary.trades > 0 ? compactPercent(summary.winRate) : "—"}</strong>
           <small>{summary.wins}W / {summary.losses}L</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "交易笔数", "Trades")}</span>
+          <span>{t("uiTrades41bfdf39")}</span>
           <strong>{summary.trades}</strong>
-          <small>{filteredRows.length} {localLabel(language, "条记录", "rows")}</small>
+          <small>{filteredRows.length} {t("uiRows308a8de9")}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "总费用", "Total Fees")}</span>
+          <span>{t("uiTotalFees3b9e0b7d")}</span>
           <strong>{money(summary.totalFees, 4)}</strong>
           <small>
-            {localLabel(language, "持仓费用", "Position fees")} {money(openPnlSummary.totalFeeUsdc, 4)}
+            {t("uiPositionFees184502da")} {money(openPnlSummary.totalFeeUsdc, 4)}
           </small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "Mark PnL", "Mark PnL")}</span>
+          <span>{t("uiMarkPnL6430b836")}</span>
           <strong>{signedMoney(openPnlSummary.markPnlUsdc)}</strong>
-          <small>{localLabel(language, "mid mark，优先使用含成本/手续费字段", "mid mark, fee-adjusted when available")}</small>
+          <small>{t("uiMidMarkFeeAdjustedWhenAvailablede0f2a8d")}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "可成交 PnL", "Executable PnL")}</span>
+          <span>{t("uiExecutablePnL89182743")}</span>
           <strong>{signedMoney(openPnlSummary.executablePnlUsdc)}</strong>
-          <small>{localLabel(language, "best bid 可退出口径", "best bid executable view")}</small>
+          <small>{t("uiBestBidExecutableView47023d16")}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "最佳单笔", "Best Trade")}</span>
+          <span>{t("uiBestTrade14641cdd")}</span>
           <strong>{summary.trades > 0 ? signedMoney(summary.bestTrade) : "—"}</strong>
-          <small>{localLabel(language, "最佳已结算结果", "Best settled result")}</small>
+          <small>{t("uiBestSettledResulta2334c3e")}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "最差单笔", "Worst Trade")}</span>
+          <span>{t("uiWorstTradef56901d7")}</span>
           <strong>{summary.trades > 0 ? signedMoney(summary.worstTrade) : "—"}</strong>
-          <small>{localLabel(language, "最差已结算结果", "Worst settled result")}</small>
+          <small>{t("uiWorstSettledResult16a0556d")}</small>
         </div>
       </div>
+
+      <ManualSettlementQueue
+        token={props.token}
+        t={t}
+        canManualSettle={props.canManualSettle}
+        onManualSettlementComplete={props.onManualSettlementComplete}
+      />
 
       <div className="analytics-controls">
         <div className="analytics-period-tabs">
@@ -4604,7 +3695,7 @@ function AnalyticsPage(props: {
         </div>
         <div className="analytics-date-query">
           <label>
-            <span>{localLabel(language, "年", "Year")}</span>
+            <span>{t("uiYear3d2f1630")}</span>
             <input
               value={yearQuery}
               onChange={(event) => setYearQuery(event.target.value)}
@@ -4614,7 +3705,7 @@ function AnalyticsPage(props: {
             />
           </label>
           <label>
-            <span>{localLabel(language, "月", "Month")}</span>
+            <span>{t("uiMonthf01bab2e")}</span>
             <input
               value={monthQuery}
               onChange={(event) => setMonthQuery(event.target.value)}
@@ -4623,7 +3714,7 @@ function AnalyticsPage(props: {
             />
           </label>
           <label>
-            <span>{localLabel(language, "日", "Day")}</span>
+            <span>{t("uiDaycbfdd519")}</span>
             <input
               value={dayQuery}
               onChange={(event) => setDayQuery(event.target.value)}
@@ -4632,11 +3723,11 @@ function AnalyticsPage(props: {
             />
           </label>
           <button type="button" className="secondary-button analytics-search-button" onClick={handleDateSearch}>
-            {localLabel(language, "搜索", "Search")}
+            {t("search")}
           </button>
         </div>
         <label>
-          <span>{localLabel(language, "查看用户", "View User")}</span>
+          <span>{t("uiViewUserd33b758b")}</span>
           <select
             className="analytics-view-user-control"
             value={props.viewedUserId ?? props.viewedUser?.id ?? ""}
@@ -4651,27 +3742,27 @@ function AnalyticsPage(props: {
         </label>
         {!props.isViewingSelf && props.viewedUser ? (
           <span className="analytics-readonly-badge">
-            {props.viewedUser.displayName || props.viewedUser.username} · {localLabel(language, "只读", "Read only")}
+            {props.viewedUser.displayName || props.viewedUser.username} · {t("uiReadOnly3f760b7f")}
           </span>
         ) : null}
         <label>
-          <span>{localLabel(language, "标的", "Symbol")}</span>
+          <span>{t("uiSymbol0c2a0a16")}</span>
           <select value="BTC" disabled>
             <option value="BTC">BTC</option>
           </select>
         </label>
         <label>
-          <span>{localLabel(language, "方向", "Direction")}</span>
+          <span>{t("uiDirection06ace5db")}</span>
           <select value={direction} onChange={(event) => setDirection(event.target.value as "ALL" | TradeSide)}>
-            <option value="ALL">{localLabel(language, "全部", "All")}</option>
+            <option value="ALL">{t("all")}</option>
             <option value="UP">UP</option>
             <option value="DOWN">DOWN</option>
           </select>
         </label>
         <label>
-          <span>{localLabel(language, "结果", "Result")}</span>
+          <span>{t("result")}</span>
           <select value={resultFilter} onChange={(event) => setResultFilter(event.target.value as AnalyticsResultFilter)}>
-            <option value="ALL">{localLabel(language, "全部", "All")}</option>
+            <option value="ALL">{t("all")}</option>
             <option value="WIN">{analyticsResultLabel("WIN", language)}</option>
             <option value="LOSE">{analyticsResultLabel("LOSE", language)}</option>
             <option value="SOLD">{analyticsResultLabel("SOLD", language)}</option>
@@ -4680,33 +3771,33 @@ function AnalyticsPage(props: {
           </select>
         </label>
         {dateQueryError ? <span className="analytics-query-error">{analyticsDateQueryErrorLabel(dateQueryError, language)}</span> : null}
-        <span>{localLabel(language, "所有时间均以 UTC 显示", "All times shown in UTC")}</span>
+        <span>{t("uiAllTimesShownInUTCea3eff53")}</span>
       </div>
 
       <div className="analytics-table-panel">
         {displayedRows.length === 0 ? (
           <div className="analytics-empty">
-            <b>{localLabel(language, "空结果", "Empty")}</b>
-            <div>{localLabel(language, "当前筛选条件下没有可展示的分析记录。", "No analytics rows match the current filters.")}</div>
+            <b>{t("uiEmptya6461b8d")}</b>
+            <div>{t("uiNoAnalyticsRowsMatchTheCurrent392ea37c")}</div>
           </div>
         ) : (
           <div className="analytics-table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>{localLabel(language, "买入时间", "Entry Time")}</th>
-                  <th>{localLabel(language, "卖出/结算时间", "Exit/Settle Time")}</th>
-                  <th>{localLabel(language, "轮次", "Round")}</th>
-                  <th>{localLabel(language, "方向", "Direction")}</th>
-                  <th>{localLabel(language, "买入总花费", "Entry Cost")}</th>
-                  <th>{localLabel(language, "买入成本价", "Entry Price")}</th>
-                  <th>{localLabel(language, "结算价/退出价", "Settle/Exit")}</th>
-                  <th>{localLabel(language, "份额", "Shares")}</th>
-                  <th>{localLabel(language, "费用", "Fees")}</th>
+                  <th>{t("uiEntryTime342d3edf")}</th>
+                  <th>{t("uiExitSettleTime0e60f35d")}</th>
+                  <th>{t("uiRound86342c68")}</th>
+                  <th>{t("uiDirection06ace5db")}</th>
+                  <th>{t("uiEntryCost65a0f840")}</th>
+                  <th>{t("uiEntryPricecb585d00")}</th>
+                  <th>{t("uiSettleExitbb76723b")}</th>
+                  <th>{t("uiShares680c0dfe")}</th>
+                  <th>{t("uiFees5ef20e69")}</th>
                   <th>PnL</th>
-                  <th>{localLabel(language, "状态", "State")}</th>
-                  <th>{localLabel(language, "结果", "Result")}</th>
-                  <th>{localLabel(language, "分析", "Analysis")}</th>
+                  <th>{t("uiState4fbe6edf")}</th>
+                  <th>{t("result")}</th>
+                  <th>{t("uiAnalysiseaf5bdb2")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -4741,7 +3832,7 @@ function AnalyticsPage(props: {
             className="analytics-load-more global"
             onClick={() => setVisibleTradeLimit((limit) => limit + ANALYTICS_TRADE_LIMIT_STEP)}
           >
-            {localLabel(language, `加载更多 ${Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP)} 条交易`, `Load ${Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP)} more trades`)}
+            {t("uiLoadValueMoreTrades26ad558e", { p0: Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP) })}
           </button>
         ) : null}
       </div>
@@ -5009,22 +4100,10 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
           : [...new Set([...facets.audit.actionTypes, ...facets.training.actionTypes, ...facets.matching.eventTypes])];
   const logInfoText =
     selectedSystem === "training"
-      ? localLabel(
-          language,
-          "交易日志保存交易行为样本：匿名用户、轮次、方向、订单、成交、滑点、盘口快照、价格源状态和上下文 JSON。",
-          "Trading logs store trading behavior samples: anonymized user, round, direction, order, fills, slippage, book snapshots, source states, and context JSON."
-        )
+      ? t("uiTradingLogsStoreTradingBehaviorSamples55427303")
       : selectedSystem === "matching"
-        ? localLabel(
-            language,
-            "撮合日志保存盘口同步、订单成交和撤单事件，按 bookKey/sequence/round/market 追踪撮合过程。",
-            "Matching logs store book sync, execution, and cancellation events, tracked by bookKey, sequence, round, and market."
-          )
-        : localLabel(
-            language,
-            "审计日志保存用户操作、撮合结果、结算流程和系统延迟事件；顶层分类是 operation、matching、settlement、latency。",
-            "Audit logs store user operations, matching outcomes, settlement flow, and latency events; categories are operation, matching, settlement, and latency."
-          );
+        ? t("uiMatchingLogsStoreBookSyncExecution54ad6232")
+        : t("uiAuditLogsStoreUserOperationsMatching102cca32");
 
   return (
     <>
@@ -5350,7 +4429,7 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
               </div>
             </div>
             <div>
-              <span>{localLabel(language, "主字段 / Main Fields", "Main Fields")}</span>
+              <span>{t("uiMainFields9332cc68")}</span>
               <div className="field-chip-row">
                 {fieldSummary.map((field) => (
                   <FieldChip key={field} label={field} tone="neutral" />
@@ -5604,12 +4683,8 @@ function LogExportDialog(props: {
       }
       setMessage(
         result.filePath
-          ? t("savedTo", { resultfilePath: result.filePath })
-          : localLabel(
-              language,
-              "导出已开始下载。当前是浏览器模式，浏览器无法直接选择任意本地保存路径，请在浏览器下载设置中选择位置。",
-              "Export download started. Browser mode cannot choose an arbitrary local save path; use your browser download settings to choose the location."
-            )
+          ? t("savedTo", { value: result.filePath })
+          : t("uiExportDownloadStartedBrowserModeCannot545c30e7")
       );
     } catch (exportError) {
       const errorMessage = exportError instanceof Error ? exportError.message : "Export failed.";
@@ -5629,22 +4704,14 @@ function LogExportDialog(props: {
             <h2>{t("exportWizard")}</h2>
           </div>
           <button className="ghost-button compact-button" onClick={props.onClose}>
-            {localLabel(language, "关闭 Close", "Close")}
+            {t("uiClose829762f5")}
           </button>
         </div>
         {message ? <div className="inline-info-banner">{message}</div> : null}
         <div className="inline-info-banner">
           {hasNativeSaveDialog
-            ? localLabel(
-                language,
-                "桌面端会在生成 ZIP 后打开系统保存对话框，请选择保存目录和文件名。",
-                "The desktop app opens the native save dialog after the ZIP is generated so you can choose the folder and file name."
-              )
-            : localLabel(
-                language,
-                "当前是浏览器模式：网页不能直接写入用户指定的任意本地路径，将使用浏览器下载兜底。",
-                "Browser mode: the page cannot write to an arbitrary local path, so it will fall back to the browser download flow."
-              )}
+            ? t("uiTheDesktopAppOpensTheNative7ae7f7b5")
+            : t("uiBrowserModeThePageCannotWrite6a6b6e7b")}
         </div>
         <div className="dialog-section">
           <strong>{t("logSystems")}</strong>
@@ -5891,7 +4958,7 @@ function BulkUserDialog(props: {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = localLabel(language, "批量用户模板.csv", "bulk-users-template.csv");
+    link.download = t("uiBulkUsersTemplateCsv42db64fc");
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -6004,7 +5071,7 @@ function BulkUserDialog(props: {
         <div className="dialog-section">
           <div className="button-row fit-actions">
             <button className="secondary-button compact-button" disabled={props.busy} onClick={downloadTemplate}>
-              {localLabel(language, "下载模板", "Download Template")}
+              {t("uiDownloadTemplatede514b86")}
             </button>
             <label className="file-import-button">
               {t("chooseCsvTsvFile")}
@@ -6015,7 +5082,7 @@ function BulkUserDialog(props: {
               disabled={props.busy}
               onClick={() => void previewCsv()}
             >
-              {localLabel(language, "预览校验", "Preview")}
+              {t("uiPreview2f1dbf47")}
             </button>
             <button
               className="ghost-button compact-button"
@@ -6031,11 +5098,7 @@ function BulkUserDialog(props: {
             </button>
           </div>
           <small className="muted-line">
-            {localLabel(
-              language,
-              "请先下载模板填写；上传或粘贴后点击预览校验，通过后再创建用户。",
-              "Download the template first; upload or paste it, preview validation, then create users."
-            )}
+            {t("uiDownloadTheTemplateFirstUploadOr21c933d6")}
           </small>
         </div>
         <div className="dialog-form">
@@ -6055,11 +5118,7 @@ function BulkUserDialog(props: {
         {localError ? <div className="inline-error-banner">{redactNetworkAddresses(localError)}</div> : null}
         {preview ? (
           <div className={previewFailed.length ? "inline-error-banner" : "inline-info-banner"}>
-            {localLabel(
-              language,
-              `预览 ${preview.total} 行，可创建 ${previewRows.length} 行，失败 ${previewFailed.length} 行。`,
-              `Previewed ${preview.total} rows, ${previewRows.length} creatable, ${previewFailed.length} failed.`
-            )}
+            {t("uiPreviewedValueRowsValueCreatableValuea14a203d", { p0: preview.total, p1: previewRows.length, p2: previewFailed.length })}
             {previewFailed.length
               ? ` ${previewFailed.map((item) => `#${item.rowNumber}: ${redactNetworkAddresses(item.error)}`).join("; ")}`
               : ""}
@@ -6067,11 +5126,7 @@ function BulkUserDialog(props: {
         ) : null}
         {result ? (
           <div className={result.failed.length ? "inline-error-banner" : "inline-info-banner"}>
-            {localLabel(
-              language,
-              `创建 ${result.created.length} 个，失败 ${result.failed.length} 个。`,
-              `Created ${result.created.length}, failed ${result.failed.length}.`
-            )}
+            {t("uiCreatedValueFailedValue3599531e", { p0: result.created.length, p1: result.failed.length })}
             {result.failed.length
               ? ` ${result.failed.map((item) => `#${item.rowNumber}: ${redactNetworkAddresses(item.error)}`).join("; ")}`
               : ""}
@@ -6086,7 +5141,7 @@ function BulkUserDialog(props: {
                 <th>{t("displayName")}</th>
                 <th>{t("role")}</th>
                 <th>{t("language")}</th>
-                <th>{localLabel(language, "组管理员", "Group Manager")}</th>
+                <th>{t("uiGroupManager8e43c165")}</th>
                 <th>{t("available")}</th>
                 <th>{t("validation")}</th>
               </tr>
@@ -6225,16 +5280,16 @@ function UserManagementPage(props: {
     isAdmin || ((me.role === "Senior Tester" || me.role === "Test Engineer") && user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === me.id);
   const canChangeGroup = (user: PublicUser) => isAdmin && user.role === "Tester" && user.id !== me.id;
   const canSetBalance = (user: PublicUser) => canManageTarget(user) || (me.role === "Senior Tester" && user.id === me.id);
-  const groupOptionLabel = (user: PublicUser) => `${user.username} / ${user.role} ${localLabel(language, "组", "group")}`;
+  const groupOptionLabel = (user: PublicUser) => `${user.username} / ${user.role} ${t("uiGroup5fc62521")}`;
   const groupLabelForUser = (user: PublicUser) => {
     if (user.role === "Admin") {
-      return localLabel(language, "系统管理员", "System admin");
+      return t("uiSystemAdmin59af7656");
     }
     if (user.role === "Senior Tester" || user.role === "Test Engineer") {
-      return localLabel(language, "组管理员", "Group manager");
+      return t("uiGroupManager51c384af");
     }
     const manager = users.find((candidate) => candidate.id === (user.managerUserId ?? user.seniorTesterId));
-    return manager ? groupOptionLabel(manager) : localLabel(language, "未分配", "Unassigned");
+    return manager ? groupOptionLabel(manager) : t("uiUnassigned5675780c");
   };
   const visibleUsers = users.filter((user) => {
     const query = searchText.trim().toLowerCase();
@@ -6292,7 +5347,7 @@ function UserManagementPage(props: {
   };
 
   const disableUser = async (user: PublicUser) => {
-    const ok = window.confirm(t("disableAccount", { userusername: user.username }));
+    const ok = window.confirm(t("disableAccount", { value: user.username }));
     if (!ok) {
       return;
     }
@@ -6309,7 +5364,7 @@ function UserManagementPage(props: {
   };
 
   const enableUser = async (user: PublicUser) => {
-    const ok = window.confirm(t("restoreAccount", { userusername: user.username }));
+    const ok = window.confirm(t("restoreAccount", { value: user.username }));
     if (!ok) {
       return;
     }
@@ -6438,7 +5493,7 @@ function UserManagementPage(props: {
       return;
     }
     if (!groupDialog.managerUserId) {
-      setError(localLabel(language, "请选择组别。", "Select a group."));
+      setError(t("uiSelectAGroupa92fb730"));
       return;
     }
     try {
@@ -6459,7 +5514,7 @@ function UserManagementPage(props: {
     <section className={props.embedded ? "user-home-panel" : "panel log-search-panel"}>
       <div className="section-header">
         <div>
-          <p className="eyebrow">{localLabel(language, "用户范围", "User Scope")}</p>
+          <p className="eyebrow">{t("userScope")}</p>
           <h2>{users.length}</h2>
         </div>
         <div className="button-row fit-actions">
@@ -6493,10 +5548,10 @@ function UserManagementPage(props: {
       {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
 
       <div className="user-overview-grid">
-        <div className="analytics-card"><span>{localLabel(language, "可见用户", "Visible Users")}</span><strong>{users.length}</strong><small>{managedCount} {localLabel(language, "可管理", "manageable")}</small></div>
-        <div className="analytics-card"><span>{localLabel(language, "活跃账号", "Active")}</span><strong>{activeCount}</strong><small>{users.length - activeCount} {localLabel(language, "停用", "disabled")}</small></div>
-        <div className="analytics-card"><span>{localLabel(language, "Tester", "Tester")}</span><strong>{roleCounts.Tester}</strong><small>{roleCounts["Senior Tester"]} Senior</small></div>
-        <div className="analytics-card"><span>{localLabel(language, "工程/管理", "Engineer/Admin")}</span><strong>{roleCounts["Test Engineer"] + roleCounts.Admin}</strong><small>{roleCounts.Admin} Admin</small></div>
+        <div className="analytics-card"><span>{t("uiVisibleUsersa57e8dbb")}</span><strong>{users.length}</strong><small>{managedCount} {t("uiManageablec5ebe68f")}</small></div>
+        <div className="analytics-card"><span>{t("uiActivecb6b213c")}</span><strong>{activeCount}</strong><small>{users.length - activeCount} {t("uiDisabled38d29ccb")}</small></div>
+        <div className="analytics-card"><span>{t("uiTester2bdfc143")}</span><strong>{roleCounts.Tester}</strong><small>{roleCounts["Senior Tester"]} Senior</small></div>
+        <div className="analytics-card"><span>{t("uiEngineerAdminb600f02c")}</span><strong>{roleCounts["Test Engineer"] + roleCounts.Admin}</strong><small>{roleCounts.Admin} Admin</small></div>
       </div>
 
       {canCreateSingleUser ? (
@@ -6535,13 +5590,13 @@ function UserManagementPage(props: {
             </select>
           </label>
           <label>
-            {localLabel(language, "组别", "Group")}
+            {t("uiGroup5b2b11e5")}
             <select
               value={createManagerUserId ?? ""}
               onChange={(event) => setForm({ ...form, seniorTesterId: event.target.value })}
               disabled={!isAdmin || createRole !== "Tester"}
             >
-              <option value="">{localLabel(language, "未分配 / 请选择", "Unassigned / Select")}</option>
+              <option value="">{t("uiUnassignedSelect204b7154")}</option>
               {selectableManagerOptions.map((user) => (
                 <option key={user.id} value={user.id}>
                   {groupOptionLabel(user)}
@@ -6561,10 +5616,10 @@ function UserManagementPage(props: {
 
       <div className="user-scope-toolbar">
         <label>
-          {localLabel(language, "搜索", "Search")}
+          {t("search")}
           <input
             value={searchText}
-            placeholder={localLabel(language, "用户名 / 昵称 / 角色", "Username / display name / role")}
+            placeholder={t("uiUsernameDisplayNameRoleb230e989")}
             onChange={(event) => setSearchText(event.target.value)}
           />
         </label>
@@ -6586,8 +5641,8 @@ function UserManagementPage(props: {
             <th>{t("displayName")}</th>
             <th>{props.t("role")}</th>
             <th>{props.t("status")}</th>
-            <th>{localLabel(language, "组别", "Group")}</th>
-            <th>{localLabel(language, "权限等级", "Permission")}</th>
+            <th>{t("uiGroup5b2b11e5")}</th>
+            <th>{t("uiPermission410e3761")}</th>
             <th>{props.t("available")}</th>
             <th>{props.t("action")}</th>
           </tr>
@@ -6617,12 +5672,12 @@ function UserManagementPage(props: {
                     <div className="table-action-cell">
                       {canUpdateUsers && canManageTarget(user) && user.id !== me.id ? (
                         <button className="ghost-button compact-button" disabled={busy} onClick={() => openEditDialog(user)}>
-                          {localLabel(language, "资料", "Edit")}
+                          {t("uiEditca7ff73d")}
                         </button>
                       ) : null}
                       {canChangeGroup(user) ? (
                         <button className="ghost-button compact-button" disabled={busy} onClick={() => openGroupDialog(user)}>
-                          {localLabel(language, "换组", "Move group")}
+                          {t("uiMoveGroup188e294c")}
                         </button>
                       ) : null}
                       {canSetBalance(user) ? (
@@ -6673,7 +5728,7 @@ function UserManagementPage(props: {
           <div className="panel user-action-dialog user-profile-dialog">
             <div className="section-header">
               <div>
-                <p className="eyebrow">{localLabel(language, "用户资料", "User Profile")}</p>
+                <p className="eyebrow">{t("uiUserProfile5e84a9c3")}</p>
                 <h2>{editDialog.user.username}</h2>
               </div>
               <button className="ghost-button compact-button" onClick={() => setEditDialog(undefined)}>
@@ -6702,7 +5757,7 @@ function UserManagementPage(props: {
                 </select>
               </label>
               <label>
-                {localLabel(language, "权限等级", "Permission Level")}
+                {t("uiPermissionLevele5753642")}
                 <select value={editDialog.permissionLevel} onChange={(event) => setEditDialog({ ...editDialog, permissionLevel: event.target.value as PermissionLevel })}>
                   <option value="Initial">Initial</option>
                   <option value="Standard">Standard</option>
@@ -6731,7 +5786,7 @@ function UserManagementPage(props: {
           <div className="panel user-action-dialog">
             <div className="section-header">
               <div>
-                <p className="eyebrow">{localLabel(language, "换组", "Move group")}</p>
+                <p className="eyebrow">{t("uiMoveGroup188e294c")}</p>
                 <h2>{groupDialog.user.username}</h2>
               </div>
               <button className="ghost-button compact-button" onClick={() => setGroupDialog(undefined)}>
@@ -6741,12 +5796,12 @@ function UserManagementPage(props: {
             {error ? <div className="inline-error-banner">{redactNetworkAddresses(error)}</div> : null}
             <div className="dialog-form">
               <label>
-                {localLabel(language, "组别", "Group")}
+                {t("uiGroup5b2b11e5")}
                 <select
                   value={groupDialog.managerUserId}
                   onChange={(event) => setGroupDialog({ ...groupDialog, managerUserId: event.target.value })}
                 >
-                  <option value="">{localLabel(language, "未分配 / 请选择", "Unassigned / Select")}</option>
+                  <option value="">{t("uiUnassignedSelect204b7154")}</option>
                   {selectableManagerOptions.map((user) => (
                     <option key={user.id} value={user.id}>{groupOptionLabel(user)}</option>
                   ))}

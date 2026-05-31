@@ -32,7 +32,8 @@ export type PermissionCode =
   | "data:export:include-d"
   | "quality:review"
   | "strategy:config"
-  | "market:config";
+  | "market:config"
+  | "settlement:manual";
 export type TradeSide = "UP" | "DOWN";
 export type OrderAction = "buy" | "sell";
 export type OrderStatus = "pending" | "filled" | "partial" | "failed" | "cancelled";
@@ -516,6 +517,26 @@ export interface RoundRecord {
   closingPriceSource?: "Coinbase" | "Gamma";
 }
 
+export interface ManualSettlementCandidate {
+  roundId: string;
+  symbol: string;
+  marketId: string;
+  marketSlug?: string;
+  title?: string;
+  startAt: number;
+  endAt: number;
+  status: RoundStatus;
+  pollCount: number;
+  pollStartAt?: number;
+  lastPollAt?: number;
+  manualReason?: string;
+  participantCount: number;
+  openPositionCount: number;
+  pendingOrderCount: number;
+  upOpenQty: number;
+  downOpenQty: number;
+}
+
 export interface OrderRecord {
   id: string;
   traceId: string;
@@ -872,6 +893,7 @@ export interface MarketPayload {
   snapshot: MarketSnapshot;
   currentRound?: RoundRecord;
   history: Array<RoundRecord & { userPnl: number; settlementPreview?: SettlementPreview }>;
+  historyRevision?: number;
   settlementPreview?: SettlementPreview;
   transportMeta: MarketTransportMeta;
 }
@@ -926,8 +948,14 @@ export interface MarketTickPayload {
   viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
-  settlementPreview?: SettlementPreview;
   transportMeta: MarketTransportMeta;
+}
+
+export interface MarketHistoryPatchPayload {
+  viewedUserId: string;
+  history: Array<RoundRecord & { userPnl: number; settlementPreview?: SettlementPreview }>;
+  historyRevision: number;
+  serverPublishTs: number;
 }
 
 export interface UserPayload {

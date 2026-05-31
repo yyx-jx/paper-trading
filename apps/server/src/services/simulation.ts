@@ -6,14 +6,12 @@ import type {
   CandleBar,
   CoinbaseConnectorState,
   ClobMarketInfo,
-  DisplayPriceSource,
   FeeBreakdown,
   Language,
   MatchingBookState,
   MatchingFill,
   MarketCandleRecord,
   MarketSnapshot,
-  MarketTrade,
   OrderLifecycleExitType,
   OrderRecord,
   OrderBookSnapshot,
@@ -30,48 +28,51 @@ import type {
   TradeSide,
   UserRecord
 } from "../domain/types";
+import { EventEmitter } from "node:events";
 import { BinanceConnector } from "./connectors/binance";
 import { CoinbaseConnector } from "./connectors/coinbase";
 import { estimateClobExecution, type ClobExecutionEstimate } from "./clob-execution";
-import { calculateClobFees } from "./clob-fees";
 import { MatchingServiceClient } from "./matching/client";
 import { PolymarketConnector } from "./connectors/polymarket";
 import { AppStore } from "./store";
 import { appMetrics } from "./metrics";
+import {
+  COINBASE_BAR_LIMITS,
+  COINBASE_INTERVAL_MS,
+  aggregateCoinbaseBars,
+  createEmptyCoinbaseIntervalBars,
+  marketCandleToBar,
+  mergeCoinbaseHistoryBars,
+  shouldReplaceCoinbaseMarketCandle
+} from "./simulation/coinbase-candles";
+import { cloneCandlePoint, cloneOrderBookSnapshot, hasOrderBookDepth, type ExecutionBookResult } from "./simulation/order-books";
+import {
+  calculateClobFee,
+  clobMarketInfoFor,
+  isAlignedToTick,
+  isBtcReferencePrice,
+  isOfficialPtbSource,
+  isPositivePrice,
+  resolvePairedDisplayPrices
+} from "./simulation/pricing";
+import {
+  GAMMA_SETTLED_LOSE_PRICE_THRESHOLD,
+  GAMMA_SETTLED_WIN_PRICE_THRESHOLD,
+  PRELIMINARY_SETTLEMENT_THRESHOLD,
+  isMarketResolved
+} from "./simulation/settlement-rules";
+import { QTY_EPSILON, isClientOrderConflict, roundCurrency, roundNumber } from "./simulation/trade-calculations";
+import { buildBehaviorLog, type BehaviorLogBuildInput } from "./simulation/log-builders";
+import { shouldRequireManualSettlement } from "./settlement/manual-queue";
 
 const LATENCY_LOG_INTERVAL_MS = 15000;
 const REDEEM_DELAY_MS = 2000;
-const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.9;
-const GAMMA_SETTLED_WIN_PRICE_THRESHOLD = 0.995;
-const GAMMA_SETTLED_LOSE_PRICE_THRESHOLD = 1 - GAMMA_SETTLED_WIN_PRICE_THRESHOLD;
-const QTY_EPSILON = 0.0001;
 const FIVE_MINUTE_MS = 5 * 60_000;
 const EXECUTION_BOOK_FRESHNESS_FLOOR_MS = 5000;
 const GAMMA_PREFETCH_START_MS = 180_000;
 const GAMMA_PREFETCH_FAST_START_MS = 60_000;
 const GAMMA_PREFETCH_END_MS = 0;
 const GAMMA_PREFETCH_INTERVAL_MS = 2000;
-const CONSERVATIVE_CLOB_MARKET_INFO: ClobMarketInfo = {
-  minimumTickSize: 0.01,
-  minimumOrderSize: 1,
-  makerFeeRate: 0,
-  takerFeeRate: 0,
-  platformFeeRate: 0,
-  platformFeeExponent: 1,
-  platformFeeTakerOnly: true,
-  feeRateAvailable: false,
-  source: "conservative",
-  conservative: true,
-  updatedAt: 0
-};
-const TRADE_CHART_INTERVALS = ["30s", "1m", "5m", "15m", "1h"] as const;
-const COINBASE_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
-  "30s": 120,
-  "1m": 60,
-  "5m": 30,
-  "15m": 24,
-  "1h": 24
-};
 
 type TradeLogTask = () => Promise<void>;
 type TradePersistSegmentName =
@@ -88,356 +89,10 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isClientOrderConflict(error: unknown) {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const candidate = error as { code?: unknown; constraint?: unknown; detail?: unknown; message?: unknown };
-  if (candidate.code !== "23505") {
-    return false;
-  }
-  return [candidate.constraint, candidate.detail, candidate.message]
-    .filter(Boolean)
-    .some((value) => String(value).includes("idx_orders_user_client_order_id"));
-}
-
-const COINBASE_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
-  "30s": 30_000,
-  "1m": 60_000,
-  "5m": 5 * 60_000,
-  "15m": 15 * 60_000,
-  "1h": 60 * 60_000
-};
 const COINBASE_MARKET_CANDLE_FLUSH_MS = 5000;
 const COINBASE_MARKET_CANDLE_FLUSH_SIZE = 50;
 const COINBASE_MARKET_CANDLE_RESTORE_MS = 24 * 60 * 60_000;
 const COINBASE_HISTORY_CANDLE_SYNC_MIN_MS = 60_000;
-const COINBASE_MARKET_CANDLE_PRIORITY: Record<MarketCandleRecord["origin"], number> = {
-  history_1m_split: 1,
-  rtds_30s: 2
-};
-
-function isPositivePrice(value?: number): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
-
-function latestTradePrice(trades: MarketTrade[], side: TradeSide): number | undefined {
-  for (let index = trades.length - 1; index >= 0; index -= 1) {
-    const trade = trades[index];
-    if (trade.side === side && isPositivePrice(trade.price)) {
-      return trade.price;
-    }
-  }
-  return undefined;
-}
-
-function resolveDisplayPrice(input: {
-  bestBid: number;
-  bestAsk: number;
-  lastTradePrice?: number;
-  outcomePrice?: number;
-}): { value: number; source: DisplayPriceSource; spread: number } {
-  const bestBid = isPositivePrice(input.bestBid) ? input.bestBid : undefined;
-  const bestAsk = isPositivePrice(input.bestAsk) ? input.bestAsk : undefined;
-  if (bestBid === undefined || bestAsk === undefined) {
-    return {
-      value: 0,
-      source: "outcome_price",
-      spread: 0
-    };
-  }
-  const spread = bestBid !== undefined && bestAsk !== undefined ? Math.max(bestAsk - bestBid, 0) : 0;
-  const midPrice = bestBid !== undefined && bestAsk !== undefined ? (bestBid + bestAsk) / 2 : undefined;
-
-  if (midPrice !== undefined) {
-    if (spread > 0.1) {
-      if (isPositivePrice(input.lastTradePrice)) {
-        return {
-          value: roundNumber(input.lastTradePrice, 4),
-          source: "last_trade",
-          spread: roundNumber(spread, 4)
-        };
-      }
-      return {
-        value: 0,
-        source: "outcome_price",
-        spread: roundNumber(spread, 4)
-      };
-    }
-    return {
-      value: roundNumber(midPrice, 4),
-      source: "mid",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  if (isPositivePrice(input.lastTradePrice)) {
-    return {
-      value: roundNumber(input.lastTradePrice, 4),
-      source: "last_trade",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  if (isPositivePrice(input.outcomePrice)) {
-    return {
-      value: roundNumber(input.outcomePrice, 4),
-      source: "outcome_price",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  return {
-    value: 0,
-    source: "outcome_price",
-    spread: roundNumber(spread, 4)
-  };
-}
-
-function resolvePairedDisplayPrices(input: {
-  upBook: OrderBookSnapshot;
-  downBook: OrderBookSnapshot;
-  recentTrades: MarketTrade[];
-  outcomePrices?: [number, number];
-}): Record<TradeSide, { value: number; source: DisplayPriceSource; spread: number }> {
-  const upAskDepthAvailable = input.upBook.asks.length > 0 && isPositivePrice(input.upBook.bestAsk);
-  const downAskDepthAvailable = input.downBook.asks.length > 0 && isPositivePrice(input.downBook.bestAsk);
-  if (!upAskDepthAvailable && !downAskDepthAvailable) {
-    return {
-      UP: { value: 0, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0, source: "outcome_price", spread: 0 }
-    };
-  }
-  if (!upAskDepthAvailable) {
-    return {
-      UP: { value: 0, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0.01, source: "outcome_price", spread: 0 }
-    };
-  }
-  if (!downAskDepthAvailable) {
-    return {
-      UP: { value: 0.01, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0, source: "outcome_price", spread: 0 }
-    };
-  }
-  return {
-    UP: resolveDisplayPrice({
-      bestBid: input.upBook.bestBid,
-      bestAsk: input.upBook.bestAsk,
-      lastTradePrice: latestTradePrice(input.recentTrades, "UP"),
-      outcomePrice: input.outcomePrices?.[0]
-    }),
-    DOWN: resolveDisplayPrice({
-      bestBid: input.downBook.bestBid,
-      bestAsk: input.downBook.bestAsk,
-      lastTradePrice: latestTradePrice(input.recentTrades, "DOWN"),
-      outcomePrice: input.outcomePrices?.[1]
-    })
-  };
-}
-
-function isMarketResolved(detail: PolymarketMarketDetail): boolean {
-  if (detail.automaticallyResolved) return true;
-  if (detail.winningTokenId) return true;
-  if (detail.winningOutcome) return true;
-  if (detail.closed) {
-    const [up, down] = detail.outcomePrices;
-    if (up >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && down <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return true;
-    if (down >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && up <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return true;
-  }
-  return false;
-}
-
-function isBtcReferencePrice(value?: number): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 1000;
-}
-
-function isOfficialPtbSource(source?: string) {
-  const normalized = source?.toLowerCase() ?? "";
-  return normalized.includes("coinbase");
-}
-
-const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
-const roundCurrency = (value: number) => roundNumber(value, 6);
-
-function clobMarketInfoFor(market?: PolymarketMarketDetail): ClobMarketInfo {
-  return market?.marketInfo ?? {
-    ...CONSERVATIVE_CLOB_MARKET_INFO,
-    conditionId: market?.conditionId,
-    updatedAt: Date.now()
-  };
-}
-
-function isAlignedToTick(price: number, tickSize: number) {
-  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(tickSize) || tickSize <= 0) {
-    return false;
-  }
-  const units = price / tickSize;
-  return Math.abs(units - Math.round(units)) < 0.000001;
-}
-
-function calculateClobFee(input: {
-  role: "maker" | "taker";
-  marketInfo: ClobMarketInfo;
-  price?: number;
-  quantity: number;
-  notional: number;
-}): { fee: number; breakdown?: FeeBreakdown } {
-  const price = input.price ?? input.notional / Math.max(input.quantity, QTY_EPSILON);
-  const result = calculateClobFees({
-    role: input.role,
-    feeRate: input.marketInfo.takerFeeRate,
-    platformFeeRate: input.marketInfo.platformFeeRate ?? input.marketInfo.takerFeeRate,
-    platformFeeExponent: input.marketInfo.platformFeeExponent,
-    platformFeeTakerOnly: input.marketInfo.platformFeeTakerOnly,
-    price,
-    quantity: input.quantity,
-    notional: input.notional,
-    digits: 6
-  });
-  return { fee: roundCurrency(result.fee), breakdown: result.breakdown };
-}
-
-function createEmptyCoinbaseIntervalBars() {
-  return {
-    "30s": [] as CandleBar[],
-    "1m": [] as CandleBar[],
-    "5m": [] as CandleBar[],
-    "15m": [] as CandleBar[],
-    "1h": [] as CandleBar[]
-  };
-}
-
-function normalizeCoinbaseBar(interval: (typeof TRADE_CHART_INTERVALS)[number], bar: CandleBar): CandleBar {
-  const bucketSize = COINBASE_INTERVAL_MS[interval];
-  const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
-  return {
-    interval,
-    startTs,
-    endTs: startTs + bucketSize,
-    open: roundNumber(bar.open, 2),
-    high: roundNumber(bar.high, 2),
-    low: roundNumber(bar.low, 2),
-    close: roundNumber(bar.close, 2),
-    volume: roundNumber(bar.volume ?? 0, 6)
-  };
-}
-
-function mergeCoinbaseHistoryBars(
-  current: CandleBar[],
-  incoming: CandleBar[] | undefined,
-  interval: (typeof TRADE_CHART_INTERVALS)[number]
-) {
-  if (!incoming?.length) {
-    return current;
-  }
-
-  const barsByStartTs = new Map<number, CandleBar>();
-  for (const bar of incoming) {
-    if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
-      const normalized = normalizeCoinbaseBar(interval, bar);
-      barsByStartTs.set(normalized.startTs, normalized);
-    }
-  }
-  for (const bar of current) {
-    if (isPositivePrice(bar.close) && isPositivePrice(bar.high) && isPositivePrice(bar.low)) {
-      const normalized = normalizeCoinbaseBar(interval, bar);
-      barsByStartTs.set(normalized.startTs, normalized);
-    }
-  }
-
-  return [...barsByStartTs.values()]
-    .sort((left, right) => left.startTs - right.startTs)
-    .slice(-COINBASE_BAR_LIMITS[interval]);
-}
-
-function aggregateCoinbaseBars(
-  interval: Exclude<(typeof TRADE_CHART_INTERVALS)[number], "30s">,
-  sourceBars: CandleBar[]
-) {
-  const bucketSize = COINBASE_INTERVAL_MS[interval];
-  const grouped = new Map<number, CandleBar>();
-  for (const bar of [...sourceBars].sort((left, right) => left.startTs - right.startTs)) {
-    if (!isPositivePrice(bar.close) || !isPositivePrice(bar.high) || !isPositivePrice(bar.low)) {
-      continue;
-    }
-    const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
-    const existing = grouped.get(startTs);
-    if (!existing) {
-      grouped.set(startTs, {
-        interval,
-        startTs,
-        endTs: startTs + bucketSize,
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        volume: bar.volume
-      });
-      continue;
-    }
-    existing.high = roundNumber(Math.max(existing.high, bar.high), 2);
-    existing.low = roundNumber(Math.min(existing.low, bar.low), 2);
-    existing.close = roundNumber(bar.close, 2);
-    existing.volume = roundNumber(existing.volume + bar.volume, 6);
-  }
-  return [...grouped.values()]
-    .sort((left, right) => left.startTs - right.startTs)
-    .slice(-COINBASE_BAR_LIMITS[interval]);
-}
-
-function marketCandleToBar(candle: MarketCandleRecord): CandleBar {
-  return {
-    interval: "30s",
-    startTs: candle.openTs,
-    endTs: candle.closeTs,
-    open: candle.open,
-    high: candle.high,
-    low: candle.low,
-    close: candle.close,
-    volume: candle.volume
-  };
-}
-
-function shouldReplaceCoinbaseMarketCandle(existing: MarketCandleRecord | undefined, incoming: MarketCandleRecord) {
-  if (!existing) {
-    return true;
-  }
-  const existingPriority = COINBASE_MARKET_CANDLE_PRIORITY[existing.origin];
-  const incomingPriority = COINBASE_MARKET_CANDLE_PRIORITY[incoming.origin];
-  return incomingPriority > existingPriority || (incomingPriority === existingPriority && incoming.updatedAt >= existing.updatedAt);
-}
-
-function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
-  return {
-    snapshotId: snapshot.snapshotId,
-    snapshotTs: snapshot.snapshotTs,
-    bestBid: snapshot.bestBid,
-    bestAsk: snapshot.bestAsk,
-    midPrice: snapshot.midPrice,
-    bids: snapshot.bids.map((level) => ({ ...level })),
-    asks: snapshot.asks.map((level) => ({ ...level }))
-  };
-}
-
-function hasOrderBookDepth(snapshot?: OrderBookSnapshot) {
-  return Boolean(snapshot && (snapshot.bids.length > 0 || snapshot.asks.length > 0));
-}
-
-function cloneCandlePoint(point: CandlePoint): CandlePoint {
-  return {
-    ts: point.ts,
-    price: point.price
-  };
-}
-
-type ExecutionBookResult = {
-  book: OrderBookSnapshot;
-  source: "cache" | "stale_cache" | "rest" | "rest_empty_cache_fallback";
-  ageMs: number;
-  fallbackReason?: string;
-};
-
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -471,6 +126,7 @@ function createDisabledCoinbaseState(symbol: string): CoinbaseConnectorState {
 }
 
 export class SimulationEngine {
+  readonly events = new EventEmitter();
   private readonly binanceConnector: BinanceConnector;
   private readonly coinbaseConnector: CoinbaseConnector;
   private readonly polymarketConnector: PolymarketConnector;
@@ -522,6 +178,7 @@ export class SimulationEngine {
       marketId: string;
       freezeWindowMs: number;
       pollDelayMs: number;
+      manualSettlementTimeoutMs: number;
       gammaPollIntervalMs: number;
       binanceRestUrl: string;
       binanceFallbackRestUrl: string;
@@ -781,6 +438,17 @@ export class SimulationEngine {
     }
   }
 
+  private emitBridgeEvent(eventName: "signal:emitted" | "paper:filled", payload: unknown) {
+    if (process.env.HYPER_BRIDGE_ENABLED !== "true") {
+      return;
+    }
+    try {
+      this.events.emit(eventName, payload);
+    } catch (error) {
+      console.warn(`[hyper-bridge] ${eventName} listener failed:`, error);
+    }
+  }
+
   async placeOrder(
     user: UserRecord,
     payload: {
@@ -842,6 +510,17 @@ export class SimulationEngine {
       const orderBookSnapshot = cloneOrderBookSnapshot(book);
       const tokenId = this.resolveTokenId(payload.side, currentRound);
       const { bookKey, marketId } = this.resolveBookContext(payload.side, currentRound);
+      this.emitBridgeEvent("signal:emitted", {
+        traceId,
+        orderId,
+        user,
+        payload,
+        bookSnapshot: orderBookSnapshot,
+        midPrice: book.midPrice,
+        estimatedFee: 0,
+        marketId,
+        emittedAt: Date.now()
+      });
       const marketInfo = clobMarketInfoFor(this.polymarketState.currentMarket);
       if (orderKind === "limit" && !isAlignedToTick(payload.limitPrice ?? 0, marketInfo.minimumTickSize)) {
         throw new Error(`Limit price must align to CLOB tick size ${marketInfo.minimumTickSize}.`);
@@ -952,7 +631,6 @@ export class SimulationEngine {
         serverPublishTs: Date.now(),
         createdAt: Date.now()
       };
-
       const tradePersistSegments: TradePersistSegments = {};
       try {
         const transactionStartedAt = Date.now();
@@ -1014,7 +692,6 @@ export class SimulationEngine {
         }
         throw writeError;
       }
-
       const successAuditEvent: AuditEvent = {
         eventId: this.store.newId("evt"),
         traceId,
@@ -1835,146 +1512,33 @@ export class SimulationEngine {
     return this.buildSnapshot();
   }
 
-  private createBehaviorLog(input: {
-    user: UserRecord;
-    actionType: string;
-    actionStatus: BehaviorActionLog["actionStatus"];
-    traceId?: string;
-    orderId?: string;
-    round?: RoundRecord;
-    snapshot: MarketSnapshot;
-    direction?: TradeSide;
-    entryOdds?: number;
-    positionNotional?: number;
-    exitType?: string;
-    exitOdds?: number;
-    settlementResult?: PositionRecord["settlementResult"];
-    bookSnapshot?: OrderBookSnapshot;
-    actualFillPrice?: number;
-    slippageBps?: number;
-    partialFilled?: boolean;
-    unfilledQty?: number;
-    executionLatencyMs?: number;
-    estimatedFee?: number;
-    actualFee?: number;
-    feeBreakdown?: FeeBreakdown;
-    feeCurrency?: "USD";
-    settlementDirection?: TradeSide;
-    settlementTimeMs?: number;
-    gammaPollCount?: number;
-    redeemFinishTimeMs?: number;
-    order?: OrderRecord;
-    failureReason?: string;
-    frozenAssetRelease?: Record<string, unknown>;
-    contextJson?: Record<string, unknown>;
-  }): BehaviorActionLog {
-    const direction = input.direction;
-    const round = input.round;
-    const snapshot = input.snapshot;
-    const bookSnapshot =
-      input.bookSnapshot ??
-      (direction ? snapshot.orderBooks[direction] : snapshot.orderBooks.UP);
-    const candles = snapshot.binance.candlesByInterval;
-    const contextJson = {
-      ...(input.order
-        ? {
-            requestAction: input.order.action,
-            requestedAmountUsdc: input.order.requestedAmountUsdc,
-            requestedQty: input.order.requestedQty,
-            orderKind: input.order.orderKind,
-            timeInForce: input.order.timeInForce,
-            limitPrice: input.order.limitPrice,
-            lifecycleStatus: input.order.lifecycleStatus,
-            resultType: input.order.resultType,
-            bookKey: input.order.bookKey,
-            bookSnapshotId: input.order.bookHash,
-            marketId: input.order.marketId,
-            marketSlug: input.order.marketSlug,
-            fills: input.order.fills,
-            estimatedFee: input.order.estimatedFee,
-            actualFee: input.order.actualFee,
-            feeBreakdown: input.order.feeBreakdown,
-            feeCurrency: input.order.feeCurrency,
-            failureReason: input.order.failureReason
-          }
-        : {}),
-      ...(input.frozenAssetRelease ? { frozenAssetRelease: input.frozenAssetRelease } : {}),
-      ...(input.failureReason ? { failureReason: input.failureReason } : {}),
-      ...(input.contextJson ?? {})
-    };
-    return {
+  private createBehaviorLog(input: BehaviorLogBuildInput): BehaviorActionLog {
+    return buildBehaviorLog({
+      ...input,
       logId: this.store.newId("blog"),
       timestampMs: Date.now(),
-      assetClass: "BTC_5M_UPDOWN",
-      actionType: input.actionType,
-      actionStatus: input.actionStatus,
-      roundId: round?.id,
-      direction,
-      entryOdds: input.entryOdds,
-      deltaClob: snapshot.clob.delta,
-      volumeClob: snapshot.clob.volume,
-      positionNotional: input.positionNotional,
-      exitType: input.exitType,
-      exitOdds: input.exitOdds,
-      settlementResult: input.settlementResult,
-      testerIdAnon: this.store.anonymizeUserId(input.user.id),
-      traceId: input.traceId,
-      orderId: input.orderId,
-      marketId: snapshot.marketId,
-      marketSlug: snapshot.marketSlug,
-      roundStatus: round?.status,
-      countdownMs: snapshot.uiMeta.countdownMs,
-      binanceSpotPrice: snapshot.binance.spotPrice,
-      binance1mLastClose: candles["1m"].at(-1)?.close ?? 0,
-      binance5mLastClose: candles["5m"].at(-1)?.close ?? 0,
-      binance1dLastClose: candles["1d"].at(-1)?.close ?? 0,
-      coinbasePrice: snapshot.coinbase.referencePrice,
-      priceToBeat: snapshot.priceToBeat,
-      upPrice: snapshot.upPrice,
-      downPrice: snapshot.downPrice,
-      upBookTop5: snapshot.orderBooks.UP.bids.slice(0, 5),
-      downBookTop5: snapshot.orderBooks.DOWN.bids.slice(0, 5),
-      recentTradesTop20: snapshot.recentTrades.slice(0, 20),
-      bookSnapshotEntry: {
-        snapshotId: bookSnapshot.snapshotId,
-        snapshotTs: bookSnapshot.snapshotTs,
-        topBids: bookSnapshot.bids.slice(0, 5),
-        topAsks: bookSnapshot.asks.slice(0, 5)
-      },
-      actualFillPrice: input.actualFillPrice,
-      slippageBps: input.slippageBps,
-      partialFilled: input.partialFilled,
-      unfilledQty: input.unfilledQty,
-      executionLatencyMs: input.executionLatencyMs,
-      estimatedFee: input.estimatedFee,
-      actualFee: input.actualFee,
-      feeBreakdown: input.feeBreakdown,
-      feeCurrency: input.feeCurrency,
-      settlementDirection: input.settlementDirection,
-      settlementTimeMs: input.settlementTimeMs,
-      gammaPollCount: input.gammaPollCount,
-      redeemFinishTimeMs: input.redeemFinishTimeMs,
-      sourceStates: {
-        binance: this.pickSourceState(snapshot.sources.binance),
-        coinbase: this.pickSourceState(snapshot.sources.coinbase),
-        clob: this.pickSourceState(snapshot.sources.clob)
-      },
-      contextJson
-    };
-  }
-
-  private pickSourceState(source: SourceHealth) {
-    return {
-      source: source.source,
-      state: source.state,
-      sourceEventTs: source.sourceEventTs,
-      serverRecvTs: source.serverRecvTs,
-      serverPublishTs: source.serverPublishTs
-    };
+      testerIdAnon: this.store.anonymizeUserId(input.user.id)
+    });
   }
 
   private async writeBehaviorLog(log: BehaviorActionLog) {
     await this.store.recordBehaviorLog(log);
+    if (log.actionType !== "place_order" || !log.traceId) {
+      return;
+    }
+    this.emitBridgeEvent("paper:filled", {
+      traceId: log.traceId,
+      fillPrice: log.actualFillPrice ?? null,
+      slippageBps: log.slippageBps ?? null,
+      status: log.actionStatus === "success" ? "filled" : "failed",
+      feeUsdc: log.actualFee ?? log.estimatedFee ?? 0,
+      filledQty:
+        typeof log.actualFillPrice === "number" && log.actualFillPrice > 0 && typeof log.positionNotional === "number"
+          ? roundNumber(log.positionNotional / log.actualFillPrice, 4)
+          : null,
+      partial: log.partialFilled ?? false,
+      filledAt: log.timestampMs ?? Date.now()
+    });
   }
 
   private enqueueTradeLog(task: TradeLogTask) {
@@ -3092,9 +2656,20 @@ export class SimulationEngine {
         }
       }
 
-      const nextStatus = this.computeRoundStatus(round, now);
-      if (nextStatus !== round.status) {
-        round.status = nextStatus;
+      if (
+        shouldRequireManualSettlement(
+          round,
+          now,
+          this.config.manualSettlementTimeoutMs,
+          this.config.pollDelayMs
+        )
+      ) {
+        await this.markRoundForManualSettlement(round, now);
+      } else {
+        const nextStatus = this.computeRoundStatus(round, now);
+        if (nextStatus !== round.status) {
+          round.status = nextStatus;
+        }
       }
 
       if (round.status === "Polling" || this.shouldPrefetchGamma(round, now)) {
@@ -3125,6 +2700,49 @@ export class SimulationEngine {
     }
 
     return changedUsers;
+  }
+
+  private async markRoundForManualSettlement(round: RoundRecord, now: number) {
+    round.status = "Manual";
+    round.acceptingOrders = false;
+    round.manualReason =
+      round.manualReason ??
+      `Gamma polling timed out after ${Math.round(this.config.manualSettlementTimeoutMs / 1000)} seconds.`;
+    this.getPreliminarySettlements().delete(round.id);
+
+    const pendingOrders = this.store.orders.filter((order) => order.roundId === round.id && order.status === "pending");
+    for (const order of pendingOrders) {
+      const user = this.store.getUserById(order.userId);
+      if (user) {
+        await this.failPendingOrder(user, order, "Round entered manual settlement");
+      }
+    }
+
+    await this.writeAuditLog({
+      eventId: this.store.newId("evt"),
+      traceId: this.store.newTraceId(),
+      category: "settlement",
+      actionType: "poll_settlement",
+      actionStatus: "timeout",
+      pageName: "trade.main",
+      moduleName: "settlement.engine",
+      symbol: round.symbol,
+      roundId: round.id,
+      serverRecvTs: now,
+      serverPublishTs: now,
+      backendLatencyMs: 0,
+      resultCode: "MANUAL_REVIEW_REQUIRED",
+      resultMessage: "Settlement polling timed out; Admin manual settlement is required.",
+      details: {
+        roundId: round.id,
+        marketId: round.marketId,
+        marketSlug: round.marketSlug,
+        pollCount: round.pollCount,
+        lastPollAt: round.lastPollAt,
+        manualReason: round.manualReason,
+        pendingOrdersFailed: pendingOrders.length
+      }
+    });
   }
 
   private scheduleSettlementPoll(round: RoundRecord, now: number) {

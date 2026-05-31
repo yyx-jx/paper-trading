@@ -9,7 +9,7 @@ import path from "node:path";
 import { Pool } from "pg";
 
 const MIGRATIONS_DIR = path.resolve(process.cwd(), "db/migrations");
-const EXPECTED_MIGRATION_ID = "000007";
+const EXPECTED_MIGRATION_ID = "000008";
 
 type Migration = {
   id: string;
@@ -210,7 +210,7 @@ async function main() {
   await resetDatabase(smokeUrl);
   await expectFailFast(smokeUrl, /schema_migrations is missing/);
   await applyMigrations(smokeUrl, migrations, "000002");
-  await expectFailFast(smokeUrl, /Required migration 000007 is not applied/);
+  await expectFailFast(smokeUrl, /Required migration 000008 is not applied/);
   await applyMigrations(smokeUrl, migrations);
   await assertSchema(smokeUrl);
 

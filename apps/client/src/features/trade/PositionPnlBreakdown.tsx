@@ -1,5 +1,9 @@
+import i18n from "../../i18n";
 import type { Language } from "../../utils/api";
-import { localLabel, money, signedMoney } from "../../utils/format";
+import { money, signedMoney } from "../../utils/format";
+const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
+
+
 
 export function PositionPnlBreakdown(props: {
   language: Language;
@@ -9,30 +13,26 @@ export function PositionPnlBreakdown(props: {
   exitFeeUsdc: number;
   totalFeeUsdc: number;
 }) {
-  const feeTitle = localLabel(
-    props.language,
-    "PnL 口径包含买入成本；费用字段单独列示。",
-    "PnL uses fee-adjusted cost basis where available; fees are shown separately."
-  );
+  const feeTitle = t("uiPnLUsesFeeAdjustedCostBasis401c0c01");
   return (
     <div className="position-pnl-breakdown" title={feeTitle}>
       <span>
-        <small>{localLabel(props.language, "Mark PnL", "Mark PnL")}</small>
+        <small>{t("uiMarkPnL6430b836")}</small>
         <b className={props.markPnlUsdc >= 0 ? "terminal-green" : "terminal-red"}>{signedMoney(props.markPnlUsdc)}</b>
       </span>
       <span>
-        <small>{localLabel(props.language, "可成交 PnL", "Executable PnL")}</small>
+        <small>{t("uiExecutablePnL89182743")}</small>
         <b className={props.executablePnlUsdc >= 0 ? "terminal-green" : "terminal-red"}>
           {signedMoney(props.executablePnlUsdc)}
         </b>
       </span>
       <span>
-        <small>{localLabel(props.language, "费用", "Fees")}</small>
+        <small>{t("uiFees5ef20e69")}</small>
         <b>{money(props.totalFeeUsdc, 4)}</b>
       </span>
       <em>
-        {localLabel(props.language, "入场", "Entry")} {money(props.entryFeeUsdc, 4)} ·{" "}
-        {localLabel(props.language, "出场", "Exit")} {money(props.exitFeeUsdc, 4)}
+        {t("uiEntrye98aa4ac")} {money(props.entryFeeUsdc, 4)} ·{" "}
+        {t("uiExitf7288879")} {money(props.exitFeeUsdc, 4)}
       </em>
     </div>
   );

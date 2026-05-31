@@ -243,6 +243,7 @@ export interface MarketPayload {
   viewedUserId: string;
   currentRound?: RoundRecord;
   history: HistoryRound[];
+  historyRevision?: number;
   snapshot: MarketSnapshot;
   settlementPreview?: SettlementPreview;
   transportMeta?: MarketTransportMeta;
@@ -298,8 +299,14 @@ export interface MarketTickPayload {
   viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
-  settlementPreview?: SettlementPreview;
   transportMeta?: MarketTransportMeta;
+}
+
+export interface MarketHistoryPatchPayload {
+  viewedUserId: string;
+  history: HistoryRound[];
+  historyRevision: number;
+  serverPublishTs: number;
 }
 
 export interface UserPayload {
@@ -380,6 +387,26 @@ export interface RoundRecord {
 
 export interface HistoryRound extends RoundRecord {
   userPnl: number;
+}
+
+export interface ManualSettlementCandidate {
+  roundId: string;
+  symbol: string;
+  marketId: string;
+  marketSlug?: string;
+  title?: string;
+  startAt: number;
+  endAt: number;
+  status: RoundStatus;
+  pollCount: number;
+  pollStartAt?: number;
+  lastPollAt?: number;
+  manualReason?: string;
+  participantCount: number;
+  openPositionCount: number;
+  pendingOrderCount: number;
+  upOpenQty: number;
+  downOpenQty: number;
 }
 
 export interface ProfileOverview {
@@ -1036,6 +1063,9 @@ export const api = {
   },
   getHistory(token: string, limit = 60, viewUserId?: string) {
     return request<HistoryRound[]>(`/api/rounds/history${buildQuery({ limit, viewUserId })}`, token);
+  },
+  getManualSettlementQueue(token: string, limit = 100) {
+    return request<ManualSettlementCandidate[]>(`/api/rounds/manual-settlement${buildQuery({ limit })}`, token);
   },
   manualSettleRound(token: string, roundId: string, input: { side: TradeSide; price?: number; reason?: string }) {
     return request<RoundRecord>(`/api/rounds/${roundId}/manual-settlement`, token, {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { AppStore } from "../apps/server/src/services/store";
 import type { MarketCandleRecord } from "../apps/server/src/domain/types";
+import { readSimulationServiceSource, readStoreServiceSource } from "./source-contracts";
 
 const migrationPath = "db/migrations/000007_market_candles.sql";
 
@@ -14,12 +15,12 @@ assert.match(migrationSource, /CHECK \(open_ts % 30000 = 0\)/);
 assert.match(migrationSource, /CHECK \(close_ts = open_ts \+ 30000\)/);
 assert.match(migrationSource, /idx_market_candles_lookup/);
 
-const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+const storeSource = readStoreServiceSource();
 assert.match(storeSource, /CREATE TABLE IF NOT EXISTS market_candles/);
 assert.match(storeSource, /upsertMarketCandles/);
 assert.match(storeSource, /getMarketCandles/);
 
-const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+const simulationSource = readSimulationServiceSource();
 assert.match(simulationSource, /flushPendingCoinbaseMarketCandles/);
 assert.match(simulationSource, /refreshCoinbaseAggregateBucketFromThirtySecondBar/);
 assert.match(simulationSource, /recordCoinbaseSample/);
@@ -41,7 +42,7 @@ function createMemoryStore() {
     seedDefaultUsers: false,
     requireSchemaMigrations: false,
     allowDevSchemaBootstrap: false,
-    expectedSchemaMigrationId: "000007",
+    expectedSchemaMigrationId: "000008",
     pgConnectionTimeoutMs: 1000,
     pgIdleTimeoutMs: 1000,
     pgMaxConnections: 1,

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { readSimulationServiceSource, readStoreServiceSource } from "./source-contracts";
 
 type UserStub = {
   id: string;
@@ -175,19 +176,19 @@ function testStaticTransactionAndMigrationWiring() {
   assert.match(migration, /CREATE TABLE IF NOT EXISTS redeem_ledger/);
   assert.match(migration, /UNIQUE \(round_id, user_id, position_id\)/);
 
-  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+  const storeSource = readStoreServiceSource();
   assert.match(storeSource, /async withTransaction<T>/);
   assert.match(storeSource, /txStorage\.run\(client, handler\)/);
   assert.match(storeSource, /async claimRedeemLedger/);
   assert.match(storeSource, /ON CONFLICT \(round_id, user_id, position_id\) DO NOTHING/);
 
-  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const simulationSource = readSimulationServiceSource();
   assert.match(simulationSource, /await this\.store\.withTransaction/);
   assert.match(simulationSource, /claimRedeemLedger/);
   assert.match(simulationSource, /redeemedPositionCount/);
 
   const configSource = readFileSync("apps/server/src/config.ts", "utf8");
-  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000007"/);
+  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000008"/);
 }
 
 async function main() {

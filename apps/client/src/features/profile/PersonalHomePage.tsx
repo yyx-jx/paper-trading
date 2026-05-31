@@ -9,7 +9,7 @@ import {
   type PublicUser,
   type Role
 } from "../../utils/api";
-import { localLabel, money, signedMoney, timeText } from "../../utils/format";
+import { money, signedMoney, timeText } from "../../utils/format";
 import { redactNetworkAddresses } from "../../utils/redaction";
 
 function roleTone(role: Role): "positive" | "negative" | "neutral" | "warning" {
@@ -83,13 +83,13 @@ export function PersonalHomePage(props: {
         <div className="personal-identity-card">
           <div className="personal-avatar">{me.displayName.slice(0, 1).toUpperCase()}</div>
           <div>
-            <span>{localLabel(language, "个人主页", "Personal Home")}</span>
+            <span>{t("uiPersonalHomed2d7fca2")}</span>
             <strong>{me.displayName}</strong>
             <small>
               @{me.username} ·{" "}
               {props.canOpenUserManagement
-                ? localLabel(language, "可查看或管理授权范围内用户", "Can view or manage authorized users")
-                : localLabel(language, "个人账号与交易分析", "Personal account and analytics")}
+                ? t("uiCanViewOrManageAuthorizedUsers952a44af")
+                : t("uiPersonalAccountAndAnalytics36c8aec6")}
             </small>
           </div>
         </div>
@@ -104,30 +104,30 @@ export function PersonalHomePage(props: {
 
       <div className="personal-summary-grid">
         <div className="analytics-card">
-          <span>{localLabel(language, "总资产", "Total Equity")}</span>
+          <span>{t("uiTotalEquitya8801bd1")}</span>
           <strong>{money(props.profile?.totalEquity ?? 0)}</strong>
-          <small>{localLabel(language, "可用", "Available")} {money(props.profile?.availableUsdc ?? me.availableUsdc)}</small>
+          <small>{t("uiAvailablee21a3cf6")} {money(props.profile?.availableUsdc ?? me.availableUsdc)}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "持仓价值", "Position Value")}</span>
+          <span>{t("positionValue")}</span>
           <strong>{money(props.profile?.positionValue ?? 0)}</strong>
-          <small>{props.positions.filter((position) => position.status === "open").length} {localLabel(language, "个未平持仓", "open positions")}</small>
+          <small>{props.positions.filter((position) => position.status === "open").length} {t("uiOpenPositionsaa21c1fa")}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "今日已实现", "Realized Today")}</span>
+          <span>{t("uiRealizedToday87bad300")}</span>
           <strong>{signedMoney(props.profile?.realizedPnlToday ?? 0)}</strong>
-          <small>{localLabel(language, "未实现", "Unrealized")} {signedMoney(props.profile?.unrealizedPnl ?? 0)}</small>
+          <small>{t("uiUnrealized69da35be")} {signedMoney(props.profile?.unrealizedPnl ?? 0)}</small>
         </div>
         <div className="analytics-card">
-          <span>{localLabel(language, "参与轮次", "Rounds")}</span>
+          <span>{t("roundsParticipated")}</span>
           <strong>{props.profile?.roundsParticipatedTotal ?? 0}</strong>
-          <small>{localLabel(language, "今日", "Today")} {props.profile?.roundsParticipatedToday ?? 0}</small>
+          <small>{t("today")} {props.profile?.roundsParticipatedToday ?? 0}</small>
         </div>
       </div>
 
       <div className="personal-grid">
         <div className="analytics-card personal-form-card">
-          <span>{localLabel(language, "账号信息", "Account")}</span>
+          <span>{t("uiAccount818e0835")}</span>
           <label>{t("displayName")}<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
           <label>{t("language")}<select value={selfLanguage} onChange={(event) => setSelfLanguage(event.target.value as Language)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
           <div className="personal-permission-list">
@@ -139,7 +139,7 @@ export function PersonalHomePage(props: {
           </div>
         </div>
         <div className="analytics-card personal-activity-card">
-          <span>{localLabel(language, "最近动态", "Recent Activity")}</span>
+          <span>{t("uiRecentActivity767220e6")}</span>
           <div className="personal-activity-list">
             {props.logs.slice(0, 6).map((log) => (
               <div key={log.eventId}><strong>{log.actionType}</strong><small>{timeText(log.serverRecvTs)} · {redactNetworkAddresses(log.resultMessage)}</small></div>

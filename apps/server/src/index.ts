@@ -14,24 +14,17 @@ import { canChangeUserGroupForActor, canCreateUserForActor, canExportUser, canVi
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
-  BookLevel,
-  CandleBar,
-  CandleInterval,
   Language,
   LogSearchQuery,
   LogSearchResult,
   LogSystem,
   MarketPayload,
-  MarketRealtimeTick,
-  MarketSnapshot,
+  MarketHistoryPatchPayload,
   MarketTickPayload,
-  MarketTransportMeta,
   MatchingEventRecord,
   PermissionLevel,
   Role,
   RoundRecord,
-  SettlementPreview,
-  SourceHealth,
   TradeSide,
   UnifiedLogRow,
   UserRecord,
@@ -55,8 +48,15 @@ import {
 } from "./services/csv-zip-export";
 import { CSV_BULK_USER_TEMPLATE, parseBulkUsersCsv, validateBulkCreateUsers } from "./services/bulk-users";
 import { LOG_FACETS } from "./services/log-facets";
+import { createJsonlStream } from "./services/log-export-stream";
 import { buildDatasetExport, previewDatasetExport } from "./services/dataset-export";
 import { appMetrics } from "./services/metrics";
+import { HyperBridge, loadHyperBridgeConfig } from "./services/hyper-bridge";
+import { createWsSessionManager } from "./ws/session";
+import { createHeartbeatController } from "./ws/heartbeat";
+import { createMarketPayloadBuilder } from "./payloads/market";
+import { createUserPayloadBuilder } from "./payloads/user";
+import { buildManualSettlementCandidates } from "./services/settlement/manual-queue";
 
 const app = Fastify({
   logger: false,
@@ -69,11 +69,10 @@ const wsConnectionCounts = {
   market: 0,
   user: 0
 };
-const wsTickets = new Map<string, { userId: string; viewedUserId: string; channel: "market" | "user"; expiresAt: number }>();
-const WS_TICKET_TTL_MS = 60_000;
-const WS_HEARTBEAT_MS = 25_000;
 const httpStartTimes = new WeakMap<object, number>();
-const heartbeatTimeoutSockets = new WeakSet<WsWebSocket>();
+const heartbeatController = createHeartbeatController({
+  recordDisconnect: (channel, reason) => appMetrics.recordWsDisconnect(channel, reason)
+});
 
 function logStartupStage(stage: string) {
   console.log(`[startup] ${new Date().toISOString()} ${stage}`);
@@ -139,6 +138,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   marketId: serverConfig.marketId,
   freezeWindowMs: serverConfig.freezeWindowMs,
   pollDelayMs: serverConfig.pollDelayMs,
+  manualSettlementTimeoutMs: serverConfig.manualSettlementTimeoutMs,
   gammaPollIntervalMs: serverConfig.gammaPollIntervalMs,
   binanceRestUrl: serverConfig.binanceRestUrl,
   binanceFallbackRestUrl: serverConfig.binanceFallbackRestUrl,
@@ -171,7 +171,13 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
 });
 
-let marketPayloadSeq = 0;
+const hyperBridge = new HyperBridge(loadHyperBridgeConfig(), {
+  info: (message) => console.log(message),
+  warn: (message) => console.warn(message)
+});
+engine.events.on("signal:emitted", (payload) => hyperBridge.onSignalEmitted(payload));
+engine.events.on("paper:filled", (payload) => hyperBridge.onPaperFilled(payload));
+
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
@@ -183,21 +189,38 @@ const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math.max(
 );
 const MARKET_WS_FULL_SNAPSHOT_RETRY_MS = 250;
 const USER_WS_RETRY_MS = 50;
-const USER_TRADE_ORDER_LIMIT = 50;
-const USER_TRADE_LIFECYCLE_LIMIT = 80;
-const MARKET_TRANSPORT_CANDLE_LIMIT = 120;
-const MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT = 10;
-const MARKET_TRANSPORT_RECENT_TRADE_LIMIT = 30;
-const MARKET_TRANSPORT_ODDS_POINT_LIMIT = 120;
-const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
 
-type CachedMarketHistory = {
-  revision: number;
-  limit: number;
-  rows: Array<RoundRecord & { userPnl: number }>;
-};
+const wsSessions = createWsSessionManager({
+  jwtSecret: serverConfig.jwtSecret,
+  store
+});
+const getUserFromRequest = wsSessions.getUserFromRequest;
+const getViewedUserFromRequest = wsSessions.getViewedUserFromRequest;
+const createWsTicket = wsSessions.createWsTicket;
+const getWsSession = wsSessions.getWsSession;
 
-const marketHistoryCache = new Map<string, CachedMarketHistory>();
+const marketPayloads = createMarketPayloadBuilder({
+  store,
+  engine,
+  historyCacheMaxUsers: Math.max(serverConfig.marketHistoryCacheMaxUsers, 1)
+});
+const createCurrentRoundPayload = marketPayloads.createCurrentRoundPayload;
+const createMarketPayload = marketPayloads.createMarketPayload;
+const createMarketTickPayload = marketPayloads.createMarketTickPayload;
+const createMarketHistoryPatchPayload = marketPayloads.createMarketHistoryPatchPayload;
+const decorateRoundWithSettlementPreview = marketPayloads.decorateRoundWithSettlementPreview;
+const getHistoryWithSettlementPreview = marketPayloads.getHistoryWithSettlementPreview;
+const getOperatedHistoryWithSettlementPreview = marketPayloads.getOperatedHistoryWithSettlementPreview;
+const markTransportSendStart = marketPayloads.markTransportSendStart;
+
+const userPayloads = createUserPayloadBuilder({
+  store,
+  marketPayloads
+});
+const createUserFullPayload = userPayloads.createUserFullPayload;
+const createUserTradePayload = userPayloads.createUserTradePayload;
+const attachHeartbeat = heartbeatController.attachHeartbeat;
+const consumeHeartbeatTimeout = heartbeatController.consumeHeartbeatTimeout;
 
 const loginSchema = z.object({
   username: z.string().min(1),
@@ -311,6 +334,10 @@ const manualSettlementSchema = z.object({
   reason: z.string().trim().max(300).optional()
 });
 
+const manualSettlementQueueQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(500).optional()
+});
+
 const trainingLogQuerySchema = z.object({
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
@@ -415,153 +442,6 @@ function signToken(user: UserRecord) {
   return jwt.sign({ userId: user.id, role: user.role }, serverConfig.jwtSecret, {
     expiresIn: "12h"
   });
-}
-
-function readToken(raw?: string) {
-  if (!raw) {
-    return undefined;
-  }
-  if (raw.startsWith("Bearer ")) {
-    return raw.slice("Bearer ".length);
-  }
-  return raw;
-}
-
-function getUserFromRequest(request: { headers: Record<string, string | string[] | undefined> }) {
-  const token = readToken(
-    typeof request.headers.authorization === "string" ? request.headers.authorization : undefined
-  );
-  if (!token) {
-    throw new Error("Missing authorization token.");
-  }
-  const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-  const user = store.getUserById(payload.userId);
-  if (!user) {
-    throw new Error("User session is invalid.");
-  }
-  if (!user.isActive) {
-    throw new Error("User account is disabled.");
-  }
-  return user;
-}
-
-function readViewUserId(query: unknown) {
-  const raw = query && typeof query === "object" ? (query as { viewUserId?: unknown }).viewUserId : undefined;
-  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
-}
-
-function resolveViewedUser(actor: UserRecord, viewUserId?: string) {
-  const target = viewUserId ? store.getUserById(viewUserId) : actor;
-  if (!target) {
-    throw new Error("Target user was not found.");
-  }
-  if (!canViewUserRecords(actor, target, store.listUserRecords())) {
-    throw new Error("Records are not available for this user.");
-  }
-  return target;
-}
-
-function getViewedUserFromRequest(
-  actor: UserRecord,
-  request: { query?: unknown }
-) {
-  return resolveViewedUser(actor, readViewUserId(request.query));
-}
-
-type WsSession = {
-  actor: UserRecord;
-  viewedUser: UserRecord;
-};
-
-function createWsTicket(user: UserRecord, channel: "market" | "user", viewUserId?: string) {
-  const viewedUser = resolveViewedUser(user, viewUserId);
-  const ticket = `wst_${nanoid(32)}`;
-  const expiresAt = Date.now() + WS_TICKET_TTL_MS;
-  wsTickets.set(ticket, {
-    userId: user.id,
-    viewedUserId: viewedUser.id,
-    channel,
-    expiresAt
-  });
-  return {
-    ticket,
-    expiresAt
-  };
-}
-
-function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user"): WsSession | undefined {
-  if (!rawTicket) {
-    return undefined;
-  }
-  const ticket = wsTickets.get(rawTicket);
-  wsTickets.delete(rawTicket);
-  if (!ticket || ticket.channel !== channel || ticket.expiresAt < Date.now()) {
-    return undefined;
-  }
-  const actor = store.getUserById(ticket.userId);
-  if (!actor) {
-    return undefined;
-  }
-  return {
-    actor,
-    viewedUser: resolveViewedUser(actor, ticket.viewedUserId)
-  };
-}
-
-function getWsSession(query: { token?: string; ticket?: string; viewUserId?: string }, channel: "market" | "user"): WsSession | undefined {
-  const ticketSession = consumeWsTicket(query.ticket, channel);
-  if (ticketSession) {
-    return ticketSession;
-  }
-  const token = readToken(query.token);
-  if (!token) {
-    return undefined;
-  }
-  const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-  const actor = store.getUserById(payload.userId);
-  if (!actor) {
-    return undefined;
-  }
-  return {
-    actor,
-    viewedUser: resolveViewedUser(actor, query.viewUserId)
-  };
-}
-
-function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
-  let alive = true;
-  let missedPongs = 0;
-  socket.on("pong", () => {
-    alive = true;
-    missedPongs = 0;
-  });
-  const timer = setInterval(() => {
-    if (socket.readyState !== WsWebSocket.OPEN) {
-      clearInterval(timer);
-      return;
-    }
-    if (!alive) {
-      missedPongs += 1;
-      if (missedPongs >= 3) {
-        heartbeatTimeoutSockets.add(socket);
-        appMetrics.recordWsDisconnect(channel, "heartbeat_timeout");
-        socket.close();
-        clearInterval(timer);
-        return;
-      }
-    }
-    alive = false;
-    socket.ping();
-  }, WS_HEARTBEAT_MS);
-  socket.on("close", () => clearInterval(timer));
-}
-
-function consumeHeartbeatTimeout(socket: WsWebSocket) {
-  if (!heartbeatTimeoutSockets.has(socket)) {
-    return false;
-  }
-  heartbeatTimeoutSockets.delete(socket);
-  return true;
 }
 
 function updateRuntimeMetrics() {
@@ -1028,251 +908,6 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null, optio
   return managerUserId;
 }
 
-function stampSourceForTransport(source: SourceHealth, serverPublishTs: number): SourceHealth {
-  return {
-    ...source,
-    serverPublishTs,
-    frontendLatencyMs: 0
-  };
-}
-
-function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = Date.now()): MarketSnapshot {
-  return {
-    ...snapshot,
-    latencyBreakdown: {
-      ...snapshot.latencyBreakdown,
-      serverComputeLatency: Math.max(serverPublishTs - snapshot.serverNow, 0)
-    },
-    sources: {
-      binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
-      coinbase: stampSourceForTransport(snapshot.sources.coinbase, serverPublishTs),
-      clob: stampSourceForTransport(snapshot.sources.clob, serverPublishTs)
-    }
-  };
-}
-
-function compactCandlesByInterval(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
-  return Object.fromEntries(
-    Object.entries(candlesByInterval).map(([interval, bars]) => [
-      interval,
-      bars.slice(-MARKET_TRANSPORT_CANDLE_LIMIT)
-    ])
-  ) as Record<CandleInterval, CandleBar[]>;
-}
-
-function compactSnapshotForTransport(snapshot: MarketSnapshot): MarketSnapshot {
-  const orderBooks = {
-    UP: {
-      ...snapshot.orderBooks.UP,
-      bids: snapshot.orderBooks.UP.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
-      asks: snapshot.orderBooks.UP.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
-    },
-    DOWN: {
-      ...snapshot.orderBooks.DOWN,
-      bids: snapshot.orderBooks.DOWN.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
-      asks: snapshot.orderBooks.DOWN.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
-    }
-  };
-  return {
-    ...snapshot,
-    orderBooks,
-    recentTrades: snapshot.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
-    candles: snapshot.candles.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
-    binance: {
-      ...snapshot.binance,
-      candlesByInterval: compactCandlesByInterval(snapshot.binance.candlesByInterval)
-    },
-    coinbase: {
-      ...snapshot.coinbase,
-      candles5s: snapshot.coinbase.candles5s.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
-      candlesByInterval: compactCandlesByInterval(snapshot.coinbase.candlesByInterval)
-    },
-    clob: {
-      ...snapshot.clob,
-      upBook: orderBooks.UP,
-      downBook: orderBooks.DOWN,
-      recentTrades: snapshot.clob.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
-      currentRoundUpPriceSeries: snapshot.clob.currentRoundUpPriceSeries.slice(-MARKET_TRANSPORT_ODDS_POINT_LIMIT)
-    }
-  };
-}
-
-function nextMarketTransportMeta(coalescedCount = 0, snapshotBuildTs?: number): MarketTransportMeta {
-  const serverPublishTs = Date.now();
-  marketPayloadSeq += 1;
-  return {
-    serverPublishTs,
-    payloadSeq: marketPayloadSeq,
-    coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    snapshotBuildTs
-  };
-}
-
-function markTransportSendStart(transportMeta: MarketTransportMeta) {
-  const sendStartedAt = Date.now();
-  transportMeta.wsSendStartTs = sendStartedAt;
-  transportMeta.serverQueueMs = Math.max(sendStartedAt - transportMeta.serverPublishTs, 0);
-  return sendStartedAt;
-}
-
-function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: number }>(
-  round: T
-): T & { settlementPreview?: SettlementPreview } {
-  const settlementPreview = engine.getSettlementPreview(round);
-  return settlementPreview ? { ...round, settlementPreview } : round;
-}
-
-function decorateCurrentRoundForTransport(round: RoundRecord | undefined) {
-  const displayRound = engine.withCurrentRoundBinanceOpenReference(engine.withCurrentRoundCoinbaseOpenReference(round));
-  return displayRound ? decorateRoundWithSettlementPreview(displayRound) : undefined;
-}
-
-function getCachedHistory(limit: number, userId?: string) {
-  const revision = store.getHistoryRevision();
-  const cacheKey = `${userId ?? "__public__"}:${limit}`;
-  const cached = marketHistoryCache.get(cacheKey);
-  if (cached && cached.revision === revision && cached.limit === limit) {
-    return cached.rows;
-  }
-  const rows = store.getHistory(limit, userId);
-  marketHistoryCache.set(cacheKey, { revision, limit, rows });
-  if (marketHistoryCache.size > MARKET_HISTORY_CACHE_MAX_USERS) {
-    const oldestKey = marketHistoryCache.keys().next().value;
-    if (oldestKey) {
-      marketHistoryCache.delete(oldestKey);
-    }
-  }
-  return rows;
-}
-
-function getHistoryWithSettlementPreview(limit: number, userId?: string) {
-  return getCachedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) {
-  return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
-}
-
-function createCurrentRoundPayload(coalescedCount = 0, viewedUserId?: string) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, store.marketSnapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const history = getHistoryWithSettlementPreview(10, viewedUserId);
-  const settlementPreview =
-    (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
-    engine.getLatestSettlementPreview(history);
-  return {
-    viewedUserId,
-    currentRound: decorateCurrentRoundForTransport(currentRound),
-    snapshot: compactSnapshotForTransport(stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs)),
-    settlementPreview,
-    transportMeta
-  };
-}
-
-function createMarketPayload(viewedUserId: string, coalescedCount = 0): MarketPayload {
-  return {
-    ...createCurrentRoundPayload(coalescedCount, viewedUserId),
-    viewedUserId,
-    history: getHistoryWithSettlementPreview(10, viewedUserId)
-  };
-}
-
-function countdownTargetTsFor(snapshot: MarketSnapshot) {
-  const countdownMs = snapshot.uiMeta.countdownMs;
-  return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
-}
-
-function latestCandleUpdates(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
-  const updates: Partial<Record<CandleInterval, CandleBar>> = {};
-  for (const [interval, bars] of Object.entries(candlesByInterval) as Array<[CandleInterval, CandleBar[]]>) {
-    const latest = bars.at(-1);
-    if (latest) {
-      updates[interval] = latest;
-    }
-  }
-  return updates;
-}
-
-function topLevelsForTick(snapshot: MarketSnapshot): Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }> {
-  return {
-    UP: {
-      bids: snapshot.orderBooks.UP.bids.slice(0, 5),
-      asks: snapshot.orderBooks.UP.asks.slice(0, 5)
-    },
-    DOWN: {
-      bids: snapshot.orderBooks.DOWN.bids.slice(0, 5),
-      asks: snapshot.orderBooks.DOWN.asks.slice(0, 5)
-    }
-  };
-}
-
-function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
-  const stamped = stampSnapshotForTransport(snapshot, serverPublishTs);
-  const currentRoundUpPricePoint = stamped.clob.currentRoundUpPriceSeries.at(-1);
-  return {
-    symbol: stamped.symbol,
-    marketId: stamped.marketId,
-    marketSlug: stamped.marketSlug,
-    serverNow: stamped.serverNow,
-    currentPrice: stamped.currentPrice,
-    binancePrice: stamped.binancePrice,
-    coinbasePrice: stamped.coinbasePrice,
-    priceToBeat: stamped.priceToBeat,
-    displayPriceToBeat: stamped.displayPriceToBeat,
-    displayPriceToBeatSource: stamped.displayPriceToBeatSource,
-    upPrice: stamped.upPrice,
-    downPrice: stamped.downPrice,
-    displayPrices: stamped.displayPrices,
-    displayPriceSource: stamped.displayPriceSource,
-    displayPriceSpread: stamped.displayPriceSpread,
-    latencyBreakdown: stamped.latencyBreakdown,
-    sources: stamped.sources,
-    binance: {
-      spotPrice: stamped.binance.spotPrice,
-      latestTick: stamped.binance.latestTick,
-      candleUpdates: latestCandleUpdates(stamped.binance.candlesByInterval)
-    },
-    coinbase: {
-      referencePrice: stamped.coinbase.referencePrice,
-      settlementReference: stamped.coinbase.settlementReference,
-      currentRoundOpenReference: stamped.coinbase.currentRoundOpenReference,
-      candleUpdates: latestCandleUpdates(stamped.coinbase.candlesByInterval),
-      latestTick:
-        stamped.coinbase.referencePrice > 0
-          ? { ts: stamped.sources.coinbase.normalizedTs || stamped.serverNow, price: stamped.coinbase.referencePrice }
-          : undefined
-    },
-    clob: {
-      delta: stamped.clob.delta,
-      volume: stamped.clob.volume,
-      currentRoundUpPricePoint,
-      bestBidAskSummary: stamped.clob.bestBidAskSummary,
-      topLevels: topLevelsForTick(stamped)
-    },
-    uiMeta: {
-      countdownMs: stamped.uiMeta.countdownMs,
-      countdownTargetTs: countdownTargetTsFor(stamped),
-      acceptingOrders: stamped.uiMeta.acceptingOrders,
-      marketSwitchState: stamped.uiMeta.marketSwitchState,
-      sourceStatusSummary: stamped.uiMeta.sourceStatusSummary
-    }
-  };
-}
-
-function createMarketTickPayload(coalescedCount = 0, viewedUserId = ""): MarketTickPayload {
-  const snapshot = store.marketSnapshot;
-  const transportMeta = nextMarketTransportMeta(coalescedCount, snapshot.serverNow);
-  const currentRound = store.getCurrentRound();
-  const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
-  return {
-    viewedUserId,
-    currentRound: decorateCurrentRoundForTransport(currentRound),
-    tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
-    settlementPreview,
-    transportMeta
-  };
-}
-
 type MarketBroadcastFrame = {
   data: MarketTickPayload;
   bytes: number;
@@ -1300,6 +935,10 @@ let marketBroadcastRetryTimer: NodeJS.Timeout | undefined;
 let marketBroadcastTickTimer: NodeJS.Timeout | undefined;
 let marketBroadcastBackpressureDropped = false;
 let marketBroadcastStarted = false;
+let lastBroadcastHistoryRevision = store.getHistoryRevision();
+let pendingMarketHistoryPatchRevision: number | undefined;
+let marketHistoryPatchTimer: NodeJS.Immediate | undefined;
+const lastMarketHistoryPatchSignatures = new Map<string, string>();
 
 function createMarketBroadcastFrame(coalescedCount = 0, droppedForBackpressure = false): MarketBroadcastFrame {
   const buildStartedAt = Date.now();
@@ -1401,7 +1040,87 @@ function requestMarketBroadcastTick(markCoalesced: boolean) {
 }
 
 function handleMarketUpdate() {
+  const historyRevision = store.getHistoryRevision();
+  if (historyRevision !== lastBroadcastHistoryRevision) {
+    lastBroadcastHistoryRevision = historyRevision;
+    scheduleMarketHistoryPatchBroadcast(historyRevision);
+  }
   requestMarketBroadcastTick(true);
+}
+
+function marketHistorySignature(history: MarketPayload["history"]) {
+  return JSON.stringify(
+    history.map((round) => ({
+      id: round.id,
+      status: round.status,
+      settledSide: round.settledSide,
+      settlementPrice: round.settlementPrice,
+      settlementTs: round.settlementTs,
+      settlementSource: round.settlementSource,
+      settlementReceivedAt: round.settlementReceivedAt,
+      redeemStartTs: round.redeemStartTs,
+      redeemFinishTs: round.redeemFinishTs,
+      userPnl: round.userPnl,
+      settlementPreview: round.settlementPreview
+    }))
+  );
+}
+
+function rememberMarketHistorySignature(viewedUserId: string, history: MarketPayload["history"]) {
+  const signature = marketHistorySignature(history);
+  const previous = lastMarketHistoryPatchSignatures.get(viewedUserId);
+  lastMarketHistoryPatchSignatures.set(viewedUserId, signature);
+  return previous !== signature;
+}
+
+function scheduleMarketHistoryPatchBroadcast(historyRevision: number) {
+  pendingMarketHistoryPatchRevision = Math.max(pendingMarketHistoryPatchRevision ?? 0, historyRevision);
+  if (marketHistoryPatchTimer) {
+    return;
+  }
+  marketHistoryPatchTimer = setImmediate(() => {
+    marketHistoryPatchTimer = undefined;
+    const revision = pendingMarketHistoryPatchRevision;
+    pendingMarketHistoryPatchRevision = undefined;
+    if (typeof revision === "number") {
+      broadcastMarketHistoryPatch(revision);
+    }
+  });
+}
+
+function broadcastMarketHistoryPatch(historyRevision: number) {
+  if (marketBroadcastClients.size === 0) {
+    return;
+  }
+  const payloadCache = new Map<string, { outbound: string; bytes: number }>();
+  for (const client of marketBroadcastClients) {
+    if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
+      continue;
+    }
+    const actor = store.getUserById(client.actorUserId);
+    if (!actor?.isActive) {
+      client.socket.close();
+      continue;
+    }
+    let cached = payloadCache.get(client.viewedUserId);
+    if (!cached) {
+      const data = createMarketHistoryPatchPayload(client.viewedUserId, historyRevision);
+      if (!rememberMarketHistorySignature(client.viewedUserId, data.history)) {
+        payloadCache.set(client.viewedUserId, { outbound: "", bytes: 0 });
+        continue;
+      }
+      const outbound = JSON.stringify({ type: "market:history-patch", data });
+      cached = { outbound, bytes: Buffer.byteLength(outbound) };
+      payloadCache.set(client.viewedUserId, cached);
+    }
+    if (!cached.outbound) {
+      continue;
+    }
+    const sendStartedAt = Date.now();
+    client.socket.send(cached.outbound, (error?: Error) => {
+      appMetrics.recordWsSend("market", cached.bytes, Date.now() - sendStartedAt, !error);
+    });
+  }
 }
 
 function scheduleFullSnapshotForClient(client: MarketBroadcastClient, delayMs = MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
@@ -1447,6 +1166,7 @@ function sendFullSnapshotForClient(client: MarketBroadcastClient) {
   }
   client.sendingFull = true;
   const data = createMarketPayload(client.viewedUserId);
+  rememberMarketHistorySignature(client.viewedUserId, data.history);
   const sendStartedAt = markTransportSendStart(data.transportMeta);
   const outbound = JSON.stringify({ type: "market", data });
   const bytes = Buffer.byteLength(outbound);
@@ -1499,6 +1219,7 @@ function startMarketBroadcasting() {
     return;
   }
   marketBroadcastStarted = true;
+  lastBroadcastHistoryRevision = store.getHistoryRevision();
   marketBroadcastTickTimer = setInterval(
     () => requestMarketBroadcastTick(false),
     Math.max(MARKET_WS_MIN_INTERVAL_MS, 50)
@@ -1519,6 +1240,11 @@ function stopMarketBroadcasting() {
     clearTimeout(marketBroadcastRetryTimer);
     marketBroadcastRetryTimer = undefined;
   }
+  if (marketHistoryPatchTimer) {
+    clearImmediate(marketHistoryPatchTimer);
+    marketHistoryPatchTimer = undefined;
+  }
+  pendingMarketHistoryPatchRevision = undefined;
   store.emitter.off("market:update", handleMarketUpdate);
 }
 
@@ -1529,6 +1255,7 @@ function createBootstrapPayload(user: UserRecord, viewedUser: UserRecord = user)
     viewedUserId: viewedUser.id,
     viewedUser: store.sanitizeUser(viewedUser),
     history: getHistoryWithSettlementPreview(30, viewedUser.id),
+    historyRevision: store.getHistoryRevision(),
     me: store.sanitizeUser(user),
     operatedHistory: getOperatedHistoryWithSettlementPreview(200, viewedUser.id),
     profile: store.getProfile(viewedUser.id),
@@ -1537,29 +1264,6 @@ function createBootstrapPayload(user: UserRecord, viewedUser: UserRecord = user)
     orderLifecycles: store.getOrderLifecycleLogs(viewedUser.id),
     logs: store.getRecentLogs(viewedUser.id),
     sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
-  };
-}
-
-function createUserFullPayload(user: UserRecord) {
-  return {
-    viewedUserId: user.id,
-    viewedUser: store.sanitizeUser(user),
-    profile: store.getProfile(user.id),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getOrders(user.id),
-    orderLifecycles: store.getOrderLifecycleLogs(user.id),
-    logs: store.getRecentLogs(user.id)
-  };
-}
-
-function createUserTradePayload(user: UserRecord) {
-  return {
-    viewedUserId: user.id,
-    profile: store.getProfile(user.id),
-    positions: store.getPositions(user.id),
-    orders: store.getRecentTradeOrders(user.id, USER_TRADE_ORDER_LIMIT),
-    orderLifecycles: store.getOrderLifecycleLogs(user.id).slice(0, USER_TRADE_LIFECYCLE_LIMIT)
   };
 }
 
@@ -1896,6 +1600,7 @@ const shutdown = async () => {
   }
   shuttingDown = true;
   stopMarketBroadcasting();
+  hyperBridge.stop();
   await engine.stop();
   await store.close();
   await matchingRuntime?.close().catch(() => undefined);
@@ -1952,6 +1657,7 @@ async function bootstrap() {
     credentials: true
   });
   await app.register(websocket);
+  hyperBridge.start();
   startMarketBroadcasting();
   app.addHook("onRequest", async (request, reply) => {
     httpStartTimes.set(request, Date.now());
@@ -2745,12 +2451,24 @@ async function bootstrap() {
     })
   );
 
+  app.get("/api/rounds/manual-settlement", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      requirePermission(user, "settlement:manual");
+      const parsed = manualSettlementQueueQuerySchema.parse(request.query);
+      return buildManualSettlementCandidates(
+        store.rounds,
+        store.positions,
+        store.orders,
+        parsed.limit ?? 100
+      );
+    })
+  );
+
   app.post("/api/rounds/:id/manual-settlement", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
-      if (user.role === "Tester") {
-        throw new Error("Tester accounts cannot enter manual settlement.");
-      }
+      requirePermission(user, "settlement:manual");
       const params = request.params as { id: string };
       const parsed = manualSettlementSchema.parse(request.body);
       return decorateRoundWithSettlementPreview(
@@ -3066,14 +2784,13 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       const parsed = trainingLogQuerySchema.parse(request.query) as BehaviorLogQuery;
       const logs = store.getBehaviorLogs(resolveBehaviorLogFilters(user, parsed));
-      const body = logs.map((log) => JSON.stringify(log)).join("\n");
       reply
         .header("Content-Type", "application/x-ndjson; charset=utf-8")
         .header(
           "Content-Disposition",
           `attachment; filename="behavior-action-logs-${new Date().toISOString().slice(0, 10)}.jsonl"`
         );
-      return reply.send(body ? `${body}\n` : "");
+      return reply.send(createJsonlStream(logs));
     } catch (error) {
       return sendApiError(reply, error, "Training log export failed.");
     }
@@ -3105,14 +2822,13 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       const parsed = auditLogQuerySchema.parse(request.query) as AuditLogQuery;
       const logs = store.getAuditLogs(resolveAuditLogFilters(user, parsed));
-      const body = logs.map((log) => JSON.stringify(log)).join("\n");
       reply
         .header("Content-Type", "application/x-ndjson; charset=utf-8")
         .header(
           "Content-Disposition",
           `attachment; filename="audit-events-${new Date().toISOString().slice(0, 10)}.jsonl"`
         );
-      return reply.send(body ? `${body}\n` : "");
+      return reply.send(createJsonlStream(logs));
     } catch (error) {
       return sendApiError(reply, error, "Audit log export failed.");
     }
