@@ -64,7 +64,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     initialBalance: Number(env.INITIAL_BALANCE ?? 10000),
     freezeWindowMs: Number(env.FREEZE_WINDOW_MS ?? 10000),
     pollDelayMs: Number(env.POLL_DELAY_MS ?? 0),
-    manualSettlementTimeoutMs: Number(env.MANUAL_SETTLEMENT_TIMEOUT_MS ?? 5 * 60_000),
+    manualSettlementTimeoutMs: Number(env.MANUAL_SETTLEMENT_TIMEOUT_MS ?? 450_000),
     marketWsMinIntervalMs: Number(env.MARKET_WS_MIN_INTERVAL_MS ?? 50),
     marketSnapshotIntervalMs: Number(env.MARKET_SNAPSHOT_INTERVAL_MS ?? 500),
     marketFullReconcileIntervalMs: Number(env.MARKET_FULL_RECONCILE_INTERVAL_MS ?? 1000),

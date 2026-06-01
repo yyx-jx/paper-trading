@@ -12,7 +12,7 @@ assert.equal(blankCoinbaseConfig.coinbaseWsUrl, DEFAULT_COINBASE_WS_URL);
 assert.equal(blankCoinbaseConfig.coinbaseRestUrl, DEFAULT_COINBASE_REST_URL);
 assert.equal(blankCoinbaseConfig.requireSchemaMigrations, false);
 assert.equal(blankCoinbaseConfig.expectedSchemaMigrationId, "000008");
-assert.equal(blankCoinbaseConfig.manualSettlementTimeoutMs, 300000);
+assert.equal(blankCoinbaseConfig.manualSettlementTimeoutMs, 450000);
 
 const disabledConfig = buildServerConfig({
   COINBASE_ENABLED: "false",

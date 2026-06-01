@@ -9,10 +9,10 @@ import {
 } from "../apps/server/src/services/settlement/manual-queue";
 
 const now = 1_700_000_000_000;
-const fiveMinutes = 5 * 60_000;
+const sevenAndHalfMinutes = 450_000;
 
 const config = buildServerConfig({});
-assert.equal(config.manualSettlementTimeoutMs, fiveMinutes);
+assert.equal(config.manualSettlementTimeoutMs, sevenAndHalfMinutes);
 
 assert.equal(ROLE_PERMISSIONS.Admin.includes("settlement:manual"), true);
 assert.equal(ROLE_PERMISSIONS.Tester.includes("settlement:manual"), false);
@@ -35,18 +35,22 @@ const baseRound: RoundRecord = {
   manualReason: "Gamma polling timed out."
 };
 
-assert.equal(shouldRequireManualSettlement(baseRound, now, fiveMinutes, 0), true);
+assert.equal(shouldRequireManualSettlement(baseRound, now, sevenAndHalfMinutes, 0), false);
 assert.equal(
-  shouldRequireManualSettlement({ ...baseRound, id: "round_recent", endAt: now - 2 * 60_000 }, now, fiveMinutes, 0),
+  shouldRequireManualSettlement({ ...baseRound, id: "round_recent", endAt: now - 2 * 60_000 }, now, sevenAndHalfMinutes, 0),
   false
 );
 assert.equal(
-  shouldRequireManualSettlement({ ...baseRound, id: "round_closed", status: "Closed" }, now, fiveMinutes, 0),
+  shouldRequireManualSettlement({ ...baseRound, id: "round_closed", status: "Closed" }, now, sevenAndHalfMinutes, 0),
   false
 );
 assert.equal(
-  shouldRequireManualSettlement({ ...baseRound, id: "round_settled", settledSide: "UP" }, now, fiveMinutes, 0),
+  shouldRequireManualSettlement({ ...baseRound, id: "round_settled", settledSide: "UP" }, now, sevenAndHalfMinutes, 0),
   false
+);
+assert.equal(
+  shouldRequireManualSettlement({ ...baseRound, id: "round_timeout", endAt: now - 8 * 60_000 }, now, sevenAndHalfMinutes, 0),
+  true
 );
 
 const positions: PositionRecord[] = [

@@ -17,6 +17,9 @@ tmp-*
 .tmp-paramiko/
 deploy/windows-production/
 deploy/windows-production-portable/
+deploy/windows-test-*/
+deploy/*.json
+deploy/*.zip
 release/
 load-test-results/
 paper_deploy_final/
@@ -37,3 +40,4 @@ docs/模拟交易平台卡顿与状态跳变.md
 docs/生产环境配置.md
 docs/*副本.md
 docs/* - 副本.md
+remote_few_shot_work/

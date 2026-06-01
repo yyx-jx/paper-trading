@@ -58,6 +58,7 @@
     "package:win:test": "node scripts/package-win-test.cjs",
     "package:win:prod": "node scripts/package-win-prod.cjs",
     "package:release": "node scripts/build-release-bundle.cjs",
+    "push:both": "powershell -ExecutionPolicy Bypass -File scripts/push-both.ps1",
     "typecheck": "tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/client/tsconfig.json",
     "start:server": "node dist/server/index.js",
     "start:matching": "node dist/matching/matching-index.js"

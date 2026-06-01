@@ -393,6 +393,7 @@ export class SimulationEngine {
         reason: input.reason
       }
     });
+    await this.applyRedeem(round);
     for (const userId of this.collectRoundPositionUsers(round.id)) {
       this.store.emitUserPayload(userId);
     }
