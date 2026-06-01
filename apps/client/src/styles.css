@@ -2497,17 +2497,250 @@ button:disabled:hover {
   color:var(--t2);
   font-size:11px;
 }
-.manual-settlement-queue .analytics-table-wrap table {
-  min-width:980px;
+.manual-settlement-queue {
+  min-width:0;
 }
-.manual-settlement-queue td strong,
-.manual-settlement-queue td small {
+.manual-settlement-entry {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:7px 9px;
+  border:1px solid var(--bd);
+  border-radius:4px;
+  background:var(--b1);
+}
+.manual-settlement-entry > div {
+  min-width:0;
+  display:grid;
+  gap:3px;
+}
+.manual-settlement-entry b {
+  color:var(--t0);
+  font-size:13px;
+  font-weight:800;
+  text-transform:uppercase;
+}
+.manual-settlement-entry span {
+  min-width:0;
+  color:var(--t2);
+  font-size:11px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.manual-settlement-entry-button {
+  position:relative;
+  min-width:112px;
+}
+.manual-settlement-entry-button em {
+  position:absolute;
+  top:-7px;
+  right:-7px;
+  min-width:18px;
+  height:18px;
+  display:grid;
+  place-items:center;
+  border:1px solid #f03060a0;
+  border-radius:999px;
+  background:#3b1119;
+  color:#ffb4c0;
+  font-size:10px;
+  font-style:normal;
+  font-weight:900;
+  line-height:1;
+}
+.manual-settlement-dialog {
+  width:min(780px,94vw);
+  max-height:86vh;
+  display:grid;
+  gap:10px;
+  overflow:hidden;
+}
+.manual-settlement-dialog-header,
+.manual-settlement-dialog-toolbar,
+.manual-settlement-card-top,
+.manual-settlement-card-body,
+.manual-settlement-dialog-footer {
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+.manual-settlement-dialog-header {
+  justify-content:space-between;
+}
+.manual-settlement-dialog-header h2 {
+  margin:0;
+  color:var(--t0);
+  font-size:18px;
+  line-height:1.1;
+}
+.manual-settlement-dialog-header span {
+  display:block;
+  margin-top:4px;
+  color:var(--t2);
+  font-size:12px;
+}
+.manual-settlement-close {
+  width:32px;
+  height:32px;
+  display:grid;
+  place-items:center;
+  border:1px solid var(--bd);
+  border-radius:4px;
+  background:var(--b2);
+  color:var(--t1);
+  font-size:22px;
+  line-height:1;
+}
+.manual-settlement-close:hover {
+  border-color:var(--bd2);
+  color:var(--t0);
+}
+.manual-settlement-dialog-toolbar {
+  justify-content:space-between;
+  padding:8px 10px;
+  border:1px solid var(--bd);
+  border-radius:4px;
+  background:#090c0f;
+}
+.manual-settlement-dialog-toolbar div {
+  display:flex;
+  align-items:baseline;
+  gap:6px;
+}
+.manual-settlement-dialog-toolbar b {
+  color:var(--A);
+  font-size:18px;
+}
+.manual-settlement-dialog-toolbar span {
+  color:var(--t2);
+  font-size:12px;
+}
+.manual-settlement-round-list {
+  min-height:0;
+  max-height:min(56vh,520px);
+  overflow:auto;
+  display:grid;
+  gap:8px;
+  padding-right:3px;
+}
+.manual-settlement-round-card {
+  display:grid;
+  gap:9px;
+  padding:10px;
+  border:1px solid var(--bd);
+  border-radius:6px;
+  background:#090c0f;
+}
+.manual-settlement-round-card:hover {
+  border-color:var(--bd2);
+}
+.manual-settlement-card-top {
+  justify-content:space-between;
+  align-items:flex-start;
+}
+.manual-settlement-card-top div {
+  min-width:0;
+}
+.manual-settlement-card-top strong,
+.manual-settlement-card-top small {
   display:block;
 }
-.manual-settlement-queue td small {
+.manual-settlement-card-top strong {
+  min-width:0;
+  color:var(--t0);
+  font-size:13px;
+  line-height:1.25;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.manual-settlement-card-top small {
   margin-top:3px;
   color:var(--t2);
   font-size:11px;
+  line-height:1.25;
+  overflow-wrap:anywhere;
+}
+.manual-settlement-card-body {
+  align-items:stretch;
+  justify-content:space-between;
+}
+.manual-settlement-metric-grid {
+  min-width:0;
+  flex:1;
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:6px;
+}
+.manual-settlement-metric-grid span {
+  min-width:0;
+  display:grid;
+  gap:3px;
+  padding:7px 8px;
+  border:1px solid #18222d;
+  border-radius:4px;
+  background:var(--b1);
+}
+.manual-settlement-metric-grid small {
+  color:var(--t2);
+  font-size:10px;
+  text-transform:uppercase;
+}
+.manual-settlement-metric-grid b {
+  min-width:0;
+  color:var(--t0);
+  font-size:12px;
+  font-weight:800;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.manual-settlement-actions {
+  width:132px;
+  flex:0 0 132px;
+  display:grid;
+  grid-template-columns:1fr;
+  gap:6px;
+}
+.settle-direction-btn {
+  min-height:34px;
+  border:1px solid var(--bd);
+  border-radius:4px;
+  background:var(--b2);
+  color:var(--t0);
+  font-size:12px;
+  font-weight:900;
+  line-height:1.1;
+}
+.settle-direction-btn.up {
+  border-color:#1fe3a270;
+  color:var(--G);
+  background:#06241c;
+}
+.settle-direction-btn.down {
+  border-color:#f0306070;
+  color:#ff9dad;
+  background:#2a0812;
+}
+.settle-direction-btn:disabled {
+  opacity:.55;
+  cursor:not-allowed;
+}
+.settlement-loading {
+  min-height:180px;
+  display:grid;
+  place-items:center;
+  border:1px dashed var(--bd2);
+  border-radius:4px;
+  color:var(--t2);
+}
+.manual-settlement-empty {
+  min-height:180px;
+}
+.manual-settlement-dialog-footer {
+  justify-content:flex-end;
 }
 .analytics-table-wrap {
   overflow-x:auto;
@@ -2623,6 +2856,45 @@ button:disabled:hover {
 .analytics-load-more.global {
   width:max-content;
   margin:4px auto 0;
+}
+
+@media (max-width: 700px) {
+  .manual-settlement-entry {
+    align-items:stretch;
+    flex-direction:column;
+  }
+  .manual-settlement-entry span {
+    white-space:normal;
+  }
+  .manual-settlement-entry-button {
+    width:100%;
+  }
+  .manual-settlement-dialog {
+    width:100vw;
+    max-height:100vh;
+    border-radius:0;
+  }
+  .manual-settlement-dialog-header,
+  .manual-settlement-dialog-toolbar,
+  .manual-settlement-card-top,
+  .manual-settlement-card-body {
+    align-items:stretch;
+    flex-direction:column;
+  }
+  .manual-settlement-metric-grid {
+    grid-template-columns:1fr;
+  }
+  .manual-settlement-round-list {
+    max-height:62vh;
+  }
+  .manual-settlement-actions {
+    width:100%;
+    flex-basis:auto;
+    grid-template-columns:1fr 1fr;
+  }
+  .settle-direction-btn {
+    min-height:38px;
+  }
 }
 
 @media (max-width: 1500px) {

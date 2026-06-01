@@ -56,9 +56,8 @@ import {
   resolvePairedDisplayPrices
 } from "./simulation/pricing";
 import {
-  GAMMA_SETTLED_LOSE_PRICE_THRESHOLD,
-  GAMMA_SETTLED_WIN_PRICE_THRESHOLD,
   PRELIMINARY_SETTLEMENT_THRESHOLD,
+  resolveExactSettledSideFromOutcomePrices,
   isMarketResolved
 } from "./simulation/settlement-rules";
 import { QTY_EPSILON, isClientOrderConflict, roundCurrency, roundNumber } from "./simulation/trade-calculations";
@@ -3772,10 +3771,7 @@ export class SimulationEngine {
   }
 
   private resolveExactOutcomeSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
-    const [upPrice, downPrice] = detail.outcomePrices;
-    if (upPrice >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && downPrice <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return "UP";
-    if (downPrice >= GAMMA_SETTLED_WIN_PRICE_THRESHOLD && upPrice <= GAMMA_SETTLED_LOSE_PRICE_THRESHOLD) return "DOWN";
-    return undefined;
+    return resolveExactSettledSideFromOutcomePrices(detail.outcomePrices);
   }
 
   private settlementPriceForSide(detail: PolymarketMarketDetail, side: TradeSide) {
@@ -3784,18 +3780,6 @@ export class SimulationEngine {
       : side === "UP"
         ? 1
         : 0;
-  }
-
-  private confirmExactGammaOutcome(roundId: string, side: TradeSide, now: number) {
-    this.gammaOutcomeConfirmations ??= new Map<string, { side: TradeSide; count: number; observedAt: number }>();
-    const previous = this.gammaOutcomeConfirmations.get(roundId);
-    if (!previous || previous.side !== side || now - previous.observedAt > 10_000) {
-      this.gammaOutcomeConfirmations.set(roundId, { side, count: 1, observedAt: now });
-      return false;
-    }
-    const next = { side, count: previous.count + 1, observedAt: now };
-    this.gammaOutcomeConfirmations.set(roundId, next);
-    return next.count >= 2;
   }
 
   private resolveTrustedGammaSettlement(
@@ -3823,22 +3807,11 @@ export class SimulationEngine {
       return undefined;
     }
 
-    if (detail.closed || detail.settlementStatus === "resolved" || detail.automaticallyResolved) {
-      this.gammaOutcomeConfirmations.delete(round.id);
-      return {
-        side: exactOutcomeSide,
-        price: this.settlementPriceForSide(detail, exactOutcomeSide),
-        message: "Gamma resolved market detail confirmed settlement."
-      };
-    }
-
-    if (!this.confirmExactGammaOutcome(round.id, exactOutcomeSide, now)) {
-      return undefined;
-    }
+    this.gammaOutcomeConfirmations.delete(round.id);
     return {
       side: exactOutcomeSide,
       price: this.settlementPriceForSide(detail, exactOutcomeSide),
-      message: "Gamma exact outcome prices confirmed settlement on consecutive polls."
+      message: "Gamma exact outcome price threshold confirmed settlement."
     };
   }
 
