@@ -17,6 +17,7 @@ import { createClient } from "redis";
 import { ROLE_PERMISSIONS, normalizeRolePermissions } from "../auth/permissions";
 import { hashPassword, isBcryptHash, verifyPassword } from "../auth/password";
 import { AsyncJsonlWriter } from "./log-writer";
+import { trimArrayByCreatedAt } from "./store/cache-pruning";
 import {
   detailString,
   hasUnsupportedBehaviorSearchFilter,
@@ -933,40 +934,21 @@ export class AppStore {
     });
   }
 
-  private trimArrayByCreatedAt<T>(
-    records: T[],
-    maxItems: number,
-    getCreatedAt: (record: T) => number,
-    onTrim?: (trimmed: T[]) => void
-  ) {
-    if (records.length <= maxItems) {
-      return;
-    }
-    const retained = [...records]
-      .sort((left, right) => getCreatedAt(right) - getCreatedAt(left))
-      .slice(0, maxItems);
-    const retainedSet = new Set(retained);
-    const trimmed = records.filter((record) => !retainedSet.has(record));
-    records.splice(0, records.length, ...retained);
-    onTrim?.(trimmed);
-  }
-
   private pruneMemoryCaches(now = Date.now()) {
-    this.trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
-    this.trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
-    this.trimArrayByCreatedAt(
+    trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
+    const ordersPrune = trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
+    const lifecyclesPrune = trimArrayByCreatedAt(
       this.orderLifecycleLogs,
       this.config.orderLifecycleMemoryMax,
-      (log) => log.updatedAt ?? log.createdAt,
-      () => this.rebuildHotIndexes()
+      (log) => log.updatedAt ?? log.createdAt
     );
-    this.trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt, () =>
-      this.rebuildHotIndexes()
-    );
-    this.trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
-    this.trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
+    const positionsPrune = trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt);
+    trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
+    trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
     this.pruneOrderBookSnapshots(now);
-    this.rebuildHotIndexes();
+    if (ordersPrune.trimmedCount > 0 || lifecyclesPrune.trimmedCount > 0 || positionsPrune.trimmedCount > 0) {
+      this.rebuildHotIndexes();
+    }
   }
 
   private pruneOrderBookSnapshots(now = Date.now()) {
@@ -2526,6 +2508,25 @@ export class AppStore {
     );
   }
 
+  async persistOrderLatency(order: OrderRecord) {
+    await this.runDb(
+      `
+      UPDATE orders
+      SET
+        persist_latency_ms = $2,
+        total_order_latency_ms = $3,
+        server_publish_ts = $4
+      WHERE id = $1
+      `,
+      [
+        order.id,
+        order.persistLatencyMs ?? null,
+        order.totalOrderLatencyMs ?? null,
+        order.serverPublishTs
+      ]
+    );
+  }
+
   async persistPosition(position: PositionRecord) {
     this.upsertPositionInMemory(position);
     this.pruneMemoryCaches();
@@ -3236,6 +3237,9 @@ export class AppStore {
     }
 
     let migratedGroups = 0;
+    if (legacyGroups.size > 0) {
+      this.rebuildHotIndexes();
+    }
     for (const [key, group] of legacyGroups) {
       if (groupsWithOpenLots.has(key) || group.positions.some((position) => (position.lockedQty ?? 0) > QTY_EPSILON)) {
         continue;

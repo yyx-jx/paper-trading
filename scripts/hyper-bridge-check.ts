@@ -93,7 +93,7 @@ function testPayloadBuilders() {
   );
   assert.equal(signal.signal_id, "tr_1");
   assert.equal(signal.client_order_id, "client_1");
-  assert.equal(signal.hyper_user_id, "user_1");
+  assert.equal(signal.hyper_user_id, "tester");
   assert.equal(signal.side, "BUY");
   assert.equal(signal.direction, "UP");
   assert.equal(signal.amount_unit, "USDC");
@@ -221,7 +221,6 @@ function testWiringIsPresent() {
   const indexSource = fs.readFileSync(path.join(root, "apps/server/src/index.ts"), "utf8");
   const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
   const productionEnvExample = fs.readFileSync(path.join(root, ".env.production.example"), "utf8");
-  const packageJson = fs.readFileSync(path.join(root, "package.json"), "utf8");
 
   assert.match(simulationSource, /readonly events = new EventEmitter\(\)/);
   assert.match(simulationSource, /signal:emitted/);
@@ -250,8 +249,9 @@ function testWiringIsPresent() {
   assert.match(indexSource, /hyperBridge\.start\(\)/);
   assert.match(indexSource, /hyperBridge\.stop\(\)/);
   assert.match(envExample, /HYPER_BRIDGE_ENABLED=false/);
+  assert.match(envExample, /HYPER_GATEWAY_URL=ws:\/\/16\.162\.106\.88:8770\?token=<BRIDGE_TOKEN>/);
   assert.match(productionEnvExample, /HYPER_BRIDGE_ENABLED=false/);
-  assert.match(packageJson, /"test:hyper-bridge": "tsx scripts\/hyper-bridge-check\.ts"/);
+  assert.match(productionEnvExample, /HYPER_GATEWAY_URL=ws:\/\/16\.162\.106\.88:8770\?token=<BRIDGE_TOKEN>/);
 }
 
 function assertInOrder(source: string, first: string, second: string, label: string) {

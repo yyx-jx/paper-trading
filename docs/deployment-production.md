@@ -13,10 +13,14 @@ Only Caddy publishes the public business port. PostgreSQL, Redis, matching-servi
 
 Create `.env.production` from `.env.production.example` and pass it with `APP_ENV_FILE=.env.production`.
 
+For a fully isolated test stack on the same host, create `.env.green` from `.env.green.example`, use a separate compose project such as `app-green`, and expose it on `PUBLIC_PORT=10002`.
+
 Required values:
 
 ```text
 PUBLIC_DOMAIN=<PRODUCTION_HOST>
+PUBLIC_BIND_HOST=0.0.0.0
+PUBLIC_PORT=10001
 PUBLIC_BASE_URL=http://<PRODUCTION_HOST>:10001
 CORS_ORIGINS=http://<PRODUCTION_HOST>:10001
 JWT_SECRET=<strong non-default secret>
@@ -25,10 +29,12 @@ POSTGRES_PASSWORD=<strong database password>
 SERVER_STRICT_PERSISTENCE=true
 SERVER_REQUIRE_MIGRATIONS=true
 SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP=false
-EXPECTED_SCHEMA_MIGRATION_ID=000005
+EXPECTED_SCHEMA_MIGRATION_ID=000008
 SEED_DEFAULT_USERS=false
 NODE_ENV=production
 DEPLOY_ENV=production
+APP_SERVER_IMAGE=p-t-app-server:latest
+MATCHING_SERVICE_IMAGE=p-t-matching-service:latest
 ```
 
 ## Public Ports
@@ -65,6 +71,20 @@ APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-f
 APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production run --rm app-server npx tsx scripts/create-admin.ts
 APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-file .env.production up -d --build
 ```
+
+## Green Test Stack
+
+Start a fully isolated green stack with a separate compose project, env file, database, Redis, and public port:
+
+```bash
+cd /srv/p-t/green
+cp .env.green.example .env.green
+APP_ENV_FILE=.env.green docker compose -p app-green -f docker-compose.deploy.yml --env-file .env.green build app-server matching-service
+APP_ENV_FILE=.env.green docker compose -p app-green -f docker-compose.deploy.yml --env-file .env.green up -d
+APP_ENV_FILE=.env.green docker compose -p app-green -f docker-compose.deploy.yml --env-file .env.green run --rm app-server npm run db:migrate
+```
+
+The green stack should use `PUBLIC_PORT=10002`, its own PostgreSQL credentials, its own Redis data, and `HYPER_BRIDGE_ENABLED=false`.
 
 ## HTTP Production Client
 

@@ -3029,10 +3029,10 @@ function TradePageRestored(props: {
       : "--";
   const estimatedOrderFee = typeof estimatedFee === "number" ? money(estimatedFee, 4) : t("uiUnavailable250f247d");
   const healthRows = [
-    { label: "CLOB", primary: `${Math.round(clobLatency.marketUpdateAgeMs)}ms`, secondary: clobComponentSummary(sourceClob, language), detail: t("uiSourceValueMsTransportValueMsf08f9752", { p0: Math.round(clobLatency.sourceDataAgeMs), p1: Math.round(clobLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceClob?.state ?? "stale" },
-    { label: "BTC", primary: `${Math.round(btcLatency.marketUpdateAgeMs)}ms`, secondary: t("uiBinanceFeed2936ce51"), detail: t("uiSourceValueMsTransportValueMsf08f9752", { p0: Math.round(btcLatency.sourceDataAgeMs), p1: Math.round(btcLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceBinance?.state ?? "stale" },
-    { label: "CB", primary: `${Math.round(coinbaseLatency.marketUpdateAgeMs)}ms`, secondary: t("uiCoinbaseFeedb41e66a7"), detail: t("uiSourceValueMsTransportValueMsf2978cd9", { p0: Math.round(coinbaseLatency.sourceDataAgeMs), p1: Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceCoinbase?.state ?? "stale" },
-    { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: t("uiSettlementPollf8a550bd"), detail: t("uiFinalSettlement004ceaa1"), tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
+    { label: "CLOB", primary: t("uiFrontendStoreValueMs1faeec6b", { p0: Math.round(clobLatency.marketUpdateAgeMs) }), secondary: t("uiStateUpstreamTransportMs3c89b45e", { p0: clobComponentSummary(sourceClob, language), p1: Math.round(clobLatency.sourceDataAgeMs), p2: Math.round(clobLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceClob?.state ?? "stale" },
+    { label: "BTC", primary: t("uiFrontendStoreValueMs1faeec6b", { p0: Math.round(btcLatency.marketUpdateAgeMs) }), secondary: t("uiStateUpstreamTransportMs3c89b45e", { p0: `${t("uiBinanceFeed2936ce51")} ${componentStateLabel(sourceBinance?.state, language)}`, p1: Math.round(btcLatency.sourceDataAgeMs), p2: Math.round(btcLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceBinance?.state ?? "stale" },
+    { label: "CB", primary: t("uiFrontendStoreValueMs1faeec6b", { p0: Math.round(coinbaseLatency.marketUpdateAgeMs) }), secondary: t("uiStateUpstreamTransportMs3c89b45e", { p0: `${t("uiCoinbaseFeedb41e66a7")} ${componentStateLabel(sourceCoinbase?.state, language)}`, p1: Math.round(coinbaseLatency.sourceDataAgeMs), p2: Math.round(coinbaseLatency.backendToFrontendLatencyMs ?? 0) }), tone: sourceCoinbase?.state ?? "stale" },
+    { label: "Gamma", primary: currentRound?.lastPollAt ? `${Math.round((nowMs - currentRound.lastPollAt) / 1000)}s` : "--", secondary: `${t("uiSettlementPollf8a550bd")} · ${t("uiFinalSettlement004ceaa1")}`, tone: currentRound?.status === "Manual" ? "manual" : "healthy" }
   ];
   const bookStatsFor = (side: TradeSide) => {
     const book = snapshot?.orderBooks[side];
@@ -3406,7 +3406,6 @@ function TradePageRestored(props: {
                 <div className={`health-dot ${item.tone}`} key={item.label}>
                   <div className="health-dot-head"><b>{item.label}</b><strong>{item.primary}</strong></div>
                   <span>{item.secondary}</span>
-                  <span>{item.detail}</span>
                 </div>
               ))}
             </div>

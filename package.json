@@ -1,6 +1,6 @@
 {
   "name": "btc-paper-trading-cs",
-  "version": "0.6.3",
+  "version": "0.6.5",
   "private": true,
   "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
@@ -147,5 +147,6 @@
       "createStartMenuShortcut": true,
       "shortcutName": "BTC Paper Trading Test"
     }
-  }
+  },
+  "productionApiBaseUrl": "http://103.147.13.98:10001"
 }

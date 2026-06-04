@@ -7,6 +7,7 @@ import {
   Registry
 } from "prom-client";
 import type { SourceHealth } from "../domain/types";
+import type { TradePersistSegmentName } from "./simulation/order-persistence";
 
 export type JsonlWriterStats = {
   queueDepth: number;
@@ -171,6 +172,14 @@ export class AppMetrics {
     help: "Order placement duration in seconds.",
     labelNames: ["status"],
     buckets: [0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 2, 5],
+    registers: [this.registry]
+  });
+
+  private readonly tradePersistSegmentDuration = new Histogram({
+    name: "trade_persist_segment_duration_seconds",
+    help: "Trade persistence segment duration in seconds.",
+    labelNames: ["segment"],
+    buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
     registers: [this.registry]
   });
 
@@ -353,6 +362,10 @@ export class AppMetrics {
   recordOrder(status: string, durationMs: number) {
     this.orderStatus.inc({ status });
     this.orderDuration.observe({ status }, durationMs / 1000);
+  }
+
+  recordTradePersistSegment(segment: TradePersistSegmentName, durationMs: number) {
+    this.tradePersistSegmentDuration.observe({ segment }, durationMs / 1000);
   }
 
   setPendingOrders(count: number) {

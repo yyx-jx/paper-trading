@@ -5,9 +5,9 @@ services:
     env_file:
       - ${APP_ENV_FILE:-.env}
     ports:
-      - "10001:10001"
+      - "${PUBLIC_BIND_HOST:-0.0.0.0}:${PUBLIC_PORT:-10001}:10001"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDY_CONFIG_PATH:-./deploy/Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -17,6 +17,12 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    command:
+      - postgres
+      - --checkpoint_timeout=15min
+      - --checkpoint_completion_target=0.9
+      - --max_wal_size=2GB
+      - --min_wal_size=256MB
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-paper_trading}
       POSTGRES_USER: ${POSTGRES_USER:-paper_trading}
@@ -33,7 +39,7 @@ services:
   redis:
     image: redis:8-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
     volumes:
       - redisdata:/data
     healthcheck:
@@ -44,6 +50,7 @@ services:
 
   matching-service:
     restart: unless-stopped
+    image: ${MATCHING_SERVICE_IMAGE:-p-t-matching-service:latest}
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -71,6 +78,7 @@ services:
 
   app-server:
     restart: unless-stopped
+    image: ${APP_SERVER_IMAGE:-p-t-app-server:latest}
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -120,8 +128,38 @@ services:
     depends_on:
       app-server:
         condition: service_healthy
+      node-exporter:
+        condition: service_started
+      cadvisor:
+        condition: service_started
     expose:
       - "9090"
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+    volumes:
+      - /:/host:ro,rslave
+    expose:
+      - "9100"
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    expose:
+      - "8080"
 
   grafana:
     image: grafana/grafana:11.4.0

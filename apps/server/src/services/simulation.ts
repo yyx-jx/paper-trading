@@ -62,6 +62,12 @@ import {
 } from "./simulation/settlement-rules";
 import { QTY_EPSILON, isClientOrderConflict, roundCurrency, roundNumber } from "./simulation/trade-calculations";
 import { buildBehaviorLog, type BehaviorLogBuildInput } from "./simulation/log-builders";
+import {
+  measureTradePersistSegment,
+  persistTradeStepsSequentially,
+  type TradePersistSegmentName,
+  type TradePersistSegments
+} from "./simulation/order-persistence";
 import { shouldRequireManualSettlement } from "./settlement/manual-queue";
 
 const LATENCY_LOG_INTERVAL_MS = 15000;
@@ -74,15 +80,12 @@ const GAMMA_PREFETCH_END_MS = 0;
 const GAMMA_PREFETCH_INTERVAL_MS = 2000;
 
 type TradeLogTask = () => Promise<void>;
-type TradePersistSegmentName =
-  | "persistOrderBookSnapshot"
-  | "persistOrder"
-  | "persistPosition"
-  | "persistUser"
-  | "persistOrderLifecycle"
-  | "commitAndOverhead"
-  | "transactionTotal";
-type TradePersistSegments = Partial<Record<TradePersistSegmentName, number>>;
+
+const tradePersistObserver = {
+  onSegmentObserved: (segment: TradePersistSegmentName, durationMs: number) => {
+    appMetrics.recordTradePersistSegment(segment, durationMs);
+  }
+};
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -428,14 +431,7 @@ export class SimulationEngine {
     name: TradePersistSegmentName,
     handler: () => Promise<T> | T
   ) {
-    const startedAt = Date.now();
-    try {
-      return await handler();
-    } finally {
-      if (segments) {
-        segments[name] = (segments[name] ?? 0) + Math.max(Date.now() - startedAt, 0);
-      }
-    }
+    return measureTradePersistSegment(segments, name, handler, tradePersistObserver);
   }
 
   private emitBridgeEvent(eventName: "signal:emitted" | "paper:filled", payload: unknown) {
@@ -649,12 +645,14 @@ export class SimulationEngine {
               await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
               order.frozenQty = frozenQty;
             }
-            await Promise.all([
-              this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order)),
-              ...(action === "buy"
-                ? [this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user))]
-                : [])
-            ]);
+            await persistTradeStepsSequentially(
+              tradePersistSegments,
+              [
+                { name: "persistOrder", run: () => this.store.persistOrder(order) },
+                ...(action === "buy" ? [{ name: "persistUser" as const, run: () => this.store.persistUser(user) }] : [])
+              ],
+              tradePersistObserver
+            );
           } else if (status === "filled" && estimate.avgPrice) {
             await this.applyFilledOrder(
               user,
@@ -673,13 +671,19 @@ export class SimulationEngine {
             await this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order));
           }
           order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
+          order.serverPublishTs = Date.now();
           order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
+          if (typeof this.store.persistOrderLatency === "function") {
+            await this.store.persistOrderLatency(order);
+          }
         });
         tradePersistSegments.transactionTotal = Math.max(Date.now() - transactionStartedAt, 0);
         const measuredSegmentTotal = Object.entries(tradePersistSegments)
           .filter(([name]) => name !== "transactionTotal" && name !== "commitAndOverhead")
           .reduce((sum, [, value]) => sum + (value ?? 0), 0);
         tradePersistSegments.commitAndOverhead = Math.max(tradePersistSegments.transactionTotal - measuredSegmentTotal, 0);
+        tradePersistObserver.onSegmentObserved("transactionTotal", tradePersistSegments.transactionTotal);
+        tradePersistObserver.onSegmentObserved("commitAndOverhead", tradePersistSegments.commitAndOverhead);
       } catch (writeError) {
         if (clientOrderId && isClientOrderConflict(writeError)) {
           const existingOrderAfterConflict =
@@ -2085,11 +2089,15 @@ export class SimulationEngine {
         order.midPrice || order.avgFillPrice || 0,
         order.actualFee ?? 0
       );
-      await Promise.all([
-        this.measureTradePersistSegment(tradePersistSegments, "persistPosition", () => this.store.persistPosition(position)),
-        this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user)),
-        this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order))
-      ]);
+      await persistTradeStepsSequentially(
+        tradePersistSegments,
+        [
+          { name: "persistPosition", run: () => this.store.persistPosition(position) },
+          { name: "persistUser", run: () => this.store.persistUser(user) },
+          { name: "persistOrder", run: () => this.store.persistOrder(order) }
+        ],
+        tradePersistObserver
+      );
       if (emitUserPayload) {
         this.store.emitUserPayload(user.id, "trade");
       }
@@ -2155,23 +2163,31 @@ export class SimulationEngine {
     const buyOrderIds = [...new Set(changedPositions.map((position) => position.buyOrderId).filter(Boolean) as string[])];
     user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
-    await Promise.all([
-      ...changedPositions.map((position) =>
-        this.measureTradePersistSegment(tradePersistSegments, "persistPosition", () => this.store.persistPosition(position))
-      ),
-      this.measureTradePersistSegment(tradePersistSegments, "persistUser", () => this.store.persistUser(user)),
-      this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order)),
-      this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () => this.store.applyLifecycleExit({
-        userId: user.id,
-        roundId: round.id,
-        side: order.side,
-        qty: order.filledQty,
-        exitType,
-        exitTokenPrice: order.avgFillPrice,
-        exitFee: order.actualFee ?? 0,
-        buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
-      }))
-    ]);
+    await persistTradeStepsSequentially(
+      tradePersistSegments,
+      [
+        ...changedPositions.map((position) => ({
+          name: "persistPosition" as const,
+          run: () => this.store.persistPosition(position)
+        })),
+        { name: "persistUser", run: () => this.store.persistUser(user) },
+        { name: "persistOrder", run: () => this.store.persistOrder(order) },
+        {
+          name: "persistOrderLifecycle",
+          run: () => this.store.applyLifecycleExit({
+            userId: user.id,
+            roundId: round.id,
+            side: order.side,
+            qty: order.filledQty,
+            exitType,
+            exitTokenPrice: order.avgFillPrice,
+            exitFee: order.actualFee ?? 0,
+            buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
+          })
+        }
+      ],
+      tradePersistObserver
+    );
     if (emitUserPayload) {
       this.store.emitUserPayload(user.id, "trade");
     }

@@ -54,6 +54,7 @@ import { appMetrics } from "./services/metrics";
 import { HyperBridge, loadHyperBridgeConfig } from "./services/hyper-bridge";
 import { createWsSessionManager } from "./ws/session";
 import { createHeartbeatController } from "./ws/heartbeat";
+import { startUserHeartbeat } from "./ws/user-heartbeat";
 import { createMarketPayloadBuilder } from "./payloads/market";
 import { createUserPayloadBuilder } from "./payloads/user";
 import { buildManualSettlementCandidates } from "./services/settlement/manual-queue";
@@ -70,12 +71,29 @@ const wsConnectionCounts = {
   user: 0
 };
 const httpStartTimes = new WeakMap<object, number>();
+const fallbackReadInFlight = new Map<string, Promise<unknown>>();
 const heartbeatController = createHeartbeatController({
   recordDisconnect: (channel, reason) => appMetrics.recordWsDisconnect(channel, reason)
 });
 
 function logStartupStage(stage: string) {
   console.log(`[startup] ${new Date().toISOString()} ${stage}`);
+}
+
+function coalesceFallbackRead<T>(key: string, build: () => T) {
+  const existing = fallbackReadInFlight.get(key);
+  if (existing) {
+    return existing as Promise<T>;
+  }
+  const pending = Promise.resolve()
+    .then(build)
+    .finally(() => fallbackReadInFlight.delete(key));
+  fallbackReadInFlight.set(key, pending);
+  return pending;
+}
+
+function fallbackReadCacheKey(name: string, viewedUserId: string, query?: unknown) {
+  return `${name}:${viewedUserId}:${JSON.stringify(query ?? {})}`;
 }
 
 function clientKey(request: { ip?: string; headers: Record<string, string | string[] | undefined> }, suffix: string) {
@@ -2490,7 +2508,10 @@ async function bootstrap() {
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
       const limit = Number((request.query as { limit?: string }).limit ?? 500);
-      return getOperatedHistoryWithSettlementPreview(limit, viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("profile-rounds-operated", viewedUser.id, { limit }),
+        () => getOperatedHistoryWithSettlementPreview(limit, viewedUser.id)
+      );
     })
   );
 
@@ -2499,7 +2520,10 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
-      return store.getProfile(viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("profile-me", viewedUser.id),
+        () => store.getProfile(viewedUser.id)
+      );
     })
   );
 
@@ -2508,7 +2532,10 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
-      return store.getPositions(viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("positions-me", viewedUser.id),
+        () => store.getPositions(viewedUser.id)
+      );
     })
   );
 
@@ -2517,7 +2544,10 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
-      return store.getOrders(viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("orders-me", viewedUser.id),
+        () => store.getOrders(viewedUser.id)
+      );
     })
   );
 
@@ -2526,7 +2556,10 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
-      return store.getOrderLifecycleLogs(viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("order-lifecycles-me", viewedUser.id),
+        () => store.getOrderLifecycleLogs(viewedUser.id)
+      );
     })
   );
 
@@ -2649,7 +2682,10 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
       const viewedUser = getViewedUserFromRequest(user, request);
-      return store.getRecentLogs(viewedUser.id);
+      return coalesceFallbackRead(
+        fallbackReadCacheKey("logs-me", viewedUser.id),
+        () => store.getRecentLogs(viewedUser.id)
+      );
     })
   );
 
@@ -3029,10 +3065,20 @@ async function bootstrap() {
       const listener = (scope?: UserPayloadScope) => queueUserPayload(scope ?? "full");
       queueUserPayload("full");
       store.emitter.on(eventName, listener);
+      const stopUserHeartbeat = startUserHeartbeat({
+        socket,
+        canSend: () =>
+          !userSendInFlight &&
+          !userRetryTimer &&
+          !pendingUserPayloadScope &&
+          socket.bufferedAmount <= 0,
+        onSend: (bytes, durationMs, ok) => appMetrics.recordWsSend("user", bytes, durationMs, ok)
+      });
       socket.on("close", () => {
         if (userRetryTimer) {
           clearTimeout(userRetryTimer);
         }
+        stopUserHeartbeat();
         wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
         appMetrics.setWsConnections("user", wsConnectionCounts.user);
         if (!consumeHeartbeatTimeout(socket)) {

@@ -21,7 +21,6 @@ ENV NODE_ENV=production
 RUN apk add --no-cache bash postgresql-client
 COPY package.json package-lock.json ./
 COPY --from=prod-deps /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
 COPY scripts ./scripts
 COPY db ./db
 COPY apps/server/src ./apps/server/src
@@ -30,9 +29,11 @@ RUN chown -R node:node /app/data
 USER node
 
 FROM base-runner AS app-server
+COPY --from=builder /app/dist/server ./dist/server
 EXPOSE 8787
 CMD ["node", "dist/server/index.js"]
 
 FROM base-runner AS matching-service
+COPY --from=builder /app/dist/matching ./dist/matching
 EXPOSE 8788
 CMD ["node", "dist/matching/matching-index.js"]

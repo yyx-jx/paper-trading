@@ -37,6 +37,7 @@ const includedTopLevel = new Set([
   "docker-compose.deploy.yml",
   ".dockerignore",
   ".env.example",
+  ".env.green.example",
   ".env.production.example",
   "package.json",
   "package-lock.json",

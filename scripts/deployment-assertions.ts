@@ -12,9 +12,10 @@ export function assertProductionDeploymentBaseline() {
   const caddy = readText("deploy/Caddyfile");
   const packageJson = readText("package.json");
   const deploymentDoc = readText("docs/deployment-production.md");
+  const envGreen = readText(".env.green.example");
 
   assert.match(compose, /caddy:/);
-  assert.match(compose, /"10001:10001"/);
+  assert.match(compose, /\$\{PUBLIC_BIND_HOST:-0\.0\.0\.0\}:\$\{PUBLIC_PORT:-10001\}:10001/);
   assert.doesNotMatch(compose, /"8787:8787"/);
   assert.doesNotMatch(compose, /"8788:8788"/);
   assert.doesNotMatch(compose, /"5432:5432"/);
@@ -22,6 +23,8 @@ export function assertProductionDeploymentBaseline() {
   assert.match(compose, /SERVER_REQUIRE_MIGRATIONS: "true"/);
   assert.match(compose, /SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP: "false"/);
   assert.match(compose, /TRUST_PROXY: "true"/);
+  assert.match(compose, /image: \$\{APP_SERVER_IMAGE:-p-t-app-server:latest\}/);
+  assert.match(compose, /image: \$\{MATCHING_SERVICE_IMAGE:-p-t-matching-service:latest\}/);
   assert.match(compose, /healthcheck:/);
   assert.match(compose, /http:\/\/127\.0\.0\.1:8787\/api\/health\/ready/);
   assert.doesNotMatch(dockerfile, /COPY data \.\/data/);
@@ -31,6 +34,9 @@ export function assertProductionDeploymentBaseline() {
   assert.match(packageJson, /"package:win:prod": "node scripts\/package-win-prod\.cjs"/);
   assert.match(packageJson, /"test:electron-config": "tsx scripts\/electron-config-check\.ts"/);
   assert.match(deploymentDoc, /ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http:\/\/103\.147\.13\.98:10001 npm run package:win:prod/);
+  assert.match(envGreen, /PUBLIC_PORT=10002/);
+  assert.match(envGreen, /POSTGRES_DB=paper_trading_green/);
+  assert.match(envGreen, /HYPER_BRIDGE_ENABLED=false/);
 
   assert.throws(() =>
     buildServerConfig({

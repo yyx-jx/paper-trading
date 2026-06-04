@@ -126,7 +126,7 @@ export function buildHyperSignal(input: SignalEmittedPayload, mode: HyperBridgeM
   return {
     signal_id: input.traceId,
     client_order_id: input.payload.clientOrderId ?? `${input.traceId}_real`,
-    hyper_user_id: input.user.id,
+    hyper_user_id: input.user.username,
     market_id: input.marketId,
     token_id: null,
     side,
