@@ -53,7 +53,7 @@ export function canChangeUserGroupForActor(actor: UserRecord, target: UserRecord
   return actor.role === "Admin" && target.role === "Tester";
 }
 
-export function canManageUser(actor: UserRecord, target: UserRecord, users: UserRecord[]) {
+export function canManageUser(actor: UserRecord, target: UserRecord, _users: UserRecord[]) {
   if (actor.role === "Admin") {
     return true;
   }

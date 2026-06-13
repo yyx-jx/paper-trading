@@ -25,6 +25,13 @@ export const USER_LIVE_RECOVERY_PAYLOADS = 1;
 
 const REALTIME_STATUS_MIN_HOLD_MS = 1500;
 const REALTIME_FAILURES_BEFORE_DEGRADE = 2;
+const channelStateLabelKeys: Record<RealtimeChannelState, string> = {
+  connecting: "uiRealtimeStateConnecting",
+  live: "uiRealtimeStateLive",
+  reconnecting: "uiRealtimeStateReconnecting",
+  fallback: "uiRealtimeStateFallback",
+  offline: "uiRealtimeStateOffline"
+};
 
 export const initialRealtimeStatus = (): RealtimeStatus => ({
   market: { state: "connecting", reconnects: 0, stateChangedAt: Date.now(), livePayloads: 0, consecutiveFailures: 0 },
@@ -91,18 +98,11 @@ export function transitionRealtimeChannel(
   return next;
 }
 
-export function realtimeStatusLabel(status: RealtimeStatus, language: Language) {
-  const states = [status.market.state, status.user.state];
-  if (states.includes("offline")) {
-    return t("backendOffline");
-  }
-  if (states.includes("fallback")) {
-    return t("uiFallbackRefresh47247ec9");
-  }
-  if (states.includes("reconnecting") || states.includes("connecting")) {
-    return t("reconnecting");
-  }
-  return t("uiLive7a0a1049");
+export function realtimeStatusLabel(status: RealtimeStatus, _language: Language) {
+  return t("uiRealtimeMarketUserState", {
+    p0: t(channelStateLabelKeys[status.market.state]),
+    p1: t(channelStateLabelKeys[status.user.state])
+  });
 }
 
 export function realtimeStatusTone(status: RealtimeStatus) {
@@ -119,7 +119,7 @@ export function realtimeStatusTone(status: RealtimeStatus) {
   return "live";
 }
 
-export function realtimeStatusDetail(status: RealtimeStatus, nowMs: number, language: Language) {
+export function realtimeStatusDetail(status: RealtimeStatus, nowMs: number, _language: Language) {
   const ageText = (at?: number) => (at ? `${Math.max(0, Math.round((nowMs - at) / 1000))}s` : "--");
   return t("uiMarketValueUserValue64f354f0", { p0: ageText(status.market.lastMessageAt), p1: ageText(status.user.lastMessageAt) });
 }

@@ -8,12 +8,14 @@ export type WsChannel = "market" | "user";
 export type WsSession = {
   actor: UserRecord;
   viewedUser: UserRecord;
+  clientInstanceId?: string;
 };
 
 type WsTicketRecord = {
   userId: string;
   viewedUserId: string;
   channel: WsChannel;
+  clientInstanceId?: string;
   expiresAt: number;
 };
 
@@ -28,10 +30,26 @@ export type WsSessionManager = {
   readViewUserId(query: unknown): string | undefined;
   resolveViewedUser(actor: UserRecord, viewUserId?: string): UserRecord;
   getViewedUserFromRequest(actor: UserRecord, request: { query?: unknown }): UserRecord;
-  createWsTicket(user: UserRecord, channel: WsChannel, viewUserId?: string): { ticket: string; expiresAt: number };
+  createWsTicket(
+    user: UserRecord,
+    channel: WsChannel,
+    viewUserId?: string,
+    clientInstanceId?: string
+  ): { ticket: string; expiresAt: number };
   consumeWsTicket(rawTicket: string | undefined, channel: WsChannel): WsSession | undefined;
-  getWsSession(query: { token?: string; ticket?: string; viewUserId?: string }, channel: WsChannel): WsSession | undefined;
+  getWsSession(
+    query: { token?: string; ticket?: string; viewUserId?: string; clientInstanceId?: string },
+    channel: WsChannel
+  ): WsSession | undefined;
 };
+
+export function normalizeClientInstanceId(raw: unknown) {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const value = raw.trim();
+  return /^[A-Za-z0-9_-]{8,80}$/.test(value) ? value : undefined;
+}
 
 export function createWsSessionManager(input: {
   jwtSecret: string;
@@ -89,7 +107,12 @@ export function createWsSessionManager(input: {
   const getViewedUserFromRequest = (actor: UserRecord, request: { query?: unknown }) =>
     resolveViewedUser(actor, readViewUserId(request.query));
 
-  const createWsTicket = (user: UserRecord, channel: WsChannel, viewUserId?: string) => {
+  const createWsTicket = (
+    user: UserRecord,
+    channel: WsChannel,
+    viewUserId?: string,
+    clientInstanceId?: string
+  ) => {
     const viewedUser = resolveViewedUser(user, viewUserId);
     const ticket = `wst_${nanoid(32)}`;
     const expiresAt = Date.now() + ticketTtlMs;
@@ -97,6 +120,7 @@ export function createWsSessionManager(input: {
       userId: user.id,
       viewedUserId: viewedUser.id,
       channel,
+      clientInstanceId: normalizeClientInstanceId(clientInstanceId),
       expiresAt
     });
     return {
@@ -120,12 +144,13 @@ export function createWsSessionManager(input: {
     }
     return {
       actor,
-      viewedUser: resolveViewedUser(actor, ticket.viewedUserId)
+      viewedUser: resolveViewedUser(actor, ticket.viewedUserId),
+      clientInstanceId: ticket.clientInstanceId
     };
   };
 
   const getWsSession = (
-    query: { token?: string; ticket?: string; viewUserId?: string },
+    query: { token?: string; ticket?: string; viewUserId?: string; clientInstanceId?: string },
     channel: WsChannel
   ): WsSession | undefined => {
     const ticketSession = consumeWsTicket(query.ticket, channel);
@@ -143,7 +168,8 @@ export function createWsSessionManager(input: {
     }
     return {
       actor,
-      viewedUser: resolveViewedUser(actor, query.viewUserId)
+      viewedUser: resolveViewedUser(actor, query.viewUserId),
+      clientInstanceId: normalizeClientInstanceId(query.clientInstanceId)
     };
   };
 

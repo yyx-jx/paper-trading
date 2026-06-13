@@ -1,6 +1,6 @@
 {
   "name": "btc-paper-trading-cs",
-  "version": "0.6.5",
+  "version": "0.7.3",
   "private": true,
   "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
@@ -36,6 +36,7 @@
     "test:order-transactions": "tsx scripts/order-transactions-check.ts && tsx scripts/order-idempotency-check.ts",
     "test:order-idempotency": "tsx scripts/order-idempotency-check.ts",
     "test:electron-config": "tsx scripts/electron-config-check.ts",
+    "test:production-proxy": "node scripts/production-proxy-ws-check.cjs",
     "test:i18n": "tsx scripts/i18n-missing-check.ts",
     "test:frontend-display": "tsx scripts/frontend-display-check.ts",
     "test:production-client-load": "tsx scripts/production-client-load-test.ts",
@@ -51,6 +52,7 @@
     "test:ui": "electron scripts/electron-ui-check.cjs",
     "test:trading": "tsx scripts/trading-engine-check.ts && tsx scripts/limit-order-lifecycle-check.ts && tsx scripts/latency-optimization-check.ts && tsx scripts/frontend-display-check.ts",
     "test:regression": "tsx scripts/flow-regression-check.ts",
+    "test:user-ws-connections": "tsx scripts/user-ws-connections-check.ts",
     "build": "npm run build:server && npm run build:matching && npm run build:renderer",
     "build:server": "tsup --config tsup.server.config.ts",
     "build:matching": "tsup --config tsup.matching.config.ts",
@@ -148,5 +150,6 @@
       "shortcutName": "BTC Paper Trading Test"
     }
   },
-  "productionApiBaseUrl": "http://103.147.13.98:10001"
+  "productionApiBaseUrl": "http://103.179.242.161:10001",
+  "productionClientConnectionMode": "proxy"
 }

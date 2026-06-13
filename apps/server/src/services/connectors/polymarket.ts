@@ -209,26 +209,6 @@ function upsertBookLevel(
   return nextLevels;
 }
 
-function applyPriceChangeToBook(
-  book: OrderBookSnapshot,
-  input: { side: "BUY" | "SELL"; price: number; qty: number; snapshotTs: number; snapshotId?: string }
-): OrderBookSnapshot | undefined {
-  if (input.snapshotTs < book.snapshotTs) {
-    return undefined;
-  }
-  const nextBook =
-    input.side === "BUY"
-      ? { ...book, bids: upsertBookLevel(book.bids, input) }
-      : { ...book, asks: upsertBookLevel(book.asks, input) };
-  const top = recomputeBookTop(nextBook);
-  return {
-    ...nextBook,
-    ...top,
-    snapshotId: input.snapshotId ?? `ws_delta_${input.snapshotTs}`,
-    snapshotTs: input.snapshotTs
-  };
-}
-
 type ParsedPriceChange = {
   side: TradeSide;
   bookSide: "BUY" | "SELL";
@@ -1053,10 +1033,6 @@ export class PolymarketConnector {
     );
   }
 
-  private matchesText(haystack: string) {
-    return haystack.includes("bitcoin") && haystack.includes("up") && haystack.includes("down");
-  }
-
   private async refreshBooks(targetMarket = this.state.currentMarket) {
     if (!targetMarket) {
       return;
@@ -1552,7 +1528,7 @@ export class PolymarketConnector {
     }
   }
 
-  private bookFromWsMessage(message: Record<string, unknown>, side: TradeSide): OrderBookSnapshot {
+  private bookFromWsMessage(message: Record<string, unknown>, _side: TradeSide): OrderBookSnapshot {
     const top = recomputeBookTop({
       bids: this.parseWsLevels(message.bids),
       asks: this.parseWsLevels(message.asks)

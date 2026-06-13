@@ -31,8 +31,11 @@ export function PersonalHomePage(props: {
   userManagementSlot?: ReactNode;
   onProfileRefresh: () => Promise<void>;
   onUserUpdated: (user: PublicUser) => void;
+  canLoadMoreLogs: boolean;
+  logsLoading: boolean;
+  onLoadMoreLogs: () => Promise<void>;
 }) {
-  const { t, token, me, language } = props;
+  const { t, token, me } = props;
   const [displayName, setDisplayName] = useState(me.displayName);
   const [selfLanguage, setSelfLanguage] = useState<Language>(me.language);
   const [passwordDialog, setPasswordDialog] = useState<{ currentPassword: string; password: string; confirmPassword: string }>();
@@ -141,11 +144,21 @@ export function PersonalHomePage(props: {
         <div className="analytics-card personal-activity-card">
           <span>{t("uiRecentActivity767220e6")}</span>
           <div className="personal-activity-list">
-            {props.logs.slice(0, 6).map((log) => (
+            {props.logs.map((log) => (
               <div key={log.eventId}><strong>{log.actionType}</strong><small>{timeText(log.serverRecvTs)} · {redactNetworkAddresses(log.resultMessage)}</small></div>
             ))}
             {props.logs.length === 0 ? <small>{t("noData")}</small> : null}
           </div>
+          {props.canLoadMoreLogs ? (
+            <button
+              type="button"
+              className="ghost-button compact-button"
+              disabled={props.logsLoading}
+              onClick={() => void props.onLoadMoreLogs()}
+            >
+              {props.logsLoading ? t("loading") : t("loadMore")}
+            </button>
+          ) : null}
         </div>
       </div>
 

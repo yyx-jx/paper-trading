@@ -1,5 +1,6 @@
 export type TradePersistSegmentName =
   | "persistOrderBookSnapshot"
+  | "persistTradeWriteBatch"
   | "persistOrder"
   | "persistPosition"
   | "persistUser"

@@ -1,7 +1,7 @@
 import WebSocket from "ws";
 import type { Agent } from "node:http";
 import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from "./network";
-import type { BinanceConnectorState, CandleBar, CandleInterval, CandlePoint, SourceHealth } from "../../domain/types";
+import type { BinanceConnectorState, CandleBar, CandleInterval, SourceHealth } from "../../domain/types";
 
 const BAR_LIMITS: Record<CandleInterval, number> = {
   "30s": 240,
@@ -274,8 +274,7 @@ export class BinanceConnector {
       this.staleTimer = undefined;
     }
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
   }
@@ -723,12 +722,17 @@ export class BinanceConnector {
     }
   }
 
+  private closeSocketQuietly(socket: WebSocket) {
+    socket.removeAllListeners();
+    socket.once("error", () => undefined);
+    socket.close();
+  }
+
   private scheduleReconnect(message: string) {
     this.reconnectCount += 1;
     this.lastWsMessageAt = 0;
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
     this.state = {

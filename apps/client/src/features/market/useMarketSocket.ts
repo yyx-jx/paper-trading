@@ -1,10 +1,5 @@
 import { useEffect, type Dispatch, type RefObject, type SetStateAction } from "react";
-import {
-  api,
-  type MarketHistoryPatchPayload,
-  type MarketPayload,
-  type MarketTickPayload
-} from "../../utils/api";
+import { api, type MarketHistoryPatchPayload, type MarketPayload, type MarketTickPayload } from "../../utils/api";
 import { redactNetworkAddresses } from "../../utils/redaction";
 import { useAppStore } from "../../store/useAppStore";
 import {
@@ -13,25 +8,15 @@ import {
   type RealtimeChannelStatus,
   type RealtimeStatus
 } from "../realtime/status";
-
-function transportAgeMs(receivedAt: number, publishTs: number, clientClockOffsetMs = 0) {
-  return Math.max(receivedAt - publishTs - clientClockOffsetMs, 0);
-}
-
-function extractMarketPayloadPublishTs(payload?: Pick<MarketPayload, "snapshot" | "transportMeta">) {
-  if (!payload?.snapshot) {
-    return 0;
-  }
-  if (payload.transportMeta?.serverPublishTs) {
-    return payload.transportMeta.serverPublishTs;
-  }
-  const snapshot = payload.snapshot;
-  return Math.max(
-    snapshot.sources.binance.serverPublishTs,
-    snapshot.sources.coinbase.serverPublishTs,
-    snapshot.sources.clob.serverPublishTs
-  );
-}
+import { createRealtimeSocketRuntime, evaluateRealtimeWatchdog } from "../realtime/socket-runtime";
+import {
+  createMarketFallbackPayload,
+  extractMarketPayloadPublishTs,
+  MARKET_SOCKET_TIMING,
+  parseMarketWsMessage,
+  type MarketWsMessage
+} from "./market-ws-message";
+import { shouldRecoverClosedMarketSocket, shouldRejectStaleMarketPayload } from "./market-reconnect-policy";
 
 export function useMarketSocket(input: {
   token?: string;
@@ -57,28 +42,19 @@ export function useMarketSocket(input: {
     const activeViewUserId = input.activeViewUserId ?? input.meId;
     let disposed = false;
     let marketSocket: WebSocket | undefined;
-    let marketReconnectTimer: number | undefined;
-    let marketWatchdogTimer: number | undefined;
-    let lastMarketMessageAt = Date.now();
+    const marketRuntime = createRealtimeSocketRuntime();
     let refreshingMarket = false;
-    let lastMarketFallbackAt = 0;
-    const reconnectDelayMs = 1000;
-    const marketPayloadRejectMs = 4000;
-    const marketStaleMs = 1500;
-    const marketReconnectStaleMs = 4000;
-    const marketFallbackCooldownMs = 1500;
     let pendingMarketTick: { data: MarketTickPayload; receivedAt: number } | undefined;
     let marketTickFrame: number | undefined;
-
     const markMarketActivity = (receivedAt = Date.now()) => {
-      lastMarketMessageAt = receivedAt;
+      marketRuntime.markFrame(receivedAt);
+      marketRuntime.markAccepted(receivedAt);
       input.updateRealtimeChannel(
         "market",
         { state: "live", lastMessageAt: receivedAt, lastError: undefined },
         { now: receivedAt, recoverPayloads: MARKET_LIVE_RECOVERY_PAYLOADS }
       );
     };
-
     const markMarketRendered = (receivedAt: number) => {
       window.requestAnimationFrame(() => {
         if (!disposed) {
@@ -86,30 +62,27 @@ export function useMarketSocket(input: {
         }
       });
     };
-
     const refreshMarketSnapshot = async () => {
       if (disposed || refreshingMarket) {
         return;
       }
       refreshingMarket = true;
-      lastMarketFallbackAt = Date.now();
-      input.updateRealtimeChannel("market", { state: "fallback", fallbackAt: lastMarketFallbackAt }, { now: lastMarketFallbackAt, failure: true });
+      const fallbackAt = marketRuntime.markFallback();
+      input.updateRealtimeChannel("market", { state: "fallback", fallbackAt }, { now: fallbackAt, failure: true });
       try {
         const roundData = await api.getCurrentRound(input.token!, activeViewUserId);
         if (!disposed) {
           const receivedAt = Date.now();
-          const payload = {
-            viewedUserId: roundData.viewedUserId ?? activeViewUserId,
-            currentRound: roundData.currentRound,
-            history: useAppStore.getState().history,
-            snapshot: roundData.snapshot,
-            settlementPreview: roundData.settlementPreview,
-            transportMeta: roundData.transportMeta
-          };
+          const payload = createMarketFallbackPayload({
+            roundData,
+            activeViewUserId,
+            history: useAppStore.getState().history
+          });
           if (input.setMarketPayload(payload, receivedAt, input.clientClockOffsetMsRef.current)) {
             markMarketActivity(receivedAt);
             markMarketRendered(receivedAt);
           } else {
+            marketRuntime.markRejected("http_snapshot_store_rejected");
             input.updateRealtimeChannel(
               "market",
               { state: marketSocket?.readyState === WebSocket.OPEN ? "live" : "fallback" },
@@ -126,9 +99,8 @@ export function useMarketSocket(input: {
         refreshingMarket = false;
       }
     };
-
     const scheduleMarketReconnect = () => {
-      if (disposed || typeof marketReconnectTimer === "number") {
+      if (disposed || typeof marketRuntime.getReconnectTimer() === "number") {
         return;
       }
       input.setRealtimeStatus((current) => ({
@@ -138,10 +110,10 @@ export function useMarketSocket(input: {
           reconnects: current.market.reconnects + 1
         }, { failure: true })
       }));
-      marketReconnectTimer = window.setTimeout(() => {
-        marketReconnectTimer = undefined;
+      marketRuntime.setReconnectTimer(window.setTimeout(() => {
+        marketRuntime.setReconnectTimer(undefined);
         void connectMarketSocket();
-      }, reconnectDelayMs);
+      }, MARKET_SOCKET_TIMING.reconnectDelayMs));
     };
 
     const connectMarketSocket = async () => {
@@ -149,6 +121,7 @@ export function useMarketSocket(input: {
         return;
       }
       marketSocket?.close();
+      marketRuntime.markConnectAttempt();
       input.updateRealtimeChannel("market", { state: "connecting", lastError: undefined }, { force: true });
       let wsUrl = api.createWsUrl("/ws/market", input.token!, activeViewUserId);
       try {
@@ -167,15 +140,10 @@ export function useMarketSocket(input: {
       };
       socket.onmessage = (event) => {
         const receivedAt = Date.now();
-        let parsed: {
-          type: "market" | "market:tick" | "market:history-patch";
-          data: MarketPayload | MarketTickPayload | MarketHistoryPatchPayload;
-        };
+        marketRuntime.markFrame(receivedAt);
+        let parsed: MarketWsMessage;
         try {
-          parsed = JSON.parse(event.data) as {
-            type: "market" | "market:tick" | "market:history-patch";
-            data: MarketPayload | MarketTickPayload | MarketHistoryPatchPayload;
-          };
+          parsed = parseMarketWsMessage(event.data);
         } catch (parseError) {
           input.updateRealtimeChannel("market", {
             lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid market message."
@@ -183,31 +151,30 @@ export function useMarketSocket(input: {
           return;
         }
         if (parsed.type === "market") {
-          const data = parsed.data as MarketPayload;
+          const data = parsed.data;
           const publishTs = extractMarketPayloadPublishTs(data);
-          const payloadAgeMs =
-            publishTs > 0 ? transportAgeMs(receivedAt, publishTs, input.clientClockOffsetMsRef.current) : 0;
-          if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
-            void refreshMarketSnapshot();
-            if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
-              socket.close();
-            }
+          if (shouldRejectStaleMarketPayload(receivedAt, publishTs, input.clientClockOffsetMsRef.current)) {
+            marketRuntime.markRejected("payload_too_old");
             return;
           }
           if (input.setMarketPayload(data, receivedAt, input.clientClockOffsetMsRef.current)) {
             markMarketActivity(receivedAt);
             markMarketRendered(receivedAt);
+          } else {
+            marketRuntime.markRejected("market_store_rejected");
           }
           return;
         }
         if (parsed.type === "market:history-patch") {
-          if (input.setMarketHistoryPatch(parsed.data as MarketHistoryPatchPayload)) {
+          if (input.setMarketHistoryPatch(parsed.data)) {
             markMarketActivity(receivedAt);
+          } else {
+            marketRuntime.markRejected("history_patch_rejected");
           }
           return;
         }
         if (parsed.type === "market:tick") {
-          pendingMarketTick = { data: parsed.data as MarketTickPayload, receivedAt };
+          pendingMarketTick = { data: parsed.data, receivedAt };
           if (typeof marketTickFrame !== "number") {
             marketTickFrame = window.requestAnimationFrame(() => {
               marketTickFrame = undefined;
@@ -217,17 +184,15 @@ export function useMarketSocket(input: {
                 return;
               }
               const publishTs = pending.data.transportMeta?.serverPublishTs ?? 0;
-              const payloadAgeMs =
-                publishTs > 0 ? transportAgeMs(pending.receivedAt, publishTs, input.clientClockOffsetMsRef.current) : 0;
-              if (publishTs > 0 && payloadAgeMs > marketPayloadRejectMs) {
-                if (payloadAgeMs > marketReconnectStaleMs && socket.readyState === WebSocket.OPEN) {
-                  socket.close();
-                }
+              if (shouldRejectStaleMarketPayload(pending.receivedAt, publishTs, input.clientClockOffsetMsRef.current)) {
+                marketRuntime.markRejected("tick_payload_too_old");
                 return;
               }
               if (input.setMarketTickPayload(pending.data, pending.receivedAt, input.clientClockOffsetMsRef.current)) {
                 markMarketActivity(pending.receivedAt);
                 input.markMarketRenderCommit(pending.receivedAt);
+              } else {
+                marketRuntime.markRejected("tick_store_rejected");
               }
             });
           }
@@ -249,13 +214,9 @@ export function useMarketSocket(input: {
       if (disposed) {
         return;
       }
-      const now = Date.now();
-      const marketIdleMs = now - lastMarketMessageAt;
-      if (!marketSocket || marketSocket.readyState !== WebSocket.OPEN) {
+      if (shouldRecoverClosedMarketSocket(marketSocket?.readyState)) {
         void refreshMarketSnapshot();
         scheduleMarketReconnect();
-      } else if (marketIdleMs > marketStaleMs) {
-        void refreshMarketSnapshot();
       }
     };
 
@@ -269,38 +230,37 @@ export function useMarketSocket(input: {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleForegroundRecovery);
     window.addEventListener("pageshow", handleForegroundRecovery);
-    marketWatchdogTimer = window.setInterval(() => {
+    marketRuntime.setWatchdogTimer(window.setInterval(() => {
       if (disposed) {
         return;
       }
       const now = Date.now();
       const socket = marketSocket;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        if (now - lastMarketFallbackAt > marketFallbackCooldownMs) {
-          void refreshMarketSnapshot();
-        }
-        if (!socket || socket.readyState === WebSocket.CLOSED) {
-          scheduleMarketReconnect();
-        }
-      } else {
-        const idleMs = now - lastMarketMessageAt;
-        if (socket.readyState === WebSocket.OPEN && idleMs > marketStaleMs && now - lastMarketFallbackAt > marketFallbackCooldownMs) {
-          void refreshMarketSnapshot();
-        }
-        if (socket.readyState === WebSocket.OPEN && idleMs > marketReconnectStaleMs) {
-          socket.close();
-        }
+      const decision = evaluateRealtimeWatchdog({
+        socketState: socket?.readyState,
+        idleMs: marketRuntime.frameIdleMs(now),
+        acceptedIdleMs: marketRuntime.acceptedIdleMs(now),
+        fallbackCooldownMs: MARKET_SOCKET_TIMING.fallbackCooldownMs,
+        staleMs: MARKET_SOCKET_TIMING.staleMs,
+        reconnectStaleMs: MARKET_SOCKET_TIMING.reconnectStaleMs,
+        sinceLastFallbackMs: marketRuntime.sinceLastFallbackMs(now),
+        connectionAgeMs: marketRuntime.connectionAgeMs(now),
+        connectingStaleMs: MARKET_SOCKET_TIMING.connectingStaleMs
+      });
+      if (decision.shouldRefresh) {
+        void refreshMarketSnapshot();
       }
-    }, 250);
+      if (decision.shouldReconnect) {
+        scheduleMarketReconnect();
+      }
+      if (decision.shouldClose && socket) {
+        socket.close();
+      }
+    }, 250));
 
     return () => {
       disposed = true;
-      if (typeof marketReconnectTimer === "number") {
-        window.clearTimeout(marketReconnectTimer);
-      }
-      if (typeof marketWatchdogTimer === "number") {
-        window.clearInterval(marketWatchdogTimer);
-      }
+      marketRuntime.cleanup((timer) => window.clearTimeout(timer));
       if (typeof marketTickFrame === "number") {
         window.cancelAnimationFrame(marketTickFrame);
       }

@@ -64,7 +64,9 @@ export class CoinbaseConnector {
   private restPollTimer?: NodeJS.Timeout;
   private staleTimer?: NodeJS.Timeout;
   private reconnectCount = 0;
-  private lastWsMessageAt = 0;
+  private lastConnectAt = 0;
+  private lastWsActivityAt = 0;
+  private lastTickerMessageAt = 0;
   private readonly listeners = new Set<(state: CoinbaseConnectorState) => void>();
   private state: CoinbaseConnectorState;
   private readonly product: string;
@@ -119,8 +121,7 @@ export class CoinbaseConnector {
       this.staleTimer = undefined;
     }
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
   }
@@ -143,6 +144,10 @@ export class CoinbaseConnector {
     }
   }
 
+  private isTickerStreamAlive(now = Date.now()) {
+    return this.lastTickerMessageAt > 0 && now - this.lastTickerMessageAt <= this.config.wsStaleMs;
+  }
+
   private async bootstrapFromRest(message: string) {
     try {
       const payload = await this.fetchJson<{ price?: string; time?: string }>(
@@ -158,7 +163,7 @@ export class CoinbaseConnector {
           updatedAt: sourceEventTs,
           status: {
             ...this.state.status,
-            state: this.lastWsMessageAt > 0 ? "healthy" : "reconnecting",
+            state: this.isTickerStreamAlive(now) ? "healthy" : "reconnecting",
             sourceEventTs,
             serverRecvTs: now,
             normalizedTs: now,
@@ -184,8 +189,8 @@ export class CoinbaseConnector {
   }
 
   private async pollRestTicker() {
-    const wsAlive = this.lastWsMessageAt > 0 && Date.now() - this.lastWsMessageAt <= this.config.wsStaleMs;
-    if (wsAlive) {
+    const now = Date.now();
+    if (this.isTickerStreamAlive(now)) {
       return;
     }
     try {
@@ -193,7 +198,6 @@ export class CoinbaseConnector {
         `${this.config.restUrl}/products/${this.product}/ticker`
       );
       const price = Number(payload.price);
-      const now = Date.now();
       const sourceEventTs = parseIsoTimestampMs(payload.time, now);
       if (Number.isFinite(price) && price > 0) {
         this.state = {
@@ -253,6 +257,7 @@ export class CoinbaseConnector {
       this.config.wsUrl,
       this.proxyWsAgent ? { agent: this.proxyWsAgent as Agent } : undefined
     );
+    this.lastConnectAt = Date.now();
 
     this.ws.on("open", () => {
       try {
@@ -292,7 +297,7 @@ export class CoinbaseConnector {
       try {
         const parsed = JSON.parse(buffer.toString()) as CoinbaseMessage;
         const now = Date.now();
-        this.lastWsMessageAt = now;
+        this.lastWsActivityAt = now;
 
         if (parsed.type === "error") {
           this.state = {
@@ -315,6 +320,7 @@ export class CoinbaseConnector {
           return;
         }
 
+        this.lastTickerMessageAt = now;
         const sourceEventTs = parseIsoTimestampMs(parsed.timestamp, now);
         let appliedPrice = 0;
         for (const ev of parsed.events) {
@@ -372,22 +378,35 @@ export class CoinbaseConnector {
   }
 
   private checkWsStale() {
-    if (!this.ws || this.lastWsMessageAt === 0) {
+    if (!this.ws) {
       return;
     }
     const now = Date.now();
-    if (now - this.lastWsMessageAt <= this.config.wsStaleMs) {
+    if (this.lastTickerMessageAt === 0) {
+      if (this.lastConnectAt > 0 && now - this.lastConnectAt > this.config.wsStaleMs) {
+        this.scheduleReconnect("Coinbase ticker stream did not start after WebSocket connect.");
+      }
       return;
     }
-    this.scheduleReconnect("Coinbase WebSocket became stale.");
+    if (this.isTickerStreamAlive(now)) {
+      return;
+    }
+    this.scheduleReconnect("Coinbase ticker stream became stale while the socket stayed open.");
+  }
+
+  private closeSocketQuietly(socket: WebSocket) {
+    socket.removeAllListeners();
+    socket.once("error", () => undefined);
+    socket.close();
   }
 
   private scheduleReconnect(message: string) {
     this.reconnectCount += 1;
-    this.lastWsMessageAt = 0;
+    this.lastConnectAt = 0;
+    this.lastWsActivityAt = 0;
+    this.lastTickerMessageAt = 0;
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
     this.state = {

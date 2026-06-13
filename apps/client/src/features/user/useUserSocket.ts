@@ -1,8 +1,9 @@
-import { startTransition, useEffect, type Dispatch, type SetStateAction } from "react";
+import { startTransition, useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import {
   api,
   type PublicUser,
   type UserPayload,
+  type UserWsMessage,
   type UserTradePayload
 } from "../../utils/api";
 import { redactNetworkAddresses } from "../../utils/redaction";
@@ -12,6 +13,8 @@ import {
   type RealtimeChannelStatus,
   type RealtimeStatus
 } from "../realtime/status";
+import { getClientInstanceId } from "../realtime/client-instance";
+import { createRealtimeSocketRuntime, evaluateRealtimeWatchdog } from "../realtime/socket-runtime";
 
 export function useUserSocket(input: {
   token?: string;
@@ -27,26 +30,37 @@ export function useUserSocket(input: {
   setUserPayload: (data: UserPayload) => void;
   setUserTradePayload: (data: UserTradePayload) => void;
 }) {
+  const latestUsersRef = useRef<{
+    me?: PublicUser;
+    activeViewedUser?: PublicUser;
+  }>({});
+  latestUsersRef.current = {
+    me: input.me,
+    activeViewedUser: input.activeViewedUser
+  };
+
+  const token = input.token;
+  const meId = input.me?.id;
+  const activeViewUserId = input.activeViewUserId ?? meId;
+  const clientInstanceId = getClientInstanceId();
+
   useEffect(() => {
-    if (!input.token || !input.me) {
+    if (!token || !meId || !activeViewUserId) {
       return;
     }
 
-    const activeViewUserId = input.activeViewUserId ?? input.me.id;
-    const activeViewedUser = input.activeViewedUser ?? input.me;
     let disposed = false;
     let userSocket: WebSocket | undefined;
-    let userReconnectTimer: number | undefined;
-    let userWatchdogTimer: number | undefined;
     let refreshingUser = false;
-    let lastUserMessageAt = Date.now();
-    let lastUserFallbackAt = 0;
+    const userRuntime = createRealtimeSocketRuntime();
     const reconnectDelayMs = 1000;
-    const userReconnectStaleMs = 12_000;
+    const userFrameReconnectStaleMs = 30_000;
+    const userConnectingStaleMs = 8000;
     const userFallbackCooldownMs = 5000;
 
     const markUserActivity = (receivedAt = Date.now()) => {
-      lastUserMessageAt = receivedAt;
+      userRuntime.markFrame(receivedAt);
+      userRuntime.markAccepted(receivedAt);
       input.updateRealtimeChannel(
         "user",
         { state: "live", lastMessageAt: receivedAt, lastError: undefined },
@@ -59,22 +73,26 @@ export function useUserSocket(input: {
         return;
       }
       refreshingUser = true;
-      lastUserFallbackAt = Date.now();
-      input.updateRealtimeChannel("user", { state: "fallback", fallbackAt: lastUserFallbackAt }, { now: lastUserFallbackAt, failure: true });
+      const fallbackAt = userRuntime.markFallback();
+      input.updateRealtimeChannel("user", { state: "fallback", fallbackAt }, { now: fallbackAt, failure: true });
       try {
         const [nextProfile, nextOperatedHistory, nextPositions, nextOrders, nextOrderLifecycles, nextLogs] = await Promise.all([
-          api.getProfile(input.token!, activeViewUserId),
-          api.getOperatedHistory(input.token!, 200, activeViewUserId),
-          api.getPositions(input.token!, activeViewUserId),
-          api.getOrders(input.token!, activeViewUserId),
-          api.getOrderLifecycles(input.token!, activeViewUserId),
-          api.getLogs(input.token!, activeViewUserId)
+          api.getProfile(token, activeViewUserId),
+          api.getOperatedHistory(token, 200, activeViewUserId),
+          api.getPositions(token, activeViewUserId),
+          api.getOrders(token, activeViewUserId),
+          api.getOrderLifecycles(token, activeViewUserId),
+          api.getLogs(token, activeViewUserId)
         ]);
         if (!disposed) {
           const receivedAt = Date.now();
+          const latestViewedUser = latestUsersRef.current.activeViewedUser ?? latestUsersRef.current.me;
+          if (!latestViewedUser) {
+            return;
+          }
           input.setUserPayload({
             viewedUserId: activeViewUserId,
-            viewedUser: activeViewedUser,
+            viewedUser: latestViewedUser,
             profile: nextProfile,
             operatedHistory: nextOperatedHistory,
             positions: nextPositions,
@@ -95,7 +113,7 @@ export function useUserSocket(input: {
     };
 
     const scheduleUserReconnect = () => {
-      if (disposed || typeof userReconnectTimer === "number") {
+      if (disposed || typeof userRuntime.getReconnectTimer() === "number") {
         return;
       }
       input.setRealtimeStatus((current) => ({
@@ -105,10 +123,10 @@ export function useUserSocket(input: {
           reconnects: current.user.reconnects + 1
         }, { failure: true })
       }));
-      userReconnectTimer = window.setTimeout(() => {
-        userReconnectTimer = undefined;
+      userRuntime.setReconnectTimer(window.setTimeout(() => {
+        userRuntime.setReconnectTimer(undefined);
         void connectUserSocket();
-      }, reconnectDelayMs);
+      }, reconnectDelayMs));
     };
 
     const connectUserSocket = async () => {
@@ -116,13 +134,14 @@ export function useUserSocket(input: {
         return;
       }
       userSocket?.close();
+      userRuntime.markConnectAttempt();
       input.updateRealtimeChannel("user", { state: "connecting", lastError: undefined }, { force: true });
-      let wsUrl = api.createWsUrl("/ws/user", input.token!, activeViewUserId);
+      let wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId, clientInstanceId);
       try {
-        const ticket = await api.createWsTicket(input.token!, "user", activeViewUserId);
+        const ticket = await api.createWsTicket(token, "user", activeViewUserId, clientInstanceId);
         wsUrl = api.createWsTicketUrl("/ws/user", ticket.ticket);
       } catch {
-        wsUrl = api.createWsUrl("/ws/user", input.token!, activeViewUserId);
+        wsUrl = api.createWsUrl("/ws/user", token, activeViewUserId, clientInstanceId);
       }
       if (disposed) {
         return;
@@ -134,20 +153,19 @@ export function useUserSocket(input: {
       };
       socket.onmessage = (event) => {
         const receivedAt = Date.now();
+        userRuntime.markFrame(receivedAt);
         const processingStartedAt = performance.now();
-        let parsed: {
-          type: "user" | "user:trade";
-          data: UserPayload | UserTradePayload;
-        };
+        let parsed: UserWsMessage;
         try {
-          parsed = JSON.parse(event.data) as {
-            type: "user" | "user:trade";
-            data: UserPayload | UserTradePayload;
-          };
+          parsed = JSON.parse(event.data) as UserWsMessage;
         } catch (parseError) {
           input.updateRealtimeChannel("user", {
             lastError: parseError instanceof Error ? redactNetworkAddresses(parseError.message) : "Invalid user message."
           });
+          return;
+        }
+        if (parsed.type === "user:heartbeat") {
+          markUserActivity(receivedAt);
           return;
         }
         const payloadBytes = typeof event.data === "string" ? event.data.length : 0;
@@ -190,7 +208,10 @@ export function useUserSocket(input: {
       if (disposed) {
         return;
       }
-      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
+      if (userSocket?.readyState === WebSocket.CONNECTING || userSocket?.readyState === WebSocket.CLOSING) {
+        return;
+      }
+      if (!userSocket || userSocket.readyState === WebSocket.CLOSED || userSocket.readyState === WebSocket.CLOSING) {
         void refreshUserSnapshot();
         scheduleUserReconnect();
       }
@@ -206,41 +227,44 @@ export function useUserSocket(input: {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("focus", handleForegroundRecovery);
     window.addEventListener("pageshow", handleForegroundRecovery);
-    userWatchdogTimer = window.setInterval(() => {
+    userRuntime.setWatchdogTimer(window.setInterval(() => {
       if (disposed) {
         return;
       }
       const now = Date.now();
-      if (!userSocket || userSocket.readyState !== WebSocket.OPEN) {
-        if (now - lastUserFallbackAt > userFallbackCooldownMs) {
-          void refreshUserSnapshot();
-        }
-        if (!userSocket || userSocket.readyState === WebSocket.CLOSED) {
-          scheduleUserReconnect();
-        }
-      } else if (now - lastUserMessageAt > userReconnectStaleMs) {
+      const decision = evaluateRealtimeWatchdog({
+        socketState: userSocket?.readyState,
+        idleMs: userRuntime.frameIdleMs(now),
+        fallbackCooldownMs: userFallbackCooldownMs,
+        reconnectStaleMs: userSocket?.readyState === WebSocket.OPEN ? userFrameReconnectStaleMs : undefined,
+        sinceLastFallbackMs: userRuntime.sinceLastFallbackMs(now),
+        connectionAgeMs: userRuntime.connectionAgeMs(now),
+        connectingStaleMs: userConnectingStaleMs
+      });
+      if (decision.shouldRefresh) {
+        void refreshUserSnapshot();
+      }
+      if (decision.shouldReconnect) {
+        scheduleUserReconnect();
+      }
+      if (decision.shouldClose && userSocket) {
         userSocket.close();
       }
-    }, 500);
+    }, 500));
 
     return () => {
       disposed = true;
-      if (typeof userReconnectTimer === "number") {
-        window.clearTimeout(userReconnectTimer);
-      }
-      if (typeof userWatchdogTimer === "number") {
-        window.clearInterval(userWatchdogTimer);
-      }
+      userRuntime.cleanup((timer) => window.clearTimeout(timer));
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("focus", handleForegroundRecovery);
       window.removeEventListener("pageshow", handleForegroundRecovery);
       userSocket?.close();
     };
   }, [
-    input.token,
-    input.me,
-    input.activeViewUserId,
-    input.activeViewedUser,
+    token,
+    meId,
+    activeViewUserId,
+    clientInstanceId,
     input.setRealtimeStatus,
     input.updateRealtimeChannel,
     input.setUserPayload,

@@ -1,5 +1,4 @@
 import cors from "@fastify/cors";
-import { createHash } from "node:crypto";
 import websocket from "@fastify/websocket";
 import Fastify from "fastify";
 import jwt from "jsonwebtoken";
@@ -8,6 +7,12 @@ import { WebSocket as WsWebSocket } from "ws";
 import { z } from "zod";
 import { serverConfig } from "./config";
 import { ApiError, sendApiError } from "./http-errors";
+import {
+  buildPagedResult,
+  normalizeHistoryPageQuery,
+  type HistoryPageQuery,
+  type PagedResult
+} from "./http/history-pagination";
 import { assertCan, assertCanManageUser } from "./auth/authz";
 import { hasPermission } from "./auth/permissions";
 import { canChangeUserGroupForActor, canCreateUserForActor, canExportUser, canViewUserRecords, getVisibleUserIdsForActor } from "./auth/scope";
@@ -19,12 +24,10 @@ import type {
   LogSearchResult,
   LogSystem,
   MarketPayload,
-  MarketHistoryPatchPayload,
   MarketTickPayload,
   MatchingEventRecord,
   PermissionLevel,
   Role,
-  RoundRecord,
   TradeSide,
   UnifiedLogRow,
   UserRecord,
@@ -34,7 +37,7 @@ import type {
 import { createMatchingServiceApp } from "./services/matching/app";
 import { MatchingServiceClient } from "./services/matching/client";
 import { SimulationEngine } from "./services/simulation";
-import { AppStore, type UserPayloadScope } from "./services/store";
+import { AppStore } from "./services/store";
 import {
   buildExportEntries,
   createZipArchive,
@@ -54,7 +57,9 @@ import { appMetrics } from "./services/metrics";
 import { HyperBridge, loadHyperBridgeConfig } from "./services/hyper-bridge";
 import { createWsSessionManager } from "./ws/session";
 import { createHeartbeatController } from "./ws/heartbeat";
-import { startUserHeartbeat } from "./ws/user-heartbeat";
+import { sendUserHeartbeat, startUserHeartbeat } from "./ws/user-heartbeat";
+import { createUserConnectionRegistry } from "./ws/user-connection-registry";
+import { createUserPayloadRequest, mergeUserPayloadRequest, type UserPayloadRequest } from "./ws/user-payload-scope";
 import { createMarketPayloadBuilder } from "./payloads/market";
 import { createUserPayloadBuilder } from "./payloads/user";
 import { buildManualSettlementCandidates } from "./services/settlement/manual-queue";
@@ -75,6 +80,7 @@ const fallbackReadInFlight = new Map<string, Promise<unknown>>();
 const heartbeatController = createHeartbeatController({
   recordDisconnect: (channel, reason) => appMetrics.recordWsDisconnect(channel, reason)
 });
+const userConnectionRegistry = createUserConnectionRegistry({ legacyLimit: 5 });
 
 function logStartupStage(stage: string) {
   console.log(`[startup] ${new Date().toISOString()} ${stage}`);
@@ -247,7 +253,8 @@ const loginSchema = z.object({
 
 const wsTicketSchema = z.object({
   channel: z.enum(["market", "user"]),
-  viewUserId: z.string().optional()
+  viewUserId: z.string().optional(),
+  clientInstanceId: z.string().optional()
 });
 
 const orderSchema = z.object({
@@ -491,6 +498,39 @@ function metricsAuthorized(authHeader: string | string[] | undefined) {
 
 function requirePermission(user: UserRecord, code: string) {
   assertCan(user, code as never);
+}
+
+function getHistoryRequestContext(request: Parameters<typeof getUserFromRequest>[0] & { query?: unknown }) {
+  const user = getUserFromRequest(request);
+  requirePermission(user, "profile:view");
+  const page = normalizeHistoryPageQuery(request.query);
+  const viewedUser = getViewedUserFromRequest(user, request);
+  return { page, viewedUser };
+}
+
+function readHistoryRows<T>(
+  cacheName: string,
+  viewedUserId: string,
+  page: HistoryPageQuery,
+  loadRows: (page: Pick<HistoryPageQuery, "limit" | "offset">) => T[]
+) {
+  return coalesceFallbackRead(
+    fallbackReadCacheKey(cacheName, viewedUserId, { limit: page.limit, offset: page.offset }),
+    () => loadRows(page)
+  );
+}
+
+function readPagedHistoryRows<T>(
+  cacheName: string,
+  viewedUserId: string,
+  page: HistoryPageQuery,
+  loadRows: (page: Pick<HistoryPageQuery, "limit" | "offset">) => T[]
+): Promise<PagedResult<T>> {
+  const lookaheadPage = { limit: page.limit + 1, offset: page.offset };
+  return coalesceFallbackRead(
+    fallbackReadCacheKey(`${cacheName}-page`, viewedUserId, { limit: page.limit, offset: page.offset }),
+    () => buildPagedResult(loadRows(lookaheadPage), page)
+  );
 }
 
 function canViewAllLogs(user: UserRecord) {
@@ -1735,7 +1775,7 @@ async function bootstrap() {
     uptimeSec: Math.round(process.uptime())
   }));
 
-  app.get("/api/health/ready", async (request, reply) => {
+  app.get("/api/health/ready", async (_request, reply) => {
     const persistence = store.getPersistenceStatus();
     const matching = await engine.getMatchingHealth().catch(() => undefined);
     const persistenceReady =
@@ -1898,7 +1938,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       const parsed = wsTicketSchema.parse(request.body);
-      return createWsTicket(user, parsed.channel, parsed.viewUserId);
+      return createWsTicket(user, parsed.channel, parsed.viewUserId, parsed.clientInstanceId);
     })
   );
 
@@ -2541,24 +2581,36 @@ async function bootstrap() {
 
   app.get("/api/orders/me", async (request) =>
     safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      requirePermission(user, "profile:view");
-      const viewedUser = getViewedUserFromRequest(user, request);
-      return coalesceFallbackRead(
-        fallbackReadCacheKey("orders-me", viewedUser.id),
-        () => store.getOrders(viewedUser.id)
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readHistoryRows("orders-me", viewedUser.id, page, (nextPage) =>
+        store.getOrders(viewedUser.id, nextPage)
+      );
+    })
+  );
+
+  app.get("/api/orders/me/page", async (request) =>
+    safeRoute(async () => {
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readPagedHistoryRows("orders-me", viewedUser.id, page, (nextPage) =>
+        store.getOrders(viewedUser.id, nextPage)
       );
     })
   );
 
   app.get("/api/order-lifecycles/me", async (request) =>
     safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      requirePermission(user, "profile:view");
-      const viewedUser = getViewedUserFromRequest(user, request);
-      return coalesceFallbackRead(
-        fallbackReadCacheKey("order-lifecycles-me", viewedUser.id),
-        () => store.getOrderLifecycleLogs(viewedUser.id)
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readHistoryRows("order-lifecycles-me", viewedUser.id, page, (nextPage) =>
+        store.getOrderLifecycleLogs(viewedUser.id, nextPage)
+      );
+    })
+  );
+
+  app.get("/api/order-lifecycles/me/page", async (request) =>
+    safeRoute(async () => {
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readPagedHistoryRows("order-lifecycles-me", viewedUser.id, page, (nextPage) =>
+        store.getOrderLifecycleLogs(viewedUser.id, nextPage)
       );
     })
   );
@@ -2587,7 +2639,7 @@ async function bootstrap() {
         appMetrics.recordOrder(result.order.status, Date.now() - startedAt);
         return {
           order: store.sanitizeOrder(result.order),
-          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+          tradePatch: createUserTradePayload(user, { positionIds: result.changedPositionIds }) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordOrder("failed", Date.now() - startedAt);
@@ -2602,11 +2654,12 @@ async function bootstrap() {
       requirePermission(user, "trade:cancel");
       store.assertWritablePersistence("Order cancellation");
       const params = request.params as { id: string };
-      const cancelled = store.sanitizeOrder(await engine.cancelOrder(user, params.id));
+      const result = await engine.cancelOrder(user, params.id);
+      const cancelled = store.sanitizeOrder(result.order);
       appMetrics.recordOrder("cancelled", 0);
       return {
         order: cancelled,
-        tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        tradePatch: createUserTradePayload(user, { positionIds: result.changedPositionIds }) satisfies UserTradePayload
       };
     })
   );
@@ -2618,11 +2671,12 @@ async function bootstrap() {
       store.assertWritablePersistence("Position sell");
       const params = request.params as { id: string };
       try {
-        const sold = store.sanitizeOrder(await store.withTransaction(() => engine.sellPosition(user, params.id)));
+        const result = await store.withTransaction(() => engine.sellPosition(user, params.id));
+        const sold = store.sanitizeOrder(result.order);
         appMetrics.recordPositionClose("success");
         return {
           order: sold,
-          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+          tradePatch: createUserTradePayload(user, { positionIds: result.changedPositionIds }) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
@@ -2644,7 +2698,7 @@ async function bootstrap() {
         appMetrics.recordPositionClose("success");
         return {
           ...result,
-          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+          tradePatch: createUserTradePayload(user, { positionIds: result.changedPositionIds }) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
@@ -2668,7 +2722,7 @@ async function bootstrap() {
         return {
           ...result,
           reverseOrder: store.sanitizeOrder(result.reverseOrder),
-          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+          tradePatch: createUserTradePayload(user, { positionIds: result.changedPositionIds }) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
@@ -2679,12 +2733,18 @@ async function bootstrap() {
 
   app.get("/api/logs/me", async (request) =>
     safeRoute(async () => {
-      const user = getUserFromRequest(request);
-      requirePermission(user, "profile:view");
-      const viewedUser = getViewedUserFromRequest(user, request);
-      return coalesceFallbackRead(
-        fallbackReadCacheKey("logs-me", viewedUser.id),
-        () => store.getRecentLogs(viewedUser.id)
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readHistoryRows("logs-me", viewedUser.id, page, (nextPage) =>
+        store.getRecentLogs(viewedUser.id, nextPage)
+      );
+    })
+  );
+
+  app.get("/api/logs/me/page", async (request) =>
+    safeRoute(async () => {
+      const { page, viewedUser } = getHistoryRequestContext(request);
+      return readPagedHistoryRows("logs-me", viewedUser.id, page, (nextPage) =>
+        store.getRecentLogs(viewedUser.id, nextPage)
       );
     })
   );
@@ -2986,7 +3046,7 @@ async function bootstrap() {
 
   app.get("/ws/user", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string; viewUserId?: string };
+      const query = request.query as { token?: string; ticket?: string; viewUserId?: string; clientInstanceId?: string };
       const session = getWsSession(query, "user");
       if (!session?.actor.isActive) {
         socket.close();
@@ -2998,40 +3058,81 @@ async function bootstrap() {
       appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
       const eventName = `user:${viewedUser.id}`;
+      const openedAt = Date.now();
+      const connectionId = `uws_${nanoid(10)}`;
       let userSendInFlight = false;
-      let pendingUserPayloadScope: UserPayloadScope | undefined;
+      let pendingUserPayloadRequest: UserPayloadRequest | undefined;
       let userRetryTimer: NodeJS.Timeout | undefined;
+      let cleaned = false;
+      let requestedCloseReason: string | undefined;
 
-      function mergeUserPayloadScope(current: UserPayloadScope | undefined, next: UserPayloadScope): UserPayloadScope {
-        if (!current) {
-          return next;
+      const closeSocket = (reason: string) => {
+        requestedCloseReason = reason;
+        if (socket.readyState === WsWebSocket.OPEN || socket.readyState === WsWebSocket.CONNECTING) {
+          socket.close(1000, reason);
+          const terminateTimer = setTimeout(() => {
+            if (socket.readyState !== WsWebSocket.CLOSED) {
+              socket.terminate();
+            }
+          }, 5_000);
+          terminateTimer.unref?.();
+          return;
         }
-        return current === "trade" || next === "trade" ? "trade" : "full";
-      }
+        if (socket.readyState !== WsWebSocket.CLOSED) {
+          socket.terminate();
+        }
+      };
 
-      const sendPayloadNow = (scope: UserPayloadScope = "full") => {
+      const registration = userConnectionRegistry.register({
+        id: connectionId,
+        actorId: actor.id,
+        viewedUserId: viewedUser.id,
+        openedAt,
+        close: closeSocket
+      });
+      if (registration.replacedCount > 0) {
+        console.warn(
+          `[ws:user] replace actorId=${actor.id} viewedUserId=${viewedUser.id} hasClientInstanceId=${Boolean(session.clientInstanceId)} groupSize=${registration.groupSize} replaced=${registration.replacedCount}`
+        );
+      }
+      if (registration.evictedCount > 0) {
+        console.warn(
+          `[ws:user] legacy-evict actorId=${actor.id} viewedUserId=${viewedUser.id} hasClientInstanceId=false groupSize=${registration.groupSize} evicted=${registration.evictedCount}`
+        );
+      }
+      console.log(
+        `[ws:user] open actorId=${actor.id} viewedUserId=${viewedUser.id} hasClientInstanceId=${Boolean(session.clientInstanceId)} groupSize=${registration.groupSize}`
+      );
+
+      const sendPayloadNow = (request: UserPayloadRequest = createUserPayloadRequest("full")) => {
+        if (cleaned) {
+          return;
+        }
         const currentActor = store.getUserById(actor.id);
         const currentViewedUser = store.getUserById(viewedUser.id);
         if (!currentActor?.isActive || !currentViewedUser || !canViewUserRecords(currentActor, currentViewedUser, store.listUserRecords())) {
-          socket.close();
+          closeSocket("permission_invalid");
           return;
         }
         if (userSendInFlight || socket.bufferedAmount > 0) {
-          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+          pendingUserPayloadRequest = mergeUserPayloadRequest(pendingUserPayloadRequest, request);
           queueUserPayload();
           return;
         }
         const buildStartedAt = Date.now();
+        const isTradePayload = request.scope === "trade";
         const outbound = JSON.stringify({
-          type: scope === "trade" ? "user:trade" : "user",
-          data: scope === "trade" ? createUserTradePayload(currentViewedUser) : createUserFullPayload(currentViewedUser)
+          type: isTradePayload ? "user:trade" : "user",
+          data: isTradePayload
+            ? createUserTradePayload(currentViewedUser, { positionIds: request.positionIds ?? [] })
+            : createUserFullPayload(currentViewedUser)
         });
         const buildLatencyMs = Date.now() - buildStartedAt;
         const outboundBytes = Buffer.byteLength(outbound);
-        appMetrics.recordUserWsPayload(scope, outboundBytes, buildLatencyMs);
+        appMetrics.recordUserWsPayload(request.scope, outboundBytes, buildLatencyMs);
         if (buildLatencyMs > 50 || outboundBytes > 200_000) {
           console.warn(
-            `[ws:user] payload scope=${scope} bytes=${outboundBytes} buildMs=${buildLatencyMs}`
+            `[ws:user] payload scope=${request.scope} bytes=${outboundBytes} buildMs=${buildLatencyMs}`
           );
         }
         const sendStartedAt = Date.now();
@@ -3039,52 +3140,86 @@ async function bootstrap() {
         socket.send(outbound, (error?: Error) => {
           userSendInFlight = false;
           appMetrics.recordWsSend("user", outboundBytes, Date.now() - sendStartedAt, !error);
-          if (pendingUserPayloadScope) {
+          if (!cleaned && pendingUserPayloadRequest) {
             queueUserPayload();
           }
         });
       };
 
-      function queueUserPayload(scope?: UserPayloadScope) {
-        if (scope) {
-          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+      function queueUserPayload(request?: UserPayloadRequest) {
+        if (cleaned) {
+          return;
+        }
+        if (request) {
+          pendingUserPayloadRequest = mergeUserPayloadRequest(pendingUserPayloadRequest, request);
         }
         if (userSendInFlight || userRetryTimer) {
           return;
         }
         userRetryTimer = setTimeout(() => {
           userRetryTimer = undefined;
-          const nextScope = pendingUserPayloadScope;
-          pendingUserPayloadScope = undefined;
-          if (nextScope) {
-            sendPayloadNow(nextScope);
+          const nextRequest = pendingUserPayloadRequest;
+          pendingUserPayloadRequest = undefined;
+          if (nextRequest) {
+            sendPayloadNow(nextRequest);
           }
         }, USER_WS_RETRY_MS);
       }
 
-      const listener = (scope?: UserPayloadScope) => queueUserPayload(scope ?? "full");
-      queueUserPayload("full");
-      store.emitter.on(eventName, listener);
+      const listener = (request?: UserPayloadRequest) => queueUserPayload(request ?? createUserPayloadRequest("full"));
+      const recordUserHeartbeatSend = (bytes: number, durationMs: number, ok: boolean) =>
+        appMetrics.recordWsSend("user", bytes, durationMs, ok);
       const stopUserHeartbeat = startUserHeartbeat({
         socket,
         canSend: () =>
+          !cleaned &&
           !userSendInFlight &&
           !userRetryTimer &&
-          !pendingUserPayloadScope &&
+          !pendingUserPayloadRequest &&
           socket.bufferedAmount <= 0,
-        onSend: (bytes, durationMs, ok) => appMetrics.recordWsSend("user", bytes, durationMs, ok)
+        onSend: recordUserHeartbeatSend
       });
-      socket.on("close", () => {
+      sendUserHeartbeat({
+        socket,
+        canSend: () => !cleaned && !userSendInFlight && socket.bufferedAmount <= 0,
+        onSend: recordUserHeartbeatSend
+      });
+      queueUserPayload(createUserPayloadRequest("full"));
+      store.emitter.on(eventName, listener);
+
+      const cleanup = (reason: string) => {
+        if (cleaned) {
+          return;
+        }
+        cleaned = true;
         if (userRetryTimer) {
           clearTimeout(userRetryTimer);
+          userRetryTimer = undefined;
         }
         stopUserHeartbeat();
+        registration.unregister();
         wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
         appMetrics.setWsConnections("user", wsConnectionCounts.user);
         if (!consumeHeartbeatTimeout(socket)) {
-          appMetrics.recordWsDisconnect("user", "close");
+          appMetrics.recordWsDisconnect("user", reason);
         }
         store.emitter.off(eventName, listener);
+        console.log(
+          `[ws:user] close actorId=${actor.id} viewedUserId=${viewedUser.id} hasClientInstanceId=${Boolean(session.clientInstanceId)} groupSize=${userConnectionRegistry.groupSize({
+            actorId: actor.id,
+            viewedUserId: viewedUser.id,
+            clientInstanceId: session.clientInstanceId
+          })} ageMs=${Date.now() - openedAt} reason=${reason}`
+        );
+      };
+
+      socket.on("close", () => {
+        cleanup(requestedCloseReason ?? "close");
+      });
+      socket.on("error", () => {
+        const reason = requestedCloseReason ?? "error";
+        cleanup(reason);
+        closeSocket(reason);
       });
     } catch {
       socket.close();

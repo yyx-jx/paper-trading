@@ -11,6 +11,11 @@ import {
   type UserTradePayload
 } from "../../utils/api";
 import { money } from "../../utils/format";
+import {
+  addPendingOrderClientId,
+  latestPendingOrderClientId,
+  removePendingOrderClientId
+} from "./pending-order-state";
 const t = (key: string, options?: Record<string, unknown>) => i18n.t(key, options);
 
 
@@ -46,13 +51,14 @@ export function useOrderActions(input: {
   setUserTradePayload: (data: UserTradePayload) => void;
   setLastOrderLatencyMs: (latency?: number) => void;
 }) {
-  const [tradeBusy, setTradeBusy] = useState(false);
   const [quickBusy, setQuickBusy] = useState(false);
   const [cancelBusyOrderId, setCancelBusyOrderId] = useState<string>();
   const [sellBusyPositionId, setSellBusyPositionId] = useState<string>();
   const [sellFeedback, setSellFeedback] = useState<{ positionId?: string; message: string }>();
-  const [pendingOrderClientId, setPendingOrderClientId] = useState<string>();
+  const [pendingOrderClientIds, setPendingOrderClientIds] = useState<string[]>([]);
   const cancellingOrderIdsRef = useRef(new Set<string>());
+  const pendingOrderClientId = latestPendingOrderClientId(pendingOrderClientIds);
+  const pendingOrderCount = pendingOrderClientIds.length;
 
   const ensureViewingSelfForMutation = () => {
     if (input.isViewingSelf) {
@@ -72,8 +78,7 @@ export function useOrderActions(input: {
       return;
     }
     const clientOrderId = createClientOrderId();
-    setPendingOrderClientId(clientOrderId);
-    setTradeBusy(true);
+    setPendingOrderClientIds((currentIds) => addPendingOrderClientId(currentIds, clientOrderId));
     input.setError(undefined);
     try {
       const result = await api.placeOrder(input.token, {
@@ -99,8 +104,7 @@ export function useOrderActions(input: {
         input.setError(message);
       }
     } finally {
-      setTradeBusy(false);
-      setPendingOrderClientId(undefined);
+      setPendingOrderClientIds((currentIds) => removePendingOrderClientId(currentIds, clientOrderId));
     }
   };
 
@@ -189,12 +193,12 @@ export function useOrderActions(input: {
   };
 
   return {
-    tradeBusy,
     quickBusy,
     cancelBusyOrderId,
     sellBusyPositionId,
     sellFeedback,
     pendingOrderClientId,
+    pendingOrderCount,
     ensureViewingSelfForMutation,
     handlePlaceOrder,
     handleCloseSide,

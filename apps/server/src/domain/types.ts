@@ -972,6 +972,7 @@ export interface UserPayload {
 export interface UserTradePayload {
   viewedUserId: string;
   profile: ProfileOverview;
+  positionsMode?: "replace" | "delta";
   positions: PositionRecord[];
   orders: OrderRecord[];
   orderLifecycles: OrderLifecycleRecord[];

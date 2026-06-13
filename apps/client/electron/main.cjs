@@ -3,9 +3,9 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const http = require("node:http");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
+const { startProductionProxyServer } = require("./production-proxy.cjs");
 
 const LOCAL_API_BASE_URL = "http://127.0.0.1:8787";
 const PRODUCTION_PROXY_PORT = 18787;
@@ -33,6 +33,14 @@ function windowTitle() {
 function productionApiBaseUrl() {
   const metadata = packagedMetadata();
   return String(metadata.productionApiBaseUrl || process.env.VITE_API_BASE_URL || "").trim();
+}
+
+function productionClientConnectionMode() {
+  const metadata = packagedMetadata();
+  const mode = String(metadata.productionClientConnectionMode || process.env.PROD_CLIENT_CONNECTION_MODE || "proxy")
+    .trim()
+    .toLowerCase();
+  return mode === "direct" ? "direct" : "proxy";
 }
 
 function configureProxyBypass() {
@@ -99,99 +107,20 @@ async function pickProductionLocalAddress(target) {
   return undefined;
 }
 
-function stripHopByHopHeaders(headers, target) {
-  const nextHeaders = { ...headers };
-  for (const key of Object.keys(nextHeaders)) {
-    if (
-      [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade"
-      ].includes(key.toLowerCase())
-    ) {
-      delete nextHeaders[key];
-    }
-  }
-  nextHeaders.host = target.host;
-  return nextHeaders;
-}
-
 async function startProductionProxy() {
   const apiBaseUrl = productionApiBaseUrl();
-  if (!apiBaseUrl || shouldEmbedBackend()) {
+  if (!apiBaseUrl || shouldEmbedBackend() || productionClientConnectionMode() !== "proxy") {
     return;
   }
   const target = new URL(apiBaseUrl);
-  if (target.protocol !== "http:") {
-    throw new Error("Production local proxy currently expects an HTTP backend origin.");
-  }
   productionProxyLocalAddress = await pickProductionLocalAddress(target);
-  productionProxyServer = http.createServer((request, response) => {
-    const upstream = http.request(
-      {
-        hostname: target.hostname,
-        port: target.port || 80,
-        method: request.method,
-        path: request.url,
-        headers: stripHopByHopHeaders(request.headers, target),
-        localAddress: productionProxyLocalAddress
-      },
-      (upstreamResponse) => {
-        response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-        upstreamResponse.pipe(response);
-      }
-    );
-    upstream.on("error", () => {
-      if (!response.headersSent) {
-        response.writeHead(502, { "content-type": "application/json" });
-      }
-      response.end(JSON.stringify({ ok: false, error: "production_proxy_unavailable" }));
-    });
-    request.pipe(upstream);
+  const proxy = await startProductionProxyServer({
+    targetUrl: apiBaseUrl,
+    host: "127.0.0.1",
+    port: PRODUCTION_PROXY_PORT,
+    localAddress: productionProxyLocalAddress
   });
-
-  productionProxyServer.on("upgrade", (request, socket, head) => {
-    const upstream = net.connect(
-      {
-        host: target.hostname,
-        port: Number(target.port || 80),
-        localAddress: productionProxyLocalAddress
-      },
-      () => {
-        const lines = [`${request.method} ${request.url} HTTP/${request.httpVersion}`];
-        for (let index = 0; index < request.rawHeaders.length; index += 2) {
-          const name = request.rawHeaders[index];
-          const value = request.rawHeaders[index + 1];
-          if (!name || name.toLowerCase() === "proxy-connection") {
-            continue;
-          }
-          lines.push(name.toLowerCase() === "host" ? `Host: ${target.host}` : `${name}: ${value}`);
-        }
-        upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
-        if (head.length > 0) {
-          upstream.write(head);
-        }
-        upstream.pipe(socket);
-        socket.pipe(upstream);
-      }
-    );
-    upstream.on("error", () => socket.destroy());
-    socket.on("error", () => upstream.destroy());
-  });
-
-  await new Promise((resolve, reject) => {
-    productionProxyServer.once("error", reject);
-    productionProxyServer.listen(PRODUCTION_PROXY_PORT, "127.0.0.1", () => {
-      productionProxyServer.off("error", reject);
-      resolve();
-    });
-  });
+  productionProxyServer = proxy.server;
 }
 
 function redactNetworkAddresses(value) {

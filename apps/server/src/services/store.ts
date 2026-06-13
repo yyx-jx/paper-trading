@@ -33,6 +33,15 @@ import {
   mergeMarketCandlesIntoMemory
 } from "./store/market-candles";
 import { cloneOrderBookSnapshot, orderBookSnapshotRef } from "./store/order-book-snapshots";
+import {
+  buildBulkUpsertQuery,
+  buildCombinedBulkUpsertQuery,
+  flattenBulkUpsertParams,
+  orderLifecyclePersistenceSpec,
+  orderPersistenceSpec,
+  positionPersistenceSpec,
+  userPersistenceSpec
+} from "./store/persistence-batches";
 import { buildProfileOverview } from "./store/profile";
 import {
   rowToAuditEvent,
@@ -44,6 +53,7 @@ import {
   rowToPosition,
   rowToRound
 } from "./store/row-mappers";
+import { createUserPayloadRequest, mergeUserPayloadRequest, type UserPayloadRequest, type UserPayloadScope } from "../ws/user-payload-scope";
 import { SCHEMA_SQL } from "./store/schema";
 import type {
   AuditEvent,
@@ -69,7 +79,6 @@ import type {
   PublicUser,
   Role,
   RoundRecord,
-  RoundStatus,
   SourceHealth,
   TradeSide,
   TradeTimeline,
@@ -83,14 +92,15 @@ const QTY_EPSILON = 0.0000001;
 const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
 const LOG_FILE_TAIL_BYTES = 512 * 1024;
 const MEMORY_GUARD_INTERVAL_MS = 15_000;
+const PRUNE_MEMORY_CACHES_THROTTLE_MS = 1_000;
 const PERSISTENCE_FAILURE_THRESHOLD = 3;
 const MARKET_CANDLE_MEMORY_RETENTION_MS = 24 * 60 * 60_000;
 const MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS = 1_000;
 const ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS = 1_000;
+const PERSIST_UPSERT_BATCH_SIZE = 50;
 const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
-export type UserPayloadScope = "full" | "trade";
 
 type PersistenceHealth = {
   enabled: boolean;
@@ -376,9 +386,6 @@ export type TradeMutationMemorySnapshot = {
   orders: OrderRecord[];
   positions: PositionRecord[];
   orderLifecycleLogs: OrderLifecycleRecord[];
-  orderBookSnapshots: Array<[string, OrderBookSnapshotRecord]>;
-  logs: AuditEvent[];
-  behaviorLogs: BehaviorActionLog[];
 };
 
 export class AppStore {
@@ -409,6 +416,7 @@ export class AppStore {
   private lastRetentionCleanupAt = 0;
   private retentionCleanupRunning = false;
   private lastMemoryGuardAt = 0;
+  private lastPruneMemoryCachesAt = 0;
   private readonly orderIndexById = new Map<string, number>();
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
@@ -416,7 +424,8 @@ export class AppStore {
   private positionsByUserId = new Map<string, PositionRecord[]>();
   private orderLifecyclesByUserId = new Map<string, OrderLifecycleRecord[]>();
   private operatedRoundIdsByUserId = new Map<string, Set<string>>();
-  private readonly pendingUserPayloadIds = new Map<string, UserPayloadScope>();
+  private readonly pendingUserPayloadIds = new Map<string, UserPayloadRequest>();
+  private readonly pendingTradePositionIds = new Map<string, Set<string>>();
   private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
   private orderBookSnapshotFlushRunning = false;
@@ -680,20 +689,7 @@ export class AppStore {
       users: [...this.users.entries()].map(([id, user]) => [id, { ...user }]),
       orders: this.orders.map((order) => ({ ...order })),
       positions: this.positions.map((position) => ({ ...position })),
-      orderLifecycleLogs: this.orderLifecycleLogs.map((log) => ({ ...log })),
-      orderBookSnapshots: [...this.orderBookSnapshots.entries()].map(([ref, record]) => [
-        ref,
-        {
-          ...record,
-          snapshot: {
-            ...record.snapshot,
-            bids: record.snapshot.bids.map((level) => ({ ...level })),
-            asks: record.snapshot.asks.map((level) => ({ ...level }))
-          }
-        }
-      ]),
-      logs: this.logs.map((log) => ({ ...log })),
-      behaviorLogs: this.behaviorLogs.map((log) => ({ ...log }))
+      orderLifecycleLogs: this.orderLifecycleLogs.map((log) => ({ ...log }))
     };
   }
 
@@ -709,19 +705,6 @@ export class AppStore {
       this.orderLifecycleLogs.length,
       ...snapshot.orderLifecycleLogs.map((log) => ({ ...log }))
     );
-    this.orderBookSnapshots.clear();
-    for (const [ref, record] of snapshot.orderBookSnapshots) {
-      this.orderBookSnapshots.set(ref, {
-        ...record,
-        snapshot: {
-          ...record.snapshot,
-          bids: record.snapshot.bids.map((level) => ({ ...level })),
-          asks: record.snapshot.asks.map((level) => ({ ...level }))
-        }
-      });
-    }
-    this.logs.splice(0, this.logs.length, ...snapshot.logs.map((log) => ({ ...log })));
-    this.behaviorLogs.splice(0, this.behaviorLogs.length, ...snapshot.behaviorLogs.map((log) => ({ ...log })));
     this.rebuildHotIndexes();
     this.bumpHistoryRevision();
   }
@@ -934,34 +917,7 @@ export class AppStore {
     });
   }
 
-  private pruneMemoryCaches(now = Date.now()) {
-    trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
-    const ordersPrune = trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
-    const lifecyclesPrune = trimArrayByCreatedAt(
-      this.orderLifecycleLogs,
-      this.config.orderLifecycleMemoryMax,
-      (log) => log.updatedAt ?? log.createdAt
-    );
-    const positionsPrune = trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt);
-    trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
-    trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
-    this.pruneOrderBookSnapshots(now);
-    if (ordersPrune.trimmedCount > 0 || lifecyclesPrune.trimmedCount > 0 || positionsPrune.trimmedCount > 0) {
-      this.rebuildHotIndexes();
-    }
-  }
-
-  private pruneOrderBookSnapshots(now = Date.now()) {
-    if (this.orderBookSnapshots.size <= this.config.orderBookSnapshotsMemoryMax) {
-      const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
-      for (const [ref, snapshot] of this.orderBookSnapshots.entries()) {
-        if (snapshot.createdAt < cutoff && !this.isSnapshotRefReferenced(ref)) {
-          this.orderBookSnapshots.delete(ref);
-        }
-      }
-      return;
-    }
-
+  private collectReferencedSnapshotRefs() {
     const referenced = new Set<string>();
     for (const order of this.orders) {
       if (order.orderBookSnapshotRef) {
@@ -972,6 +928,41 @@ export class AppStore {
       if (log.orderBookSnapshotRef) {
         referenced.add(log.orderBookSnapshotRef);
       }
+    }
+    return referenced;
+  }
+
+  private pruneMemoryCaches(now = Date.now(), options?: { force?: boolean }) {
+    const force = options?.force === true;
+    if (!force && this.lastPruneMemoryCachesAt > 0 && now - this.lastPruneMemoryCachesAt < PRUNE_MEMORY_CACHES_THROTTLE_MS) {
+      return;
+    }
+    this.lastPruneMemoryCachesAt = now;
+    trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
+    const ordersPrune = trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
+    const lifecyclesPrune = trimArrayByCreatedAt(
+      this.orderLifecycleLogs,
+      this.config.orderLifecycleMemoryMax,
+      (log) => log.updatedAt ?? log.createdAt
+    );
+    const positionsPrune = trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt);
+    trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
+    trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
+    this.pruneOrderBookSnapshots(now, this.collectReferencedSnapshotRefs());
+    if (ordersPrune.trimmedCount > 0 || lifecyclesPrune.trimmedCount > 0 || positionsPrune.trimmedCount > 0) {
+      this.rebuildHotIndexes();
+    }
+  }
+
+  private pruneOrderBookSnapshots(now = Date.now(), referenced = this.collectReferencedSnapshotRefs()) {
+    if (this.orderBookSnapshots.size <= this.config.orderBookSnapshotsMemoryMax) {
+      const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
+      for (const [ref, snapshot] of this.orderBookSnapshots.entries()) {
+        if (snapshot.createdAt < cutoff && !referenced.has(ref)) {
+          this.orderBookSnapshots.delete(ref);
+        }
+      }
+      return;
     }
 
     const snapshots = [...this.orderBookSnapshots.values()].sort((left, right) => right.createdAt - left.createdAt);
@@ -987,11 +978,6 @@ export class AppStore {
       }
       this.orderBookSnapshots.delete(snapshot.ref);
     }
-  }
-
-  private isSnapshotRefReferenced(ref: string) {
-    return this.orders.some((order) => order.orderBookSnapshotRef === ref) ||
-      this.orderLifecycleLogs.some((log) => log.orderBookSnapshotRef === ref);
   }
 
   private heapUsedMb() {
@@ -1023,66 +1009,119 @@ export class AppStore {
     return user;
   }
 
+  private prepareUsersForPersistence(users: readonly UserRecord[]) {
+    for (const user of users) {
+      user.permissionCodes = ROLE_PERMISSIONS[user.role];
+      user.managerUserId = user.managerUserId ?? user.seniorTesterId;
+      user.permissionLevel = user.permissionLevel ?? "Standard";
+      user.updatedAt = user.updatedAt || Date.now();
+    }
+  }
+
+  private applyUsersToMemory(users: readonly UserRecord[]) {
+    for (const user of users) {
+      this.users.set(user.id, user);
+    }
+  }
+
+  private applyOrdersToMemory(orders: readonly OrderRecord[]) {
+    for (const order of orders) {
+      if (order.orderBookSnapshot) {
+        this.prepareOrderBookSnapshotForOrder(order);
+      }
+      this.upsertOrderInMemory(order);
+    }
+  }
+
+  private applyPositionsToMemory(positions: readonly PositionRecord[]) {
+    const positionIdsByUser = new Map<string, string[]>();
+    for (const position of positions) {
+      this.upsertPositionInMemory(position);
+      const ids = positionIdsByUser.get(position.userId) ?? [];
+      ids.push(position.id);
+      positionIdsByUser.set(position.userId, ids);
+    }
+    return positionIdsByUser;
+  }
+
+  private applyOrderLifecyclesToMemory(logs: readonly OrderLifecycleRecord[]) {
+    for (const log of logs) {
+      this.upsertOrderLifecycleInMemory(log);
+    }
+  }
+
+  private refreshHistoryViews(positionIdsByUser?: ReadonlyMap<string, string[]>) {
+    this.pruneMemoryCaches();
+    this.bumpHistoryRevision();
+    if (!positionIdsByUser) {
+      return;
+    }
+    for (const [userId, positionIds] of positionIdsByUser.entries()) {
+      this.markTradePositionChanges(userId, positionIds);
+    }
+  }
+
+  private async runBulkUpsert<T>(
+    spec: {
+      columns: readonly string[];
+      conflictTarget: string;
+      mapRecord: (record: T) => readonly unknown[];
+      table: string;
+      updateAssignments: readonly string[];
+    },
+    records: readonly T[]
+  ) {
+    for (let index = 0; index < records.length; index += PERSIST_UPSERT_BATCH_SIZE) {
+      const batch = records.slice(index, index + PERSIST_UPSERT_BATCH_SIZE);
+      await this.runDb(buildBulkUpsertQuery(spec, batch), flattenBulkUpsertParams(spec, batch));
+    }
+  }
+
+  async persistTradeRecords(input: {
+    orderLifecycles?: readonly OrderLifecycleRecord[];
+    orders?: readonly OrderRecord[];
+    positions?: readonly PositionRecord[];
+    users?: readonly UserRecord[];
+  }) {
+    const users = input.users ?? [];
+    const orders = input.orders ?? [];
+    const positions = input.positions ?? [];
+    const orderLifecycles = input.orderLifecycles ?? [];
+    if (!users.length && !orders.length && !positions.length && !orderLifecycles.length) {
+      return;
+    }
+
+    this.prepareUsersForPersistence(users);
+    this.applyUsersToMemory(users);
+    this.applyOrdersToMemory(orders);
+    const positionIdsByUser = this.applyPositionsToMemory(positions);
+    this.applyOrderLifecyclesToMemory(orderLifecycles);
+    if (orders.length || positions.length || orderLifecycles.length) {
+      this.refreshHistoryViews(positionIdsByUser);
+    }
+
+    const statement = buildCombinedBulkUpsertQuery([
+      { alias: "users_upsert", spec: userPersistenceSpec, records: users },
+      { alias: "orders_upsert", spec: orderPersistenceSpec, records: orders },
+      { alias: "positions_upsert", spec: positionPersistenceSpec, records: positions },
+      { alias: "order_lifecycles_upsert", spec: orderLifecyclePersistenceSpec, records: orderLifecycles }
+    ]);
+    if (statement.query) {
+      await this.runDb(statement.query, statement.params);
+    }
+  }
+
+  async persistUsers(users: readonly UserRecord[]) {
+    if (!users.length) {
+      return;
+    }
+    this.prepareUsersForPersistence(users);
+    this.applyUsersToMemory(users);
+    await this.runBulkUpsert(userPersistenceSpec, users);
+  }
+
   async persistUser(user: UserRecord) {
-    user.permissionCodes = ROLE_PERMISSIONS[user.role];
-    user.managerUserId = user.managerUserId ?? user.seniorTesterId;
-    user.permissionLevel = user.permissionLevel ?? "Standard";
-    user.updatedAt = user.updatedAt || Date.now();
-    this.users.set(user.id, user);
-    await this.runDb(
-      `
-      INSERT INTO users (
-        id, username, password, display_name, role, language, permission_codes, available_usdc,
-        is_active, senior_tester_id, disabled_at, disabled_by, manager_user_id, permission_level,
-        failed_login_count, locked_until, password_changed_at, last_login_at, must_change_password,
-        created_at, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-      ON CONFLICT (id) DO UPDATE SET
-        username = EXCLUDED.username,
-        password = EXCLUDED.password,
-        display_name = EXCLUDED.display_name,
-        role = EXCLUDED.role,
-        language = EXCLUDED.language,
-        permission_codes = EXCLUDED.permission_codes,
-        available_usdc = EXCLUDED.available_usdc,
-        is_active = EXCLUDED.is_active,
-        senior_tester_id = EXCLUDED.senior_tester_id,
-        disabled_at = EXCLUDED.disabled_at,
-        disabled_by = EXCLUDED.disabled_by,
-        manager_user_id = EXCLUDED.manager_user_id,
-        permission_level = EXCLUDED.permission_level,
-        failed_login_count = EXCLUDED.failed_login_count,
-        locked_until = EXCLUDED.locked_until,
-        password_changed_at = EXCLUDED.password_changed_at,
-        last_login_at = EXCLUDED.last_login_at,
-        must_change_password = EXCLUDED.must_change_password,
-        updated_at = EXCLUDED.updated_at
-      `,
-      [
-        user.id,
-        user.username,
-        user.password,
-        user.displayName,
-        user.role,
-        user.language,
-        JSON.stringify(user.permissionCodes),
-        user.availableUsdc,
-        user.isActive,
-        user.seniorTesterId ?? null,
-        user.disabledAt ?? null,
-        user.disabledBy ?? null,
-        user.managerUserId ?? null,
-        user.permissionLevel ?? "Standard",
-        user.failedLoginCount ?? 0,
-        user.lockedUntil ?? null,
-        user.passwordChangedAt ?? null,
-        user.lastLoginAt ?? null,
-        user.mustChangePassword ?? false,
-        user.createdAt,
-        user.updatedAt
-      ]
-    );
+    await this.persistUsers([user]);
   }
 
   async createUser(input: {
@@ -1405,14 +1444,28 @@ export class AppStore {
       .map((position) => this.decoratePosition(position));
   }
 
+  getTradePositions(userId: string, positionIds?: string[]) {
+    if (!positionIds) {
+      return this.getPositions(userId);
+    }
+    const requestedIds = new Set(positionIds);
+    return [...(this.positionsByUserId.get(userId) ?? [])]
+      .filter((position) => requestedIds.has(position.id))
+      .sort((left, right) => right.openedAt - left.openedAt)
+      .map((position) => this.decoratePosition(position));
+  }
+
   getPositionById(positionId: string) {
     const index = this.positionIndexById?.get(positionId);
     return typeof index === "number" ? this.positions[index] : this.positions.find((position) => position.id === positionId);
   }
 
-  getOrders(userId: string) {
+  getOrders(userId: string, options?: { limit?: number; offset?: number }) {
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
     return [...(this.ordersByUserId.get(userId) ?? [])]
       .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined)
       .map((order) => this.sanitizeOrder(order));
   }
 
@@ -1461,10 +1514,13 @@ export class AppStore {
     };
   }
 
-  getOrderLifecycleLogs(userId: string, options?: { includeSnapshots?: boolean }) {
+  getOrderLifecycleLogs(userId: string, options?: { includeSnapshots?: boolean; limit?: number; offset?: number }) {
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
     return this.orderLifecycleLogs
       .filter((log) => log.userId === userId)
       .sort((left, right) => right.orderTimestampMs - left.orderTimestampMs)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined)
       .map((log) => {
         const snapshot = options?.includeSnapshots && log.orderBookSnapshotRef
           ? this.getOrderBookSnapshot(log.orderBookSnapshotRef)
@@ -1480,11 +1536,14 @@ export class AppStore {
     return this.orderBookSnapshots.get(ref)?.snapshot;
   }
 
-  getRecentLogs(userId: string) {
+  getRecentLogs(userId: string, options?: { limit?: number; offset?: number }) {
     const threshold = Date.now() - this.config.logRetentionMs;
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
     return this.logs
       .filter((log) => log.serverRecvTs >= threshold && (!userId || log.userId === userId))
-      .sort((left, right) => right.serverRecvTs - left.serverRecvTs);
+      .sort((left, right) => right.serverRecvTs - left.serverRecvTs)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined);
   }
 
   async searchAuditLogs(filters?: LogSearchQuery, options?: { limit?: number; offset?: number }) {
@@ -1855,9 +1914,22 @@ export class AppStore {
     return buildProfileOverview(this.users.get(userId), this.getPositions(userId), this.getOrders(userId));
   }
 
+  markTradePositionChanges(userId: string, positionIds: Iterable<string>) {
+    const nextIds = [...new Set([...positionIds].filter((id) => typeof id === "string" && id.trim().length > 0))];
+    if (nextIds.length === 0) {
+      return;
+    }
+    const existing = this.pendingTradePositionIds.get(userId) ?? new Set<string>();
+    for (const positionId of nextIds) {
+      existing.add(positionId);
+    }
+    this.pendingTradePositionIds.set(userId, existing);
+  }
+
   emitUserPayload(userId: string, scope: UserPayloadScope = "full") {
-    const existingScope = this.pendingUserPayloadIds.get(userId);
-    this.pendingUserPayloadIds.set(userId, existingScope === "full" || scope === "full" ? "full" : "trade");
+    const existingRequest = this.pendingUserPayloadIds.get(userId);
+    const nextRequest = createUserPayloadRequest(scope);
+    this.pendingUserPayloadIds.set(userId, mergeUserPayloadRequest(existingRequest, nextRequest));
     if (this.userPayloadFlushScheduled) {
       return;
     }
@@ -1869,8 +1941,14 @@ export class AppStore {
     const payloadRequests = [...this.pendingUserPayloadIds.entries()];
     this.pendingUserPayloadIds.clear();
     this.userPayloadFlushScheduled = false;
-    for (const [userId, scope] of payloadRequests) {
-      this.emitter.emit(`user:${userId}`, scope);
+    for (const [userId, request] of payloadRequests) {
+      const trackedPositionIds = this.pendingTradePositionIds.get(userId);
+      this.pendingTradePositionIds.delete(userId);
+      const nextRequest =
+        request.scope === "trade"
+          ? createUserPayloadRequest("trade", [...(request.positionIds ?? []), ...(trackedPositionIds ?? [])])
+          : request;
+      this.emitter.emit(`user:${userId}`, nextRequest);
     }
   }
 
@@ -2243,76 +2321,16 @@ export class AppStore {
   }
 
   async persistOrderLifecycle(log: OrderLifecycleRecord) {
-    this.upsertOrderLifecycleInMemory(log);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
+    await this.persistOrderLifecycles([log]);
+  }
 
-    await this.runDb(
-      `
-      INSERT INTO order_lifecycle_logs (
-        id, buy_order_id, trace_id, user_id, tester_id, round_id, symbol, asset_class, market_id,
-        market_slug, direction, order_timestamp_ms, entry_token_price, btc_trade_price,
-        btc_open_price_to_beat, delta_btc, volume_token_qty, remaining_token_qty,
-        closed_token_qty, position_notional, exit_type, exit_token_price, exit_notional,
-        settlement_result, order_book_snapshot_ref, actual_fill_price, slippage_bps,
-        match_latency_ms, settlement_time_ms, settlement_direction, entry_fee, exit_fee, fee_currency, created_at, updated_at
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,
-        $33,$34,$35
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        remaining_token_qty = EXCLUDED.remaining_token_qty,
-        closed_token_qty = EXCLUDED.closed_token_qty,
-        exit_type = EXCLUDED.exit_type,
-        exit_token_price = EXCLUDED.exit_token_price,
-        exit_notional = EXCLUDED.exit_notional,
-        settlement_result = EXCLUDED.settlement_result,
-        settlement_time_ms = EXCLUDED.settlement_time_ms,
-        settlement_direction = EXCLUDED.settlement_direction,
-        exit_fee = EXCLUDED.exit_fee,
-        fee_currency = EXCLUDED.fee_currency,
-        updated_at = EXCLUDED.updated_at
-      `,
-      [
-        log.id,
-        log.buyOrderId,
-        log.traceId,
-        log.userId,
-        log.testerId,
-        log.roundId,
-        log.symbol,
-        log.assetClass,
-        log.marketId,
-        log.marketSlug ?? null,
-        log.direction,
-        log.orderTimestampMs,
-        log.entryTokenPrice ?? null,
-        log.btcTradePrice ?? null,
-        log.btcOpenPriceToBeat ?? null,
-        log.deltaBtc ?? null,
-        log.volumeTokenQty,
-        log.remainingTokenQty,
-        log.closedTokenQty,
-        log.positionNotional,
-        log.exitType ?? null,
-        log.exitTokenPrice ?? null,
-        log.exitNotional,
-        log.settlementResult ?? null,
-        log.orderBookSnapshotRef ?? null,
-        log.actualFillPrice ?? null,
-        log.slippageBps ?? null,
-        log.matchLatencyMs,
-        log.settlementTimeMs ?? null,
-        log.settlementDirection ?? null,
-        log.entryFee ?? null,
-        log.exitFee ?? null,
-        log.feeCurrency ?? null,
-        log.createdAt,
-        log.updatedAt
-      ]
-    );
+  async persistOrderLifecycles(logs: readonly OrderLifecycleRecord[]) {
+    if (!logs.length) {
+      return;
+    }
+    this.applyOrderLifecyclesToMemory(logs);
+    this.refreshHistoryViews();
+    await this.runBulkUpsert(orderLifecyclePersistenceSpec, logs);
   }
 
   async applyLifecycleExit(input: {
@@ -2342,6 +2360,7 @@ export class AppStore {
       .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
 
     const feePerQty = (input.exitFee ?? 0) / Math.max(input.qty, QTY_EPSILON);
+    const updatedLogs: OrderLifecycleRecord[] = [];
     for (const log of logs) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2359,8 +2378,11 @@ export class AppStore {
       log.exitTokenPrice = roundNumber(log.exitNotional / Math.max(log.closedTokenQty, QTY_EPSILON), 4);
       log.exitType = log.exitType && log.exitType !== input.exitType ? "mixed" : input.exitType;
       log.updatedAt = Date.now();
-      await this.persistOrderLifecycle(log);
+      updatedLogs.push(log);
       remaining = roundNumber(Math.max(remaining - take, 0), 4);
+    }
+    if (updatedLogs.length > 0) {
+      await this.persistOrderLifecycles(updatedLogs);
     }
   }
 
@@ -2380,6 +2402,7 @@ export class AppStore {
         log.direction === input.side &&
         log.remainingTokenQty > QTY_EPSILON
     );
+    const updatedLogs: OrderLifecycleRecord[] = [];
     for (const log of logs) {
       const remaining = log.remainingTokenQty;
       log.closedTokenQty = roundNumber(log.closedTokenQty + remaining, 4);
@@ -2392,120 +2415,24 @@ export class AppStore {
       log.settlementTimeMs = input.settlementTimeMs;
       log.feeCurrency = log.feeCurrency ?? "USD";
       log.updatedAt = Date.now();
-      await this.persistOrderLifecycle(log);
+      updatedLogs.push(log);
+    }
+    if (updatedLogs.length > 0) {
+      await this.persistOrderLifecycles(updatedLogs);
     }
   }
 
   async persistOrder(order: OrderRecord) {
-    if (order.orderBookSnapshot) {
-      this.prepareOrderBookSnapshotForOrder(order);
-    }
-    this.upsertOrderInMemory(order);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
+    await this.persistOrders([order]);
+  }
 
-    await this.runDb(
-      `
-      INSERT INTO orders (
-        id, trace_id, user_id, round_id, symbol, market_id, order_kind, time_in_force, limit_price,
-        lifecycle_status, result_type, token_id, book_key, book_hash, requested_amount_usdc,
-        requested_qty, frozen_usdc, frozen_qty, fills, estimated_fee, actual_fee, fee_breakdown, fee_currency,
-        source_latency_ms, market_slug, order_book_snapshot_ref, order_book_snapshot,
-        action, side, status, notional_usdc,
-        expected_qty, filled_qty, unfilled_qty, avg_fill_price, best_bid, best_ask, mid_price,
-        book_snapshot_ts, partial_filled, slippage_bps, match_latency_ms,
-        book_acquire_latency_ms, local_match_latency_ms, persist_latency_ms, total_order_latency_ms, failure_reason,
-        client_order_id, client_send_ts, server_recv_ts, server_publish_ts, created_at
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-        $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
-        $41,$42,$43,$44,$45,$46,$47,$48,$49,$50,
-        $51,$52
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        lifecycle_status = EXCLUDED.lifecycle_status,
-        result_type = EXCLUDED.result_type,
-        status = EXCLUDED.status,
-        filled_qty = EXCLUDED.filled_qty,
-        unfilled_qty = EXCLUDED.unfilled_qty,
-        avg_fill_price = EXCLUDED.avg_fill_price,
-        notional_usdc = EXCLUDED.notional_usdc,
-        partial_filled = EXCLUDED.partial_filled,
-        slippage_bps = EXCLUDED.slippage_bps,
-        match_latency_ms = EXCLUDED.match_latency_ms,
-        book_acquire_latency_ms = EXCLUDED.book_acquire_latency_ms,
-        local_match_latency_ms = EXCLUDED.local_match_latency_ms,
-        persist_latency_ms = EXCLUDED.persist_latency_ms,
-        total_order_latency_ms = EXCLUDED.total_order_latency_ms,
-        frozen_usdc = EXCLUDED.frozen_usdc,
-        frozen_qty = EXCLUDED.frozen_qty,
-        fills = EXCLUDED.fills,
-        estimated_fee = EXCLUDED.estimated_fee,
-        actual_fee = EXCLUDED.actual_fee,
-        fee_breakdown = EXCLUDED.fee_breakdown,
-        fee_currency = EXCLUDED.fee_currency,
-        order_book_snapshot_ref = EXCLUDED.order_book_snapshot_ref,
-        failure_reason = EXCLUDED.failure_reason,
-        client_order_id = EXCLUDED.client_order_id,
-        server_publish_ts = EXCLUDED.server_publish_ts
-      `,
-      [
-        order.id,
-        order.traceId,
-        order.userId,
-        order.roundId,
-        order.symbol,
-        order.marketId,
-        order.orderKind ?? null,
-        order.timeInForce ?? null,
-        order.limitPrice ?? null,
-        order.lifecycleStatus ?? order.status,
-        order.resultType ?? null,
-        order.tokenId ?? null,
-        order.bookKey ?? null,
-        order.bookHash ?? null,
-        order.requestedAmountUsdc ?? null,
-        order.requestedQty ?? null,
-        order.frozenUsdc ?? null,
-        order.frozenQty ?? null,
-        JSON.stringify(order.fills ?? []),
-        order.estimatedFee ?? null,
-        order.actualFee ?? null,
-        JSON.stringify(order.feeBreakdown ?? null),
-        order.feeCurrency ?? null,
-        order.sourceLatencyMs ?? null,
-        order.marketSlug ?? null,
-        order.orderBookSnapshotRef ?? null,
-        null,
-        order.action,
-        order.side,
-        order.status,
-        order.notionalUsdc,
-        order.expectedQty,
-        order.filledQty,
-        order.unfilledQty,
-        order.avgFillPrice ?? null,
-        order.bestBid,
-        order.bestAsk,
-        order.midPrice,
-        order.bookSnapshotTs,
-        order.partialFilled,
-        order.slippageBps ?? null,
-        order.matchLatencyMs,
-        order.bookAcquireLatencyMs ?? null,
-        order.localMatchLatencyMs ?? null,
-        order.persistLatencyMs ?? null,
-        order.totalOrderLatencyMs ?? null,
-        order.failureReason ?? null,
-        order.clientOrderId ?? null,
-        order.clientSendTs ?? null,
-        order.serverRecvTs,
-        order.serverPublishTs,
-        order.createdAt
-      ]
-    );
+  async persistOrders(orders: readonly OrderRecord[]) {
+    if (!orders.length) {
+      return;
+    }
+    this.applyOrdersToMemory(orders);
+    this.refreshHistoryViews();
+    await this.runBulkUpsert(orderPersistenceSpec, orders);
   }
 
   async persistOrderLatency(order: OrderRecord) {
@@ -2528,76 +2455,16 @@ export class AppStore {
   }
 
   async persistPosition(position: PositionRecord) {
-    this.upsertPositionInMemory(position);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
+    await this.persistPositions([position]);
+  }
 
-    await this.runDb(
-      `
-      INSERT INTO positions (
-        id, buy_order_id, user_id, round_id, side, qty, locked_qty, average_entry, notional_spent, current_mark,
-        current_bid, current_ask, current_mid, current_value, source_latency_ms,
-        unrealized_pnl, realized_pnl, entry_fee_usdc, exit_fee_usdc, total_fee_usdc,
-        cost_basis_usdc, mark_pnl_usdc, executable_pnl_usdc, status, opened_at, closed_at, settlement_result
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        buy_order_id = EXCLUDED.buy_order_id,
-        qty = EXCLUDED.qty,
-        locked_qty = EXCLUDED.locked_qty,
-        average_entry = EXCLUDED.average_entry,
-        notional_spent = EXCLUDED.notional_spent,
-        current_mark = EXCLUDED.current_mark,
-        current_bid = EXCLUDED.current_bid,
-        current_ask = EXCLUDED.current_ask,
-        current_mid = EXCLUDED.current_mid,
-        current_value = EXCLUDED.current_value,
-        source_latency_ms = EXCLUDED.source_latency_ms,
-        unrealized_pnl = EXCLUDED.unrealized_pnl,
-        realized_pnl = EXCLUDED.realized_pnl,
-        entry_fee_usdc = EXCLUDED.entry_fee_usdc,
-        exit_fee_usdc = EXCLUDED.exit_fee_usdc,
-        total_fee_usdc = EXCLUDED.total_fee_usdc,
-        cost_basis_usdc = EXCLUDED.cost_basis_usdc,
-        mark_pnl_usdc = EXCLUDED.mark_pnl_usdc,
-        executable_pnl_usdc = EXCLUDED.executable_pnl_usdc,
-        status = EXCLUDED.status,
-        closed_at = EXCLUDED.closed_at,
-        settlement_result = EXCLUDED.settlement_result
-      `,
-      [
-        position.id,
-        position.buyOrderId ?? null,
-        position.userId,
-        position.roundId,
-        position.side,
-        position.qty,
-        position.lockedQty ?? 0,
-        position.averageEntry,
-        position.notionalSpent,
-        position.currentMark,
-        position.currentBid ?? null,
-        position.currentAsk ?? null,
-        position.currentMid ?? null,
-        position.currentValue ?? null,
-        position.sourceLatencyMs ?? null,
-        position.unrealizedPnl,
-        position.realizedPnl,
-        position.entryFeeUsdc ?? 0,
-        position.exitFeeUsdc ?? 0,
-        position.totalFeeUsdc ?? roundNumber((position.entryFeeUsdc ?? 0) + (position.exitFeeUsdc ?? 0), 8),
-        position.costBasisUsdc ?? position.notionalSpent,
-        position.markPnlUsdc ?? roundNumber((position.currentValue ?? position.qty * position.currentMark) - (position.costBasisUsdc ?? position.notionalSpent), 2),
-        position.executablePnlUsdc ?? roundNumber(((position.currentBid ?? position.currentMark) * position.qty) - (position.costBasisUsdc ?? position.notionalSpent), 2),
-        position.status,
-        position.openedAt,
-        position.closedAt ?? null,
-        position.settlementResult ?? null
-      ]
-    );
+  async persistPositions(positions: readonly PositionRecord[]) {
+    if (!positions.length) {
+      return;
+    }
+    const positionIdsByUser = this.applyPositionsToMemory(positions);
+    this.refreshHistoryViews(positionIdsByUser);
+    await this.runBulkUpsert(positionPersistenceSpec, positions);
   }
 
   async recordLog(event: AuditEvent, options?: { emitUserPayload?: boolean; payloadScope?: UserPayloadScope }) {
@@ -3193,7 +3060,7 @@ export class AppStore {
       );
       this.rebuildHotIndexes();
       await this.rebuildLegacyOpenPositionLotsFromLifecycle();
-      this.pruneMemoryCaches();
+      this.pruneMemoryCaches(undefined, { force: true });
     }
 
     if (this.redisEnabled && this.redis?.isOpen) {
@@ -3350,7 +3217,7 @@ export class AppStore {
       this.lastMemoryGuardAt = now;
       this.updateMemoryProtectionState();
       if (this.memoryProtectionState !== "normal") {
-        this.pruneMemoryCaches(now);
+        this.pruneMemoryCaches(now, { force: true });
       }
     }
     if (!this.retentionCleanupRunning && now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {

@@ -21,6 +21,7 @@ import type {
   UserPayload,
   UserTradePayload
 } from "../utils/api";
+import { mergeUserTradePayload as mergeTradePayloadState } from "../features/user/user-trade-payload";
 
 interface AppState {
   token?: string;
@@ -58,6 +59,11 @@ interface AppState {
   markMarketRenderCommit: (clientRecvTs?: number) => void;
   setUserPayload: (data: UserPayload) => void;
   setUserTradePayload: (data: UserTradePayload) => void;
+  appendUserHistory: (data: {
+    orders?: OrderRecord[];
+    orderLifecycles?: OrderLifecycleRecord[];
+    logs?: AuditEvent[];
+  }) => void;
   setSourceStatus: (status: SourceHealth[]) => void;
   setLastOrderLatencyMs: (latency?: number) => void;
 }
@@ -191,26 +197,18 @@ function mergeCandleUpdates(
 }
 
 function mergeRecordsById<T extends { id: string }>(current: T[], updates: T[], limit = 500) {
-  const byId = new Map<string, T>();
-  for (const item of current) {
-    byId.set(item.id, item);
-  }
-  for (const item of updates) {
-    byId.set(item.id, item);
-  }
-  return [...byId.values()].slice(0, limit);
+  return mergeRecordsByKey(current, updates, (item) => item.id, limit);
 }
 
-function mergeUserTradePayload(state: AppState, data: UserTradePayload) {
-  return {
-    viewedUserId: data.viewedUserId,
-    profile: data.profile,
-    positions: data.positions,
-    orders: mergeRecordsById(state.orders, data.orders).sort((left, right) => right.createdAt - left.createdAt),
-    orderLifecycles: mergeRecordsById(state.orderLifecycles, data.orderLifecycles).sort(
-      (left, right) => right.orderTimestampMs - left.orderTimestampMs
-    )
-  };
+function mergeRecordsByKey<T>(current: T[], updates: T[], getKey: (item: T) => string, limit = 500) {
+  const byId = new Map<string, T>();
+  for (const item of current) {
+    byId.set(getKey(item), item);
+  }
+  for (const item of updates) {
+    byId.set(getKey(item), item);
+  }
+  return [...byId.values()].slice(0, limit);
 }
 
 function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): MarketSnapshot {
@@ -445,9 +443,23 @@ export const useAppStore = create<AppState>((set) => ({
   setUserTradePayload: (data) =>
     set((state) =>
       shouldAcceptViewedPayload(state, data.viewedUserId)
-        ? mergeUserTradePayload(state, data)
+        ? mergeTradePayloadState(state, data)
         : state
     ),
+  appendUserHistory: (data) =>
+    set((state) => ({
+      orders: data.orders
+        ? mergeRecordsById(state.orders, data.orders).sort((left, right) => right.createdAt - left.createdAt)
+        : state.orders,
+      orderLifecycles: data.orderLifecycles
+        ? mergeRecordsById(state.orderLifecycles, data.orderLifecycles).sort(
+          (left, right) => right.orderTimestampMs - left.orderTimestampMs
+        )
+        : state.orderLifecycles,
+      logs: data.logs
+        ? mergeRecordsByKey(state.logs, data.logs, (log) => log.eventId).sort((left, right) => right.serverRecvTs - left.serverRecvTs)
+        : state.logs
+    })),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),
   setLastOrderLatencyMs: (lastOrderLatencyMs) => set({ lastOrderLatencyMs })
 }));

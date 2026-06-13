@@ -6,10 +6,7 @@ import type {
   CandleBar,
   CoinbaseConnectorState,
   ClobMarketInfo,
-  FeeBreakdown,
   Language,
-  MatchingBookState,
-  MatchingFill,
   MarketCandleRecord,
   MarketSnapshot,
   OrderLifecycleExitType,
@@ -57,14 +54,12 @@ import {
 } from "./simulation/pricing";
 import {
   PRELIMINARY_SETTLEMENT_THRESHOLD,
-  resolveExactSettledSideFromOutcomePrices,
-  isMarketResolved
+  resolveExactSettledSideFromOutcomePrices
 } from "./simulation/settlement-rules";
 import { QTY_EPSILON, isClientOrderConflict, roundCurrency, roundNumber } from "./simulation/trade-calculations";
 import { buildBehaviorLog, type BehaviorLogBuildInput } from "./simulation/log-builders";
 import {
   measureTradePersistSegment,
-  persistTradeStepsSequentially,
   type TradePersistSegmentName,
   type TradePersistSegments
 } from "./simulation/order-persistence";
@@ -160,9 +155,6 @@ export class SimulationEngine {
   private readonly lastLatencyState = new Map<string, string>();
   private queuedLatencySnapshot?: MarketSnapshot;
   private latencyLogsRunning = false;
-  private readonly matchingBooks = new Map<string, MatchingBookState>();
-  private readonly currentBookKeys = new Map<TradeSide, string>();
-  private readonly lastSyncedSnapshotIds = new Map<string, string>();
   private preliminarySettlements = new Map<string, SettlementPreview>();
   private gammaOutcomeConfirmations = new Map<string, { side: TradeSide; count: number; observedAt: number }>();
   private gammaSettlementDiagnostics = new Set<string>();
@@ -398,7 +390,7 @@ export class SimulationEngine {
     });
     await this.applyRedeem(round);
     for (const userId of this.collectRoundPositionUsers(round.id)) {
-      this.store.emitUserPayload(userId);
+      this.store.emitUserPayload(userId, "trade");
     }
     this.scheduleReconcile();
     return round;
@@ -459,7 +451,7 @@ export class SimulationEngine {
       positionIds?: string[];
       exitType?: Exclude<OrderLifecycleExitType, "settlement" | "mixed">;
     }
-  ): Promise<{ order: OrderRecord }> {
+  ): Promise<{ order: OrderRecord; changedPositionIds: string[] }> {
     const snapshot = this.captureActionSnapshot();
     const traceId = this.store.newTraceId();
     const now = Date.now();
@@ -473,7 +465,7 @@ export class SimulationEngine {
           ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
           : undefined;
       if (existingOrder) {
-        return { order: existingOrder };
+        return { order: existingOrder, changedPositionIds: [] };
       }
       if (action === "buy") {
         this.assertCanBuyOrder(currentRound, now);
@@ -628,6 +620,7 @@ export class SimulationEngine {
         createdAt: Date.now()
       };
       const tradePersistSegments: TradePersistSegments = {};
+      let changedPositionIds: string[] = [];
       try {
         const transactionStartedAt = Date.now();
         await this.runTradeWriteTransaction(async () => {
@@ -642,19 +635,18 @@ export class SimulationEngine {
               order.frozenUsdc = frozen;
             } else {
               const frozenQty = roundNumber(payload.qty ?? 0, 4);
-              await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
+              changedPositionIds = await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
               order.frozenQty = frozenQty;
             }
-            await persistTradeStepsSequentially(
-              tradePersistSegments,
-              [
-                { name: "persistOrder", run: () => this.store.persistOrder(order) },
-                ...(action === "buy" ? [{ name: "persistUser" as const, run: () => this.store.persistUser(user) }] : [])
-              ],
-              tradePersistObserver
-            );
+            if (action === "buy") {
+              await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+                this.store.persistTradeRecords({ orders: [order], users: [user] })
+              );
+            } else {
+              await this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order));
+            }
           } else if (status === "filled" && estimate.avgPrice) {
-            await this.applyFilledOrder(
+            changedPositionIds = await this.applyFilledOrder(
               user,
               currentRound,
               order,
@@ -673,10 +665,12 @@ export class SimulationEngine {
           order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
           order.serverPublishTs = Date.now();
           order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
-          if (typeof this.store.persistOrderLatency === "function") {
-            await this.store.persistOrderLatency(order);
-          }
         });
+        if (typeof this.store.persistOrderLatency === "function") {
+          void this.store.persistOrderLatency(order).catch((error) => {
+            console.warn("[simulation] Failed to persist order latency outside transaction:", error);
+          });
+        }
         tradePersistSegments.transactionTotal = Math.max(Date.now() - transactionStartedAt, 0);
         const measuredSegmentTotal = Object.entries(tradePersistSegments)
           .filter(([name]) => name !== "transactionTotal" && name !== "commitAndOverhead")
@@ -685,13 +679,13 @@ export class SimulationEngine {
         tradePersistObserver.onSegmentObserved("transactionTotal", tradePersistSegments.transactionTotal);
         tradePersistObserver.onSegmentObserved("commitAndOverhead", tradePersistSegments.commitAndOverhead);
       } catch (writeError) {
-        if (clientOrderId && isClientOrderConflict(writeError)) {
+          if (clientOrderId && isClientOrderConflict(writeError)) {
           const existingOrderAfterConflict =
             typeof this.store.findOrderByClientOrderId === "function"
               ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
               : undefined;
           if (existingOrderAfterConflict) {
-            return { order: existingOrderAfterConflict };
+            return { order: existingOrderAfterConflict, changedPositionIds: [] };
           }
         }
         throw writeError;
@@ -813,7 +807,7 @@ export class SimulationEngine {
         await this.writeBehaviorLog(successBehaviorLog);
       });
       this.store.emitUserPayload(user.id, "trade");
-      return { order };
+      return { order, changedPositionIds };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Order failed.";
       const serverNow = Date.now();
@@ -894,6 +888,7 @@ export class SimulationEngine {
 
       const releasedFrozenUsdc = order.frozenUsdc ?? 0;
       const releasedFrozenQty = order.frozenQty ?? 0;
+      let changedPositionIds: string[] = [];
       await this.runTradeWriteTransaction(async () => {
         order.status = "cancelled";
         order.lifecycleStatus = "cancelled";
@@ -904,7 +899,7 @@ export class SimulationEngine {
           await this.store.persistUser(user);
         }
         if (order.frozenQty && order.frozenQty > 0) {
-          await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
+          changedPositionIds = await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
           order.frozenQty = 0;
         }
         order.serverPublishTs = Date.now();
@@ -971,7 +966,7 @@ export class SimulationEngine {
         ]);
       });
       this.store.emitUserPayload(user.id, "trade");
-      return order;
+      return { order, changedPositionIds };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Cancel order failed.";
       const serverNow = Date.now();
@@ -1046,7 +1041,7 @@ export class SimulationEngine {
       if (availableQty <= QTY_EPSILON) {
         throw new Error("Position has no unlocked quantity available to sell.");
       }
-      const { order } = await this.placeOrder(user, {
+      const result = await this.placeOrder(user, {
         action: "sell",
         side: position.side,
         qty: availableQty,
@@ -1055,6 +1050,7 @@ export class SimulationEngine {
         positionIds: [positionId],
         exitType
       });
+      const { order } = result;
       if (order.status !== "filled") {
         throw new Error(order.failureReason ?? "Sell order was not fully filled.");
       }
@@ -1117,7 +1113,7 @@ export class SimulationEngine {
         })
         );
       });
-      return order;
+      return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sell position failed.";
       const currentRound = position ? this.store.getRoundById(position.roundId) : this.getActiveRound(Date.now());
@@ -1210,9 +1206,6 @@ export class SimulationEngine {
   }) {
     const bookKey = this.resolveReplayBookKey(input);
     const response = await this.matchingClient.getCurrentBook(bookKey);
-    if (response.book) {
-      this.cacheMatchingBook(response.book);
-    }
     return {
       bookKey,
       book: response.book
@@ -1258,7 +1251,7 @@ export class SimulationEngine {
       const requestedQty = roundNumber(positions.reduce((sum, position) => sum + position.qty, 0), 4);
 
       const failures: Array<{ positionId: string; message: string }> = [];
-      const { order } = await this.placeOrder(user, {
+      const result = await this.placeOrder(user, {
         action: "sell",
         side: payload.side,
         qty: requestedQty,
@@ -1267,6 +1260,7 @@ export class SimulationEngine {
         positionIds: positions.map((position) => position.id),
         exitType: "close_side"
       });
+      const { order } = result;
       if (order.status !== "filled") {
         const message = order.failureReason ?? "Close side sell order was not fully filled.";
         failures.push(...positions.map((position) => ({ positionId: position.id, message })));
@@ -1342,7 +1336,8 @@ export class SimulationEngine {
         totalProceeds,
         avgFillPrice,
         matchLatencyMs: order.matchLatencyMs,
-        failures
+        failures,
+        changedPositionIds: result.changedPositionIds
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Close side failed.";
@@ -1462,7 +1457,8 @@ export class SimulationEngine {
       return {
         closeResult,
         reverseSide,
-        reverseOrder: result.order
+        reverseOrder: result.order,
+        changedPositionIds: [...closeResult.changedPositionIds, ...result.changedPositionIds]
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Reverse side failed.";
@@ -1854,66 +1850,6 @@ export class SimulationEngine {
     return this.resolveBookContext(input.side ?? "UP", round, input.marketId).bookKey;
   }
 
-  private async syncMatchingBooks() {
-    const activeRound = this.getActiveRound();
-    await Promise.all([this.syncMatchingBook("UP", activeRound), this.syncMatchingBook("DOWN", activeRound)]);
-  }
-
-  private async ensureCurrentMatchingBook(side: TradeSide, round?: RoundRecord, forceSync = false) {
-    const state = await this.syncMatchingBook(side, round, forceSync);
-    return state?.snapshot ?? this.polymarketState.orderBooks[side];
-  }
-
-  private async syncMatchingBook(side: TradeSide, round?: RoundRecord, forceSync = false) {
-    const sourceBook = this.polymarketState.orderBooks[side];
-    const context = this.resolveBookContext(side, round);
-    const cached = this.matchingBooks.get(context.bookKey);
-    this.currentBookKeys.set(side, context.bookKey);
-
-    if (!forceSync && cached && this.lastSyncedSnapshotIds.get(context.bookKey) === sourceBook.snapshotId) {
-      return cached;
-    }
-
-    try {
-      const response = await this.matchingClient.syncBook({
-        bookKey: context.bookKey,
-        roundId: context.roundId,
-        marketId: context.marketId,
-        bookSide: side,
-        source: "Polymarket",
-        sourceSnapshot: sourceBook,
-        syncedAt: Date.now()
-      });
-      this.cacheMatchingBook(response.book);
-      this.lastSyncedSnapshotIds.set(context.bookKey, sourceBook.snapshotId);
-      return response.book;
-    } catch {
-      if (cached) {
-        return cached;
-      }
-
-      const current = await this.matchingClient.getCurrentBook(context.bookKey).catch(() => ({ book: undefined }));
-      if (current.book) {
-        this.cacheMatchingBook(current.book);
-        return current.book;
-      }
-      return undefined;
-    }
-  }
-
-  private async refreshMatchingBook(bookKey: string) {
-    const response = await this.matchingClient.getCurrentBook(bookKey);
-    if (response.book) {
-      this.cacheMatchingBook(response.book);
-    }
-    return response.book;
-  }
-
-  private cacheMatchingBook(book: MatchingBookState) {
-    this.matchingBooks.set(book.bookKey, book);
-    this.currentBookKeys.set(book.bookSide, book.bookKey);
-  }
-
   private getDisplayedBook(side: TradeSide): OrderBookSnapshot {
     return this.polymarketState.orderBooks[side];
   }
@@ -2009,6 +1945,7 @@ export class SimulationEngine {
     positionIds?: string[]
   ) {
     let remaining = qty;
+    const changedPositionIds: string[] = [];
     for (const position of this.scopedPositions(userId, roundId, side, positionIds)) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2021,14 +1958,17 @@ export class SimulationEngine {
       position.lockedQty = roundNumber((position.lockedQty ?? 0) + take, 4);
       remaining = roundNumber(Math.max(remaining - take, 0), 4);
       await this.store.persistPosition(position);
+      changedPositionIds.push(position.id);
     }
     if (remaining > QTY_EPSILON) {
       throw new Error("Insufficient unlocked position quantity.");
     }
+    return changedPositionIds;
   }
 
   private async unlockSellQty(userId: string, roundId: string, side: TradeSide, qty: number) {
     let remaining = qty;
+    const changedPositionIds: string[] = [];
     for (const position of this.scopedPositions(userId, roundId, side)) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2041,7 +1981,9 @@ export class SimulationEngine {
       position.lockedQty = roundNumber(Math.max(locked - release, 0), 4);
       remaining = roundNumber(Math.max(remaining - release, 0), 4);
       await this.store.persistPosition(position);
+      changedPositionIds.push(position.id);
     }
+    return changedPositionIds;
   }
 
   private async applyFilledOrder(
@@ -2089,19 +2031,17 @@ export class SimulationEngine {
         order.midPrice || order.avgFillPrice || 0,
         order.actualFee ?? 0
       );
-      await persistTradeStepsSequentially(
-        tradePersistSegments,
-        [
-          { name: "persistPosition", run: () => this.store.persistPosition(position) },
-          { name: "persistUser", run: () => this.store.persistUser(user) },
-          { name: "persistOrder", run: () => this.store.persistOrder(order) }
-        ],
-        tradePersistObserver
+      await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+        this.store.persistTradeRecords({
+          orders: [order],
+          positions: [position],
+          users: [user]
+        })
       );
       if (emitUserPayload) {
         this.store.emitUserPayload(user.id, "trade");
       }
-      return;
+      return [position.id];
     }
 
     let remainingQty = order.filledQty;
@@ -2163,34 +2103,29 @@ export class SimulationEngine {
     const buyOrderIds = [...new Set(changedPositions.map((position) => position.buyOrderId).filter(Boolean) as string[])];
     user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
-    await persistTradeStepsSequentially(
-      tradePersistSegments,
-      [
-        ...changedPositions.map((position) => ({
-          name: "persistPosition" as const,
-          run: () => this.store.persistPosition(position)
-        })),
-        { name: "persistUser", run: () => this.store.persistUser(user) },
-        { name: "persistOrder", run: () => this.store.persistOrder(order) },
-        {
-          name: "persistOrderLifecycle",
-          run: () => this.store.applyLifecycleExit({
-            userId: user.id,
-            roundId: round.id,
-            side: order.side,
-            qty: order.filledQty,
-            exitType,
-            exitTokenPrice: order.avgFillPrice,
-            exitFee: order.actualFee ?? 0,
-            buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
-          })
-        }
-      ],
-      tradePersistObserver
+    await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+      this.store.persistTradeRecords({
+        orders: [order],
+        positions: changedPositions,
+        users: [user]
+      })
+    );
+    await this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () =>
+      this.store.applyLifecycleExit({
+        userId: user.id,
+        roundId: round.id,
+        side: order.side,
+        qty: order.filledQty,
+        exitType,
+        exitTokenPrice: order.avgFillPrice,
+        exitFee: order.actualFee ?? 0,
+        buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
+      })
     );
     if (emitUserPayload) {
       this.store.emitUserPayload(user.id, "trade");
     }
+    return changedPositions.map((position) => position.id);
   }
 
   private async recordBuyLifecycle(
@@ -2519,7 +2454,7 @@ export class SimulationEngine {
       await this.store.setMarketSnapshot(snapshot);
       this.scheduleLatencyLogs(snapshot);
       for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
-        this.store.emitUserPayload(userId);
+        this.store.emitUserPayload(userId, "trade");
       }
       this.schedulePendingOrderProcessing();
     } finally {
@@ -2559,7 +2494,6 @@ export class SimulationEngine {
   }
 
   private async syncDiscoveredRounds() {
-    const now = Date.now();
     for (const discovered of this.polymarketState.discoveredRounds) {
       const currentMarket = this.polymarketState.currentMarket;
       const isCurrentMarket = currentMarket?.slug === discovered.marketSlug;
@@ -2778,7 +2712,7 @@ export class SimulationEngine {
             }
           }
           for (const userId of this.collectRoundPositionUsers(round.id)) {
-            this.store.emitUserPayload(userId);
+            this.store.emitUserPayload(userId, "trade");
           }
           this.scheduleReconcile();
         }
@@ -3240,6 +3174,7 @@ export class SimulationEngine {
 
   private refreshOpenPositions(snapshot: MarketSnapshot) {
     const changedUsers = new Set<string>();
+    const changedPositionIdsByUser = new Map<string, Set<string>>();
     const activeRound = this.getActiveRound(snapshot.serverNow);
     for (const position of this.store.positions) {
       if (position.status !== "open") {
@@ -3276,7 +3211,13 @@ export class SimulationEngine {
         position.markPnlUsdc = unrealizedPnl;
         position.executablePnlUsdc = executablePnl;
         changedUsers.add(position.userId);
+        const changedPositionIds = changedPositionIdsByUser.get(position.userId) ?? new Set<string>();
+        changedPositionIds.add(position.id);
+        changedPositionIdsByUser.set(position.userId, changedPositionIds);
       }
+    }
+    for (const [userId, positionIds] of changedPositionIdsByUser.entries()) {
+      this.store.markTradePositionChanges(userId, positionIds);
     }
     return changedUsers;
   }
@@ -3702,7 +3643,7 @@ export class SimulationEngine {
       });
 
       for (const userId of userIds) {
-        this.store.emitUserPayload(userId);
+        this.store.emitUserPayload(userId, "trade");
       }
       await this.publishSettlementMarketSnapshot(round, "redeem_completed");
     } catch (error) {

@@ -22,7 +22,6 @@ import {
   type LogFacets,
   type LogSearchQuery,
   type LogSystem,
-  type MarketTrade,
   type MarketSnapshot,
   type OrderAction,
   type OrderLifecycleRecord,
@@ -52,13 +51,14 @@ import { PositionPnlBreakdown } from "./features/trade/PositionPnlBreakdown";
 import { positionDisplayedPnl, summarizePositionPnl } from "./features/trade/pnl";
 import { useOrderActions } from "./features/trade/useOrderActions";
 import { useMarketSocket } from "./features/market/useMarketSocket";
+import { latencyForSource } from "./features/market/source-latency";
 import { useUserSocket } from "./features/user/useUserSocket";
+import { usePagedUserHistory } from "./features/user/usePagedUserHistory";
 import { ManualSettlementQueue } from "./features/settlement/ManualSettlementQueue";
 import {
   ACTION_STATUS_OPTIONS,
   CONNECTION_STATE_OPTIONS,
   DEFAULT_LOG_FACETS,
-  LANGUAGE_OPTIONS,
   LATENCY_PHASE_OPTIONS,
   LATENCY_SOURCE_OPTIONS,
   LOG_EXPORT_SYSTEMS,
@@ -168,17 +168,6 @@ function roundTimeRangeText(round: Pick<RoundRecord, "startAt" | "endAt">) {
   return `${chartTimeText(round.startAt)}-${chartTimeText(round.endAt)} UTC`;
 }
 
-function datedRoundTimeRangeText(round: Pick<RoundRecord, "startAt" | "endAt">) {
-  const start = utcParts(round.startAt);
-  const end = utcParts(round.endAt);
-  const startDate = `${start.year}-${start.month}-${start.day}`;
-  const endDate = `${end.year}-${end.month}-${end.day}`;
-  if (startDate === endDate) {
-    return `${startDate} ${start.hour}:${start.minute}-${end.hour}:${end.minute} UTC`;
-  }
-  return `${startDate} ${start.hour}:${start.minute} - ${endDate} ${end.hour}:${end.minute} UTC`;
-}
-
 function roundTitleText(
   round: Pick<RoundRecord, "symbol" | "startAt" | "endAt"> | undefined,
   _language: Language,
@@ -262,25 +251,8 @@ function parseLimitPriceCentsInput(value: string) {
   return parsed;
 }
 
-function shortChartHint(language: Language) {
+function shortChartHint(_language: Language) {
   return t("wheelZoomShiftYDblReset");
-}
-
-function buildAxisLabelIndices(length: number, targetCount: number) {
-  if (length <= 0) {
-    return [];
-  }
-  if (length <= targetCount) {
-    return Array.from({ length }, (_, index) => index);
-  }
-
-  const lastIndex = length - 1;
-  const indices = new Set<number>();
-  for (let step = 0; step < targetCount; step += 1) {
-    indices.add(Math.round((step * lastIndex) / Math.max(targetCount - 1, 1)));
-  }
-  indices.add(lastIndex);
-  return [...indices].sort((left, right) => left - right);
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -323,7 +295,7 @@ function countdownTone(countdownMs: number) {
   return "live";
 }
 
-function activeRoundTradeBlockReason(round: RoundRecord | undefined, nowMs: number, language: Language) {
+function activeRoundTradeBlockReason(round: RoundRecord | undefined, nowMs: number, _language: Language) {
   if (!round || nowMs < round.startAt || nowMs >= round.endAt) {
     return t("uiNoActiveTradableRound94c14d76");
   }
@@ -395,40 +367,6 @@ function isCurrentRoundOrder(order: OrderRecord, currentRound?: RoundRecord) {
   return order.roundId === currentRound.id || Boolean(order.marketSlug && order.marketSlug === currentRound.marketSlug);
 }
 
-function orderStatusLabel(order: OrderRecord, language: Language) {
-  if (order.status === "pending") {
-    return t("pending");
-  }
-  if (order.status === "filled") {
-    return t("filled");
-  }
-  if (order.status === "cancelled") {
-    return t("cancelled");
-  }
-  if (order.status === "failed") {
-    return t("failed");
-  }
-  return order.status;
-}
-
-function orderResultLabel(order: OrderRecord, language: Language) {
-  const kind = order.orderKind === "limit" ? t("limit") : t("market");
-  return `${kind} / ${orderStatusLabel(order, language)}`;
-}
-
-function orderStatusTone(status: OrderRecord["status"]) {
-  if (status === "filled") {
-    return "positive";
-  }
-  if (status === "pending" || status === "partial") {
-    return "warning";
-  }
-  if (status === "failed") {
-    return "negative";
-  }
-  return "neutral";
-}
-
 function orderBookExecutionPrice(order: OrderRecord) {
   const price = order.action === "buy" ? order.bestAsk : order.bestBid;
   return price > 0 ? price : order.midPrice;
@@ -475,13 +413,13 @@ function orderReferencePriceText(order: OrderRecord, snapshot?: MarketSnapshot) 
   return tokenPriceText(referencePrice);
 }
 
-function orderTradeLabel(order: OrderRecord, language: Language) {
+function orderTradeLabel(order: OrderRecord, _language: Language) {
   const actionLabel = (order.action === "buy" ? t("buy") : t("sell"));
   const sideLabel = order.side === "UP" ? "UP" : "DOWN";
   return `${actionLabel} ${sideLabel}`;
 }
 
-function orderPriceQualifier(order: OrderRecord, language: Language) {
+function orderPriceQualifier(order: OrderRecord, _language: Language) {
   if (order.status === "filled") {
     return t("uiFillExclFee8feb86d7");
   }
@@ -492,31 +430,6 @@ function orderPriceQualifier(order: OrderRecord, language: Language) {
     return t("uiLimit0295355c");
   }
   return t("uiLatestTradeDisplayf79d82d5");
-}
-
-function OrderExecutionCell({ order, language }: { order: OrderRecord; language: Language }) {
-  const bookPrice = orderBookExecutionPrice(order);
-  return (
-    <div className="field-stack compact-order-metrics">
-      <strong>{order.avgFillPrice ? decimal(order.avgFillPrice, 4) : "--"}</strong>
-      <small className="cell-note">
-        {t("book")}: {bookPrice > 0 ? decimal(bookPrice, 4) : "--"}
-      </small>
-      <small className="cell-note">
-        {t("slippage")}: {typeof order.slippageBps === "number" ? `${decimal(order.slippageBps, 2)} bps` : "--"}
-      </small>
-    </div>
-  );
-}
-
-function auditStatusTone(status: AuditEvent["actionStatus"]) {
-  if (status === "success") {
-    return "positive";
-  }
-  if (status === "timeout") {
-    return "warning";
-  }
-  return "negative";
 }
 
 const AUDIT_ACTION_LABEL_KEYS: Record<string, string> = {
@@ -565,24 +478,6 @@ function auditCategoryLabel(category: string | undefined, _language: Language) {
   return key ? t(key) : category;
 }
 
-function actionTone(action: string) {
-  if (action === "buy") {
-    return "positive";
-  }
-  if (action === "sell") {
-    return "negative";
-  }
-  return "info";
-}
-
-function sideTone(side: TradeSide) {
-  return side === "UP" ? "positive" : "negative";
-}
-
-function orderKindLabel(order: OrderRecord, language: Language) {
-  return order.orderKind === "limit" ? t("limit") : t("market");
-}
-
 function sortOrdersForTradingPage(left: OrderRecord, right: OrderRecord, currentRound?: RoundRecord) {
   const leftCurrent = isCurrentRoundOrder(left, currentRound) ? 1 : 0;
   const rightCurrent = isCurrentRoundOrder(right, currentRound) ? 1 : 0;
@@ -597,54 +492,15 @@ function sortOrdersForTradingPage(left: OrderRecord, right: OrderRecord, current
   return right.createdAt - left.createdAt;
 }
 
-function transportAgeMs(receivedAt: number, publishTs: number, clientClockOffsetMs = 0) {
-  return Math.max(receivedAt - publishTs - clientClockOffsetMs, 0);
-}
-
 function latencyFor(source?: SourceHealth, now = Date.now(), clientRecvTs?: number, clientClockOffsetMs = 0) {
-  if (!source || source.state === "disabled") {
-    return {
-      sourceToBackendLatencyMs: 0,
-      backendToFrontendLatencyMs: undefined,
-      endToEndLatencyMs: undefined,
-      dataAgeMs: 0,
-      sourceDataAgeMs: 0,
-      marketUpdateAgeMs: 0,
-      disabled: true
-    };
-  }
-  const backendToFrontendLatencyMs =
-    typeof source.clientRecvTs === "number"
-      ? transportAgeMs(source.clientRecvTs, source.serverPublishTs, clientClockOffsetMs)
-      : typeof clientRecvTs === "number"
-        ? Math.max(clientRecvTs - source.serverPublishTs - clientClockOffsetMs, 0)
-        : typeof source.frontendLatencyMs === "number"
-          ? Math.max(source.frontendLatencyMs, 0)
-          : undefined;
-  return {
-    sourceToBackendLatencyMs: Math.max(source.acquireLatencyMs, 0),
-    backendToFrontendLatencyMs,
-    endToEndLatencyMs:
-      typeof backendToFrontendLatencyMs === "number"
-        ? Math.max(source.serverPublishTs - source.sourceEventTs + backendToFrontendLatencyMs, 0)
-        : undefined,
-    dataAgeMs: Math.max(now - source.normalizedTs, 0),
-    sourceDataAgeMs: Math.max(now - source.normalizedTs, 0),
-    marketUpdateAgeMs:
-      typeof source.clientRecvTs === "number"
-        ? Math.max(now - source.clientRecvTs, 0)
-        : typeof clientRecvTs === "number"
-          ? Math.max(now - clientRecvTs, 0)
-          : 0,
-    disabled: false
-  };
+  return latencyForSource(source, now, clientRecvTs, clientClockOffsetMs);
 }
 
 function sourceComponent(source: SourceHealth | undefined, key: string) {
   return source?.components?.[key];
 }
 
-function componentStateLabel(state: SourceHealth["state"] | undefined, language: Language) {
+function componentStateLabel(state: SourceHealth["state"] | undefined, _language: Language) {
   if (!state) return t("uiUnknown30b090da");
   const keys: Record<SourceHealth["state"], string> = {
     healthy: "sourceStateHealthy",
@@ -878,28 +734,6 @@ function CoinbaseComparisonChart(props: {
   );
 }
 
-function roundMoveLabel(round: HistoryRound, language: Language) {
-  if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isBtcReferencePrice(round.polymarketClosePrice)) {
-    return "--";
-  }
-  const delta = round.polymarketClosePrice - round.polymarketOpenPrice;
-  if (Math.abs(delta) < 0.0001) {
-    return t("flat");
-  }
-  return delta > 0 ? t("up") : t("down");
-}
-
-function roundMoveTone(round: HistoryRound) {
-  if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isBtcReferencePrice(round.polymarketClosePrice)) {
-    return "tone-neutral";
-  }
-  const delta = round.polymarketClosePrice - round.polymarketOpenPrice;
-  if (Math.abs(delta) < 0.0001) {
-    return "tone-neutral";
-  }
-  return delta > 0 ? "tone-positive" : "tone-negative";
-}
-
 function roundHasEnded(round: Pick<RoundRecord, "endAt">, nowMs: number) {
   return nowMs >= round.endAt;
 }
@@ -922,7 +756,7 @@ function recentRoundOutcome(input: {
   nowMs: number;
   language: Language;
 }) {
-  const { round, nowMs, language } = input;
+  const { round, nowMs } = input;
   const preview = round.settlementPreview;
   if (!roundHasEnded(round, nowMs)) {
     return {
@@ -964,45 +798,6 @@ function recentRoundOutcome(input: {
   };
 }
 
-interface EquityCurvePoint {
-  roundId: string;
-  marketSlug?: string;
-  status: RoundRecord["status"];
-  startAt: number;
-  endAt: number;
-  roundPnl: number;
-  orderCount: number;
-  cumulativeEquity: number;
-  label: string;
-  datedLabel: string;
-}
-
-type OperatedCurveWindow = 10 | 30 | 60 | "all";
-
-interface RoundDisplayMeta {
-  roundId: string;
-  marketSlug?: string;
-  status?: RoundRecord["status"];
-  startAt?: number;
-  endAt?: number;
-  userPnl?: number;
-}
-
-interface RoundGroupedPositionView extends RoundDisplayMeta {
-  positions: PositionRecord[];
-  totalQty: number;
-  openCount: number;
-  positionValue: number;
-  floatingPnl: number;
-}
-
-interface RoundGroupedOrderView extends RoundDisplayMeta {
-  orders: OrderRecord[];
-  pendingCount: number;
-  notionalUsdc: number;
-  filledQty: number;
-}
-
 interface RoundCalendarItem {
   roundId: string;
   marketSlug?: string;
@@ -1029,251 +824,6 @@ function parseBtcFiveMinuteSlugStart(value?: string) {
   }
   const startAt = Number(match[1]) * 1000;
   return Number.isSafeInteger(startAt) && startAt > 0 ? startAt : undefined;
-}
-
-function inferRoundMeta(roundId: string, historyByRoundId: Map<string, HistoryRound>, marketSlug?: string): RoundDisplayMeta {
-  const historyRound = historyByRoundId.get(roundId);
-  if (historyRound) {
-    return {
-      roundId,
-      marketSlug: historyRound.marketSlug ?? marketSlug,
-      status: historyRound.status,
-      startAt: historyRound.startAt,
-      endAt: historyRound.endAt,
-      userPnl: historyRound.userPnl
-    };
-  }
-  const inferredSlug = marketSlug ?? roundId;
-  const slugStartAt = parseBtcFiveMinuteSlugStart(inferredSlug);
-  return {
-    roundId,
-    marketSlug,
-    startAt: slugStartAt,
-    endAt: typeof slugStartAt === "number" ? slugStartAt + 5 * 60_000 : undefined
-  };
-}
-
-function roundDisplayTitle(meta: RoundDisplayMeta, language: Language) {
-  if (typeof meta.startAt === "number" && typeof meta.endAt === "number") {
-    return roundTimeRangeText({ startAt: meta.startAt, endAt: meta.endAt });
-  }
-  return t("roundTimePending");
-}
-
-function roundSecondaryText(meta: RoundDisplayMeta, language: Language) {
-  const slug = meta.marketSlug ?? meta.roundId;
-  return `${t("market")}: ${slug}`;
-}
-
-function buildOperatedHistory(history: HistoryRound[], orders: OrderRecord[]) {
-  const orderCountByRoundId = new Map<string, number>();
-  for (const order of orders) {
-    orderCountByRoundId.set(order.roundId, (orderCountByRoundId.get(order.roundId) ?? 0) + 1);
-  }
-  return [...history]
-    .filter((round) => (orderCountByRoundId.get(round.id) ?? 0) > 0)
-    .sort((left, right) => left.startAt - right.startAt)
-    .map((round) => ({ round, orderCount: orderCountByRoundId.get(round.id) ?? 0 }));
-}
-
-function applyCurveWindow<T>(items: T[], window: OperatedCurveWindow) {
-  return window === "all" ? items : items.slice(Math.max(items.length - window, 0));
-}
-
-function CompactEquityCurve(props: { points: EquityCurvePoint[]; minValue: number; maxValue: number }) {
-  const [hoverIndex, setHoverIndex] = useState<number>();
-  const width = 1080;
-  const height = 420;
-  const padLeft = 58;
-  const padRight = 14;
-  const padTop = 10;
-  const padBottom = 34;
-  const chartWidth = width - padLeft - padRight;
-  const chartHeight = height - padTop - padBottom;
-  const domainMin = props.minValue;
-  const domainMax = props.maxValue > props.minValue ? props.maxValue : props.minValue + 1;
-  const valueRange = domainMax - domainMin;
-  const xFor = (index: number) =>
-    props.points.length === 1 ? padLeft + chartWidth / 2 : padLeft + (index / (props.points.length - 1)) * chartWidth;
-  const yFor = (value: number) => padTop + chartHeight - ((value - domainMin) / valueRange) * chartHeight;
-  const linePoints = props.points
-    .map((point, index) => `${xFor(index).toFixed(1)},${yFor(point.cumulativeEquity).toFixed(1)}`)
-    .join(" ");
-  const ticks = [domainMax, domainMin + valueRange / 2, domainMin];
-  const first = props.points[0];
-  const last = props.points[props.points.length - 1];
-  const hoverPoint = typeof hoverIndex === "number" ? props.points[hoverIndex] : undefined;
-  const hoverX = typeof hoverIndex === "number" ? xFor(hoverIndex) : undefined;
-  const hoverY = hoverPoint ? yFor(hoverPoint.cumulativeEquity) : undefined;
-  const tooltipX = typeof hoverX === "number" ? Math.min(Math.max(hoverX + 18, padLeft), width - 330) : 0;
-  const tooltipY = typeof hoverY === "number" ? Math.min(Math.max(hoverY - 76, padTop + 8), height - padBottom - 106) : 0;
-
-  const handlePointerMove = (event: ReactMouseEvent<SVGSVGElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const pointerX = ((event.clientX - rect.left) / rect.width) * width;
-    const nearestIndex = props.points.reduce(
-      (nearest, _point, index) =>
-        Math.abs(xFor(index) - pointerX) < Math.abs(xFor(nearest) - pointerX) ? index : nearest,
-      0
-    );
-    setHoverIndex(nearestIndex);
-  };
-
-  return (
-    <svg
-      className="profile-fast-curve"
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label="Equity curve"
-      onMouseMove={handlePointerMove}
-      onMouseLeave={() => setHoverIndex(undefined)}
-    >
-      {ticks.map((tick) => {
-        const y = yFor(tick);
-        return (
-          <g key={tick.toFixed(2)}>
-            <line x1={padLeft} x2={width - padRight} y1={y} y2={y} />
-            <text x={padLeft - 8} y={y + 4} textAnchor="end">
-              {money(tick, 0)}
-            </text>
-          </g>
-        );
-      })}
-      <polyline points={linePoints} />
-      {props.points.map((point, index) => (
-        <circle key={point.roundId} cx={xFor(index)} cy={yFor(point.cumulativeEquity)} r="2.8">
-          <title>
-            {`${point.datedLabel} · ${point.marketSlug ?? point.roundId} · ${signedMoney(point.roundPnl)} · ${signedMoney(point.cumulativeEquity)}`}
-          </title>
-        </circle>
-      ))}
-      {hoverPoint && typeof hoverX === "number" && typeof hoverY === "number" ? (
-        <g className="profile-fast-curve-hover">
-          <line className="hover-line" x1={hoverX} x2={hoverX} y1={padTop} y2={height - padBottom} />
-          <circle className="hover-dot" cx={hoverX} cy={hoverY} r="6" />
-          <g className="hover-tooltip" transform={`translate(${tooltipX} ${tooltipY})`}>
-            <rect width="310" height="96" rx="12" />
-            <text x="12" y="22">{hoverPoint.datedLabel}</text>
-            <text x="12" y="42">{hoverPoint.marketSlug ?? hoverPoint.roundId}</text>
-            <text x="12" y="64">{t("singleRoundPnlLabel", { value: signedMoney(hoverPoint.roundPnl) })}</text>
-            <text x="12" y="84">{t("cumulativeReturnLabel", { value: signedMoney(hoverPoint.cumulativeEquity) })}</text>
-          </g>
-        </g>
-      ) : null}
-      {first ? (
-        <text className="x-label" x={padLeft} y={height - 9}>
-          {first.datedLabel}
-        </text>
-      ) : null}
-      {last && last !== first ? (
-        <text className="x-label" x={width - padRight} y={height - 9} textAnchor="end">
-          {last.datedLabel}
-        </text>
-      ) : null}
-    </svg>
-  );
-}
-
-function buildCurveSeries(history: HistoryRound[], orders: OrderRecord[], window: OperatedCurveWindow): EquityCurvePoint[] {
-  const operated = buildOperatedHistory(history, orders);
-  const visible = applyCurveWindow(operated, window);
-  if (visible.length === 0) {
-    return [];
-  }
-
-  let runningProfit = 0;
-
-  return visible.map(({ round, orderCount }) => {
-    runningProfit += round.userPnl;
-    return {
-      roundId: round.id,
-      marketSlug: round.marketSlug,
-      status: round.status,
-      startAt: round.startAt,
-      endAt: round.endAt,
-      roundPnl: round.userPnl,
-      orderCount,
-      cumulativeEquity: Number(runningProfit.toFixed(2)),
-      label: roundTimeRangeText(round),
-      datedLabel: datedRoundTimeRangeText(round)
-    };
-  });
-}
-
-function buildRoundCalendarItems(history: HistoryRound[], orders: OrderRecord[]): RoundCalendarItem[] {
-  return buildOperatedHistory(history, orders).map(({ round, orderCount }, index) => ({
-    roundId: round.id,
-    marketSlug: round.marketSlug,
-    status: round.status,
-    startAt: round.startAt,
-    endAt: round.endAt,
-    roundPnl: round.userPnl,
-    orderCount,
-    sequence: index + 1,
-    label: roundTimeRangeText(round),
-    datedLabel: datedRoundTimeRangeText(round)
-  }));
-}
-
-function buildGroupedPositions(history: HistoryRound[], positions: PositionRecord[], orders: OrderRecord[]): RoundGroupedPositionView[] {
-  const historyByRoundId = new Map(history.map((round) => [round.id, round]));
-  const slugByRoundId = new Map<string, string>();
-  for (const order of orders) {
-    if (order.marketSlug && !slugByRoundId.has(order.roundId)) {
-      slugByRoundId.set(order.roundId, order.marketSlug);
-    }
-  }
-  const grouped = new Map<string, PositionRecord[]>();
-  for (const position of positions) {
-    grouped.set(position.roundId, [...(grouped.get(position.roundId) ?? []), position]);
-  }
-  return [...grouped.entries()]
-    .map(([roundId, roundPositions]) => {
-      const meta = inferRoundMeta(roundId, historyByRoundId, slugByRoundId.get(roundId));
-      return {
-        ...meta,
-        positions: roundPositions,
-        totalQty: roundPositions.reduce((sum, position) => sum + position.qty, 0),
-        openCount: roundPositions.filter((position) => position.displayStatus === "open").length,
-        positionValue: roundPositions.reduce((sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark), 0),
-        floatingPnl: roundPositions.reduce((sum, position) => sum + positionDisplayedPnl(position), 0)
-      };
-    })
-    .sort((left, right) => (right.startAt ?? 0) - (left.startAt ?? 0));
-}
-
-function buildGroupedOrders(history: HistoryRound[], orders: OrderRecord[]): RoundGroupedOrderView[] {
-  const historyByRoundId = new Map(history.map((round) => [round.id, round]));
-  const grouped = new Map<string, OrderRecord[]>();
-  for (const order of orders) {
-    grouped.set(order.roundId, [...(grouped.get(order.roundId) ?? []), order]);
-  }
-  return [...grouped.entries()]
-    .map(([roundId, roundOrders]) => {
-      const marketSlug = roundOrders.find((order) => order.marketSlug)?.marketSlug;
-      const meta = inferRoundMeta(roundId, historyByRoundId, marketSlug);
-      return {
-        ...meta,
-        orders: roundOrders.sort((left, right) => right.createdAt - left.createdAt),
-        pendingCount: roundOrders.filter((order) => order.status === "pending").length,
-        notionalUsdc: roundOrders.reduce((sum, order) => sum + (order.requestedAmountUsdc ?? order.notionalUsdc), 0),
-        filledQty: roundOrders.reduce((sum, order) => sum + order.filledQty, 0)
-      };
-    })
-    .sort((left, right) => (right.startAt ?? 0) - (left.startAt ?? 0));
-}
-
-function sourceTone(state?: SourceHealth["state"]) {
-  if (state === "healthy") {
-    return "positive";
-  }
-  if (state === "disabled") {
-    return "neutral";
-  }
-  if (state === "reconnecting" || state === "stale") {
-    return "warning";
-  }
-  return "negative";
 }
 
 function isBtcReferencePrice(value?: number): value is number {
@@ -1309,18 +859,11 @@ function spreadDisplayText(spread?: number) {
   return signedMoney(spread);
 }
 
-function ptbDisplayLabel(language: Language, source?: MarketSnapshot["displayPriceToBeatSource"]) {
+function ptbDisplayLabel(_language: Language, source?: MarketSnapshot["displayPriceToBeatSource"]) {
   if (source === "binance_open_fallback") {
     return t("uiPTBBinanceOpenf6c19fc9");
   }
   return "PTB";
-}
-
-function metricValueForSource(source: SourceHealth | undefined, value: number, digits = 2) {
-  if (source?.state === "disabled" || !isBtcReferencePrice(value)) {
-    return "--";
-  }
-  return money(value, digits);
 }
 
 function AppMetric(props: {
@@ -1463,7 +1006,6 @@ function CandlestickChart(props: {
   const zoomedRange = Math.max((maxWithPadding - minWithPadding) / effectiveYZoom, 1);
   const range = zoomedRange;
   const zoomMax = mid + zoomedRange / 2;
-  const zoomMin = mid - zoomedRange / 2;
   const innerWidth = width - padding.left - padding.right;
   const innerHeight = height - padding.top - padding.bottom;
   const domainSpanMs = Math.max(domainEndTs - domainStartTs, 1);
@@ -1877,6 +1419,7 @@ function App() {
     markMarketRenderCommit,
     setUserPayload,
     setUserTradePayload,
+    appendUserHistory,
     setLastOrderLatencyMs
   } = useAppStore();
   const [bootstrapping, setBootstrapping] = useState(false);
@@ -1913,13 +1456,12 @@ function App() {
     me;
   const isViewingSelf = !effectiveViewUserId || effectiveViewUserId === me?.id;
   const {
-    tradeBusy,
     quickBusy,
     cancelBusyOrderId,
     sellBusyPositionId,
     sellFeedback,
     pendingOrderClientId,
-    ensureViewingSelfForMutation,
+    pendingOrderCount,
     handlePlaceOrder,
     handleCloseSide,
     handleReverseSide,
@@ -2092,6 +1634,16 @@ function App() {
     updateRealtimeChannel,
     setUserPayload,
     setUserTradePayload
+  });
+
+  const historyPager = usePagedUserHistory({
+    token,
+    viewedUserId: effectiveViewUserId,
+    ordersCount: orders.length,
+    orderLifecyclesCount: orderLifecycles.length,
+    logsCount: logs.length,
+    appendUserHistory,
+    onError: setError
   });
 
   const handleLogin = async (username: string, password: string) => {
@@ -2312,9 +1864,9 @@ function App() {
             limitPrice={limitPrice}
             orderAction={orderAction}
             orderKind={orderKind}
-            tradeBusy={tradeBusy}
             quickBusy={quickBusy}
             pendingOrderClientId={pendingOrderClientId}
+            pendingOrderCount={pendingOrderCount}
             sellBusyPositionId={sellBusyPositionId}
             sellFeedback={sellFeedback}
             canPlaceOrder={isViewingSelf && me.permissionCodes.includes("trade:order")}
@@ -2370,6 +1922,9 @@ function App() {
               setUser(nextMe);
             }}
             onUserUpdated={setUser}
+            canLoadMoreLogs={historyPager.canLoadLogs}
+            logsLoading={historyPager.logsLoading}
+            onLoadMoreLogs={historyPager.loadMoreLogs}
           />
         ) : currentPage === "profile" ? (
           <AnalyticsPage
@@ -2396,6 +1951,9 @@ function App() {
             roundLogBusyRoundId={roundLogBusyRoundId}
             canManualSettle={me.role === "Admin" && me.permissionCodes.includes("settlement:manual")}
             onManualSettlementComplete={refreshAfterManualSettlement}
+            canLoadMoreHistory={historyPager.canLoadTradeHistory}
+            historyLoading={historyPager.tradeLoading}
+            onLoadMoreHistory={historyPager.loadMoreTradeHistory}
           />
         ) : (
           <LogSearchPage
@@ -2713,13 +2271,13 @@ function analyticsResultLabel(result: AnalyticsResult, _language: Language) {
   return t(labels[result]);
 }
 
-function analyticsSettlementLabel(state: AnalyticsSettlementState, language: Language) {
+function analyticsSettlementLabel(state: AnalyticsSettlementState, _language: Language) {
   return state === "SETTLED"
     ? t("uiSettled3f248bb9")
     : t("uiUnsettledec860135");
 }
 
-function analyticsRowAnalysis(result: AnalyticsResult, language: Language): { text: string; tone: AnalyticsTone } {
+function analyticsRowAnalysis(result: AnalyticsResult, _language: Language): { text: string; tone: AnalyticsTone } {
   if (result === "WIN") {
     return {
       tone: "positive",
@@ -2785,9 +2343,9 @@ function TradePageRestored(props: {
   limitPrice: string;
   orderAction: OrderAction;
   orderKind: PaperOrderKind;
-  tradeBusy: boolean;
   quickBusy: boolean;
   pendingOrderClientId?: string;
+  pendingOrderCount: number;
   sellBusyPositionId?: string;
   sellFeedback?: { positionId?: string; message: string };
   canPlaceOrder: boolean;
@@ -3016,10 +2574,10 @@ function TradePageRestored(props: {
     { key: "system", label: t("uiSystemDelayeeffe398") }
   ].map((group) => ({ ...group, items: riskAlerts.filter((alert) => alert.group === group.key) })).filter((group) => group.items.length > 0);
   const latencyRows = [
-    { label: t("uiMarketUpdateAgebf535c1f"), value: marketUpdateAge },
-    { label: t("uiOldestSourceAge44acef60"), value: sourceAgeMax },
-    { label: t("uiBackendCompute74f83d9a"), value: snapshot?.latencyBreakdown.serverComputeLatency },
-    { label: t("uiFrontendTransport3df4869f"), value: snapshot?.latencyBreakdown.clientTransportLatency }
+    { label: t("uiMarketUpdateAgebf535c1f"), value: marketUpdateAge, title: t("uiStoreAcceptedAgeHint") },
+    { label: t("uiOldestSourceAge44acef60"), value: sourceAgeMax, title: t("uiOldestUpstreamEventAgeHint") },
+    { label: t("uiBackendCompute74f83d9a"), value: snapshot?.latencyBreakdown.serverComputeLatency, title: t("uiSnapshotPublishGapHint") },
+    { label: t("uiFrontendTransport3df4869f"), value: snapshot?.latencyBreakdown.clientTransportLatency, title: t("uiServerToClientLatencyHint") }
   ];
   const topLatency = [...latencyRows].sort((left, right) => (right.value ?? -1) - (left.value ?? -1))[0];
   const selectedSummary = snapshot?.clob.bestBidAskSummary[selectedSide];
@@ -3103,7 +2661,7 @@ function TradePageRestored(props: {
           <small>{t("uiLatencySplit08e91cc3")}</small>
           <strong>{topLatency?.label ?? "--"} {typeof topLatency?.value === "number" ? `${Math.round(topLatency.value)}ms` : "--"}</strong>
           <div className="latency-mini-list">
-            {latencyRows.map((row) => <span key={row.label}>{row.label}: {typeof row.value === "number" ? `${Math.round(row.value)}ms` : "--"}</span>)}
+            {latencyRows.map((row) => <span key={row.label} title={row.title}>{row.label}: {typeof row.value === "number" ? `${Math.round(row.value)}ms` : "--"}</span>)}
           </div>
         </div>
         <div className="monitor-cell compact monitor-balance">
@@ -3472,13 +3030,13 @@ function TradePageRestored(props: {
                 <span>{t("available")}: {money(profile?.availableUsdc ?? 0)}</span>
                 <span>{t("estimatedQty")}: {decimal(estimatedQty, 4)}</span>
               </div>
-              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade || props.tradeBusy} title={executeBlockReason} onClick={props.onPlaceOrder}>
-                {props.tradeBusy ? t("loading") : props.orderAction === "buy" ? `BUY ${selectedSide}` : `SELL ${selectedSide}`}
+              <button className={`execute ${selectedSide === "DOWN" ? "down" : "up"}`} disabled={!canTrade} title={executeBlockReason} onClick={props.onPlaceOrder}>
+                {props.orderAction === "buy" ? `BUY ${selectedSide}` : `SELL ${selectedSide}`}
               </button>
               {props.pendingOrderClientId ? (
                 <div className="inline-info-banner compact-feedback" role="status">
                   <strong>{t("uiOrderSubmitteda80277a1")}</strong>
-                  <span>{props.pendingOrderClientId.slice(0, 8)}</span>
+                  <span>{props.pendingOrderClientId.slice(0, 8)}{props.pendingOrderCount > 1 ? ` +${props.pendingOrderCount - 1}` : ""}</span>
                 </div>
               ) : null}
               <div className="quick-row">
@@ -3530,6 +3088,9 @@ function AnalyticsPage(props: {
   roundLogBusyRoundId?: string;
   canManualSettle: boolean;
   onManualSettlementComplete: () => Promise<void>;
+  canLoadMoreHistory: boolean;
+  historyLoading: boolean;
+  onLoadMoreHistory: () => Promise<void>;
 }) {
   const { t, language } = props;
   type AnalyticsResultFilter = "ALL" | AnalyticsResult;
@@ -3834,6 +3395,16 @@ function AnalyticsPage(props: {
             {t("uiLoadValueMoreTrades26ad558e", { p0: Math.min(filteredRows.length - visibleTradeLimit, ANALYTICS_TRADE_LIMIT_STEP) })}
           </button>
         ) : null}
+        {props.canLoadMoreHistory ? (
+          <button
+            type="button"
+            className="analytics-load-more global"
+            disabled={props.historyLoading}
+            onClick={() => void props.onLoadMoreHistory()}
+          >
+            {props.historyLoading ? t("loading") : t("loadMore")}
+          </button>
+        ) : null}
       </div>
     </section>
   );
@@ -3859,15 +3430,6 @@ function LogSearchPage(props: { t: (key: string, options?: Record<string, unknow
     me.role === "Admin" ||
     me.role === "Test Engineer" ||
     me.role === "Senior Tester";
-
-  const numberFilter = (key: string) => {
-    const value = filters[key];
-    if (!value) {
-      return undefined;
-    }
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  };
 
   const selectedSystem = (filters.system as LogSystem) || "all";
   const visibleUsers = users.filter((user) => !filters.role || user.role === filters.role);
@@ -4544,7 +4106,6 @@ function LogExportDialog(props: {
   onClose: () => void;
 }) {
   const { t, token, me, baseQuery } = props;
-  const language = me.language;
   const hasNativeSaveDialog = Boolean(window.paperTradingDesktop?.saveFile);
   const availableUsers = useMemo(() => {
     const byId = new Map<string, PublicUser>();
@@ -4941,7 +4502,7 @@ function BulkUserDialog(props: {
   onCreated: () => Promise<void>;
   onClose: () => void;
 }) {
-  const { t, token, language } = props;
+  const { t, token } = props;
   const template =
     "username,password,displayName,role,language,managerUsername,availableUsdc,permissionLevel,mustChangePassword\n" +
     "tester_new_01,ChangeMe123,Tester New 01,Tester,zh-CN,,10000,Standard,true";

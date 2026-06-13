@@ -36,14 +36,32 @@ function testStaticTransactionContracts() {
     "this.upsertIndexedRecord(this.orders, this.orderIndexById, order);",
     "order hot index upsert must use generic record helper"
   );
+  assertIncludes(storeSource, "private lastPruneMemoryCachesAt = 0;", "store prune throttle timestamp");
+  assertIncludes(storeSource, "private collectReferencedSnapshotRefs()", "store shared referenced snapshot collector");
+  assertIncludes(storeSource, "this.pruneOrderBookSnapshots(now, this.collectReferencedSnapshotRefs());", "store shared referenced snapshot pruning");
+  assertNotIncludes(
+    storeSource,
+    "orderBookSnapshots: [...this.orderBookSnapshots.entries()]",
+    "trade mutation snapshot should not deep copy order book snapshots"
+  );
+  assertNotIncludes(
+    storeSource,
+    "logs: this.logs.map((log) => ({ ...log }))",
+    "trade mutation snapshot should not deep copy audit logs"
+  );
+  assertNotIncludes(
+    storeSource,
+    "behaviorLogs: this.behaviorLogs.map((log) => ({ ...log }))",
+    "trade mutation snapshot should not deep copy behavior logs"
+  );
 
   assertIncludes(simulationSource, "runTradeWriteTransaction", "simulation trade write helper");
   assertIncludes(simulationSource, "type TradePersistSegments", "simulation trade persist segment type");
-  assertIncludes(simulationSource, "persistTradeStepsSequentially", "simulation sequential trade persist helper");
+  assertIncludes(simulationSource, "\"persistTradeWriteBatch\"", "simulation batched trade persist segment");
+  assertIncludes(simulationSource, "this.store.persistTradeRecords({", "simulation batched trade persistence helper");
   assertIncludes(simulationSource, "onSegmentObserved", "simulation trade persist metric callback");
-  assertIncludes(simulationSource, "apps/server/src/services/simulation/order-persistence.ts", "simulation order persistence module");
   assertIncludes(simulationSource, "tradePersistSegments", "simulation trade persist segment logging");
-  assertIncludes(simulationSource, "await this.store.persistOrderLatency(order)", "simulation latency field persistence");
+  assertIncludes(simulationSource, "void this.store.persistOrderLatency(order).catch((error) => {", "simulation async latency field persistence");
   assertIncludes(simulationSource, "this.store.captureTradeMutationSnapshot()", "simulation transaction memory capture");
   assertIncludes(simulationSource, "this.store.restoreTradeMutationSnapshot(memorySnapshot)", "simulation transaction memory restore");
   assertNotIncludes(
@@ -195,9 +213,9 @@ async function testMemorySnapshotRestoresOrderState() {
   assert.equal(store.positions.length, 1);
   assert.equal(store.positions[0]?.lockedQty, 0);
   assert.equal(store.getPositionById("pos-new"), undefined);
-  assert.equal(store.orderBookSnapshots.has("book-new"), false);
-  assert.deepEqual(store.logs.map((log) => log.eventId), ["evt-1"]);
-  assert.deepEqual(store.behaviorLogs.map((log) => log.logId), ["beh-1"]);
+  assert.equal(store.orderBookSnapshots.has("book-new"), true);
+  assert.deepEqual(store.logs.map((log) => log.eventId), ["evt-new", "evt-1"]);
+  assert.deepEqual(store.behaviorLogs.map((log) => log.logId), ["beh-new", "beh-1"]);
 }
 
 async function testOrderHotIndexUpsertDoesNotRecurse() {
@@ -338,6 +356,58 @@ async function testPruneMemoryCachesRebuildsHotIndexesWhenTradeRecordsTrimmed() 
   assert.deepEqual(store.behaviorLogs.map((log) => log.logId), ["blog-new"]);
 }
 
+async function testPruneMemoryCachesThrottlesRepeatedCalls() {
+  const { AppStore } = (await import("../apps/server/src/services/store")) as {
+    AppStore: new (...args: never[]) => unknown;
+  };
+  const store = Object.create(AppStore.prototype) as Record<string, unknown> & {
+    config: Record<string, number>;
+    rounds: Array<Record<string, unknown>>;
+    orders: Array<Record<string, unknown>>;
+    orderLifecycleLogs: Array<Record<string, unknown>>;
+    positions: Array<Record<string, unknown>>;
+    logs: Array<Record<string, unknown>>;
+    behaviorLogs: Array<Record<string, unknown>>;
+    orderBookSnapshots: Map<string, Record<string, unknown>>;
+    lastPruneMemoryCachesAt: number;
+    rebuildHotIndexes: () => void;
+    pruneOrderBookSnapshots: () => void;
+    pruneMemoryCaches: (now?: number, options?: { force?: boolean }) => void;
+  };
+
+  store.config = {
+    roundsMemoryMax: 10,
+    ordersMemoryMax: 10,
+    orderLifecycleMemoryMax: 10,
+    positionsMemoryMax: 10,
+    auditLogsMemoryMax: 10,
+    behaviorLogsMemoryMax: 10,
+    orderBookSnapshotsMemoryMax: 10,
+    orderBookSnapshotsMemoryMaxAgeMs: 60_000
+  };
+  store.rounds = [];
+  store.orders = [];
+  store.orderLifecycleLogs = [];
+  store.positions = [];
+  store.logs = [];
+  store.behaviorLogs = [];
+  store.orderBookSnapshots = new Map();
+  store.lastPruneMemoryCachesAt = 0;
+  store.rebuildHotIndexes = () => undefined;
+
+  let orderBookPrunes = 0;
+  store.pruneOrderBookSnapshots = () => {
+    orderBookPrunes += 1;
+  };
+
+  store.pruneMemoryCaches(10_000);
+  store.pruneMemoryCaches(10_500);
+  store.pruneMemoryCaches(11_000);
+  store.pruneMemoryCaches(11_100, { force: true });
+
+  assert.equal(orderBookPrunes, 3);
+}
+
 function testWinGreenOrderLatencyScriptContract() {
   const modulePath = path.join(process.cwd(), "scripts/win-green-order-latency.mjs");
   const source = readFileSync(modulePath, "utf8");
@@ -364,6 +434,7 @@ async function main() {
   await testOrderHotIndexUpsertDoesNotRecurse();
   await testPruneMemoryCachesSkipsHotIndexRebuildWhenNothingTrimmed();
   await testPruneMemoryCachesRebuildsHotIndexesWhenTradeRecordsTrimmed();
+  await testPruneMemoryCachesThrottlesRepeatedCalls();
   testWinGreenOrderLatencyScriptContract();
   console.log("order-transactions-check ok");
 }

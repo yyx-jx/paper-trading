@@ -323,10 +323,20 @@ export interface UserPayload {
 export interface UserTradePayload {
   viewedUserId: string;
   profile: ProfileOverview;
+  positionsMode?: "replace" | "delta";
   positions: PositionRecord[];
   orders: OrderRecord[];
   orderLifecycles: OrderLifecycleRecord[];
 }
+
+export interface UserHeartbeatPayload {
+  serverNow: number;
+}
+
+export type UserWsMessage =
+  | { type: "user"; data: UserPayload }
+  | { type: "user:trade"; data: UserTradePayload }
+  | { type: "user:heartbeat"; data: UserHeartbeatPayload };
 
 export interface BootstrapPayload extends MarketPayload, UserPayload {
   me: PublicUser;
@@ -737,6 +747,21 @@ export interface LogSearchResult {
   system: LogSystem;
 }
 
+export const USER_HISTORY_PAGE_SIZE = 25;
+
+export interface HistoryPageRequest {
+  limit?: number;
+  offset?: number;
+}
+
+export interface PagedResult<T> {
+  rows: T[];
+  limit: number;
+  offset: number;
+  nextOffset?: number;
+  hasMore: boolean;
+}
+
 export interface LogFacets {
   audit: {
     categories: LogCategory[];
@@ -1003,11 +1028,14 @@ export const api = {
     }
     return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
-  createWsUrl(path: string, token: string, viewUserId?: string) {
+  createWsUrl(path: string, token: string, viewUserId?: string, clientInstanceId?: string) {
     const base = wsBaseUrl();
     const params = new URLSearchParams({ token });
     if (viewUserId) {
       params.set("viewUserId", viewUserId);
+    }
+    if (clientInstanceId) {
+      params.set("clientInstanceId", clientInstanceId);
     }
     return `${base}${path}?${params.toString()}`;
   },
@@ -1015,10 +1043,10 @@ export const api = {
     const base = wsBaseUrl();
     return `${base}${path}?ticket=${ticket}`;
   },
-  createWsTicket(token: string, channel: "market" | "user", viewUserId?: string) {
+  createWsTicket(token: string, channel: "market" | "user", viewUserId?: string, clientInstanceId?: string) {
     return request<{ ticket: string; expiresAt: number }>("/api/ws/tickets", token, {
       method: "POST",
-      body: JSON.stringify({ channel, viewUserId })
+      body: JSON.stringify({ channel, viewUserId, clientInstanceId })
     });
   },
   async login(username: string, password: string) {
@@ -1082,14 +1110,23 @@ export const api = {
   getPositions(token: string, viewUserId?: string) {
     return request<PositionRecord[]>(`/api/positions/me${buildQuery({ viewUserId })}`, token);
   },
-  getOrders(token: string, viewUserId?: string) {
-    return request<OrderRecord[]>(`/api/orders/me${buildQuery({ viewUserId })}`, token);
+  getOrders(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<OrderRecord[]>(`/api/orders/me${buildQuery({ viewUserId, ...page })}`, token);
   },
-  getOrderLifecycles(token: string, viewUserId?: string) {
-    return request<OrderLifecycleRecord[]>(`/api/order-lifecycles/me${buildQuery({ viewUserId })}`, token);
+  getOrdersPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<OrderRecord>>(`/api/orders/me/page${buildQuery({ viewUserId, ...page })}`, token);
   },
-  getLogs(token: string, viewUserId?: string) {
-    return request<AuditEvent[]>(`/api/logs/me${buildQuery({ viewUserId })}`, token);
+  getOrderLifecycles(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<OrderLifecycleRecord[]>(`/api/order-lifecycles/me${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getOrderLifecyclesPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<OrderLifecycleRecord>>(`/api/order-lifecycles/me/page${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getLogs(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<AuditEvent[]>(`/api/logs/me${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getLogsPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<AuditEvent>>(`/api/logs/me/page${buildQuery({ viewUserId, ...page })}`, token);
   },
   getSourceStatus(token: string) {
     return request<SourceHealth[]>("/api/system/sources/status", token);
