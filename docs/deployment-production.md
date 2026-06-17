@@ -25,7 +25,7 @@ POSTGRES_PASSWORD=<strong database password>
 SERVER_STRICT_PERSISTENCE=true
 SERVER_REQUIRE_MIGRATIONS=true
 SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP=false
-EXPECTED_SCHEMA_MIGRATION_ID=000004
+EXPECTED_SCHEMA_MIGRATION_ID=000005
 SEED_DEFAULT_USERS=false
 NODE_ENV=production
 DEPLOY_ENV=production
@@ -71,7 +71,7 @@ APP_ENV_FILE=.env.production docker compose -f docker-compose.deploy.yml --env-f
 Build the temporary HTTP production client only after accepting the plaintext transport risk:
 
 ```bash
-ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://<PRODUCTION_HOST>:10001 npm run package:win:prod
+ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001 npm run package:win:prod
 ```
 
 The production client does not start a local backend. WebSocket URLs are derived from the API URL and use `ws://` for this temporary HTTP origin.

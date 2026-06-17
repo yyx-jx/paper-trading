@@ -8,6 +8,7 @@ import type {
   MarketTickPayload,
   MarketSnapshot,
   MarketTransportMeta,
+  OrderLifecycleRecord,
   OrderRecord,
   PositionRecord,
   ProfileOverview,
@@ -15,12 +16,16 @@ import type {
   RoundRecord,
   SettlementPreview,
   SourceHealth,
-  UserPayload
+  TradeSide,
+  UserPayload,
+  UserTradePayload
 } from "../utils/api";
 
 interface AppState {
   token?: string;
   me?: PublicUser;
+  viewedUserId?: string;
+  viewedUser?: PublicUser;
   currentPage: "trade" | "home" | "profile" | "logs";
   currentRound?: RoundRecord;
   history: HistoryRound[];
@@ -29,6 +34,7 @@ interface AppState {
   profile?: ProfileOverview;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
   sourceStatus: SourceHealth[];
   lastOrderLatencyMs?: number;
@@ -40,6 +46,7 @@ interface AppState {
   settlementPreview?: SettlementPreview;
   setAuth: (token: string, me?: PublicUser) => void;
   setUser: (me: PublicUser) => void;
+  setViewedUserTarget: (viewedUserId: string, viewedUser?: PublicUser) => void;
   clearAuth: () => void;
   setCurrentPage: (page: "trade" | "home" | "profile" | "logs") => void;
   setBootstrap: (data: BootstrapPayload) => void;
@@ -47,6 +54,7 @@ interface AppState {
   setMarketTickPayload: (data: MarketTickPayload, clientRecvTs?: number, clientClockOffsetMs?: number) => boolean;
   markMarketRenderCommit: (clientRecvTs?: number) => void;
   setUserPayload: (data: UserPayload) => void;
+  setUserTradePayload: (data: UserTradePayload) => void;
   setSourceStatus: (status: SourceHealth[]) => void;
   setLastOrderLatencyMs: (latency?: number) => void;
 }
@@ -57,7 +65,7 @@ function fallbackTransportMeta(snapshot: MarketSnapshot): MarketTransportMeta {
   return {
     serverPublishTs: Math.max(
       snapshot.sources.binance.serverPublishTs,
-      snapshot.sources.chainlink.serverPublishTs,
+      snapshot.sources.coinbase.serverPublishTs,
       snapshot.sources.clob.serverPublishTs
     ),
     payloadSeq: 0
@@ -78,6 +86,10 @@ function shouldAcceptMarketPayload(
     return transportMeta.serverPublishTs >= state.lastMarketServerPublishTs;
   }
   return true;
+}
+
+function shouldAcceptViewedPayload(state: AppState, viewedUserId?: string) {
+  return !state.viewedUserId || !viewedUserId || state.viewedUserId === viewedUserId;
 }
 
 function stampSourceReceipt(source: SourceHealth, clientRecvTs: number, serverPublishTs: number, clientClockOffsetMs = 0): SourceHealth {
@@ -103,7 +115,7 @@ function stampSnapshotReceipt(
     },
     sources: {
       binance: stampSourceReceipt(snapshot.sources.binance, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
-      chainlink: stampSourceReceipt(snapshot.sources.chainlink, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
+      coinbase: stampSourceReceipt(snapshot.sources.coinbase, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs),
       clob: stampSourceReceipt(snapshot.sources.clob, clientRecvTs, transportMeta.serverPublishTs, clientClockOffsetMs)
     }
   };
@@ -123,7 +135,86 @@ function appendRealtimePoint(points: MarketSnapshot["clob"]["currentRoundUpPrice
   return [...points, point].slice(-240);
 }
 
+function mergeBookTop(book: MarketSnapshot["orderBooks"][TradeSide], top: { bestBid: number; bestAsk: number }) {
+  const bestBid = Number.isFinite(top.bestBid) ? top.bestBid : book.bestBid;
+  const bestAsk = Number.isFinite(top.bestAsk) ? top.bestAsk : book.bestAsk;
+  const midPrice = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : book.midPrice;
+  return {
+    ...book,
+    bestBid,
+    bestAsk,
+    midPrice
+  };
+}
+
+function mergeBookTopLevels(
+  book: MarketSnapshot["orderBooks"][TradeSide],
+  top: { bestBid: number; bestAsk: number },
+  levels?: { bids: MarketSnapshot["orderBooks"][TradeSide]["bids"]; asks: MarketSnapshot["orderBooks"][TradeSide]["asks"] }
+) {
+  const mergedTop = mergeBookTop(book, top);
+  return {
+    ...mergedTop,
+    bids: levels?.bids ?? mergedTop.bids,
+    asks: levels?.asks ?? mergedTop.asks
+  };
+}
+
+function mergeCandleBar<T extends { startTs: number }>(bars: T[], update?: T) {
+  if (!update) {
+    return bars;
+  }
+  const next = bars.filter((bar) => bar.startTs !== update.startTs);
+  next.push(update);
+  return next.sort((left, right) => left.startTs - right.startTs).slice(-240);
+}
+
+function mergeCandleUpdates(
+  candlesByInterval: MarketSnapshot["binance"]["candlesByInterval"],
+  updates?: MarketRealtimeTick["binance"]["candleUpdates"]
+) {
+  if (!updates) {
+    return candlesByInterval;
+  }
+  return {
+    ...candlesByInterval,
+    "30s": mergeCandleBar(candlesByInterval["30s"], updates["30s"]),
+    "1m": mergeCandleBar(candlesByInterval["1m"], updates["1m"]),
+    "5m": mergeCandleBar(candlesByInterval["5m"], updates["5m"]),
+    "15m": mergeCandleBar(candlesByInterval["15m"], updates["15m"]),
+    "1h": mergeCandleBar(candlesByInterval["1h"], updates["1h"]),
+    "1d": mergeCandleBar(candlesByInterval["1d"], updates["1d"])
+  };
+}
+
+function mergeRecordsById<T extends { id: string }>(current: T[], updates: T[], limit = 500) {
+  const byId = new Map<string, T>();
+  for (const item of current) {
+    byId.set(item.id, item);
+  }
+  for (const item of updates) {
+    byId.set(item.id, item);
+  }
+  return [...byId.values()].slice(0, limit);
+}
+
+function mergeUserTradePayload(state: AppState, data: UserTradePayload) {
+  return {
+    viewedUserId: data.viewedUserId,
+    profile: data.profile,
+    positions: data.positions,
+    orders: mergeRecordsById(state.orders, data.orders).sort((left, right) => right.createdAt - left.createdAt),
+    orderLifecycles: mergeRecordsById(state.orderLifecycles, data.orderLifecycles).sort(
+      (left, right) => right.orderTimestampMs - left.orderTimestampMs
+    )
+  };
+}
+
 function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): MarketSnapshot {
+  const topOrderBooks = {
+    UP: mergeBookTopLevels(snapshot.orderBooks.UP, tick.clob.bestBidAskSummary.UP, tick.clob.topLevels?.UP),
+    DOWN: mergeBookTopLevels(snapshot.orderBooks.DOWN, tick.clob.bestBidAskSummary.DOWN, tick.clob.topLevels?.DOWN)
+  };
   return {
     ...snapshot,
     marketId: tick.marketId,
@@ -131,7 +222,7 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     serverNow: tick.serverNow,
     currentPrice: tick.currentPrice,
     binancePrice: tick.binancePrice,
-    chainlinkPrice: tick.chainlinkPrice,
+    coinbasePrice: tick.coinbasePrice,
     priceToBeat: tick.priceToBeat,
     displayPriceToBeat: tick.displayPriceToBeat,
     displayPriceToBeatSource: tick.displayPriceToBeatSource,
@@ -142,29 +233,33 @@ function mergeRealtimeTick(snapshot: MarketSnapshot, tick: MarketRealtimeTick): 
     displayPriceSpread: tick.displayPriceSpread,
     latencyBreakdown: tick.latencyBreakdown,
     sources: tick.sources,
-    orderBooks: tick.orderBooks,
+    orderBooks: topOrderBooks,
     binance: {
       ...snapshot.binance,
       spotPrice: tick.binance.spotPrice,
-      latestTick: tick.binance.latestTick
+      latestTick: tick.binance.latestTick,
+      candlesByInterval: mergeCandleUpdates(snapshot.binance.candlesByInterval, tick.binance.candleUpdates)
     },
-    chainlink: {
-      ...snapshot.chainlink,
-      referencePrice: tick.chainlink.referencePrice,
-      settlementReference: tick.chainlink.settlementReference
+    coinbase: {
+      ...snapshot.coinbase,
+      referencePrice: tick.coinbase.referencePrice,
+      settlementReference: tick.coinbase.settlementReference,
+      currentRoundOpenReference: tick.coinbase.currentRoundOpenReference,
+      candlesByInterval: mergeCandleUpdates(snapshot.coinbase.candlesByInterval, tick.coinbase.candleUpdates)
     },
     clob: {
       ...snapshot.clob,
       delta: tick.clob.delta,
       volume: tick.clob.volume,
-      upBook: tick.orderBooks.UP,
-      downBook: tick.orderBooks.DOWN,
+      upBook: topOrderBooks.UP,
+      downBook: topOrderBooks.DOWN,
       currentRoundUpPriceSeries: appendRealtimePoint(snapshot.clob.currentRoundUpPriceSeries, tick.clob.currentRoundUpPricePoint),
       bestBidAskSummary: tick.clob.bestBidAskSummary
     },
     uiMeta: {
       ...snapshot.uiMeta,
       countdownMs: tick.uiMeta.countdownMs,
+      countdownTargetTs: tick.uiMeta.countdownTargetTs,
       acceptingOrders: tick.uiMeta.acceptingOrders,
       marketSwitchState: tick.uiMeta.marketSwitchState,
       sourceStatusSummary: tick.uiMeta.sourceStatusSummary
@@ -179,18 +274,32 @@ export const useAppStore = create<AppState>((set) => ({
   operatedHistory: [],
   positions: [],
   orders: [],
+  orderLifecycles: [],
   logs: [],
   sourceStatus: [],
   setAuth: (token, me) => {
     window.localStorage.setItem("paper-trading-token", token);
-    set({ token, me });
+    set({ token, me, viewedUserId: me?.id, viewedUser: me });
   },
   setUser: (me) => set({ me }),
+  setViewedUserTarget: (viewedUserId, viewedUser) =>
+    set({
+      viewedUserId,
+      viewedUser,
+      profile: undefined,
+      positions: [],
+      orders: [],
+      orderLifecycles: [],
+      logs: [],
+      operatedHistory: []
+    }),
   clearAuth: () => {
     window.localStorage.removeItem("paper-trading-token");
     set({
       token: undefined,
       me: undefined,
+      viewedUserId: undefined,
+      viewedUser: undefined,
       currentRound: undefined,
       snapshot: undefined,
       profile: undefined,
@@ -198,6 +307,7 @@ export const useAppStore = create<AppState>((set) => ({
       operatedHistory: [],
       positions: [],
       orders: [],
+      orderLifecycles: [],
       logs: [],
       sourceStatus: [],
       lastOrderLatencyMs: undefined,
@@ -216,12 +326,15 @@ export const useAppStore = create<AppState>((set) => ({
     const transportMeta = data.transportMeta ?? fallbackTransportMeta(data.snapshot);
     set({
       me: data.me,
+      viewedUserId: data.viewedUserId,
+      viewedUser: data.viewedUser,
       currentRound: data.currentRound,
       history: data.history,
       operatedHistory: data.operatedHistory ?? [],
       profile: data.profile,
       positions: data.positions,
       orders: data.orders,
+      orderLifecycles: data.orderLifecycles,
       logs: data.logs,
       sourceStatus: data.sourceStatus ?? [],
       snapshot: stampSnapshotReceipt(data.snapshot, clientRecvTs, transportMeta),
@@ -237,6 +350,9 @@ export const useAppStore = create<AppState>((set) => ({
     let accepted = false;
     const transportMeta = data.transportMeta ?? fallbackTransportMeta(data.snapshot);
     set((state) => {
+      if (!shouldAcceptViewedPayload(state, data.viewedUserId)) {
+        return state;
+      }
       if (!shouldAcceptMarketPayload(state, transportMeta)) {
         return state;
       }
@@ -262,7 +378,7 @@ export const useAppStore = create<AppState>((set) => ({
       return false;
     }
     set((state) => {
-      if (!state.snapshot || !shouldAcceptMarketPayload(state, transportMeta)) {
+      if (!state.snapshot || !shouldAcceptViewedPayload(state, data.viewedUserId) || !shouldAcceptMarketPayload(state, transportMeta)) {
         return state;
       }
       accepted = true;
@@ -286,13 +402,26 @@ export const useAppStore = create<AppState>((set) => ({
       lastMarketRenderLatencyMs: clientRecvTs ? Math.max(Date.now() - clientRecvTs, 0) : undefined
     }),
   setUserPayload: (data) =>
-    set({
-      profile: data.profile,
-      operatedHistory: data.operatedHistory ?? [],
-      positions: data.positions,
-      orders: data.orders,
-      logs: data.logs
-    }),
+    set((state) =>
+      shouldAcceptViewedPayload(state, data.viewedUserId)
+        ? {
+          viewedUserId: data.viewedUserId,
+          viewedUser: data.viewedUser,
+          profile: data.profile,
+          operatedHistory: data.operatedHistory ?? [],
+          positions: data.positions,
+          orders: data.orders,
+          orderLifecycles: data.orderLifecycles,
+          logs: data.logs
+        }
+        : state
+    ),
+  setUserTradePayload: (data) =>
+    set((state) =>
+      shouldAcceptViewedPayload(state, data.viewedUserId)
+        ? mergeUserTradePayload(state, data)
+        : state
+    ),
   setSourceStatus: (sourceStatus) => set({ sourceStatus }),
   setLastOrderLatencyMs: (lastOrderLatencyMs) => set({ lastOrderLatencyMs })
 }));

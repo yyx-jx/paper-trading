@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
   scripts: Record<string, string>;
@@ -7,7 +7,9 @@ const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
     productName: string;
     appId: string;
     directories: { output: string };
-    win: { artifactName: string };
+    icon?: string;
+    extraResources?: Array<{ from: string; to: string }>;
+    win: { artifactName: string; icon?: string };
   };
 };
 const mainSource = readFileSync("apps/client/electron/main.cjs", "utf8");
@@ -17,6 +19,7 @@ const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
 const appSource = readFileSync("apps/client/src/App.tsx", "utf8");
 const redactionSource = readFileSync("apps/client/src/utils/redaction.ts", "utf8");
 
+assert.equal(packageJson.version, "0.6.1");
 assert.equal(packageJson.scripts["package:win:test"], "node scripts/package-win-test.cjs");
 assert.equal(packageJson.scripts["package:win:prod"], "node scripts/package-win-prod.cjs");
 assert.equal(packageJson.scripts["test:electron-config"], "tsx scripts/electron-config-check.ts");
@@ -24,6 +27,11 @@ assert.equal(packageJson.build.productName, "BTC Paper Trading Test");
 assert.match(packageJson.build.appId, /\.test$/);
 assert.equal(packageJson.build.directories.output, "deploy/windows-test");
 assert.match(packageJson.build.win.artifactName, /Test/);
+assert.equal(packageJson.build.icon, "apps/client/assets/app-icon.png");
+assert.equal(packageJson.build.win.icon, "apps/client/assets/app-icon.png");
+assert.deepEqual(packageJson.build.extraResources, [{ from: "apps/client/assets/app-icon.png", to: "app-icon.png" }]);
+assert.equal(existsSync("docs/259db7edad98b9adbc3ef9ad6110812e.jpg"), true);
+assert.equal(existsSync("apps/client/assets/app-icon.png"), true);
 
 assert.match(mainSource, /const LOCAL_API_BASE_URL = "http:\/\/127\.0\.0\.1:8787";/);
 assert.match(mainSource, /function configureProxyBypass\(\)/);
@@ -36,6 +44,11 @@ assert.match(mainSource, /proxy-bypass-list/);
 assert.match(mainSource, /no-proxy-server/);
 assert.match(mainSource, /function redactNetworkAddresses/);
 assert.match(mainSource, /function shouldEmbedBackend\(\)/);
+assert.match(mainSource, /function resolveAppIconPath\(\)/);
+assert.match(mainSource, /icon: resolveAppIconPath\(\)/);
+assert.match(mainSource, /function windowTitle\(\)/);
+assert.match(mainSource, /HT Paper Trading v\$\{appVersion\(\)\}/);
+assert.match(mainSource, /title: windowTitle\(\)/);
 assert.match(mainSource, /process\.env\.ELECTRON_EMBED_BACKEND/);
 assert.match(mainSource, /override === "true"/);
 assert.match(mainSource, /override === "false"/);
@@ -51,18 +64,27 @@ assert.match(prodPackageSource, /hostname === "localhost"/);
 assert.match(prodPackageSource, /hostname === "127\.0\.0\.1"/);
 assert.match(prodPackageSource, /ELECTRON_EMBED_BACKEND: "false"/);
 assert.match(prodPackageSource, /-c\.productName=BTC Paper Trading/);
+assert.match(prodPackageSource, /const packageVersion = String\(packageJson\.version \|\| "0\.0\.0"\);/);
+assert.match(prodPackageSource, /const productionArtifactName = `BTC Paper Trading Setup \$\{packageVersion\}\.\\\$\{ext\}`;/);
 assert.match(prodPackageSource, /-c\.extraMetadata\.productionApiBaseUrl=\$\{process\.env\.VITE_API_BASE_URL\}/);
+assert.match(prodPackageSource, /-c\.win\.artifactName=\$\{productionArtifactName\}/);
 assert.match(prodPackageSource, /-c\.directories\.output=deploy\/windows-production/);
 assert.match(prodPackageSource, /const rendererApiBaseUrl = "http:\/\/127\.0\.0\.1:18787"/);
 assert.match(prodPackageSource, /VITE_API_BASE_URL: rendererApiBaseUrl/);
 
 assert.match(testPackageSource, /package:win:test|Windows test installer|memory backend|PERSISTENCE_MODE=memory/s);
-assert.match(apiSource, /const API_BASE_URL = import\.meta\.env\.VITE_API_BASE_URL \|\| "http:\/\/127\.0\.0\.1:8787";/);
+assert.match(apiSource, /const RAW_API_BASE_URL = \(import\.meta\.env\.VITE_API_BASE_URL \?\? ""\)\.trim\(\);/);
+assert.match(apiSource, /const API_BASE_URL = RAW_API_BASE_URL \|\| \(import\.meta\.env\.DEV \? "" : "http:\/\/127\.0\.0\.1:8787"\);/);
+assert.match(apiSource, /function wsBaseUrl\(\)/);
 assert.match(apiSource, /redactNetworkAddresses/);
 assert.match(apiSource, /async checkHealth\(\)/);
 assert.doesNotMatch(apiSource, /baseUrl: API_BASE_URL/);
 assert.match(apiSource, /replace\("https:\/\/", "wss:\/\/"\)/);
 assert.match(appSource, /redactNetworkAddresses/);
+assert.match(appSource, /declare const __APP_VERSION__: string/);
+assert.match(appSource, /document\.title = __APP_DISPLAY_TITLE__/);
+assert.match(appSource, /APP_VERSION_LABEL/);
+assert.match(appSource, /terminal-login-version">\{APP_VERSION_LABEL\} · Hyper Terminal/);
 assert.match(appSource, /jsonPreview = \(value: unknown\) => redactNetworkAddresses/);
 assert.doesNotMatch(appSource, /<span>\{api\.baseUrl\}<\/span>/);
 assert.doesNotMatch(appSource, /api\.baseUrl/);

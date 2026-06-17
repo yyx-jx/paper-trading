@@ -17,6 +17,8 @@ const excludedNames = new Set([
   "backups",
   "release",
   "deploy/windows-production",
+  "deploy/windows-production-archive",
+  "deploy/windows-production-portable",
   "deploy/windows-test",
   "paper_deploy_final"
 ]);

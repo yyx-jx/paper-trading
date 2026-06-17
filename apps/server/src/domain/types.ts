@@ -54,13 +54,14 @@ export type RoundStatus =
   | "Settled"
   | "Redeeming"
   | "Closed"
-  | "Manual";
+  | "Manual"
+  | "AdminReviewed";
 export type MarketSwitchState = "active" | "prefetching_next" | "next_ready" | "market_not_ready";
 export type ConnectionState = "healthy" | "reconnecting" | "stale" | "degraded" | "disabled";
 export type LogCategory = "operation" | "matching" | "settlement" | "latency";
 export type LogSystem = "all" | "audit" | "training" | "matching";
 export type LogGroup = "operation" | "settlement" | "market_latency" | "system_latency" | "matching_action";
-export type LatencySource = "binance" | "chainlink" | "clob" | "system";
+export type LatencySource = "binance" | "coinbase" | "clob" | "system";
 export type LatencyPhase = "backend" | "acquire" | "publish" | "frontend";
 export type MatchingLogKind = "action" | "engine";
 
@@ -111,7 +112,7 @@ export interface PublicUser {
 }
 
 export interface SourceHealth {
-  source: "Binance" | "Chainlink" | "CLOB";
+  source: "Binance" | "Coinbase" | "CLOB";
   symbol: string;
   state: ConnectionState;
   reconnectCount: number;
@@ -123,6 +124,16 @@ export interface SourceHealth {
   publishLatencyMs: number;
   frontendLatencyMs: number;
   message?: string;
+  components?: Record<string, SourceComponentHealth>;
+}
+
+export interface SourceComponentHealth {
+  name: string;
+  label?: string;
+  state: ConnectionState;
+  sourceEventTs: number;
+  serverRecvTs: number;
+  message?: string;
 }
 
 export interface MarketTransportMeta {
@@ -132,6 +143,9 @@ export interface MarketTransportMeta {
   serverQueueMs?: number;
   snapshotBuildTs?: number;
   wsSendStartTs?: number;
+  broadcastBuildMs?: number;
+  broadcastFanoutSize?: number;
+  droppedForBackpressure?: boolean;
 }
 
 export interface ClobMarketInfo {
@@ -168,8 +182,8 @@ export interface FeeBreakdown {
 }
 
 export interface LatencyBreakdown {
-  sourceEventAge: Record<"binance" | "chainlink" | "clob", number>;
-  serverIngressLatency: Record<"binance" | "chainlink" | "clob", number>;
+  sourceEventAge: Record<"binance" | "coinbase" | "clob", number>;
+  serverIngressLatency: Record<"binance" | "coinbase" | "clob", number>;
   serverComputeLatency: number;
   clientTransportLatency?: number;
 }
@@ -179,7 +193,7 @@ export interface SettlementPreview {
   state: "preliminary" | "confirmed" | "manual";
   side?: TradeSide;
   price?: number;
-  source: "CLOB" | "Gamma" | "Polymarket" | "Chainlink";
+  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase" | "Admin";
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
@@ -244,6 +258,33 @@ export interface CandleBar {
   volume: number;
 }
 
+export type MarketCandleSource = "coinbase";
+export type MarketCandleOrigin = "rtds_30s" | "history_1m_split";
+
+export interface MarketCandleRecord {
+  source: MarketCandleSource;
+  symbol: string;
+  interval: "30s";
+  openTs: number;
+  closeTs: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  origin: MarketCandleOrigin;
+  updatedAt: number;
+}
+
+export interface MarketCandleQuery {
+  source: MarketCandleSource;
+  symbol: string;
+  interval: "30s";
+  fromOpenTs?: number;
+  toOpenTs?: number;
+  limit?: number;
+}
+
 export interface MatchingBookOrder {
   id: string;
   ownerId: string;
@@ -285,7 +326,7 @@ export interface MarketSnapshot {
   seriesSlug?: string;
   serverNow: number;
   binancePrice: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   currentPrice: number;
   priceToBeat: number;
   displayPriceToBeat?: number;
@@ -296,7 +337,7 @@ export interface MarketSnapshot {
   displayPriceSource: Record<TradeSide, DisplayPriceSource>;
   displayPriceSpread: Record<TradeSide, number>;
   latencyBreakdown: LatencyBreakdown;
-  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  sources: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   orderBooks: Record<TradeSide, OrderBookSnapshot>;
   recentTrades: MarketTrade[];
   candles: CandlePoint[];
@@ -305,9 +346,10 @@ export interface MarketSnapshot {
     latestTick?: CandlePoint;
     candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
-  chainlink: {
+  coinbase: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     candles5s: CandleBar[];
     candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
@@ -325,6 +367,7 @@ export interface MarketSnapshot {
     marketTitle: string;
     marketSubtitle?: string;
     countdownMs: number;
+    countdownTargetTs?: number;
     acceptingOrders: boolean;
     marketSwitchState: MarketSwitchState;
     sourceStatusSummary: Array<{ source: SourceHealth["source"]; state: ConnectionState }>;
@@ -454,9 +497,9 @@ export interface RoundRecord {
   settledSide?: TradeSide;
   settlementPrice?: number;
   settlementTs?: number;
-  settlementSource?: "Polymarket" | "Gamma" | "Chainlink" | "CLOB";
+  settlementSource?: "Polymarket" | "Gamma" | "Coinbase" | "CLOB" | "Admin";
   polymarketSettlementPrice?: number;
-  polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual";
+  polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual" | "admin_review";
   polymarketOpenPrice?: number;
   polymarketClosePrice?: number;
   polymarketOpenPriceSource?: string;
@@ -465,11 +508,13 @@ export interface RoundRecord {
   redeemScheduledAt?: number;
   binanceOpenPrice?: number;
   binanceClosePrice?: number;
+  coinbaseOpenPrice?: number;
+  coinbaseClosePrice?: number;
   redeemStartTs?: number;
   redeemFinishTs?: number;
   manualReason?: string;
   acceptingOrders?: boolean;
-  closingPriceSource?: "Chainlink" | "Gamma";
+  closingPriceSource?: "Coinbase" | "Gamma";
 }
 
 export interface OrderRecord {
@@ -570,6 +615,7 @@ export interface OrderLifecycleRecord {
 
 export interface PositionRecord {
   id: string;
+  buyOrderId?: string;
   userId: string;
   roundId: string;
   side: TradeSide;
@@ -625,6 +671,7 @@ export interface AuditEvent {
 export interface AuditLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   roundId?: string;
@@ -640,6 +687,7 @@ export interface AuditLogQuery {
 export interface BehaviorLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   roundId?: string;
@@ -674,6 +722,7 @@ export interface LogSearchQuery {
   systems?: Array<Exclude<LogSystem, "all">>;
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -820,6 +869,7 @@ export interface ProfileOverview {
 }
 
 export interface MarketPayload {
+  viewedUserId: string;
   snapshot: MarketSnapshot;
   currentRound?: RoundRecord;
   history: Array<RoundRecord & { userPnl: number; settlementPreview?: SettlementPreview }>;
@@ -834,7 +884,7 @@ export interface MarketRealtimeTick {
   serverNow: number;
   currentPrice: number;
   binancePrice: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   priceToBeat: number;
   displayPriceToBeat?: number;
   displayPriceToBeatSource?: "official" | "binance_open_fallback";
@@ -844,22 +894,25 @@ export interface MarketRealtimeTick {
   displayPriceSource: Record<TradeSide, DisplayPriceSource>;
   displayPriceSpread: Record<TradeSide, number>;
   latencyBreakdown: LatencyBreakdown;
-  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
-  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  sources: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   binance: {
     spotPrice: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
-  chainlink: {
+  coinbase: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   clob: {
     delta: number;
     volume: number;
     currentRoundUpPricePoint?: CandlePoint;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+    topLevels?: Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }>;
   };
   uiMeta: {
     countdownMs: number;
@@ -871,6 +924,7 @@ export interface MarketRealtimeTick {
 }
 
 export interface MarketTickPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
   settlementPreview?: SettlementPreview;
@@ -878,11 +932,22 @@ export interface MarketTickPayload {
 }
 
 export interface UserPayload {
+  viewedUserId: string;
+  viewedUser: PublicUser;
   profile: ProfileOverview;
   operatedHistory: Array<RoundRecord & { userPnl: number }>;
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
+}
+
+export interface UserTradePayload {
+  viewedUserId: string;
+  profile: ProfileOverview;
+  positions: PositionRecord[];
+  orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
 }
 
 export interface BehaviorActionLog {
@@ -911,7 +976,7 @@ export interface BehaviorActionLog {
   binance1mLastClose: number;
   binance5mLastClose: number;
   binance1dLastClose: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   priceToBeat: number;
   upPrice: number;
   downPrice: number;
@@ -938,7 +1003,7 @@ export interface BehaviorActionLog {
   gammaPollCount?: number;
   redeemFinishTimeMs?: number;
   sourceStates: Record<
-    "binance" | "chainlink" | "clob",
+    "binance" | "coinbase" | "clob",
     Pick<SourceHealth, "source" | "state" | "sourceEventTs" | "serverRecvTs" | "serverPublishTs">
   >;
   strategyClusterLabel?: string;
@@ -991,7 +1056,7 @@ export interface BinanceConnectorState {
   status: SourceHealth;
 }
 
-export interface ChainlinkConnectorState {
+export interface CoinbaseConnectorState {
   price: number;
   updatedAt: number;
   candlesByInterval?: Partial<Record<CandleInterval, CandleBar[]>>;

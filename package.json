@@ -1,6 +1,6 @@
 {
   "name": "btc-paper-trading-cs",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "private": true,
   "main": "apps/client/electron/main.cjs",
   "description": "BTC 5-minute paper trading system with Linux-ready backend and cross-platform desktop client.",
@@ -36,8 +36,12 @@
     "test:order-transactions": "tsx scripts/order-transactions-check.ts && tsx scripts/order-idempotency-check.ts",
     "test:order-idempotency": "tsx scripts/order-idempotency-check.ts",
     "test:electron-config": "tsx scripts/electron-config-check.ts",
+    "test:frontend-display": "tsx scripts/frontend-display-check.ts",
     "test:production-client-load": "tsx scripts/production-client-load-test.ts",
     "test:market-ws-latency": "tsx scripts/market-ws-latency-sample.ts",
+    "test:market-ws-multi-client-latency": "tsx scripts/market-ws-multi-client-latency.ts",
+    "test:market-tick-payload": "tsx scripts/market-tick-payload-check.ts",
+    "test:polymarket-health": "tsx scripts/polymarket-health-check.ts",
     "test:logs": "tsx scripts/log-search-check.ts",
     "test:bulk-users": "tsx scripts/bulk-user-check.ts",
     "test:csv-bulk-users": "tsx scripts/csv-bulk-user-check.ts",
@@ -72,6 +76,7 @@
     "react-i18next": "^15.7.3",
     "recharts": "^3.2.1",
     "redis": "^5.8.3",
+    "tsx": "^4.20.6",
     "undici": "^8.1.0",
     "viem": "^2.38.2",
     "ws": "^8.18.3",
@@ -90,7 +95,6 @@
     "electron": "^37.4.0",
     "electron-builder": "^26.8.1",
     "tsup": "^8.5.0",
-    "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vite": "^7.1.12",
     "wait-on": "^8.0.5"
@@ -101,6 +105,13 @@
     "asar": true,
     "asarUnpack": [
       "dist/server/**/*"
+    ],
+    "icon": "apps/client/assets/app-icon.png",
+    "extraResources": [
+      {
+        "from": "apps/client/assets/app-icon.png",
+        "to": "app-icon.png"
+      }
     ],
     "npmRebuild": false,
     "directories": {
@@ -113,6 +124,7 @@
       "dist/server/**/*"
     ],
     "win": {
+      "icon": "apps/client/assets/app-icon.png",
       "signAndEditExecutable": false,
       "target": [
         {

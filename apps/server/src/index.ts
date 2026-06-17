@@ -10,10 +10,13 @@ import { serverConfig } from "./config";
 import { ApiError, sendApiError } from "./http-errors";
 import { assertCan, assertCanManageUser } from "./auth/authz";
 import { hasPermission } from "./auth/permissions";
-import { canExportUser, getVisibleUserIdsForActor } from "./auth/scope";
+import { canChangeUserGroupForActor, canCreateUserForActor, canExportUser, canViewUserRecords, getVisibleUserIdsForActor } from "./auth/scope";
 import type {
   AuditLogQuery,
   BehaviorLogQuery,
+  BookLevel,
+  CandleBar,
+  CandleInterval,
   Language,
   LogSearchQuery,
   LogSearchResult,
@@ -32,12 +35,13 @@ import type {
   TradeSide,
   UnifiedLogRow,
   UserRecord,
+  UserTradePayload,
   DatasetExportRequest
 } from "./domain/types";
 import { createMatchingServiceApp } from "./services/matching/app";
 import { MatchingServiceClient } from "./services/matching/client";
 import { SimulationEngine } from "./services/simulation";
-import { AppStore } from "./services/store";
+import { AppStore, type UserPayloadScope } from "./services/store";
 import {
   buildExportEntries,
   createZipArchive,
@@ -65,7 +69,7 @@ const wsConnectionCounts = {
   market: 0,
   user: 0
 };
-const wsTickets = new Map<string, { userId: string; channel: "market" | "user"; expiresAt: number }>();
+const wsTickets = new Map<string, { userId: string; viewedUserId: string; channel: "market" | "user"; expiresAt: number }>();
 const WS_TICKET_TTL_MS = 60_000;
 const WS_HEARTBEAT_MS = 25_000;
 const httpStartTimes = new WeakMap<object, number>();
@@ -101,7 +105,7 @@ const store = new AppStore({
   databaseUrl: serverConfig.databaseUrl,
   redisUrl: serverConfig.redisUrl,
   persistenceMode: serverConfig.persistenceMode,
-  chainlinkEnabled: serverConfig.chainlinkEnabled,
+  coinbaseEnabled: serverConfig.coinbaseEnabled,
   strictPersistence: serverConfig.strictPersistence,
   seedDefaultUsers: serverConfig.seedDefaultUsers,
   requireSchemaMigrations: serverConfig.requireSchemaMigrations,
@@ -136,6 +140,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   freezeWindowMs: serverConfig.freezeWindowMs,
   pollDelayMs: serverConfig.pollDelayMs,
   gammaPollIntervalMs: serverConfig.gammaPollIntervalMs,
+  gammaMaxPolls: serverConfig.gammaMaxPolls,
   binanceRestUrl: serverConfig.binanceRestUrl,
   binanceFallbackRestUrl: serverConfig.binanceFallbackRestUrl,
   binanceFallbackRestPollMs: serverConfig.binanceFallbackRestPollMs,
@@ -144,18 +149,12 @@ const engine = new SimulationEngine(store, matchingClient, {
   binanceRestPollMs: serverConfig.binanceRestPollMs,
   binanceWsStaleMs: serverConfig.binanceWsStaleMs,
   upstreamProxyUrl: serverConfig.upstreamProxyUrl,
-  chainlinkEnabled: serverConfig.chainlinkEnabled,
-  chainlinkRpcUrl: serverConfig.chainlinkRpcUrl,
-  chainlinkFallbackRpcUrls: serverConfig.chainlinkFallbackRpcUrls,
-  chainlinkRequestTimeoutMs: serverConfig.chainlinkRequestTimeoutMs,
-  chainlinkBtcUsdProxyAddress: serverConfig.chainlinkBtcUsdProxyAddress as `0x${string}`,
-  chainlinkPollMs: serverConfig.chainlinkPollMs,
-  chainlinkRtdsWsUrl: serverConfig.chainlinkRtdsWsUrl,
-  chainlinkRtdsSymbol: serverConfig.chainlinkRtdsSymbol,
-  chainlinkRtdsPingMs: serverConfig.chainlinkRtdsPingMs,
-  chainlinkHistoryUrl: serverConfig.chainlinkHistoryUrl,
-  chainlinkHistoryFeedId: serverConfig.chainlinkHistoryFeedId,
-  chainlinkHistoryPollMs: serverConfig.chainlinkHistoryPollMs,
+  coinbaseEnabled: serverConfig.coinbaseEnabled,
+  coinbaseWsUrl: serverConfig.coinbaseWsUrl,
+  coinbaseRestUrl: serverConfig.coinbaseRestUrl,
+  coinbaseRestPollMs: serverConfig.coinbaseRestPollMs,
+  coinbaseRequestTimeoutMs: serverConfig.coinbaseRequestTimeoutMs,
+  coinbaseWsStaleMs: serverConfig.coinbaseWsStaleMs,
   gammaBaseUrl: serverConfig.gammaBaseUrl,
   clobBaseUrl: serverConfig.clobBaseUrl,
   dataApiBaseUrl: serverConfig.dataApiBaseUrl,
@@ -167,6 +166,7 @@ const engine = new SimulationEngine(store, matchingClient, {
   polymarketDiscoveryKeywords: serverConfig.polymarketDiscoveryKeywords,
   marketDiscoveryIntervalMs: serverConfig.marketDiscoveryIntervalMs,
   marketSnapshotIntervalMs: serverConfig.marketSnapshotIntervalMs,
+  marketFullReconcileIntervalMs: serverConfig.marketFullReconcileIntervalMs,
   polymarketBookPollMs: serverConfig.polymarketBookPollMs,
   polymarketBookCalibrationMs: serverConfig.polymarketBookCalibrationMs,
   polymarketTradesPollMs: serverConfig.polymarketTradesPollMs
@@ -176,6 +176,20 @@ let marketPayloadSeq = 0;
 const MARKET_WS_RETRY_MS = 25;
 const MARKET_WS_MIN_INTERVAL_MS = Math.max(serverConfig.marketWsMinIntervalMs, 0);
 const MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS = 10_000;
+const MARKET_WS_FULL_SNAPSHOT_STAGGER_MS = 40;
+const MARKET_WS_INITIAL_FULL_SNAPSHOT_MAX_DELAY_MS = 2_000;
+const MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS = Math.max(
+  1,
+  Math.floor(MARKET_WS_INITIAL_FULL_SNAPSHOT_MAX_DELAY_MS / MARKET_WS_FULL_SNAPSHOT_STAGGER_MS)
+);
+const MARKET_WS_FULL_SNAPSHOT_RETRY_MS = 250;
+const USER_WS_RETRY_MS = 50;
+const USER_TRADE_ORDER_LIMIT = 50;
+const USER_TRADE_LIFECYCLE_LIMIT = 80;
+const MARKET_TRANSPORT_CANDLE_LIMIT = 120;
+const MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT = 10;
+const MARKET_TRANSPORT_RECENT_TRADE_LIMIT = 30;
+const MARKET_TRANSPORT_ODDS_POINT_LIMIT = 120;
 const MARKET_HISTORY_CACHE_MAX_USERS = Math.max(serverConfig.marketHistoryCacheMaxUsers, 1);
 
 type CachedMarketHistory = {
@@ -192,7 +206,8 @@ const loginSchema = z.object({
 });
 
 const wsTicketSchema = z.object({
-  channel: z.enum(["market", "user"])
+  channel: z.enum(["market", "user"]),
+  viewUserId: z.string().optional()
 });
 
 const orderSchema = z.object({
@@ -216,6 +231,7 @@ const selfProfileSchema = z.object({
 });
 
 const roleSchema = z.enum(["Tester", "Senior Tester", "Test Engineer", "Admin"]);
+const DEFAULT_GROUP_MANAGER_USERNAME = "JDH1";
 
 const createUserSchema = z.object({
   username: z.string().trim().min(1),
@@ -238,6 +254,10 @@ const updateUserSchema = z.object({
   permissionLevel: z.enum(["Initial", "Standard"]).optional(),
   availableUsdc: z.number().nonnegative().optional(),
   isActive: z.boolean().optional()
+});
+
+const changeUserGroupSchema = z.object({
+  managerUserId: z.string().trim().min(1)
 });
 
 const bulkCreateUserItemSchema = z.object({
@@ -286,7 +306,7 @@ const quickSideSchema = z.object({
   clientSendTs: z.number().optional()
 });
 
-const manualSettlementSchema = z.object({
+const settlementActionSchema = z.object({
   side: z.enum(["UP", "DOWN"]),
   price: z.number().nonnegative().optional(),
   reason: z.string().trim().max(300).optional()
@@ -295,6 +315,7 @@ const manualSettlementSchema = z.object({
 const trainingLogQuerySchema = z.object({
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   roundId: z.string().optional(),
   actionType: z.string().optional(),
@@ -308,6 +329,7 @@ const trainingLogQuerySchema = z.object({
 const auditLogQuerySchema = z.object({
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   roundId: z.string().optional(),
   category: z.enum(["operation", "matching", "settlement", "latency"]).optional(),
@@ -323,6 +345,7 @@ const logSearchQuerySchema = z.object({
   system: z.enum(["all", "audit", "training", "matching"]).optional(),
   from: z.coerce.number().optional(),
   to: z.coerce.number().optional(),
+  viewUserId: z.string().optional(),
   userId: z.string().optional(),
   role: roleSchema.optional(),
   category: z.enum(["operation", "matching", "settlement", "latency"]).optional(),
@@ -340,7 +363,7 @@ const logSearchQuerySchema = z.object({
   resultCode: z.string().optional(),
   direction: z.enum(["UP", "DOWN"]).optional(),
   roundStatus: z
-    .enum(["Trading", "Frozen", "Settling", "Polling", "Settled", "Redeeming", "Closed", "Manual"])
+    .enum(["Trading", "Frozen", "Settling", "Polling", "Settled", "Redeeming", "Closed", "Manual", "AdminReviewed"])
     .optional(),
   settlementResult: z.enum(["win", "loss", "sold"]).optional(),
   bookKey: z.string().optional(),
@@ -349,7 +372,7 @@ const logSearchQuerySchema = z.object({
   sequenceFrom: z.coerce.number().optional(),
   sequenceTo: z.coerce.number().optional(),
   logGroup: z.enum(["operation", "settlement", "market_latency", "system_latency", "matching_action"]).optional(),
-  latencySource: z.enum(["binance", "chainlink", "clob", "system"]).optional(),
+  latencySource: z.enum(["binance", "coinbase", "clob", "system"]).optional(),
   connectionState: z.enum(["healthy", "reconnecting", "stale", "degraded", "disabled"]).optional(),
   latencyPhase: z.enum(["backend", "acquire", "publish", "frontend"]).optional(),
   latencyMinMs: z.coerce.number().optional(),
@@ -423,20 +446,51 @@ function getUserFromRequest(request: { headers: Record<string, string | string[]
   return user;
 }
 
-function createWsTicket(user: UserRecord, channel: "market" | "user") {
+function readViewUserId(query: unknown) {
+  const raw = query && typeof query === "object" ? (query as { viewUserId?: unknown }).viewUserId : undefined;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+function resolveViewedUser(actor: UserRecord, viewUserId?: string) {
+  const target = viewUserId ? store.getUserById(viewUserId) : actor;
+  if (!target) {
+    throw new Error("Target user was not found.");
+  }
+  if (!canViewUserRecords(actor, target, store.listUserRecords())) {
+    throw new Error("Records are not available for this user.");
+  }
+  return target;
+}
+
+function getViewedUserFromRequest(
+  actor: UserRecord,
+  request: { query?: unknown }
+) {
+  return resolveViewedUser(actor, readViewUserId(request.query));
+}
+
+type WsSession = {
+  actor: UserRecord;
+  viewedUser: UserRecord;
+};
+
+function createWsTicket(user: UserRecord, channel: "market" | "user", viewUserId?: string) {
+  const viewedUser = resolveViewedUser(user, viewUserId);
   const ticket = `wst_${nanoid(32)}`;
+  const expiresAt = Date.now() + WS_TICKET_TTL_MS;
   wsTickets.set(ticket, {
     userId: user.id,
+    viewedUserId: viewedUser.id,
     channel,
-    expiresAt: Date.now() + WS_TICKET_TTL_MS
+    expiresAt
   });
   return {
     ticket,
-    expiresAt: Date.now() + WS_TICKET_TTL_MS
+    expiresAt
   };
 }
 
-function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user") {
+function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "user"): WsSession | undefined {
   if (!rawTicket) {
     return undefined;
   }
@@ -445,20 +499,34 @@ function consumeWsTicket(rawTicket: string | undefined, channel: "market" | "use
   if (!ticket || ticket.channel !== channel || ticket.expiresAt < Date.now()) {
     return undefined;
   }
-  return store.getUserById(ticket.userId);
+  const actor = store.getUserById(ticket.userId);
+  if (!actor) {
+    return undefined;
+  }
+  return {
+    actor,
+    viewedUser: resolveViewedUser(actor, ticket.viewedUserId)
+  };
 }
 
-function getWsUser(query: { token?: string; ticket?: string }, channel: "market" | "user") {
-  const ticketUser = consumeWsTicket(query.ticket, channel);
-  if (ticketUser) {
-    return ticketUser;
+function getWsSession(query: { token?: string; ticket?: string; viewUserId?: string }, channel: "market" | "user"): WsSession | undefined {
+  const ticketSession = consumeWsTicket(query.ticket, channel);
+  if (ticketSession) {
+    return ticketSession;
   }
   const token = readToken(query.token);
   if (!token) {
     return undefined;
   }
   const payload = jwt.verify(token, serverConfig.jwtSecret) as { userId: string };
-  return store.getUserById(payload.userId);
+  const actor = store.getUserById(payload.userId);
+  if (!actor) {
+    return undefined;
+  }
+  return {
+    actor,
+    viewedUser: resolveViewedUser(actor, query.viewUserId)
+  };
 }
 
 function attachHeartbeat(socket: WsWebSocket, channel: "market" | "user") {
@@ -529,11 +597,11 @@ function requirePermission(user: UserRecord, code: string) {
 }
 
 function canViewAllLogs(user: UserRecord) {
-  return hasPermission(user, "logs:view:all");
+  return user.role === "Admin";
 }
 
 function canViewTeamLogs(user: UserRecord) {
-  return hasPermission(user, "logs:view:managed") || hasPermission(user, "logs:view:team");
+  return user.role === "Senior Tester" || user.role === "Test Engineer";
 }
 
 function teamVisibleUserIds(user: UserRecord) {
@@ -541,37 +609,39 @@ function teamVisibleUserIds(user: UserRecord) {
 }
 
 function resolveAuditLogFilters(user: UserRecord, parsed: AuditLogQuery): AuditLogQuery {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
   if (canViewAllLogs(user)) {
-    return parsed;
+    return { ...parsed, userId: requestedUserId, viewUserId: undefined };
   }
   if (canViewTeamLogs(user)) {
     const userIds = teamVisibleUserIds(user);
-    if (parsed.userId && !userIds.includes(parsed.userId)) {
+    if (requestedUserId && !userIds.includes(requestedUserId)) {
       throw new Error("Logs are not available for this user.");
     }
-    return { ...parsed, userIds };
+    return requestedUserId ? { ...parsed, userId: requestedUserId, viewUserId: undefined } : { ...parsed, viewUserId: undefined, userIds };
   }
-  if (parsed.userId && parsed.userId !== user.id) {
+  if (requestedUserId && requestedUserId !== user.id) {
     throw new Error("Logs are not available for this user.");
   }
-  return { ...parsed, userId: user.id };
+  return { ...parsed, userId: user.id, viewUserId: undefined };
 }
 
 function resolveBehaviorLogFilters(user: UserRecord, parsed: BehaviorLogQuery): BehaviorLogQuery {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
   if (canViewAllLogs(user)) {
-    return parsed;
+    return { ...parsed, userId: requestedUserId, viewUserId: undefined };
   }
   if (canViewTeamLogs(user)) {
     const userIds = teamVisibleUserIds(user);
-    if (parsed.userId && !userIds.includes(parsed.userId)) {
+    if (requestedUserId && !userIds.includes(requestedUserId)) {
       throw new Error("Logs are not available for this user.");
     }
-    return { ...parsed, userIds };
+    return requestedUserId ? { ...parsed, userId: requestedUserId, viewUserId: undefined } : { ...parsed, viewUserId: undefined, userIds };
   }
-  if (parsed.userId && parsed.userId !== user.id) {
+  if (requestedUserId && requestedUserId !== user.id) {
     throw new Error("Logs are not available for this user.");
   }
-  return { ...parsed, userId: user.id };
+  return { ...parsed, userId: user.id, viewUserId: undefined };
 }
 
 const LOG_SEARCH_DEFAULT_LIMIT = 100;
@@ -631,11 +701,12 @@ function scopedUserIdsForActor(actor: UserRecord) {
 function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): LogSearchQuery {
   const scopedIds = scopedUserIdsForActor(actor);
   const allUsers = store.listUsers() as unknown as UserRecord[];
-  const requestedUser = parsed.userId ? store.getUserById(parsed.userId) : undefined;
-  if (parsed.userId && !requestedUser) {
+  const requestedUserId = parsed.userId ?? parsed.viewUserId;
+  const requestedUser = requestedUserId ? store.getUserById(requestedUserId) : undefined;
+  if (requestedUserId && !requestedUser) {
     throw new Error("Target user was not found.");
   }
-  if (parsed.userId && scopedIds && !scopedIds.includes(parsed.userId)) {
+  if (requestedUserId && scopedIds && !scopedIds.includes(requestedUserId)) {
     throw new Error("Logs are not available for this user.");
   }
   if (parsed.userIds?.length) {
@@ -649,7 +720,7 @@ function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): Log
     }
   }
 
-  let userIds = parsed.userId ? [parsed.userId] : parsed.userIds?.length ? [...new Set(parsed.userIds)] : scopedIds;
+  let userIds = requestedUserId ? [requestedUserId] : parsed.userIds?.length ? [...new Set(parsed.userIds)] : scopedIds;
   if (parsed.role) {
     const roleIds = new Set(allUsers.filter((user) => user.role === parsed.role).map((user) => user.id));
     userIds = userIds ? userIds.filter((userId) => roleIds.has(userId)) : [...roleIds];
@@ -657,8 +728,9 @@ function resolveLogSearchFilters(actor: UserRecord, parsed: LogSearchQuery): Log
 
   return {
     ...parsed,
-    userId: parsed.userId,
-    userIds: parsed.userId ? undefined : userIds,
+    viewUserId: undefined,
+    userId: requestedUserId,
+    userIds: requestedUserId ? undefined : userIds,
     system: parsed.system ?? (parsed.systems?.length === 1 ? parsed.systems[0] : parsed.system)
   };
 }
@@ -692,13 +764,13 @@ function deriveAuditLogGroup(log: Pick<Awaited<ReturnType<AppStore["searchAuditL
     return "settlement" as const;
   }
   if (log.category === "latency") {
-    return ["binance", "chainlink", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
+    return ["binance", "coinbase", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
   }
   return "operation" as const;
 }
 
 function deriveLatencySource(moduleName?: string) {
-  if (moduleName === "binance" || moduleName === "chainlink" || moduleName === "clob") {
+  if (moduleName === "binance" || moduleName === "coinbase" || moduleName === "clob") {
     return moduleName;
   }
   return "system";
@@ -915,6 +987,15 @@ function listUsersForActor(actor: UserRecord) {
   return store.listUsers().filter((user) => visibleIds.has(user.id));
 }
 
+function isGroupManagerUser(user: UserRecord | undefined) {
+  return Boolean(user && (user.role === "Senior Tester" || user.role === "Test Engineer"));
+}
+
+function getDefaultGroupManagerId() {
+  const manager = store.findUserByUsername(DEFAULT_GROUP_MANAGER_USERNAME);
+  return isGroupManagerUser(manager) ? manager?.id : undefined;
+}
+
 function getTargetUserForManagement(actor: UserRecord, targetUserId: string) {
   const target = store.getUserById(targetUserId);
   if (!target) {
@@ -931,7 +1012,7 @@ function getTargetUserForBalance(actor: UserRecord, targetUserId: string) {
   return getTargetUserForManagement(actor, targetUserId);
 }
 
-function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
+function normalizeManagerUserId(role: Role, managerUserId?: string | null, options?: { requireActive?: boolean }) {
   if (role !== "Tester") {
     return undefined;
   }
@@ -939,8 +1020,11 @@ function normalizeManagerUserId(role: Role, managerUserId?: string | null) {
     return undefined;
   }
   const senior = store.getUserById(managerUserId);
-  if (!senior || senior.role !== "Senior Tester") {
-    throw new Error("managerUserId must point to a Senior Tester.");
+  if (!senior || (senior.role !== "Senior Tester" && senior.role !== "Test Engineer")) {
+    throw new Error("managerUserId must point to a Senior Tester or Test Engineer.");
+  }
+  if (options?.requireActive && !senior.isActive) {
+    throw new Error("managerUserId must point to an active Senior Tester or Test Engineer.");
   }
   return managerUserId;
 }
@@ -962,22 +1046,74 @@ function stampSnapshotForTransport(snapshot: MarketSnapshot, serverPublishTs = D
     },
     sources: {
       binance: stampSourceForTransport(snapshot.sources.binance, serverPublishTs),
-      chainlink: stampSourceForTransport(snapshot.sources.chainlink, serverPublishTs),
+      coinbase: stampSourceForTransport(snapshot.sources.coinbase, serverPublishTs),
       clob: stampSourceForTransport(snapshot.sources.clob, serverPublishTs)
     }
   };
 }
 
-function nextMarketTransportMeta(coalescedCount = 0, pendingSince?: number, snapshotBuildTs?: number): MarketTransportMeta {
+function compactCandlesByInterval(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
+  return Object.fromEntries(
+    Object.entries(candlesByInterval).map(([interval, bars]) => [
+      interval,
+      bars.slice(-MARKET_TRANSPORT_CANDLE_LIMIT)
+    ])
+  ) as Record<CandleInterval, CandleBar[]>;
+}
+
+function compactSnapshotForTransport(snapshot: MarketSnapshot): MarketSnapshot {
+  const orderBooks = {
+    UP: {
+      ...snapshot.orderBooks.UP,
+      bids: snapshot.orderBooks.UP.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
+      asks: snapshot.orderBooks.UP.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
+    },
+    DOWN: {
+      ...snapshot.orderBooks.DOWN,
+      bids: snapshot.orderBooks.DOWN.bids.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT),
+      asks: snapshot.orderBooks.DOWN.asks.slice(0, MARKET_TRANSPORT_ORDER_BOOK_LEVEL_LIMIT)
+    }
+  };
+  return {
+    ...snapshot,
+    orderBooks,
+    recentTrades: snapshot.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
+    candles: snapshot.candles.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
+    binance: {
+      ...snapshot.binance,
+      candlesByInterval: compactCandlesByInterval(snapshot.binance.candlesByInterval)
+    },
+    coinbase: {
+      ...snapshot.coinbase,
+      candles5s: snapshot.coinbase.candles5s.slice(-MARKET_TRANSPORT_CANDLE_LIMIT),
+      candlesByInterval: compactCandlesByInterval(snapshot.coinbase.candlesByInterval)
+    },
+    clob: {
+      ...snapshot.clob,
+      upBook: orderBooks.UP,
+      downBook: orderBooks.DOWN,
+      recentTrades: snapshot.clob.recentTrades.slice(0, MARKET_TRANSPORT_RECENT_TRADE_LIMIT),
+      currentRoundUpPriceSeries: snapshot.clob.currentRoundUpPriceSeries.slice(-MARKET_TRANSPORT_ODDS_POINT_LIMIT)
+    }
+  };
+}
+
+function nextMarketTransportMeta(coalescedCount = 0, snapshotBuildTs?: number): MarketTransportMeta {
   const serverPublishTs = Date.now();
   marketPayloadSeq += 1;
   return {
     serverPublishTs,
     payloadSeq: marketPayloadSeq,
     coalescedCount: coalescedCount > 0 ? coalescedCount : undefined,
-    serverQueueMs: pendingSince ? Math.max(serverPublishTs - pendingSince, 0) : undefined,
     snapshotBuildTs
   };
+}
+
+function markTransportSendStart(transportMeta: MarketTransportMeta) {
+  const sendStartedAt = Date.now();
+  transportMeta.wsSendStartTs = sendStartedAt;
+  transportMeta.serverQueueMs = Math.max(sendStartedAt - transportMeta.serverPublishTs, 0);
+  return sendStartedAt;
 }
 
 function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: number }>(
@@ -985,6 +1121,11 @@ function decorateRoundWithSettlementPreview<T extends RoundRecord & { userPnl?: 
 ): T & { settlementPreview?: SettlementPreview } {
   const settlementPreview = engine.getSettlementPreview(round);
   return settlementPreview ? { ...round, settlementPreview } : round;
+}
+
+function decorateCurrentRoundForTransport(round: RoundRecord | undefined) {
+  const displayRound = engine.withCurrentRoundBinanceOpenReference(engine.withCurrentRoundCoinbaseOpenReference(round));
+  return displayRound ? decorateRoundWithSettlementPreview(displayRound) : undefined;
 }
 
 function getCachedHistory(limit: number, userId?: string) {
@@ -1013,31 +1154,57 @@ function getOperatedHistoryWithSettlementPreview(limit: number, userId: string) 
   return store.getOperatedHistory(limit, userId).map((round) => decorateRoundWithSettlementPreview(round));
 }
 
-function createCurrentRoundPayload(coalescedCount = 0, pendingSince?: number) {
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, store.marketSnapshot.serverNow);
+function createCurrentRoundPayload(coalescedCount = 0, viewedUserId?: string) {
+  const transportMeta = nextMarketTransportMeta(coalescedCount, store.marketSnapshot.serverNow);
   const currentRound = store.getCurrentRound();
-  const history = getHistoryWithSettlementPreview(10);
+  const history = getHistoryWithSettlementPreview(10, viewedUserId);
   const settlementPreview =
     (currentRound ? engine.getSettlementPreview(currentRound) : undefined) ??
     engine.getLatestSettlementPreview(history);
   return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
-    snapshot: stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs),
+    viewedUserId,
+    currentRound: decorateCurrentRoundForTransport(currentRound),
+    snapshot: compactSnapshotForTransport(stampSnapshotForTransport(store.marketSnapshot, transportMeta.serverPublishTs)),
     settlementPreview,
     transportMeta
   };
 }
 
-function createMarketPayload(userId: string, coalescedCount = 0, pendingSince?: number): MarketPayload {
+function createMarketPayload(viewedUserId: string, coalescedCount = 0): MarketPayload {
   return {
-    ...createCurrentRoundPayload(coalescedCount, pendingSince),
-    history: getHistoryWithSettlementPreview(10, userId)
+    ...createCurrentRoundPayload(coalescedCount, viewedUserId),
+    viewedUserId,
+    history: getHistoryWithSettlementPreview(10, viewedUserId)
   };
 }
 
 function countdownTargetTsFor(snapshot: MarketSnapshot) {
   const countdownMs = snapshot.uiMeta.countdownMs;
   return Number.isFinite(countdownMs) && countdownMs > 0 ? snapshot.serverNow + countdownMs : undefined;
+}
+
+function latestCandleUpdates(candlesByInterval: Record<CandleInterval, CandleBar[]>) {
+  const updates: Partial<Record<CandleInterval, CandleBar>> = {};
+  for (const [interval, bars] of Object.entries(candlesByInterval) as Array<[CandleInterval, CandleBar[]]>) {
+    const latest = bars.at(-1);
+    if (latest) {
+      updates[interval] = latest;
+    }
+  }
+  return updates;
+}
+
+function topLevelsForTick(snapshot: MarketSnapshot): Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }> {
+  return {
+    UP: {
+      bids: snapshot.orderBooks.UP.bids.slice(0, 5),
+      asks: snapshot.orderBooks.UP.asks.slice(0, 5)
+    },
+    DOWN: {
+      bids: snapshot.orderBooks.DOWN.bids.slice(0, 5),
+      asks: snapshot.orderBooks.DOWN.asks.slice(0, 5)
+    }
+  };
 }
 
 function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: number): MarketRealtimeTick {
@@ -1050,7 +1217,7 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
     serverNow: stamped.serverNow,
     currentPrice: stamped.currentPrice,
     binancePrice: stamped.binancePrice,
-    chainlinkPrice: stamped.chainlinkPrice,
+    coinbasePrice: stamped.coinbasePrice,
     priceToBeat: stamped.priceToBeat,
     displayPriceToBeat: stamped.displayPriceToBeat,
     displayPriceToBeatSource: stamped.displayPriceToBeatSource,
@@ -1061,24 +1228,27 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
     displayPriceSpread: stamped.displayPriceSpread,
     latencyBreakdown: stamped.latencyBreakdown,
     sources: stamped.sources,
-    orderBooks: stamped.orderBooks,
     binance: {
       spotPrice: stamped.binance.spotPrice,
-      latestTick: stamped.binance.latestTick
+      latestTick: stamped.binance.latestTick,
+      candleUpdates: latestCandleUpdates(stamped.binance.candlesByInterval)
     },
-    chainlink: {
-      referencePrice: stamped.chainlink.referencePrice,
-      settlementReference: stamped.chainlink.settlementReference,
+    coinbase: {
+      referencePrice: stamped.coinbase.referencePrice,
+      settlementReference: stamped.coinbase.settlementReference,
+      currentRoundOpenReference: stamped.coinbase.currentRoundOpenReference,
+      candleUpdates: latestCandleUpdates(stamped.coinbase.candlesByInterval),
       latestTick:
-        stamped.chainlink.referencePrice > 0
-          ? { ts: stamped.sources.chainlink.normalizedTs || stamped.serverNow, price: stamped.chainlink.referencePrice }
+        stamped.coinbase.referencePrice > 0
+          ? { ts: stamped.sources.coinbase.normalizedTs || stamped.serverNow, price: stamped.coinbase.referencePrice }
           : undefined
     },
     clob: {
       delta: stamped.clob.delta,
       volume: stamped.clob.volume,
       currentRoundUpPricePoint,
-      bestBidAskSummary: stamped.clob.bestBidAskSummary
+      bestBidAskSummary: stamped.clob.bestBidAskSummary,
+      topLevels: topLevelsForTick(stamped)
     },
     uiMeta: {
       countdownMs: stamped.uiMeta.countdownMs,
@@ -1090,31 +1260,307 @@ function createMarketRealtimeTick(snapshot: MarketSnapshot, serverPublishTs: num
   };
 }
 
-function createMarketTickPayload(coalescedCount = 0, pendingSince?: number): MarketTickPayload {
+function createMarketTickPayload(coalescedCount = 0, viewedUserId = ""): MarketTickPayload {
   const snapshot = store.marketSnapshot;
-  const transportMeta = nextMarketTransportMeta(coalescedCount, pendingSince, snapshot.serverNow);
+  const transportMeta = nextMarketTransportMeta(coalescedCount, snapshot.serverNow);
   const currentRound = store.getCurrentRound();
   const settlementPreview = currentRound ? engine.getSettlementPreview(currentRound) : undefined;
   return {
-    currentRound: currentRound ? decorateRoundWithSettlementPreview(currentRound) : undefined,
+    viewedUserId,
+    currentRound: decorateCurrentRoundForTransport(currentRound),
     tick: createMarketRealtimeTick(snapshot, transportMeta.serverPublishTs),
     settlementPreview,
     transportMeta
   };
 }
 
-function createBootstrapPayload(user: UserRecord) {
-  const market = createCurrentRoundPayload();
+type MarketBroadcastFrame = {
+  data: MarketTickPayload;
+  bytes: number;
+  buildMs: number;
+  serializeMs: number;
+};
+
+type MarketBroadcastClient = {
+  actorUserId: string;
+  viewedUserId: string;
+  socket: WsWebSocket;
+  closed: boolean;
+  sendingTick: boolean;
+  sendingFull: boolean;
+  fullOrdinal: number;
+  fullTimer?: NodeJS.Timeout;
+  fullRetryTimer?: NodeJS.Timeout;
+};
+
+const marketBroadcastClients = new Set<MarketBroadcastClient>();
+let marketBroadcastClientOrdinal = 0;
+let marketBroadcastLastSentAt = 0;
+let marketBroadcastCoalescedCount = 0;
+let marketBroadcastRetryTimer: NodeJS.Timeout | undefined;
+let marketBroadcastTickTimer: NodeJS.Timeout | undefined;
+let marketBroadcastBackpressureDropped = false;
+let marketBroadcastStarted = false;
+
+function createMarketBroadcastFrame(coalescedCount = 0, droppedForBackpressure = false): MarketBroadcastFrame {
+  const buildStartedAt = Date.now();
+  const data = createMarketTickPayload(coalescedCount);
+  const buildMs = Date.now() - buildStartedAt;
+  data.transportMeta.broadcastBuildMs = buildMs;
+  data.transportMeta.broadcastFanoutSize = marketBroadcastClients.size;
+  data.transportMeta.droppedForBackpressure = droppedForBackpressure || undefined;
+  markTransportSendStart(data.transportMeta);
+  const serializeStartedAt = Date.now();
+  const outbound = JSON.stringify({ type: "market:tick", data });
+  const serializeMs = Date.now() - serializeStartedAt;
+  return {
+    data,
+    bytes: Buffer.byteLength(outbound),
+    buildMs,
+    serializeMs
+  };
+}
+
+function scheduleMarketBroadcastRetry(delayMs = MARKET_WS_RETRY_MS) {
+  if (marketBroadcastRetryTimer) {
+    return;
+  }
+  marketBroadcastRetryTimer = setTimeout(() => {
+    marketBroadcastRetryTimer = undefined;
+    flushMarketBroadcast();
+  }, Math.max(delayMs, MARKET_WS_RETRY_MS));
+}
+
+function broadcastMarketTickFrame(frame: MarketBroadcastFrame) {
+  const sendStartedAt = Date.now();
+  let skippedForBackpressure = 0;
+  let maxBufferedAmount = 0;
+  for (const client of marketBroadcastClients) {
+    if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
+      continue;
+    }
+    const actor = store.getUserById(client.actorUserId);
+    if (!actor?.isActive) {
+      client.socket.close();
+      continue;
+    }
+    maxBufferedAmount = Math.max(maxBufferedAmount, client.socket.bufferedAmount);
+    if (client.sendingTick || client.socket.bufferedAmount > 0) {
+      skippedForBackpressure += 1;
+      marketBroadcastBackpressureDropped = true;
+      continue;
+    }
+    client.sendingTick = true;
+    const outbound = JSON.stringify({
+      type: "market:tick",
+      data: {
+        ...frame.data,
+        viewedUserId: client.viewedUserId
+      }
+    });
+    const bytes = Buffer.byteLength(outbound);
+    client.socket.send(outbound, (error?: Error) => {
+      client.sendingTick = false;
+      appMetrics.recordWsSend("market", bytes, Date.now() - sendStartedAt, !error);
+    });
+  }
+  appMetrics.recordMarketBroadcast({
+    buildMs: frame.buildMs,
+    serializeMs: frame.serializeMs,
+    fanoutSize: marketBroadcastClients.size,
+    skippedForBackpressure,
+    maxBufferedAmount
+  });
+}
+
+function flushMarketBroadcast() {
+  if (marketBroadcastClients.size === 0) {
+    marketBroadcastCoalescedCount = 0;
+    return;
+  }
+  const now = Date.now();
+  const elapsedSinceLastSend = marketBroadcastLastSentAt ? now - marketBroadcastLastSentAt : MARKET_WS_MIN_INTERVAL_MS;
+  if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
+    scheduleMarketBroadcastRetry(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend);
+    return;
+  }
+  const frame = createMarketBroadcastFrame(marketBroadcastCoalescedCount, marketBroadcastBackpressureDropped);
+  marketBroadcastCoalescedCount = 0;
+  marketBroadcastBackpressureDropped = false;
+  marketBroadcastLastSentAt = Date.now();
+  broadcastMarketTickFrame(frame);
+}
+
+function requestMarketBroadcastTick(markCoalesced: boolean) {
+  if (markCoalesced) {
+    marketBroadcastCoalescedCount += 1;
+  }
+  if (marketBroadcastClients.size === 0) {
+    return;
+  }
+  flushMarketBroadcast();
+}
+
+function handleMarketUpdate() {
+  requestMarketBroadcastTick(true);
+}
+
+function scheduleFullSnapshotForClient(client: MarketBroadcastClient, delayMs = MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
+  if (client.closed || client.fullTimer || client.fullRetryTimer) {
+    return;
+  }
+  client.fullTimer = setTimeout(() => {
+    client.fullTimer = undefined;
+    sendFullSnapshotForClient(client);
+  }, delayMs);
+}
+
+function retryFullSnapshotForClient(client: MarketBroadcastClient) {
+  if (client.closed || client.fullRetryTimer) {
+    return;
+  }
+  client.fullRetryTimer = setTimeout(() => {
+    client.fullRetryTimer = undefined;
+    sendFullSnapshotForClient(client);
+  }, MARKET_WS_FULL_SNAPSHOT_RETRY_MS);
+}
+
+function sendFullSnapshotForClient(client: MarketBroadcastClient) {
+  if (client.closed || client.socket.readyState !== WsWebSocket.OPEN) {
+    return;
+  }
+  const actor = store.getUserById(client.actorUserId);
+  if (!actor?.isActive) {
+    client.socket.close();
+    return;
+  }
+  const tickRecentlySent =
+    marketBroadcastLastSentAt > 0 && Date.now() - marketBroadcastLastSentAt < MARKET_WS_MIN_INTERVAL_MS;
+  if (
+    client.sendingFull ||
+    client.sendingTick ||
+    marketBroadcastRetryTimer ||
+    tickRecentlySent ||
+    client.socket.bufferedAmount > 0
+  ) {
+    retryFullSnapshotForClient(client);
+    return;
+  }
+  client.sendingFull = true;
+  const data = createMarketPayload(client.viewedUserId);
+  const sendStartedAt = markTransportSendStart(data.transportMeta);
+  const outbound = JSON.stringify({ type: "market", data });
+  const bytes = Buffer.byteLength(outbound);
+  client.socket.send(outbound, (error?: Error) => {
+    client.sendingFull = false;
+    appMetrics.recordWsSend("market", bytes, Date.now() - sendStartedAt, !error);
+    if (!client.closed) {
+      scheduleFullSnapshotForClient(client);
+    }
+  });
+}
+
+function initialFullSnapshotDelayMs(client: MarketBroadcastClient) {
+  if (marketBroadcastClients.size <= 1) {
+    return 0;
+  }
+  return (client.fullOrdinal % MARKET_WS_INITIAL_FULL_SNAPSHOT_SLOTS) * MARKET_WS_FULL_SNAPSHOT_STAGGER_MS;
+}
+
+function registerMarketBroadcastClient(actorUserId: string, viewedUserId: string, socket: WsWebSocket) {
+  const client: MarketBroadcastClient = {
+    actorUserId,
+    viewedUserId,
+    socket,
+    closed: false,
+    sendingTick: false,
+    sendingFull: false,
+    fullOrdinal: marketBroadcastClientOrdinal++
+  };
+  marketBroadcastClients.add(client);
+  requestMarketBroadcastTick(false);
+  scheduleFullSnapshotForClient(
+    client,
+    Math.max(initialFullSnapshotDelayMs(client), MARKET_WS_FULL_SNAPSHOT_RETRY_MS)
+  );
+  return () => {
+    client.closed = true;
+    marketBroadcastClients.delete(client);
+    if (client.fullTimer) {
+      clearTimeout(client.fullTimer);
+    }
+    if (client.fullRetryTimer) {
+      clearTimeout(client.fullRetryTimer);
+    }
+  };
+}
+
+function startMarketBroadcasting() {
+  if (marketBroadcastStarted) {
+    return;
+  }
+  marketBroadcastStarted = true;
+  marketBroadcastTickTimer = setInterval(
+    () => requestMarketBroadcastTick(false),
+    Math.max(MARKET_WS_MIN_INTERVAL_MS, 50)
+  );
+  store.emitter.on("market:update", handleMarketUpdate);
+}
+
+function stopMarketBroadcasting() {
+  if (!marketBroadcastStarted) {
+    return;
+  }
+  marketBroadcastStarted = false;
+  if (marketBroadcastTickTimer) {
+    clearInterval(marketBroadcastTickTimer);
+    marketBroadcastTickTimer = undefined;
+  }
+  if (marketBroadcastRetryTimer) {
+    clearTimeout(marketBroadcastRetryTimer);
+    marketBroadcastRetryTimer = undefined;
+  }
+  store.emitter.off("market:update", handleMarketUpdate);
+}
+
+function createBootstrapPayload(user: UserRecord, viewedUser: UserRecord = user) {
+  const market = createCurrentRoundPayload(0, viewedUser.id);
   return {
     ...market,
-    history: getHistoryWithSettlementPreview(60, user.id),
+    viewedUserId: viewedUser.id,
+    viewedUser: store.sanitizeUser(viewedUser),
+    history: getHistoryWithSettlementPreview(30, viewedUser.id),
     me: store.sanitizeUser(user),
-    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(200, viewedUser.id),
+    profile: store.getProfile(viewedUser.id),
+    positions: store.getPositions(viewedUser.id),
+    orders: store.getOrders(viewedUser.id),
+    orderLifecycles: store.getOrderLifecycleLogs(viewedUser.id),
+    logs: store.getRecentLogs(viewedUser.id),
+    sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
+  };
+}
+
+function createUserFullPayload(user: UserRecord) {
+  return {
+    viewedUserId: user.id,
+    viewedUser: store.sanitizeUser(user),
     profile: store.getProfile(user.id),
+    operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
     positions: store.getPositions(user.id),
     orders: store.getOrders(user.id),
-    logs: store.getRecentLogs(user.id),
-    sourceStatus: user.permissionCodes.includes("system:status:view" as never) ? store.getSourceStatus() : []
+    orderLifecycles: store.getOrderLifecycleLogs(user.id),
+    logs: store.getRecentLogs(user.id)
+  };
+}
+
+function createUserTradePayload(user: UserRecord) {
+  return {
+    viewedUserId: user.id,
+    profile: store.getProfile(user.id),
+    positions: store.getPositions(user.id),
+    orders: store.getRecentTradeOrders(user.id, USER_TRADE_ORDER_LIMIT),
+    orderLifecycles: store.getOrderLifecycleLogs(user.id).slice(0, USER_TRADE_LIFECYCLE_LIMIT)
   };
 }
 
@@ -1162,6 +1608,7 @@ async function recordUserManagementAudit(input: {
     | "user.enable"
     | "user.resetPassword"
     | "user.changePassword"
+    | "user.group.update"
     | "user.balance.set";
   success: boolean;
   serverRecvTs: number;
@@ -1204,9 +1651,21 @@ async function buildLogsExportZip(actor: UserRecord, query: ExportQuery) {
     anonId: store.anonymizeUserId(user.id)
   }));
   const scopedQuery = resolveLogSearchFilters(actor, query);
-  const baseExportUsers = query.userIds?.length
-    ? resolveExportUsers(actor, allUsers).filter((user) => query.userIds?.includes(user.id))
-    : resolveExportUsers(actor, allUsers, query.userId);
+  const visibleExportUsers = resolveExportUsers(actor, allUsers);
+  const requestedUserIds = query.userIds?.length
+    ? [...new Set(query.userIds)]
+    : scopedQuery.userId
+      ? [scopedQuery.userId]
+      : undefined;
+  if (requestedUserIds?.length) {
+    const visibleIds = new Set(visibleExportUsers.map((user) => user.id));
+    if (requestedUserIds.some((userId) => !visibleIds.has(userId))) {
+      throw new Error("Logs are not available for this user.");
+    }
+  }
+  const baseExportUsers = requestedUserIds?.length
+    ? visibleExportUsers.filter((user) => requestedUserIds.includes(user.id))
+    : visibleExportUsers;
   const exportUsers = baseExportUsers.filter((user) => {
     if (query.role && user.role !== query.role) {
       return false;
@@ -1409,16 +1868,16 @@ async function safeRoute<T>(handler: () => Promise<T>) {
 
 function warnForLocalMisconfiguration() {
   if (serverConfig.upstreamProxyUrl) {
-    console.warn(`[startup] Using upstream proxy for Binance/Polymarket: ${serverConfig.upstreamProxyUrl}`);
+    console.warn(`[startup] Using upstream proxy for Binance/Coinbase/Polymarket: ${serverConfig.upstreamProxyUrl}`);
   }
-  if (!serverConfig.chainlinkEnabled) {
-    console.warn("[startup] Testing mode: Chainlink disabled. Local success will depend on Binance and Polymarket only.");
+  if (!serverConfig.coinbaseEnabled) {
+    console.warn("[startup] Testing mode: Coinbase disabled. Local success will depend on Binance and Polymarket only.");
     return;
   }
 
   const warnings: string[] = [];
-  if (!serverConfig.chainlinkRtdsWsUrl || !serverConfig.chainlinkRtdsWsUrl.startsWith("wss://")) {
-    warnings.push("CHAINLINK_RTDS_WS_URL must point to the Polymarket RTDS WebSocket.");
+  if (!serverConfig.coinbaseWsUrl || !serverConfig.coinbaseWsUrl.startsWith("wss://")) {
+    warnings.push("COINBASE_WS_URL must point to the Coinbase Advanced Trade WebSocket.");
   }
   if (warnings.length === 0) {
     return;
@@ -1437,6 +1896,7 @@ const shutdown = async () => {
     return;
   }
   shuttingDown = true;
+  stopMarketBroadcasting();
   await engine.stop();
   await store.close();
   await matchingRuntime?.close().catch(() => undefined);
@@ -1493,6 +1953,7 @@ async function bootstrap() {
     credentials: true
   });
   await app.register(websocket);
+  startMarketBroadcasting();
   app.addHook("onRequest", async (request, reply) => {
     httpStartTimes.set(request, Date.now());
     const requestId =
@@ -1611,6 +2072,7 @@ async function bootstrap() {
         sampleCount: orderLatencies.length
       },
       jsonl: jsonlStats,
+      orderBookSnapshots: store.getOrderBookSnapshotQueueStats(),
       persistence,
       externalSources: sources.map((source) => ({
         source: source.source,
@@ -1713,7 +2175,7 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       const parsed = wsTicketSchema.parse(request.body);
-      return createWsTicket(user, parsed.channel);
+      return createWsTicket(user, parsed.channel, parsed.viewUserId);
     })
   );
 
@@ -1729,7 +2191,8 @@ async function bootstrap() {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
       requirePermission(user, "profile:view");
-      return createBootstrapPayload(user);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return createBootstrapPayload(user, viewedUser);
     })
   );
 
@@ -1814,12 +2277,25 @@ async function bootstrap() {
       requirePermission(actor, "users:create");
       const serverRecvTs = Date.now();
       const parsed = createUserSchema.parse(request.body);
-      const managerUserId = normalizeManagerUserId(parsed.role as Role, parsed.managerUserId ?? parsed.seniorTesterId);
+      const requestedRole = parsed.role as Role;
+      if (!canCreateUserForActor(actor, requestedRole)) {
+        throw new Error("You can only create Tester accounts in your own group.");
+      }
+      const finalRole = actor.role === "Admin" ? requestedRole : "Tester";
+      const requestedManagerUserId = parsed.managerUserId ?? parsed.seniorTesterId;
+      if (actor.role !== "Admin" && requestedManagerUserId && requestedManagerUserId !== actor.id) {
+        throw new Error("You can only assign new Tester accounts to your own group.");
+      }
+      const managerUserId = normalizeManagerUserId(
+        finalRole,
+        actor.role === "Admin" ? requestedManagerUserId ?? getDefaultGroupManagerId() : actor.id,
+        { requireActive: true }
+      );
       const created = await store.createUser({
         username: parsed.username,
         password: parsed.password,
         displayName: parsed.displayName,
-        role: parsed.role as Role,
+        role: finalRole,
         language: (parsed.language ?? "zh-CN") as Language,
         seniorTesterId: managerUserId,
         managerUserId,
@@ -1856,17 +2332,28 @@ async function bootstrap() {
       const target = getTargetUserForManagement(actor, params.id);
       const parsed = updateUserSchema.parse(request.body);
       const nextRole = (parsed.role ?? target.role) as Role;
+      const hasManagerPatch =
+        Object.prototype.hasOwnProperty.call(parsed, "managerUserId") ||
+        Object.prototype.hasOwnProperty.call(parsed, "seniorTesterId");
       if (actor.role !== "Admin" && parsed.role && parsed.role !== target.role) {
         throw new Error("Only Admin can change user roles.");
       }
       if (actor.role !== "Admin" && typeof parsed.isActive === "boolean") {
         throw new Error("Use enable/disable actions for account status changes.");
       }
+      const requestedManagerUserId = parsed.managerUserId ?? parsed.seniorTesterId;
+      const clearingManager = parsed.managerUserId === null || parsed.seniorTesterId === null;
+      if (actor.role !== "Admin" && (clearingManager || (requestedManagerUserId && requestedManagerUserId !== actor.id))) {
+        throw new Error("You can only keep Tester accounts in your own group.");
+      }
       const managerUserId = normalizeManagerUserId(
         nextRole,
-        parsed.managerUserId === null || parsed.seniorTesterId === null
-          ? undefined
-          : parsed.managerUserId ?? parsed.seniorTesterId ?? target.managerUserId ?? target.seniorTesterId
+        actor.role !== "Admin"
+          ? actor.id
+          : clearingManager
+            ? undefined
+            : requestedManagerUserId ?? target.managerUserId ?? target.seniorTesterId,
+        { requireActive: hasManagerPatch && !clearingManager }
       );
       const updated = await store.updateUserProfile(target.id, {
         displayName: parsed.displayName,
@@ -1893,6 +2380,45 @@ async function bootstrap() {
           permissionLevel: updated.permissionLevel ?? "Standard",
           availableUsdc: updated.availableUsdc,
           isActive: updated.isActive
+        }
+      });
+      return store.sanitizeUser(updated);
+    })
+  );
+
+  app.patch("/api/users/:id/group", async (request) =>
+    safeRoute(async () => {
+      const actor = getUserFromRequest(request);
+      requirePermission(actor, "users:manager:update");
+      if (actor.role !== "Admin") {
+        throw new Error("Only Admin can change user groups.");
+      }
+      const serverRecvTs = Date.now();
+      const params = request.params as { id: string };
+      const target = store.getUserById(params.id);
+      if (!target) {
+        throw new Error("Target user was not found.");
+      }
+      if (!canChangeUserGroupForActor(actor, target)) {
+        throw new Error("Only Tester accounts can be moved between groups.");
+      }
+      const parsed = changeUserGroupSchema.parse(request.body);
+      const managerUserId = normalizeManagerUserId("Tester", parsed.managerUserId, { requireActive: true });
+      const updated = await store.updateUserProfile(target.id, {
+        seniorTesterId: managerUserId,
+        managerUserId
+      });
+      await recordUserManagementAudit({
+        actor,
+        actionType: "user.group.update",
+        success: true,
+        serverRecvTs,
+        targetUserId: updated.id,
+        resultMessage: "User group was changed.",
+        details: {
+          username: updated.username,
+          role: updated.role,
+          managerUserId: updated.managerUserId ?? updated.seniorTesterId
         }
       });
       return store.sanitizeUser(updated);
@@ -2122,7 +2648,7 @@ async function bootstrap() {
   app.post("/api/users/:id/enable", async (request) =>
     safeRoute(async () => {
       const actor = getUserFromRequest(request);
-      requirePermission(actor, "users:disable");
+      requirePermission(actor, "users:enable");
       const serverRecvTs = Date.now();
       const params = request.params as { id: string };
       const target = getTargetUserForManagement(actor, params.id);
@@ -2205,7 +2731,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
-      return createCurrentRoundPayload();
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return createCurrentRoundPayload(0, viewedUser.id);
     })
   );
 
@@ -2213,25 +2740,25 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "trade:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const limit = Number((request.query as { limit?: string }).limit ?? 10);
-      return getHistoryWithSettlementPreview(limit, user.id);
+      return getHistoryWithSettlementPreview(limit, viewedUser.id);
     })
   );
 
-  app.post("/api/rounds/:id/manual-settlement", async (request) =>
+app.post("/api/rounds/:id/admin-review", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
-      if (user.role === "Tester") {
-        throw new Error("Tester accounts cannot enter manual settlement.");
+      if (user.role !== "Admin") {
+        throw new Error("Only Admin can review rounds.");
       }
       const params = request.params as { id: string };
-      const parsed = manualSettlementSchema.parse(request.body);
+      const parsed = settlementActionSchema.parse(request.body);
       return decorateRoundWithSettlementPreview(
         await store.withTransaction(() =>
-          engine.manualSettleRound(user, {
+          engine.adminReviewRound(user, {
             roundId: params.id,
             side: parsed.side,
-            price: parsed.price,
             reason: parsed.reason
           })
         )
@@ -2239,12 +2766,63 @@ async function bootstrap() {
     })
   );
 
+  app.post("/api/rounds/:id/settle-my-positions", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      const params = request.params as { id: string };
+      return store.withTransaction(() =>
+        engine.redeemUserPositions(user, { roundId: params.id })
+      );
+    })
+  );
+
+  app.get("/api/rounds/unsettled", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      const now = Date.now();
+      // 从 store.rounds 中找 Manual/AdminReviewed 轮次
+      const unsettledStatuses = new Set(["Manual", "AdminReviewed"]);
+      const rounds = store.rounds.filter(
+        (round) =>
+          unsettledStatuses.has(round.status) &&
+          now >= round.endAt + 10 * 60 * 1000
+      );
+      // 再从当前用户的开放持仓中找需要结算的轮次
+      const openPositionRoundIds = new Set(
+        store.positions
+          .filter((p) => p.userId === user.id && p.status === "open" && p.roundId)
+          .map((p) => p.roundId)
+      );
+      const existingRoundIds = new Set(rounds.map((r) => r.id));
+      for (const roundId of openPositionRoundIds) {
+        if (!existingRoundIds.has(roundId)) {
+          const round = await store.findRoundOrFallback(roundId);
+          if (round) {
+            rounds.push(round);
+            existingRoundIds.add(roundId);
+          }
+        }
+      }
+      // Manual 排最前，AdminReviewed 按最近结算时间倒序（刚审核的排最前），其余按结束时间
+      rounds.sort((a, b) => {
+        if (a.status === "Manual" && b.status !== "Manual") return -1;
+        if (b.status === "Manual" && a.status !== "Manual") return 1;
+        if (a.status === "AdminReviewed" && b.status === "AdminReviewed") {
+          return (b.settlementTs ?? b.endAt) - (a.settlementTs ?? a.endAt);
+        }
+        return (b.endAt ?? 0) - (a.endAt ?? 0);
+      });
+      return rounds.map((round) => decorateRoundWithSettlementPreview(round));
+    })
+  );
+
   app.get("/api/profile/rounds/operated", async (request) =>
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const limit = Number((request.query as { limit?: string }).limit ?? 500);
-      return getOperatedHistoryWithSettlementPreview(limit, user.id);
+      return getOperatedHistoryWithSettlementPreview(limit, viewedUser.id);
     })
   );
 
@@ -2252,7 +2830,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getProfile(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getProfile(viewedUser.id);
     })
   );
 
@@ -2260,7 +2839,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getPositions(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getPositions(viewedUser.id);
     })
   );
 
@@ -2268,7 +2848,17 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getOrders(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getOrders(viewedUser.id);
+    })
+  );
+
+  app.get("/api/order-lifecycles/me", async (request) =>
+    safeRoute(async () => {
+      const user = getUserFromRequest(request);
+      requirePermission(user, "profile:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getOrderLifecycleLogs(viewedUser.id);
     })
   );
 
@@ -2294,7 +2884,10 @@ async function bootstrap() {
           }
         );
         appMetrics.recordOrder(result.order.status, Date.now() - startedAt);
-        return { order: store.sanitizeOrder(result.order) };
+        return {
+          order: store.sanitizeOrder(result.order),
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordOrder("failed", Date.now() - startedAt);
         throw error;
@@ -2310,7 +2903,10 @@ async function bootstrap() {
       const params = request.params as { id: string };
       const cancelled = store.sanitizeOrder(await engine.cancelOrder(user, params.id));
       appMetrics.recordOrder("cancelled", 0);
-      return cancelled;
+      return {
+        order: cancelled,
+        tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+      };
     })
   );
 
@@ -2323,7 +2919,10 @@ async function bootstrap() {
       try {
         const sold = store.sanitizeOrder(await store.withTransaction(() => engine.sellPosition(user, params.id)));
         appMetrics.recordPositionClose("success");
-        return sold;
+        return {
+          order: sold,
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
         throw error;
@@ -2342,7 +2941,10 @@ async function bootstrap() {
           engine.closeSide(user, parsed as { side: TradeSide; clientSendTs?: number })
         );
         appMetrics.recordPositionClose("success");
-        return result;
+        return {
+          ...result,
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
+        };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
         throw error;
@@ -2364,7 +2966,8 @@ async function bootstrap() {
         appMetrics.recordPositionClose("success");
         return {
           ...result,
-          reverseOrder: store.sanitizeOrder(result.reverseOrder)
+          reverseOrder: store.sanitizeOrder(result.reverseOrder),
+          tradePatch: createUserTradePayload(user) satisfies UserTradePayload
         };
       } catch (error) {
         appMetrics.recordPositionClose("failed");
@@ -2377,7 +2980,8 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
-      return store.getRecentLogs(user.id);
+      const viewedUser = getViewedUserFromRequest(user, request);
+      return store.getRecentLogs(viewedUser.id);
     })
   );
 
@@ -2537,10 +3141,11 @@ async function bootstrap() {
     safeRoute(async () => {
       const user = getUserFromRequest(request);
       requirePermission(user, "profile:view");
+      const viewedUser = getViewedUserFromRequest(user, request);
       const parsed = auditLogQuerySchema.pick({ roundId: true }).required().parse(request.query) as { roundId: string };
       return {
-        auditLogs: store.getAuditLogs({ userId: user.id, roundId: parsed.roundId }),
-        behaviorLogs: store.getBehaviorLogs({ userId: user.id, roundId: parsed.roundId })
+        auditLogs: store.getAuditLogs({ userId: viewedUser.id, roundId: parsed.roundId }),
+        behaviorLogs: store.getBehaviorLogs({ userId: viewedUser.id, roundId: parsed.roundId })
       };
     })
   );
@@ -2571,8 +3176,8 @@ async function bootstrap() {
       if (!timeline) {
         throw new Error("Order timeline was not found.");
       }
-      const teamUserIds = canViewTeamLogs(user) ? teamVisibleUserIds(user) : [user.id];
-      if (!canViewAllLogs(user) && !teamUserIds.includes(timeline.order.userId)) {
+      const timelineUser = store.getUserById(timeline.order.userId);
+      if (!timelineUser || !canViewUserRecords(user, timelineUser, store.listUserRecords())) {
         throw new Error("Order timeline is not available for this user.");
       }
       const matchingReplay = timeline.order.bookKey
@@ -2654,165 +3259,23 @@ async function bootstrap() {
 
   app.get("/ws/market", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "market");
-      if (!user || !user.isActive) {
+      const query = request.query as { token?: string; ticket?: string; viewUserId?: string };
+      const session = getWsSession(query, "market");
+      if (!session?.actor.isActive) {
         socket.close();
         return;
       }
       attachHeartbeat(socket, "market");
       wsConnectionCounts.market += 1;
       appMetrics.setWsConnections("market", wsConnectionCounts.market);
-
-      let lastTickSentAt = 0;
-      let lastFullSentAt = 0;
-      let lastSentAt = 0;
-      let sending = false;
-      let pendingTick = false;
-      let pendingFull = false;
-      let pendingSince: number | undefined;
-      let coalescedCount = 0;
-      let retryTimer: NodeJS.Timeout | undefined;
-      let tickTimer: NodeJS.Timeout | undefined;
-      let fullTimer: NodeJS.Timeout | undefined;
-      let closed = false;
-
-      const isSocketOpen = () => !closed && socket.readyState === WsWebSocket.OPEN;
-      const scheduleRetry = (delayMs = MARKET_WS_RETRY_MS) => {
-        if (closed || retryTimer) {
-          return;
-        }
-        retryTimer = setTimeout(() => {
-          retryTimer = undefined;
-          if (pendingFull || pendingTick) {
-            flushPending();
-          }
-        }, Math.max(delayMs, MARKET_WS_RETRY_MS));
-      };
-
-      const deferLatest = (kind: "tick" | "full") => {
-        if (kind === "full") {
-          pendingFull = true;
-        } else {
-          pendingTick = true;
-        }
-        pendingSince ??= Date.now();
-        coalescedCount += 1;
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        const pacingDelay = Math.max(MARKET_WS_MIN_INTERVAL_MS - elapsedSinceLastSend, 0);
-        scheduleRetry(pacingDelay);
-      };
-
-      const sendEnvelope = (
-        type: "market:tick" | "market",
-        data: MarketTickPayload | MarketPayload,
-        kind: "tick" | "full"
-      ) => {
-        if (!isSocketOpen()) {
-          return false;
-        }
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
-          socket.close();
-          return false;
-        }
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest(kind);
-          return false;
-        }
-        const elapsedSinceLastSend = lastSentAt ? Date.now() - lastSentAt : MARKET_WS_MIN_INTERVAL_MS;
-        if (elapsedSinceLastSend < MARKET_WS_MIN_INTERVAL_MS) {
-          deferLatest(kind);
-          return false;
-        }
-        sending = true;
-        const sendStartedAt = Date.now();
-        data.transportMeta.wsSendStartTs = sendStartedAt;
-        const outbound = JSON.stringify({ type, data });
-        socket.send(outbound, (error?: Error) => {
-          sending = false;
-          appMetrics.recordWsSend("market", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
-          if (!error) {
-            lastSentAt = Date.now();
-            if (kind === "tick") {
-              lastTickSentAt = lastSentAt;
-            } else {
-              lastFullSentAt = lastSentAt;
-            }
-          }
-          if (pendingFull || pendingTick) {
-            scheduleRetry();
-          }
-        });
-        return true;
-      };
-
-      const sendTick = () => {
-        const data = createMarketTickPayload(coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingTick = false;
-        return sendEnvelope("market:tick", data, "tick");
-      };
-
-      const sendFull = () => {
-        const data = createMarketPayload(user.id, coalescedCount, pendingSince);
-        coalescedCount = 0;
-        pendingSince = undefined;
-        pendingFull = false;
-        return sendEnvelope("market", data, "full");
-      };
-
-      const flushPending = () => {
-        if (!isSocketOpen()) {
-          return;
-        }
-        if (pendingFull || Date.now() - lastFullSentAt >= MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS) {
-          if (sendFull()) {
-            return;
-          }
-        }
-        if (pendingTick || Date.now() - lastTickSentAt >= MARKET_WS_MIN_INTERVAL_MS) {
-          sendTick();
-        }
-      };
-
-      const tickListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("tick");
-          return;
-        }
-        sendTick();
-      };
-      const fullListener = () => {
-        if (sending || socket.bufferedAmount > 0) {
-          deferLatest("full");
-          return;
-        }
-        sendFull();
-      };
-
-      sendFull();
-      tickTimer = setInterval(tickListener, Math.max(MARKET_WS_MIN_INTERVAL_MS, 50));
-      fullTimer = setInterval(fullListener, MARKET_WS_FULL_SNAPSHOT_INTERVAL_MS);
-      store.emitter.on("market:update", tickListener);
+      const unregisterMarketClient = registerMarketBroadcastClient(session.actor.id, session.viewedUser.id, socket);
       socket.on("close", () => {
-        closed = true;
+        unregisterMarketClient();
         wsConnectionCounts.market = Math.max(0, wsConnectionCounts.market - 1);
         appMetrics.setWsConnections("market", wsConnectionCounts.market);
         if (!consumeHeartbeatTimeout(socket)) {
           appMetrics.recordWsDisconnect("market", "close");
         }
-        if (retryTimer) {
-          clearTimeout(retryTimer);
-        }
-        if (tickTimer) {
-          clearInterval(tickTimer);
-        }
-        if (fullTimer) {
-          clearInterval(fullTimer);
-        }
-        store.emitter.off("market:update", tickListener);
       });
     } catch {
       socket.close();
@@ -2821,43 +3284,89 @@ async function bootstrap() {
 
   app.get("/ws/user", { websocket: true }, (socket, request) => {
     try {
-      const query = request.query as { token?: string; ticket?: string };
-      const user = getWsUser(query, "user");
-      if (!user || !user.isActive) {
+      const query = request.query as { token?: string; ticket?: string; viewUserId?: string };
+      const session = getWsSession(query, "user");
+      if (!session?.actor.isActive) {
         socket.close();
         return;
       }
+      const { actor, viewedUser } = session;
       attachHeartbeat(socket, "user");
       wsConnectionCounts.user += 1;
       appMetrics.setWsConnections("user", wsConnectionCounts.user);
 
-      const eventName = `user:${user.id}`;
-      const sendPayload = () => {
-        const currentUser = store.getUserById(user.id);
-        if (!currentUser?.isActive) {
+      const eventName = `user:${viewedUser.id}`;
+      let userSendInFlight = false;
+      let pendingUserPayloadScope: UserPayloadScope | undefined;
+      let userRetryTimer: NodeJS.Timeout | undefined;
+
+      function mergeUserPayloadScope(current: UserPayloadScope | undefined, next: UserPayloadScope): UserPayloadScope {
+        if (!current) {
+          return next;
+        }
+        return current === "trade" || next === "trade" ? "trade" : "full";
+      }
+
+      const sendPayloadNow = (scope: UserPayloadScope = "full") => {
+        const currentActor = store.getUserById(actor.id);
+        const currentViewedUser = store.getUserById(viewedUser.id);
+        if (!currentActor?.isActive || !currentViewedUser || !canViewUserRecords(currentActor, currentViewedUser, store.listUserRecords())) {
           socket.close();
           return;
         }
+        if (userSendInFlight || socket.bufferedAmount > 0) {
+          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+          queueUserPayload();
+          return;
+        }
+        const buildStartedAt = Date.now();
         const outbound = JSON.stringify({
-          type: "user",
-          data: {
-            profile: store.getProfile(user.id),
-            operatedHistory: getOperatedHistoryWithSettlementPreview(500, user.id),
-            positions: store.getPositions(user.id),
-            orders: store.getOrders(user.id),
-            logs: store.getRecentLogs(user.id)
-          }
+          type: scope === "trade" ? "user:trade" : "user",
+          data: scope === "trade" ? createUserTradePayload(currentViewedUser) : createUserFullPayload(currentViewedUser)
         });
+        const buildLatencyMs = Date.now() - buildStartedAt;
+        const outboundBytes = Buffer.byteLength(outbound);
+        appMetrics.recordUserWsPayload(scope, outboundBytes, buildLatencyMs);
+        if (buildLatencyMs > 50 || outboundBytes > 200_000) {
+          console.warn(
+            `[ws:user] payload scope=${scope} bytes=${outboundBytes} buildMs=${buildLatencyMs}`
+          );
+        }
         const sendStartedAt = Date.now();
+        userSendInFlight = true;
         socket.send(outbound, (error?: Error) => {
-          appMetrics.recordWsSend("user", Buffer.byteLength(outbound), Date.now() - sendStartedAt, !error);
+          userSendInFlight = false;
+          appMetrics.recordWsSend("user", outboundBytes, Date.now() - sendStartedAt, !error);
+          if (pendingUserPayloadScope) {
+            queueUserPayload();
+          }
         });
       };
 
-      const listener = () => sendPayload();
-      sendPayload();
+      function queueUserPayload(scope?: UserPayloadScope) {
+        if (scope) {
+          pendingUserPayloadScope = mergeUserPayloadScope(pendingUserPayloadScope, scope);
+        }
+        if (userSendInFlight || userRetryTimer) {
+          return;
+        }
+        userRetryTimer = setTimeout(() => {
+          userRetryTimer = undefined;
+          const nextScope = pendingUserPayloadScope;
+          pendingUserPayloadScope = undefined;
+          if (nextScope) {
+            sendPayloadNow(nextScope);
+          }
+        }, USER_WS_RETRY_MS);
+      }
+
+      const listener = (scope?: UserPayloadScope) => queueUserPayload(scope ?? "full");
+      queueUserPayload("full");
       store.emitter.on(eventName, listener);
       socket.on("close", () => {
+        if (userRetryTimer) {
+          clearTimeout(userRetryTimer);
+        }
         wsConnectionCounts.user = Math.max(0, wsConnectionCounts.user - 1);
         appMetrics.setWsConnections("user", wsConnectionCounts.user);
         if (!consumeHeartbeatTimeout(socket)) {

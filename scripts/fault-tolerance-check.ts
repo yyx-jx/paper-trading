@@ -13,11 +13,11 @@ function createStore(overrides: Partial<ConstructorParameters<typeof AppStore>[0
     databaseUrl: "postgresql://postgres:postgres@127.0.0.1:1/unavailable",
     redisUrl: "redis://127.0.0.1:1",
     persistenceMode: "external",
-    chainlinkEnabled: true,
+    coinbaseEnabled: true,
     strictPersistence: true,
     requireSchemaMigrations: true,
     allowDevSchemaBootstrap: false,
-    expectedSchemaMigrationId: "000004",
+    expectedSchemaMigrationId: "000007",
     pgConnectionTimeoutMs: 25,
     pgIdleTimeoutMs: 25,
     pgMaxConnections: 1,
@@ -75,7 +75,7 @@ async function assertSchemaGuardFails() {
               ? { rows: [{ exists: true }], rowCount: 1 }
               : { rows: [], rowCount: 0 }
         }),
-      /Required migration 000004 is not applied/
+      /Required migration 000007 is not applied/
     );
   } finally {
     await Promise.all([missingStore.close(), outdatedStore.close()]);
@@ -121,22 +121,22 @@ async function assertExternalSourcesAreObservable() {
     persistence: { postgres: true, redis: false },
     sources: [
       sourceHealth("Binance", "degraded", 20_000),
-      sourceHealth("Chainlink", "stale", 120_000),
+      sourceHealth("Coinbase", "stale", 120_000),
       sourceHealth("CLOB", "reconnecting", 45_000)
     ]
   });
   const text = await metrics.text();
   assert.match(text, /persistence_state\{target="redis"\} -1/);
   assert.match(text, /source_status\{source="binance",state="degraded"\} 1/);
-  assert.match(text, /source_status\{source="chainlink",state="stale"\} 1/);
+  assert.match(text, /source_status\{source="coinbase",state="stale"\} 1/);
   assert.match(text, /source_status\{source="clob",state="reconnecting"\} 1/);
-  assert.match(text, /source_stale_age_seconds\{source="chainlink"\}/);
+  assert.match(text, /source_stale_age_seconds\{source="coinbase"\}/);
 }
 
 function assertNoRequestStormPatterns() {
   const connectorFiles = [
     "apps/server/src/services/connectors/binance.ts",
-    "apps/server/src/services/connectors/chainlink.ts",
+    "apps/server/src/services/connectors/coinbase.ts",
     "apps/server/src/services/connectors/polymarket.ts"
   ];
   for (const file of connectorFiles) {

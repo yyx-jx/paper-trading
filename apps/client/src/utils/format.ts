@@ -48,5 +48,9 @@ export function localLabel(language: Language, zh: string, en: string) {
 }
 
 export function tokenPriceText(value?: number, digits = 1) {
-  return `${decimal((value ?? 0) * 100, digits)}¢`;
+  return `${decimal((value ?? 0) * 100, digits)}\u00A2`;
+}
+
+export function tradeDisplayPriceText(value?: number) {
+  return `${Math.round((value ?? 0) * 100)}\u00A2`;
 }

@@ -24,8 +24,13 @@ function testStaticTransactionContracts() {
   assertIncludes(storeSource, "restoreTradeMutationSnapshot(snapshot: TradeMutationMemorySnapshot)", "store trade memory restore");
   assertIncludes(storeSource, "this.rebuildHotIndexes();", "store restore index rebuild");
   assertIncludes(storeSource, "async withTransaction<T>(handler: () => Promise<T>)", "store transaction helper");
+  assertIncludes(storeSource, "prepareOrderBookSnapshotForOrder(order: OrderRecord)", "store async order book snapshot preparation");
+  assertIncludes(storeSource, "private async flushOrderBookSnapshotQueue()", "store background order book snapshot flush");
 
   assertIncludes(simulationSource, "private async runTradeWriteTransaction<T>", "simulation trade write helper");
+  assertIncludes(simulationSource, "type TradePersistSegments", "simulation trade persist segment type");
+  assertIncludes(simulationSource, "private async measureTradePersistSegment", "simulation trade persist segment measurement");
+  assertIncludes(simulationSource, "tradePersistSegments", "simulation trade persist segment logging");
   assertIncludes(simulationSource, "this.store.captureTradeMutationSnapshot()", "simulation transaction memory capture");
   assertIncludes(simulationSource, "this.store.restoreTradeMutationSnapshot(memorySnapshot)", "simulation transaction memory restore");
 
@@ -34,6 +39,12 @@ function testStaticTransactionContracts() {
     "async placeOrder(",
     "await this.runTradeWriteTransaction(async () => {",
     "placeOrder write transaction"
+  );
+  assertInOrder(
+    simulationSource,
+    "await this.runTradeWriteTransaction(async () => {",
+    "this.store.prepareOrderBookSnapshotForOrder(order)",
+    "order book snapshot reference preparation"
   );
   assertInOrder(
     simulationSource,

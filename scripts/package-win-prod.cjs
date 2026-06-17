@@ -7,6 +7,9 @@ const outputDir = path.join(root, "deploy", "windows-production");
 const readmePath = path.join(outputDir, "production-client-readme.md");
 const redactedApiBaseUrl = "http://<PRODUCTION_HOST>:10001";
 const rendererApiBaseUrl = "http://127.0.0.1:18787";
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const packageVersion = String(packageJson.version || "0.0.0");
+const productionArtifactName = `BTC Paper Trading Setup ${packageVersion}.\${ext}`;
 
 function assertInsideRoot(targetPath) {
   const relative = path.relative(root, targetPath);
@@ -54,7 +57,7 @@ function runNodeScript(scriptPath, args, extraEnv = {}) {
 function createPortableZip() {
   const unpackedDir = path.join(outputDir, "win-unpacked");
   const exePath = path.join(unpackedDir, "BTC Paper Trading.exe");
-  const zipPath = path.join(outputDir, "BTC Paper Trading Portable.zip");
+  const zipPath = path.join(outputDir, `BTC Paper Trading Portable ${packageVersion}.zip`);
   if (!fs.existsSync(exePath)) {
     throw new Error("electron-builder did not produce win-unpacked/BTC Paper Trading.exe.");
   }
@@ -109,7 +112,7 @@ try {
     "-c.productName=BTC Paper Trading",
     `-c.extraMetadata.productionApiBaseUrl=${process.env.VITE_API_BASE_URL}`,
     "-c.directories.output=deploy/windows-production",
-    "-c.win.artifactName=BTC Paper Trading Setup.${ext}",
+    `-c.win.artifactName=${productionArtifactName}`,
     "-c.nsis.shortcutName=BTC Paper Trading"
   ]);
 } catch (error) {
@@ -134,6 +137,8 @@ fs.writeFileSync(
 This installer is the production C/S client. It does not start a local memory backend by default.
 
 - API base URL shown in this README: ${redactedApiBaseUrl}
+- Client version: ${packageVersion}
+- Installer filename: BTC Paper Trading Setup ${packageVersion}.exe
 - Client runtime URL: ${rendererApiBaseUrl}
 - WebSocket URLs are derived from the API base URL and use WSS for HTTPS origins or WS for temporary HTTP origins.
 - Temporary HTTP mode: ${process.env.ALLOW_INSECURE_PROD_HTTP === "true" ? "enabled" : "disabled"}

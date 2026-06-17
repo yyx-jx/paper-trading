@@ -32,6 +32,7 @@ export interface ExportQuery {
   systems?: LogSearchQuery["systems"];
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -159,7 +160,7 @@ function auditLogGroup(row: AuditEvent) {
     return "settlement";
   }
   if (row.category === "latency") {
-    return ["binance", "chainlink", "clob"].includes(row.moduleName) ? "market_latency" : "system_latency";
+    return ["binance", "coinbase", "clob"].includes(row.moduleName) ? "market_latency" : "system_latency";
   }
   return "operation";
 }
@@ -168,7 +169,7 @@ function latencySource(row: AuditEvent) {
   if (row.category !== "latency") {
     return "";
   }
-  return ["binance", "chainlink", "clob"].includes(row.moduleName) ? row.moduleName : "system";
+  return ["binance", "coinbase", "clob"].includes(row.moduleName) ? row.moduleName : "system";
 }
 
 export function toCsv<T>(rows: T[], columns: CsvColumn<T>[]) {
@@ -263,7 +264,7 @@ export function trainingLogsCsv(user: ExportUser, logs: BehaviorActionLog[]) {
     { header: "binance_1m_last_close", value: (row) => row.binance1mLastClose },
     { header: "binance_5m_last_close", value: (row) => row.binance5mLastClose },
     { header: "binance_1d_last_close", value: (row) => row.binance1dLastClose },
-    { header: "chainlink_price", value: (row) => row.chainlinkPrice },
+    { header: "coinbase_price", value: (row) => row.coinbasePrice },
     { header: "price_to_beat", value: (row) => row.priceToBeat },
     { header: "up_price", value: (row) => row.upPrice },
     { header: "down_price", value: (row) => row.downPrice },
@@ -418,6 +419,8 @@ export function operatedRoundsCsv(user: ExportUser, rounds: Array<RoundRecord & 
     { header: "settlement_source", value: (row) => row.settlementSource },
     { header: "binance_open_price", value: (row) => row.binanceOpenPrice },
     { header: "binance_close_price", value: (row) => row.binanceClosePrice },
+    { header: "coinbase_open_price", value: (row) => row.coinbaseOpenPrice },
+    { header: "coinbase_close_price", value: (row) => row.coinbaseClosePrice },
     { header: "polymarket_open_price", value: (row) => row.polymarketOpenPrice },
     { header: "polymarket_close_price", value: (row) => row.polymarketClosePrice },
     { header: "accepting_orders", value: (row) => row.acceptingOrders },
@@ -451,16 +454,12 @@ function safePathSegment(value: string) {
 }
 
 export function resolveExportUsers(actor: UserRecord, allUsers: ExportUser[], targetUserId?: string) {
-  const allAllowed =
-    actor.role === "Admin" ||
-    actor.role === "Test Engineer" ||
-    actor.permissionCodes.includes("logs:view:all" as never);
-  const teamAllowed = actor.role === "Senior Tester" || actor.permissionCodes.includes("logs:view:team" as never);
-  const visibleUsers = allAllowed
-    ? allUsers
-    : teamAllowed
-      ? allUsers.filter((user) => user.id === actor.id || (user.role === "Tester" && user.seniorTesterId === actor.id))
-      : allUsers.filter((user) => user.id === actor.id);
+  const visibleUsers =
+    actor.role === "Admin"
+      ? allUsers
+      : actor.role === "Senior Tester" || actor.role === "Test Engineer"
+        ? allUsers.filter((user) => user.id === actor.id || (user.role === "Tester" && (user.managerUserId ?? user.seniorTesterId) === actor.id))
+        : allUsers.filter((user) => user.id === actor.id);
   if (!targetUserId) {
     return visibleUsers;
   }

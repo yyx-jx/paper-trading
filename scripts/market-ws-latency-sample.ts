@@ -22,7 +22,7 @@ interface TransportMeta {
 }
 
 interface SourceHealth {
-  source: "Binance" | "Chainlink" | "CLOB";
+  source: "Binance" | "Coinbase" | "CLOB";
   state: string;
   sourceEventTs: number;
   serverRecvTs: number;
@@ -31,10 +31,10 @@ interface SourceHealth {
 }
 
 interface TickLike {
-  sources?: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  sources?: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   latencyBreakdown?: {
-    sourceEventAge?: Record<"binance" | "chainlink" | "clob", number>;
-    serverIngressLatency?: Record<"binance" | "chainlink" | "clob", number>;
+    sourceEventAge?: Record<"binance" | "coinbase" | "clob", number>;
+    serverIngressLatency?: Record<"binance" | "coinbase" | "clob", number>;
   };
 }
 
@@ -49,6 +49,7 @@ interface MarketMessage {
 
 const baseUrl = requiredEnv("LOAD_TEST_BASE_URL").replace(/\/+$/, "");
 const durationMs = envInt("LOAD_TEST_SAMPLE_MS", 120_000);
+const clobSourceAgeLimitMs = envInt("LOAD_TEST_CLOB_SOURCE_AGE_LIMIT_MS", 1500);
 const outputPath = process.env.LOAD_TEST_OUTPUT?.trim();
 const tokenFromEnv = process.env.LOAD_TEST_TOKEN?.trim();
 const username = process.env.LOAD_TEST_USERNAME?.trim();
@@ -64,25 +65,35 @@ const queueLatencies: number[] = [];
 const snapshotAges: number[] = [];
 const wsSendAges: number[] = [];
 const clientProcessLatencies: number[] = [];
-const sourceToBackend: Record<"binance" | "chainlink" | "clob", number[]> = {
+const payloadBytes: number[] = [];
+const tickPayloadBytes: number[] = [];
+const fullPayloadBytes: number[] = [];
+const sourceToBackend: Record<"binance" | "coinbase" | "clob", number[]> = {
   binance: [],
-  chainlink: [],
+  coinbase: [],
   clob: []
 };
-const sourceAges: Record<"binance" | "chainlink" | "clob", number[]> = {
+const sourceAges: Record<"binance" | "coinbase" | "clob", number[]> = {
   binance: [],
-  chainlink: [],
+  coinbase: [],
   clob: []
 };
 
 let tickCount = 0;
 let fullCount = 0;
+let openedAt = 0;
+let firstTickAt = 0;
+let firstFullAt = 0;
 let lastMessageAt = 0;
 let lastTickAt = 0;
 let firstPayloadSeq = 0;
 let lastPayloadSeq = 0;
 let outOfOrder = 0;
 let clockOffsetMs = 0;
+let clobSourceAgeOverLimitSamples = 0;
+let clobSourceAgeOverLimitStreaks = 0;
+let clobSourceAgeOverLimitStartedAt = 0;
+let clobSourceAgeLongestOverLimitMs = 0;
 
 void main().catch((error) => {
   console.error(error instanceof Error ? error.message : error);
@@ -100,6 +111,7 @@ async function main() {
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket open.")), 10_000);
     socket.once("open", () => {
+      openedAt = Date.now();
       clearTimeout(timeout);
       resolve();
     });
@@ -121,11 +133,12 @@ async function main() {
       return;
     }
     const processedAt = Date.now();
-    recordMessage(parsed, receivedAt, processedAt);
+    recordMessage(parsed, receivedAt, processedAt, raw);
   });
 
   await sleep(durationMs);
-  socket.close();
+  socket.terminate();
+  await sleep(100);
 
   const result = buildResult(startedAt, Date.now());
   const text = JSON.stringify(result, null, 2);
@@ -135,18 +148,28 @@ async function main() {
   console.log(text);
 }
 
-function recordMessage(message: MarketMessage, receivedAt: number, processedAt: number) {
+function recordMessage(message: MarketMessage, receivedAt: number, processedAt: number, raw: WebSocket.RawData) {
+  const rawBytes = rawDataByteLength(raw);
+  payloadBytes.push(rawBytes);
   if (lastMessageAt > 0) {
     intervals.push(receivedAt - lastMessageAt);
   }
   lastMessageAt = receivedAt;
   if (message.type === "market:tick") {
+    tickPayloadBytes.push(rawBytes);
+    if (!firstTickAt) {
+      firstTickAt = receivedAt;
+    }
     if (lastTickAt > 0) {
       tickIntervals.push(receivedAt - lastTickAt);
     }
     lastTickAt = receivedAt;
     tickCount += 1;
   } else {
+    fullPayloadBytes.push(rawBytes);
+    if (!firstFullAt) {
+      firstFullAt = receivedAt;
+    }
     fullCount += 1;
   }
 
@@ -185,18 +208,26 @@ function recordMessage(message: MarketMessage, receivedAt: number, processedAt: 
   if (!sources) {
     return;
   }
-  for (const key of ["binance", "chainlink", "clob"] as const) {
+  for (const key of ["binance", "coinbase", "clob"] as const) {
     const source = sources[key];
     sourceToBackend[key].push(Math.max(source.serverRecvTs - source.sourceEventTs, 0));
-    sourceAges[key].push(Math.max(receivedAt - source.normalizedTs - clockOffsetMs, 0));
+    const sourceAge = Math.max(receivedAt - source.normalizedTs - clockOffsetMs, 0);
+    sourceAges[key].push(sourceAge);
+    if (key === "clob") {
+      recordClobSourceAgeLimit(sourceAge, receivedAt);
+    }
   }
 }
 
 function buildResult(startedAt: number, finishedAt: number) {
+  finalizeClobSourceAgeLimit(finishedAt);
   return {
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date(finishedAt).toISOString(),
     durationMs: finishedAt - startedAt,
+    openMs: openedAt ? openedAt - startedAt : 0,
+    firstTickMs: firstTickAt ? firstTickAt - startedAt : 0,
+    firstFullMs: firstFullAt ? firstFullAt - startedAt : 0,
     tickCount,
     fullCount,
     firstPayloadSeq,
@@ -214,6 +245,7 @@ function buildResult(startedAt: number, finishedAt: number) {
     serverToClientMax: max(serverToClientLatencies),
     tickServerToClientP50: percentile(tickServerToClientLatencies, 50),
     tickServerToClientP95: percentile(tickServerToClientLatencies, 95),
+    tickServerToClientP99: percentile(tickServerToClientLatencies, 99),
     tickServerToClientMax: max(tickServerToClientLatencies),
     fullServerToClientP50: percentile(fullServerToClientLatencies, 50),
     fullServerToClientP95: percentile(fullServerToClientLatencies, 95),
@@ -222,13 +254,57 @@ function buildResult(startedAt: number, finishedAt: number) {
     serverQueueP95: percentile(queueLatencies, 95),
     snapshotBuildAgeP95: percentile(snapshotAges, 95),
     renderCommitAgeP95: percentile(clientProcessLatencies, 95),
+    payloadBytesP95: percentile(payloadBytes, 95),
+    payloadBytesMax: max(payloadBytes),
+    tickPayloadBytesP95: percentile(tickPayloadBytes, 95),
+    fullPayloadBytesP95: percentile(fullPayloadBytes, 95),
     binanceSourceToBackendP95: percentile(sourceToBackend.binance, 95),
     clobSourceToBackendP95: percentile(sourceToBackend.clob, 95),
-    chainlinkSourceToBackendP95: percentile(sourceToBackend.chainlink, 95),
+    coinbaseSourceToBackendP95: percentile(sourceToBackend.coinbase, 95),
+    binanceSourceAgeP50: percentile(sourceAges.binance, 50),
     binanceSourceAgeP95: percentile(sourceAges.binance, 95),
+    binanceSourceAgeP99: percentile(sourceAges.binance, 99),
+    binanceSourceAgeMax: max(sourceAges.binance),
+    clobSourceAgeP50: percentile(sourceAges.clob, 50),
     clobSourceAgeP95: percentile(sourceAges.clob, 95),
-    chainlinkSourceAgeP95: percentile(sourceAges.chainlink, 95)
+    clobSourceAgeP99: percentile(sourceAges.clob, 99),
+    clobSourceAgeMax: max(sourceAges.clob),
+    clobSourceAgeLimitMs,
+    clobSourceAgeOverLimitSamples,
+    clobSourceAgeOverLimitStreaks,
+    clobSourceAgeLongestOverLimitMs,
+    coinbaseSourceAgeP50: percentile(sourceAges.coinbase, 50),
+    coinbaseSourceAgeP95: percentile(sourceAges.coinbase, 95),
+    coinbaseSourceAgeP99: percentile(sourceAges.coinbase, 99),
+    coinbaseSourceAgeMax: max(sourceAges.coinbase)
   };
+}
+
+function recordClobSourceAgeLimit(sourceAge: number, receivedAt: number) {
+  if (sourceAge <= clobSourceAgeLimitMs) {
+    finalizeClobSourceAgeLimit(receivedAt);
+    return;
+  }
+  clobSourceAgeOverLimitSamples += 1;
+  if (!clobSourceAgeOverLimitStartedAt) {
+    clobSourceAgeOverLimitStartedAt = receivedAt;
+    clobSourceAgeOverLimitStreaks += 1;
+  }
+  clobSourceAgeLongestOverLimitMs = Math.max(
+    clobSourceAgeLongestOverLimitMs,
+    receivedAt - clobSourceAgeOverLimitStartedAt
+  );
+}
+
+function finalizeClobSourceAgeLimit(now: number) {
+  if (!clobSourceAgeOverLimitStartedAt) {
+    return;
+  }
+  clobSourceAgeLongestOverLimitMs = Math.max(
+    clobSourceAgeLongestOverLimitMs,
+    now - clobSourceAgeOverLimitStartedAt
+  );
+  clobSourceAgeOverLimitStartedAt = 0;
 }
 
 async function sampleClockOffset() {
@@ -331,6 +407,16 @@ function percentile(values: number[], p: number) {
   const sorted = [...values].sort((left, right) => left - right);
   const index = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
   return Math.round(sorted[index]);
+}
+
+function rawDataByteLength(raw: WebSocket.RawData) {
+  if (typeof raw === "string") {
+    return Buffer.byteLength(raw);
+  }
+  if (Array.isArray(raw)) {
+    return raw.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  }
+  return Buffer.from(raw).byteLength;
 }
 
 function max(values: number[]) {

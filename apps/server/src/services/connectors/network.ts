@@ -36,20 +36,3 @@ export async function fetchJsonWithTimeout<T>(url: string, timeoutMs: number, di
     clearTimeout(timer);
   }
 }
-
-export async function fetchTextWithTimeout(url: string, timeoutMs: number, dispatcher?: Dispatcher): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await undiciFetch(url, {
-      signal: controller.signal,
-      dispatcher
-    });
-    if (!response.ok) {
-      throw new Error(`Request failed with ${response.status} for ${url}.`);
-    }
-    return await response.text();
-  } finally {
-    clearTimeout(timer);
-  }
-}

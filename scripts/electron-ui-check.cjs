@@ -480,17 +480,17 @@ async function main() {
           }
         }
         const charts = Array.from(document.querySelectorAll(".terminal-center .terminal-chart-block .candle-chart"));
-        const hasMainChart = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.chainlink) .candle-chart"));
-        const hasMainPlaceholder = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.chainlink) .chart-empty"));
-        const hasChainlinkChart = Boolean(document.querySelector(".terminal-chart-block.chainlink .candle-chart"));
-        const hasChainlinkPlaceholder = Boolean(document.querySelector(".terminal-chart-block.chainlink .chart-empty"));
-        if ((!hasMainChart && !hasMainPlaceholder) || (!hasChainlinkChart && !hasChainlinkPlaceholder)) {
+        const hasMainChart = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.coinbase) .candle-chart"));
+        const hasMainPlaceholder = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.coinbase) .chart-empty"));
+        const hasCoinbaseChart = Boolean(document.querySelector(".terminal-chart-block.coinbase .candle-chart"));
+        const hasCoinbasePlaceholder = Boolean(document.querySelector(".terminal-chart-block.coinbase .chart-empty"));
+        if ((!hasMainChart && !hasMainPlaceholder) || (!hasCoinbaseChart && !hasCoinbasePlaceholder)) {
           throw new Error(label + ": expected chart or placeholder blocks, got " + JSON.stringify({
             charts: charts.length,
             hasMainChart,
             hasMainPlaceholder,
-            hasChainlinkChart,
-            hasChainlinkPlaceholder
+            hasCoinbaseChart,
+            hasCoinbasePlaceholder
           }));
         }
         for (const [index, chart] of charts.entries()) {
@@ -536,7 +536,7 @@ async function main() {
         );
       };
       const assertPriceOverlayLabels = (label) => {
-        const mainChart = document.querySelector(".terminal-center .terminal-chart-block:not(.chainlink) .candle-chart");
+        const mainChart = document.querySelector(".terminal-center .terminal-chart-block:not(.coinbase) .candle-chart");
         if (!mainChart) {
           throw new Error(label + ": missing main chart for price overlay labels.");
         }
@@ -579,13 +579,13 @@ async function main() {
           body: (document.body.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 500)
         };
       };
-      const ensureChainlinkChartMode = async () => {
+      const ensureCoinbaseChartMode = async () => {
         for (let attempt = 0; attempt < 20; attempt += 1) {
           if (!document.querySelector(".terminal-center.book-expanded")) {
             return;
           }
           const closeButton = Array.from(document.querySelectorAll(".terminal-depth button"))
-            .find((button) => (button.textContent || "").trim().toUpperCase() === "CL");
+            .find((button) => (button.textContent || "").trim().toUpperCase() === "CB");
           if (closeButton) {
             closeButton.click();
           }
@@ -594,23 +594,23 @@ async function main() {
         throw new Error("Unable to close expanded order book before chart stress: " + JSON.stringify(chartReadinessDebug()));
       };
       const waitForCandlestickCharts = async () => {
-        await ensureChainlinkChartMode();
+        await ensureCoinbaseChartMode();
         for (let attempt = 0; attempt < 120; attempt += 1) {
-          const hasMainPlaceholder = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.chainlink) .chart-empty"));
-          const hasChainlinkChart = Boolean(document.querySelector(".terminal-chart-block.chainlink .candle-chart"));
-          const hasChainlinkPlaceholder = Boolean(document.querySelector(".terminal-chart-block.chainlink .chart-empty"));
+          const hasMainPlaceholder = Boolean(document.querySelector(".terminal-center .terminal-chart-block:not(.coinbase) .chart-empty"));
+          const hasCoinbaseChart = Boolean(document.querySelector(".terminal-chart-block.coinbase .candle-chart"));
+          const hasCoinbasePlaceholder = Boolean(document.querySelector(".terminal-chart-block.coinbase .chart-empty"));
           if (chartNodes().length >= 2) {
             return { hasMainChart: true, hasSecondaryChart: true };
           }
-          if (chartNodes().length >= 1 && hasChainlinkPlaceholder) {
+          if (chartNodes().length >= 1 && hasCoinbasePlaceholder) {
             return { hasMainChart: true, hasSecondaryChart: false };
           }
-          if (hasMainPlaceholder && (hasChainlinkChart || hasChainlinkPlaceholder)) {
-            return { hasMainChart: false, hasSecondaryChart: hasChainlinkChart };
+          if (hasMainPlaceholder && (hasCoinbaseChart || hasCoinbasePlaceholder)) {
+            return { hasMainChart: false, hasSecondaryChart: hasCoinbaseChart };
           }
           await sleep(500);
         }
-        throw new Error("Expected a main chart plus a CL chart or placeholder before wheel stress: " + JSON.stringify(chartReadinessDebug()));
+        throw new Error("Expected a main chart plus a CB chart or placeholder before wheel stress: " + JSON.stringify(chartReadinessDebug()));
       };
       const chartAt = (index) => {
         const chart = chartNodes()[index];
@@ -714,8 +714,8 @@ async function main() {
       assertPageStable("before wheel stress");
       if (!chartReadiness.hasMainChart) {
         const tradeText = (document.body.textContent || "").replace(/\\s+/g, " ");
-        if (!tradeText.includes("B5")) {
-          throw new Error("Trade page did not render the B5 chart placeholder.");
+        if (!tradeText.includes("HT")) {
+          throw new Error("Trade page did not render the HT chart placeholder.");
         }
         if ((window.__uiErrors || []).length > 0) {
           throw new Error("Frontend runtime errors with chart placeholders: " + JSON.stringify(window.__uiErrors));
@@ -731,7 +731,7 @@ async function main() {
       if (hasSecondaryChart) {
         await hoverChart(1);
         await spinChart(1, -120, false, 3);
-        assertPriceOverlayLabels("after hovered CL chart three-wheel stress");
+        assertPriceOverlayLabels("after hovered CB chart three-wheel stress");
       }
       await spinChart(0, -120, false, 5);
       if (!(getVisibleCount() < initialVisibleCount)) {
@@ -739,10 +739,10 @@ async function main() {
       }
       await spinChart(0, 120, false, 40);
       if (hasSecondaryChart) {
-        const beforeChainlinkWheelVisibleCount = getVisibleCount();
+        const beforeCoinbaseWheelVisibleCount = getVisibleCount();
         await spinChart(1, -120, false, 3);
-        if (!(getVisibleCount() < beforeChainlinkWheelVisibleCount)) {
-          throw new Error("CL chart wheel-up did not update the shared visible candle count.");
+        if (!(getVisibleCount() < beforeCoinbaseWheelVisibleCount)) {
+          throw new Error("CB chart wheel-up did not update the shared visible candle count.");
         }
       }
       const beforeMainShiftZoom = getYZooms();
@@ -760,12 +760,12 @@ async function main() {
       } else {
         await spinChart(0, 120, true, 4);
       }
-      const afterChainlinkShiftZoom = getYZooms();
-      if (!(afterChainlinkShiftZoom[0] < afterMainShiftZoom[0])) {
+      const afterCoinbaseShiftZoom = getYZooms();
+      if (!(afterCoinbaseShiftZoom[0] < afterMainShiftZoom[0])) {
         throw new Error("Shift+wheel did not zoom the price axis out.");
       }
-      if (hasSecondaryChart && !(afterChainlinkShiftZoom[1] < afterMainShiftZoom[1])) {
-        throw new Error("CL chart Shift+wheel did not zoom both price axes out.");
+      if (hasSecondaryChart && !(afterCoinbaseShiftZoom[1] < afterMainShiftZoom[1])) {
+        throw new Error("CB chart Shift+wheel did not zoom both price axes out.");
       }
       assertPriceOverlayLabels("after secondary Shift+wheel");
       await spinChart(0, 5000, false, 3);
@@ -815,8 +815,8 @@ async function main() {
       if (/Polymarket|\\bodds\\b|赔率/i.test(tradeText)) {
         throw new Error("Trade page still exposes old Polymarket/odds wording.");
       }
-      if (!tradeText.includes("B5")) {
-        throw new Error("Trade page did not render the B5 section.");
+      if (!tradeText.includes("HT")) {
+        throw new Error("Trade page did not render the HT section.");
       }
       const topRightLinkText = Array.from(document.querySelectorAll(".terminal-top-right a"))
         .map((node) => (node.textContent || "").trim())

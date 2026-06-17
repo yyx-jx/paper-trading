@@ -187,7 +187,7 @@ function testStaticTransactionAndMigrationWiring() {
   assert.match(simulationSource, /redeemedPositionCount/);
 
   const configSource = readFileSync("apps/server/src/config.ts", "utf8");
-  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000004"/);
+  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000007"/);
 }
 
 async function main() {
