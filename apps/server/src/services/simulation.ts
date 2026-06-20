@@ -4,15 +4,11 @@ import type {
   BinanceConnectorState,
   CandlePoint,
   CandleBar,
-  ChainlinkConnectorState,
+  CoinbaseConnectorState,
   ClobMarketInfo,
-  DisplayPriceSource,
-  FeeBreakdown,
   Language,
-  MatchingBookState,
-  MatchingFill,
+  MarketCandleRecord,
   MarketSnapshot,
-  MarketTrade,
   OrderLifecycleExitType,
   OrderRecord,
   OrderBookSnapshot,
@@ -29,326 +25,71 @@ import type {
   TradeSide,
   UserRecord
 } from "../domain/types";
+import { EventEmitter } from "node:events";
 import { BinanceConnector } from "./connectors/binance";
-import { ChainlinkConnector } from "./connectors/chainlink";
+import { CoinbaseConnector } from "./connectors/coinbase";
 import { estimateClobExecution, type ClobExecutionEstimate } from "./clob-execution";
-import { calculateClobFees } from "./clob-fees";
 import { MatchingServiceClient } from "./matching/client";
 import { PolymarketConnector } from "./connectors/polymarket";
-import { PolymarketReferenceResolver } from "./connectors/polymarket-reference";
 import { AppStore } from "./store";
+import { appMetrics } from "./metrics";
+import {
+  COINBASE_BAR_LIMITS,
+  COINBASE_INTERVAL_MS,
+  aggregateCoinbaseBars,
+  createEmptyCoinbaseIntervalBars,
+  marketCandleToBar,
+  mergeCoinbaseHistoryBars,
+  shouldReplaceCoinbaseMarketCandle
+} from "./simulation/coinbase-candles";
+import { cloneCandlePoint, cloneOrderBookSnapshot, hasOrderBookDepth, type ExecutionBookResult } from "./simulation/order-books";
+import {
+  calculateClobFee,
+  clobMarketInfoFor,
+  isAlignedToTick,
+  isBtcReferencePrice,
+  isOfficialPtbSource,
+  isPositivePrice,
+  resolvePairedDisplayPrices
+} from "./simulation/pricing";
+import {
+  PRELIMINARY_SETTLEMENT_THRESHOLD,
+  resolveExactSettledSideFromOutcomePrices
+} from "./simulation/settlement-rules";
+import { QTY_EPSILON, isClientOrderConflict, roundCurrency, roundNumber } from "./simulation/trade-calculations";
+import { buildBehaviorLog, type BehaviorLogBuildInput } from "./simulation/log-builders";
+import {
+  measureTradePersistSegment,
+  type TradePersistSegmentName,
+  type TradePersistSegments
+} from "./simulation/order-persistence";
+import { shouldRequireManualSettlement } from "./settlement/manual-queue";
 
 const LATENCY_LOG_INTERVAL_MS = 15000;
 const REDEEM_DELAY_MS = 2000;
-const PRELIMINARY_SETTLEMENT_THRESHOLD = 0.9;
-const QTY_EPSILON = 0.0001;
 const FIVE_MINUTE_MS = 5 * 60_000;
 const EXECUTION_BOOK_FRESHNESS_FLOOR_MS = 5000;
 const GAMMA_PREFETCH_START_MS = 180_000;
 const GAMMA_PREFETCH_FAST_START_MS = 60_000;
 const GAMMA_PREFETCH_END_MS = 0;
 const GAMMA_PREFETCH_INTERVAL_MS = 2000;
-const CONSERVATIVE_CLOB_MARKET_INFO: ClobMarketInfo = {
-  minimumTickSize: 0.01,
-  minimumOrderSize: 1,
-  makerFeeRate: 0,
-  takerFeeRate: 0,
-  platformFeeRate: 0,
-  platformFeeExponent: 1,
-  platformFeeTakerOnly: true,
-  feeRateAvailable: false,
-  source: "conservative",
-  conservative: true,
-  updatedAt: 0
-};
-const TRADE_CHART_INTERVALS = ["30s", "1m", "5m", "15m", "1h"] as const;
-const CHAINLINK_BAR_LIMITS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
-  "30s": 120,
-  "1m": 60,
-  "5m": 30,
-  "15m": 24,
-  "1h": 24
+
+type TradeLogTask = () => Promise<void>;
+
+const tradePersistObserver = {
+  onSegmentObserved: (segment: TradePersistSegmentName, durationMs: number) => {
+    appMetrics.recordTradePersistSegment(segment, durationMs);
+  }
 };
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isClientOrderConflict(error: unknown) {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-  const candidate = error as { code?: unknown; constraint?: unknown; detail?: unknown; message?: unknown };
-  if (candidate.code !== "23505") {
-    return false;
-  }
-  return [candidate.constraint, candidate.detail, candidate.message]
-    .filter(Boolean)
-    .some((value) => String(value).includes("idx_orders_user_client_order_id"));
-}
-
-const CHAINLINK_INTERVAL_MS: Record<(typeof TRADE_CHART_INTERVALS)[number], number> = {
-  "30s": 30_000,
-  "1m": 60_000,
-  "5m": 5 * 60_000,
-  "15m": 15 * 60_000,
-  "1h": 60 * 60_000
-};
-
-function isPositivePrice(value?: number): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
-}
-
-function latestTradePrice(trades: MarketTrade[], side: TradeSide): number | undefined {
-  for (let index = trades.length - 1; index >= 0; index -= 1) {
-    const trade = trades[index];
-    if (trade.side === side && isPositivePrice(trade.price)) {
-      return trade.price;
-    }
-  }
-  return undefined;
-}
-
-function resolveDisplayPrice(input: {
-  bestBid: number;
-  bestAsk: number;
-  lastTradePrice?: number;
-  outcomePrice?: number;
-}): { value: number; source: DisplayPriceSource; spread: number } {
-  const bestBid = isPositivePrice(input.bestBid) ? input.bestBid : undefined;
-  const bestAsk = isPositivePrice(input.bestAsk) ? input.bestAsk : undefined;
-  if (bestBid === undefined || bestAsk === undefined) {
-    return {
-      value: 0,
-      source: "outcome_price",
-      spread: 0
-    };
-  }
-  const spread = bestBid !== undefined && bestAsk !== undefined ? Math.max(bestAsk - bestBid, 0) : 0;
-  const midPrice = bestBid !== undefined && bestAsk !== undefined ? (bestBid + bestAsk) / 2 : undefined;
-
-  if (midPrice !== undefined) {
-    if (spread > 0.1) {
-      if (isPositivePrice(input.lastTradePrice)) {
-        return {
-          value: roundNumber(input.lastTradePrice, 4),
-          source: "last_trade",
-          spread: roundNumber(spread, 4)
-        };
-      }
-      return {
-        value: 0,
-        source: "outcome_price",
-        spread: roundNumber(spread, 4)
-      };
-    }
-    return {
-      value: roundNumber(midPrice, 4),
-      source: "mid",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  if (isPositivePrice(input.lastTradePrice)) {
-    return {
-      value: roundNumber(input.lastTradePrice, 4),
-      source: "last_trade",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  if (isPositivePrice(input.outcomePrice)) {
-    return {
-      value: roundNumber(input.outcomePrice, 4),
-      source: "outcome_price",
-      spread: roundNumber(spread, 4)
-    };
-  }
-
-  return {
-    value: 0,
-    source: "outcome_price",
-    spread: roundNumber(spread, 4)
-  };
-}
-
-function resolvePairedDisplayPrices(input: {
-  upBook: OrderBookSnapshot;
-  downBook: OrderBookSnapshot;
-  recentTrades: MarketTrade[];
-  outcomePrices?: [number, number];
-}): Record<TradeSide, { value: number; source: DisplayPriceSource; spread: number }> {
-  const upAskDepthAvailable = input.upBook.asks.length > 0 && isPositivePrice(input.upBook.bestAsk);
-  const downAskDepthAvailable = input.downBook.asks.length > 0 && isPositivePrice(input.downBook.bestAsk);
-  if (!upAskDepthAvailable && !downAskDepthAvailable) {
-    return {
-      UP: { value: 0, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0, source: "outcome_price", spread: 0 }
-    };
-  }
-  if (!upAskDepthAvailable) {
-    return {
-      UP: { value: 0, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0.01, source: "outcome_price", spread: 0 }
-    };
-  }
-  if (!downAskDepthAvailable) {
-    return {
-      UP: { value: 0.01, source: "outcome_price", spread: 0 },
-      DOWN: { value: 0, source: "outcome_price", spread: 0 }
-    };
-  }
-  return {
-    UP: resolveDisplayPrice({
-      bestBid: input.upBook.bestBid,
-      bestAsk: input.upBook.bestAsk,
-      lastTradePrice: latestTradePrice(input.recentTrades, "UP"),
-      outcomePrice: input.outcomePrices?.[0]
-    }),
-    DOWN: resolveDisplayPrice({
-      bestBid: input.downBook.bestBid,
-      bestAsk: input.downBook.bestAsk,
-      lastTradePrice: latestTradePrice(input.recentTrades, "DOWN"),
-      outcomePrice: input.outcomePrices?.[1]
-    })
-  };
-}
-
-function isMarketResolved(detail: PolymarketMarketDetail): boolean {
-  if (detail.automaticallyResolved) return true;
-  if (detail.winningTokenId) return true;
-  if (detail.winningOutcome) return true;
-  if (detail.closed) {
-    const [up, down] = detail.outcomePrices;
-    if (up === 1 && down === 0) return true;
-    if (up === 0 && down === 1) return true;
-  }
-  return false;
-}
-
-function isBtcReferencePrice(value?: number): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 1000;
-}
-
-function isOfficialPtbSource(source?: string) {
-  const normalized = source?.toLowerCase() ?? "";
-  return normalized.includes("chainlink data streams") || normalized.includes("data.chain.link");
-}
-
-const roundNumber = (value: number, digits = 2) => Number(value.toFixed(digits));
-const roundCurrency = (value: number) => roundNumber(value, 6);
-
-function clobMarketInfoFor(market?: PolymarketMarketDetail): ClobMarketInfo {
-  return market?.marketInfo ?? {
-    ...CONSERVATIVE_CLOB_MARKET_INFO,
-    conditionId: market?.conditionId,
-    updatedAt: Date.now()
-  };
-}
-
-function isAlignedToTick(price: number, tickSize: number) {
-  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(tickSize) || tickSize <= 0) {
-    return false;
-  }
-  const units = price / tickSize;
-  return Math.abs(units - Math.round(units)) < 0.000001;
-}
-
-function calculateClobFee(input: {
-  role: "maker" | "taker";
-  marketInfo: ClobMarketInfo;
-  price?: number;
-  quantity: number;
-  notional: number;
-}): { fee: number; breakdown?: FeeBreakdown } {
-  const price = input.price ?? input.notional / Math.max(input.quantity, QTY_EPSILON);
-  const result = calculateClobFees({
-    role: input.role,
-    feeRate: input.marketInfo.takerFeeRate,
-    platformFeeRate: input.marketInfo.platformFeeRate ?? input.marketInfo.takerFeeRate,
-    platformFeeExponent: input.marketInfo.platformFeeExponent,
-    platformFeeTakerOnly: input.marketInfo.platformFeeTakerOnly,
-    price,
-    quantity: input.quantity,
-    notional: input.notional,
-    digits: 6
-  });
-  return { fee: roundCurrency(result.fee), breakdown: result.breakdown };
-}
-
-function createEmptyChainlinkIntervalBars() {
-  return {
-    "30s": [] as CandleBar[],
-    "1m": [] as CandleBar[],
-    "5m": [] as CandleBar[],
-    "15m": [] as CandleBar[],
-    "1h": [] as CandleBar[]
-  };
-}
-
-function upsertSampleBar(
-  bars: CandleBar[],
-  interval: (typeof TRADE_CHART_INTERVALS)[number],
-  price: number,
-  ts: number
-) {
-  const bucketSize = CHAINLINK_INTERVAL_MS[interval];
-  const startTs = Math.floor(ts / bucketSize) * bucketSize;
-  const endTs = startTs + bucketSize - 1;
-  const lastBar = bars.at(-1);
-  if (lastBar && lastBar.startTs === startTs) {
-    lastBar.high = roundNumber(Math.max(lastBar.high, price), 2);
-    lastBar.low = roundNumber(Math.min(lastBar.low, price), 2);
-    lastBar.close = roundNumber(price, 2);
-    lastBar.volume += 1;
-    return bars.slice(-CHAINLINK_BAR_LIMITS[interval]);
-  }
-
-  return [
-    ...bars,
-    {
-      interval,
-      startTs,
-      endTs,
-      open: roundNumber(price, 2),
-      high: roundNumber(price, 2),
-      low: roundNumber(price, 2),
-      close: roundNumber(price, 2),
-      volume: 1
-    }
-  ].slice(-CHAINLINK_BAR_LIMITS[interval]);
-}
-
-function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
-  return {
-    snapshotId: snapshot.snapshotId,
-    snapshotTs: snapshot.snapshotTs,
-    bestBid: snapshot.bestBid,
-    bestAsk: snapshot.bestAsk,
-    midPrice: snapshot.midPrice,
-    bids: snapshot.bids.map((level) => ({ ...level })),
-    asks: snapshot.asks.map((level) => ({ ...level }))
-  };
-}
-
-function hasOrderBookDepth(snapshot?: OrderBookSnapshot) {
-  return Boolean(snapshot && (snapshot.bids.length > 0 || snapshot.asks.length > 0));
-}
-
-function cloneCandlePoint(point: CandlePoint): CandlePoint {
-  return {
-    ts: point.ts,
-    price: point.price
-  };
-}
-
-type ExecutionBookResult = {
-  book: OrderBookSnapshot;
-  source: "cache" | "stale_cache" | "rest" | "rest_empty_cache_fallback";
-  ageMs: number;
-  fallbackReason?: string;
-};
-
+const COINBASE_MARKET_CANDLE_FLUSH_MS = 5000;
+const COINBASE_MARKET_CANDLE_FLUSH_SIZE = 50;
+const COINBASE_MARKET_CANDLE_RESTORE_MS = 24 * 60 * 60_000;
+const COINBASE_HISTORY_CANDLE_SYNC_MIN_MS = 60_000;
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -359,13 +100,13 @@ function utcRangeText(startAt: number, endAt: number) {
   return `${pad2(start.getUTCHours())}:${pad2(start.getUTCMinutes())}-${pad2(end.getUTCHours())}:${pad2(end.getUTCMinutes())} UTC`;
 }
 
-function createDisabledChainlinkState(symbol: string): ChainlinkConnectorState {
+function createDisabledCoinbaseState(symbol: string): CoinbaseConnectorState {
   const now = Date.now();
   return {
     price: 0,
     updatedAt: 0,
     status: {
-      source: "Chainlink",
+      source: "Coinbase",
       symbol,
       state: "disabled",
       reconnectCount: 0,
@@ -376,41 +117,52 @@ function createDisabledChainlinkState(symbol: string): ChainlinkConnectorState {
       acquireLatencyMs: 0,
       publishLatencyMs: 0,
       frontendLatencyMs: 0,
-      message: "Chainlink is disabled in local testing mode."
+      message: "Coinbase is disabled in local testing mode."
     }
   };
 }
 
 export class SimulationEngine {
+  readonly events = new EventEmitter();
   private readonly binanceConnector: BinanceConnector;
-  private readonly chainlinkConnector: ChainlinkConnector;
+  private readonly coinbaseConnector: CoinbaseConnector;
   private readonly polymarketConnector: PolymarketConnector;
-  private readonly polymarketReferenceResolver: PolymarketReferenceResolver;
   private binanceState: BinanceConnectorState;
-  private chainlinkState: ChainlinkConnectorState;
-  private chainlinkCandles5s: CandleBar[] = [];
-  private chainlinkCandlesByInterval = createEmptyChainlinkIntervalBars();
+  private coinbaseState: CoinbaseConnectorState;
+  private coinbaseCandles5s: CandleBar[] = [];
+  private coinbaseCandlesByInterval = createEmptyCoinbaseIntervalBars();
   private polymarketState: PolymarketConnectorState;
   private currentRoundUpPriceSeries: CandlePoint[] = [];
   private currentRoundUpPriceSeriesRoundId?: string;
+  private currentRoundBinanceOpenReferences = new Map<string, number>();
+  private lastCoinbaseSampleKey?: string;
+  private lastCoinbaseHistorySyncKey?: string;
+  private lastCoinbaseHistorySyncAt = 0;
+  private pendingCoinbaseMarketCandles = new Map<number, MarketCandleRecord>();
+  private coinbaseMarketCandleFlushTimer?: NodeJS.Timeout;
+  private coinbaseMarketCandleFlushRunning = false;
   private readonly unsubscribers: Array<() => void> = [];
   private reconcileTimer?: NodeJS.Timeout;
   private reconcileRunning = false;
   private reconcileQueued = false;
+  private snapshotRefreshRunning = false;
+  private snapshotRefreshQueued = false;
+  private snapshotRefreshQueuedAt?: number;
+  private readonly snapshotRefreshSources = new Set<"binance" | "coinbase" | "clob">();
   private readonly pollLocks = new Set<string>();
   private redeemLocks = new Set<string>();
   private readonly lastLatencyLogAt = new Map<string, number>();
   private readonly lastLatencyState = new Map<string, string>();
   private queuedLatencySnapshot?: MarketSnapshot;
   private latencyLogsRunning = false;
-  private readonly matchingBooks = new Map<string, MatchingBookState>();
-  private readonly currentBookKeys = new Map<TradeSide, string>();
-  private readonly lastSyncedSnapshotIds = new Map<string, string>();
   private preliminarySettlements = new Map<string, SettlementPreview>();
   private gammaOutcomeConfirmations = new Map<string, { side: TradeSide; count: number; observedAt: number }>();
   private gammaSettlementDiagnostics = new Set<string>();
   private marketSyncSlug?: string;
   private pendingOrdersRunning = false;
+  private tradeLogQueue: TradeLogTask[] = [];
+  private tradeLogFlushScheduled = false;
+  private tradeLogFlushRunning = false;
 
   constructor(
     private readonly store: AppStore,
@@ -420,6 +172,7 @@ export class SimulationEngine {
       marketId: string;
       freezeWindowMs: number;
       pollDelayMs: number;
+      manualSettlementTimeoutMs: number;
       gammaPollIntervalMs: number;
       binanceRestUrl: string;
       binanceFallbackRestUrl: string;
@@ -429,18 +182,12 @@ export class SimulationEngine {
       binanceRestPollMs: number;
       binanceWsStaleMs: number;
       upstreamProxyUrl?: string;
-      chainlinkEnabled: boolean;
-      chainlinkRpcUrl: string;
-      chainlinkFallbackRpcUrls: string[];
-      chainlinkRequestTimeoutMs: number;
-      chainlinkBtcUsdProxyAddress: `0x${string}`;
-      chainlinkPollMs: number;
-      chainlinkRtdsWsUrl: string;
-      chainlinkRtdsSymbol: string;
-      chainlinkRtdsPingMs: number;
-      chainlinkHistoryUrl: string;
-      chainlinkHistoryFeedId: string;
-      chainlinkHistoryPollMs: number;
+      coinbaseEnabled: boolean;
+      coinbaseWsUrl: string;
+      coinbaseRestUrl: string;
+      coinbaseRestPollMs: number;
+      coinbaseRequestTimeoutMs: number;
+      coinbaseWsStaleMs: number;
       gammaBaseUrl: string;
       clobBaseUrl: string;
       dataApiBaseUrl: string;
@@ -452,6 +199,7 @@ export class SimulationEngine {
       polymarketDiscoveryKeywords: string[];
       marketDiscoveryIntervalMs: number;
       marketSnapshotIntervalMs: number;
+      marketFullReconcileIntervalMs: number;
       polymarketBookPollMs: number;
       polymarketBookCalibrationMs: number;
       polymarketTradesPollMs: number;
@@ -468,14 +216,13 @@ export class SimulationEngine {
       wsStaleMs: config.binanceWsStaleMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
-    this.chainlinkConnector = new ChainlinkConnector({
+    this.coinbaseConnector = new CoinbaseConnector({
       symbol: config.symbol,
-      rtdsWsUrl: config.chainlinkRtdsWsUrl,
-      rtdsSymbol: config.chainlinkRtdsSymbol,
-      rtdsPingMs: config.chainlinkRtdsPingMs,
-      historyUrl: config.chainlinkHistoryUrl,
-      historyFeedId: config.chainlinkHistoryFeedId,
-      historyPollMs: config.chainlinkHistoryPollMs,
+      wsUrl: config.coinbaseWsUrl,
+      restUrl: config.coinbaseRestUrl,
+      restPollMs: config.coinbaseRestPollMs,
+      requestTimeoutMs: config.coinbaseRequestTimeoutMs,
+      wsStaleMs: config.coinbaseWsStaleMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
     this.polymarketConnector = new PolymarketConnector({
@@ -494,48 +241,48 @@ export class SimulationEngine {
       tradesPollMs: config.polymarketTradesPollMs,
       upstreamProxyUrl: config.upstreamProxyUrl
     });
-    this.polymarketReferenceResolver = new PolymarketReferenceResolver({
-      requestTimeoutMs: config.polymarketDiscoveryTimeoutMs,
-      upstreamProxyUrl: config.upstreamProxyUrl
-    });
     this.binanceState = this.binanceConnector.getState();
-    this.chainlinkState = config.chainlinkEnabled
-      ? this.chainlinkConnector.getState()
-      : createDisabledChainlinkState(config.symbol);
+    this.coinbaseState = config.coinbaseEnabled
+      ? this.coinbaseConnector.getState()
+      : createDisabledCoinbaseState(config.symbol);
     this.polymarketState = this.polymarketConnector.getState();
   }
 
   async start() {
+    if (this.config.coinbaseEnabled) {
+      await this.restoreCoinbaseMarketCandles();
+    }
     this.unsubscribers.push(
       this.binanceConnector.subscribe((state) => {
         this.binanceState = state;
-        this.scheduleReconcile();
+        this.scheduleSnapshotOnlyRefresh("binance");
       }),
       this.polymarketConnector.subscribe((state) => {
         this.polymarketState = state;
-        this.scheduleReconcile();
+        this.scheduleSnapshotOnlyRefresh("clob");
       })
     );
-    if (this.config.chainlinkEnabled) {
+    if (this.config.coinbaseEnabled) {
       this.unsubscribers.push(
-        this.chainlinkConnector.subscribe((state) => {
-          this.chainlinkState = state;
-          this.recordChainlinkSample(state.price, state.updatedAt || Date.now());
-          this.scheduleReconcile();
+        this.coinbaseConnector.subscribe((state) => {
+          this.coinbaseState = state;
+          this.recordCoinbaseSample(state.price, state.updatedAt || Date.now());
+          this.syncCoinbaseHistoryCandles(state.candlesByInterval);
+          this.scheduleSnapshotOnlyRefresh("coinbase");
         })
       );
     }
 
     this.binanceConnector.start();
-    if (this.config.chainlinkEnabled) {
-      this.chainlinkConnector.start();
+    if (this.config.coinbaseEnabled) {
+      this.coinbaseConnector.start();
     }
     this.polymarketConnector.start();
     this.reconcileTimer = setInterval(
-      () => this.scheduleReconcile(),
-      Math.max(this.config.marketSnapshotIntervalMs, 50)
+      () => this.scheduleFullReconcile(),
+      Math.max(this.config.marketFullReconcileIntervalMs, 250)
     );
-    this.scheduleReconcile();
+    this.scheduleFullReconcile();
   }
 
   async stop() {
@@ -547,9 +294,14 @@ export class SimulationEngine {
       this.unsubscribers.pop()?.();
     }
     this.binanceConnector.stop();
-    if (this.config.chainlinkEnabled) {
-      this.chainlinkConnector.stop();
+    if (this.config.coinbaseEnabled) {
+      this.coinbaseConnector.stop();
     }
+    if (this.coinbaseMarketCandleFlushTimer) {
+      clearTimeout(this.coinbaseMarketCandleFlushTimer);
+      this.coinbaseMarketCandleFlushTimer = undefined;
+    }
+    await this.flushPendingCoinbaseMarketCandles();
     this.polymarketConnector.stop();
   }
 
@@ -636,8 +388,9 @@ export class SimulationEngine {
         reason: input.reason
       }
     });
+    await this.applyRedeem(round);
     for (const userId of this.collectRoundPositionUsers(round.id)) {
-      this.store.emitUserPayload(userId);
+      this.store.emitUserPayload(userId, "trade");
     }
     this.scheduleReconcile();
     return round;
@@ -665,6 +418,25 @@ export class SimulationEngine {
     }
   }
 
+  private async measureTradePersistSegment<T>(
+    segments: TradePersistSegments | undefined,
+    name: TradePersistSegmentName,
+    handler: () => Promise<T> | T
+  ) {
+    return measureTradePersistSegment(segments, name, handler, tradePersistObserver);
+  }
+
+  private emitBridgeEvent(eventName: "signal:emitted" | "paper:filled", payload: unknown) {
+    if (process.env.HYPER_BRIDGE_ENABLED !== "true") {
+      return;
+    }
+    try {
+      this.events.emit(eventName, payload);
+    } catch (error) {
+      console.warn(`[hyper-bridge] ${eventName} listener failed:`, error);
+    }
+  }
+
   async placeOrder(
     user: UserRecord,
     payload: {
@@ -679,7 +451,7 @@ export class SimulationEngine {
       positionIds?: string[];
       exitType?: Exclude<OrderLifecycleExitType, "settlement" | "mixed">;
     }
-  ): Promise<{ order: OrderRecord }> {
+  ): Promise<{ order: OrderRecord; changedPositionIds: string[] }> {
     const snapshot = this.captureActionSnapshot();
     const traceId = this.store.newTraceId();
     const now = Date.now();
@@ -693,9 +465,13 @@ export class SimulationEngine {
           ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
           : undefined;
       if (existingOrder) {
-        return { order: existingOrder };
+        return { order: existingOrder, changedPositionIds: [] };
       }
-      this.assertCanCreateNewOrder(currentRound, now);
+      if (action === "buy") {
+        this.assertCanBuyOrder(currentRound, now);
+      } else {
+        this.assertCanSellOrder(currentRound, now);
+      }
       if (orderKind === "limit" && (!payload.limitPrice || payload.limitPrice <= 0)) {
         throw new Error("Limit orders require a positive limit price.");
       }
@@ -722,6 +498,17 @@ export class SimulationEngine {
       const orderBookSnapshot = cloneOrderBookSnapshot(book);
       const tokenId = this.resolveTokenId(payload.side, currentRound);
       const { bookKey, marketId } = this.resolveBookContext(payload.side, currentRound);
+      this.emitBridgeEvent("signal:emitted", {
+        traceId,
+        orderId,
+        user,
+        payload,
+        bookSnapshot: orderBookSnapshot,
+        midPrice: book.midPrice,
+        estimatedFee: 0,
+        marketId,
+        emittedAt: Date.now()
+      });
       const marketInfo = clobMarketInfoFor(this.polymarketState.currentMarket);
       if (orderKind === "limit" && !isAlignedToTick(payload.limitPrice ?? 0, marketInfo.minimumTickSize)) {
         throw new Error(`Limit price must align to CLOB tick size ${marketInfo.minimumTickSize}.`);
@@ -832,177 +619,199 @@ export class SimulationEngine {
         serverPublishTs: Date.now(),
         createdAt: Date.now()
       };
-
+      const tradePersistSegments: TradePersistSegments = {};
+      let changedPositionIds: string[] = [];
       try {
+        const transactionStartedAt = Date.now();
         await this.runTradeWriteTransaction(async () => {
-        const persistStartTs = Date.now();
-        if (status === "pending") {
-          if (action === "buy") {
-            const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
-            user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
-            order.frozenUsdc = frozen;
-          } else {
-            const frozenQty = roundNumber(payload.qty ?? 0, 4);
-            await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
-            order.frozenQty = frozenQty;
-          }
-          await Promise.all([
-            this.store.persistOrder(order),
-            ...(action === "buy" ? [this.store.persistUser(user)] : [])
-          ]);
-        } else if (status === "filled" && estimate.avgPrice) {
-          await this.applyFilledOrder(
-            user,
-            currentRound,
-            order,
-            estimate,
-            payload.positionIds,
-            payload.exitType ?? "manual_sell",
-            false
-          );
-          if (order.action === "buy") {
-            await this.recordBuyLifecycle(user, currentRound, order, snapshot);
-          }
-        } else {
-          await this.store.persistOrder(order);
-        }
-        order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
-        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
-
-        await Promise.all([
-          this.writeAuditLog({
-            eventId: this.store.newId("evt"),
-            traceId,
-            category: "matching",
-            actionType: "place_order",
-            actionStatus: status === "failed" ? "failed" : "success",
-            userId: user.id,
-            role: user.role,
-            pageName: "trade.main",
-            moduleName: "order.panel",
-            symbol: this.config.symbol,
-            roundId: currentRound.id,
-            clientSendTs: payload.clientSendTs,
-            serverRecvTs,
-            engineStartTs,
-            engineFinishTs,
-            serverPublishTs: order.serverPublishTs,
-            backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
-            resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
-            resultMessage:
-              status === "failed"
-                ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
-                : status === "pending"
-                  ? "Limit order is pending against future Polymarket CLOB depth."
-                  : "Order fully matched against the current Polymarket CLOB snapshot.",
-            details: {
-              traceId,
-              roundId: currentRound.id,
-              marketId,
-              marketSlug: currentRound.marketSlug,
-              orderId: order.id,
-              clientOrderId,
-              positionId: payload.positionIds?.[0],
-              bookKey,
-              bookHash: book.snapshotId,
-              bookSnapshotId: book.snapshotId,
-              matchingSequence: undefined,
-              tokenId,
-              action,
-              side: payload.side,
-              orderKind,
-              timeInForce: order.timeInForce,
-              limitPrice: payload.limitPrice,
-              notionalUsdc: payload.amount,
-              requestedQty: payload.qty,
-              filledQty: order.filledQty,
-              unfilledQty: order.unfilledQty,
-              avgFillPrice: order.avgFillPrice,
-              bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-              localMatchLatencyMs: order.localMatchLatencyMs,
-              persistLatencyMs: order.persistLatencyMs,
-              totalOrderLatencyMs: order.totalOrderLatencyMs,
-              executionBookSource: executionBook.source,
-              executionBookAgeMs: executionBook.ageMs,
-              executionBookFallbackReason: executionBook.fallbackReason,
-              sourceLatencyMs,
-              slippageBps: order.slippageBps,
-              estimatedFee: order.estimatedFee,
-              actualFee: order.actualFee,
-              feeBreakdown: order.feeBreakdown,
-              feeCurrency: order.feeCurrency,
-              marketInfo,
-              failureReason: order.failureReason
+          const persistStartTs = Date.now();
+          await this.measureTradePersistSegment(tradePersistSegments, "persistOrderBookSnapshot", () => {
+            this.store.prepareOrderBookSnapshotForOrder(order);
+          });
+          if (status === "pending") {
+            if (action === "buy") {
+              const frozen = roundNumber((payload.amount ?? 0) + orderFee, 2);
+              user.availableUsdc = roundNumber(user.availableUsdc - frozen, 2);
+              order.frozenUsdc = frozen;
+            } else {
+              const frozenQty = roundNumber(payload.qty ?? 0, 4);
+              changedPositionIds = await this.lockSellQty(user.id, currentRound.id, payload.side, frozenQty, payload.positionIds);
+              order.frozenQty = frozenQty;
             }
-          }),
-          this.writeBehaviorLog(
-            this.createBehaviorLog({
+            if (action === "buy") {
+              await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+                this.store.persistTradeRecords({ orders: [order], users: [user] })
+              );
+            } else {
+              await this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order));
+            }
+          } else if (status === "filled" && estimate.avgPrice) {
+            changedPositionIds = await this.applyFilledOrder(
               user,
-              actionType: "place_order",
-              actionStatus: status === "failed" ? "failed" : "success",
-              traceId,
-              orderId: order.id,
-              round: currentRound,
-              snapshot,
-              direction: payload.side,
-              entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-              positionNotional: order.notionalUsdc,
-              bookSnapshot: book,
+              currentRound,
               order,
-              actualFillPrice: order.avgFillPrice,
-              slippageBps: order.slippageBps,
-              partialFilled: order.partialFilled,
-              unfilledQty: order.unfilledQty,
-              executionLatencyMs: order.matchLatencyMs,
-              estimatedFee: order.estimatedFee,
-              actualFee: order.actualFee,
-              feeBreakdown: order.feeBreakdown,
-              feeCurrency: order.feeCurrency,
-              failureReason: order.failureReason,
-              contextJson: {
-                roundStatus: currentRound.status,
-                acceptingOrders: currentRound.acceptingOrders,
-                requestAction: action,
-                requestSide: payload.side,
-                requestAmount: payload.amount,
-                requestQty: payload.qty,
-                clientOrderId,
-                orderType: orderKind,
-                isAccepted: status !== "failed",
-                bookSnapshotId: book.snapshotId,
-                bookKey,
-                bookAcquireLatencyMs: order.bookAcquireLatencyMs,
-                localMatchLatencyMs: order.localMatchLatencyMs,
-                persistLatencyMs: order.persistLatencyMs,
-                totalOrderLatencyMs: order.totalOrderLatencyMs,
-                executionBookSource: executionBook.source,
-                executionBookAgeMs: executionBook.ageMs,
-                executionBookFallbackReason: executionBook.fallbackReason,
-                marketInfo
-              }
-            })
-          )
-        ]);
-        order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
+              estimate,
+              payload.positionIds,
+              payload.exitType ?? "manual_sell",
+              false,
+              tradePersistSegments
+            );
+            if (order.action === "buy") {
+              await this.recordBuyLifecycle(user, currentRound, order, snapshot, tradePersistSegments);
+            }
+          } else {
+            await this.measureTradePersistSegment(tradePersistSegments, "persistOrder", () => this.store.persistOrder(order));
+          }
+          order.persistLatencyMs = Math.max(Date.now() - persistStartTs, 0);
+          order.serverPublishTs = Date.now();
+          order.totalOrderLatencyMs = Math.max(Date.now() - serverRecvTs, 1);
         });
+        if (typeof this.store.persistOrderLatency === "function") {
+          void this.store.persistOrderLatency(order).catch((error) => {
+            console.warn("[simulation] Failed to persist order latency outside transaction:", error);
+          });
+        }
+        tradePersistSegments.transactionTotal = Math.max(Date.now() - transactionStartedAt, 0);
+        const measuredSegmentTotal = Object.entries(tradePersistSegments)
+          .filter(([name]) => name !== "transactionTotal" && name !== "commitAndOverhead")
+          .reduce((sum, [, value]) => sum + (value ?? 0), 0);
+        tradePersistSegments.commitAndOverhead = Math.max(tradePersistSegments.transactionTotal - measuredSegmentTotal, 0);
+        tradePersistObserver.onSegmentObserved("transactionTotal", tradePersistSegments.transactionTotal);
+        tradePersistObserver.onSegmentObserved("commitAndOverhead", tradePersistSegments.commitAndOverhead);
       } catch (writeError) {
-        if (clientOrderId && isClientOrderConflict(writeError)) {
+          if (clientOrderId && isClientOrderConflict(writeError)) {
           const existingOrderAfterConflict =
             typeof this.store.findOrderByClientOrderId === "function"
               ? await this.store.findOrderByClientOrderId(user.id, clientOrderId)
               : undefined;
           if (existingOrderAfterConflict) {
-            return { order: existingOrderAfterConflict };
+            return { order: existingOrderAfterConflict, changedPositionIds: [] };
           }
         }
         throw writeError;
       }
-      this.store.emitUserPayload(user.id);
-      return { order };
+      const successAuditEvent: AuditEvent = {
+        eventId: this.store.newId("evt"),
+        traceId,
+        category: "matching",
+        actionType: "place_order",
+        actionStatus: status === "failed" ? "failed" : "success",
+        userId: user.id,
+        role: user.role,
+        pageName: "trade.main",
+        moduleName: "order.panel",
+        symbol: this.config.symbol,
+        roundId: currentRound.id,
+        clientSendTs: payload.clientSendTs,
+        serverRecvTs,
+        engineStartTs,
+        engineFinishTs,
+        serverPublishTs: order.serverPublishTs,
+        backendLatencyMs: order.totalOrderLatencyMs ?? order.matchLatencyMs,
+        resultCode: status === "failed" ? "ORDER_FAILED" : status === "pending" ? "ORDER_PENDING" : "ORDER_FILLED",
+        resultMessage:
+          status === "failed"
+            ? estimate.failureReason ?? "Polymarket CLOB depth was insufficient."
+            : status === "pending"
+              ? "Limit order is pending against future Polymarket CLOB depth."
+              : "Order fully matched against the current Polymarket CLOB snapshot.",
+        details: {
+          traceId,
+          roundId: currentRound.id,
+          marketId,
+          marketSlug: currentRound.marketSlug,
+          orderId: order.id,
+          clientOrderId,
+          positionId: payload.positionIds?.[0],
+          bookKey,
+          bookHash: book.snapshotId,
+          bookSnapshotId: book.snapshotId,
+          matchingSequence: undefined,
+          tokenId,
+          action,
+          side: payload.side,
+          orderKind,
+          timeInForce: order.timeInForce,
+          limitPrice: payload.limitPrice,
+          notionalUsdc: payload.amount,
+          requestedQty: payload.qty,
+          filledQty: order.filledQty,
+          unfilledQty: order.unfilledQty,
+          avgFillPrice: order.avgFillPrice,
+          bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+          localMatchLatencyMs: order.localMatchLatencyMs,
+          persistLatencyMs: order.persistLatencyMs,
+          totalOrderLatencyMs: order.totalOrderLatencyMs,
+          tradePersistSegments,
+          executionBookSource: executionBook.source,
+          executionBookAgeMs: executionBook.ageMs,
+          executionBookFallbackReason: executionBook.fallbackReason,
+          sourceLatencyMs,
+          slippageBps: order.slippageBps,
+          estimatedFee: order.estimatedFee,
+          actualFee: order.actualFee,
+          feeBreakdown: order.feeBreakdown,
+          feeCurrency: order.feeCurrency,
+          marketInfo,
+          failureReason: order.failureReason
+        }
+      };
+      const successBehaviorLog = this.createBehaviorLog({
+        user,
+        actionType: "place_order",
+        actionStatus: status === "failed" ? "failed" : "success",
+        traceId,
+        orderId: order.id,
+        round: currentRound,
+        snapshot,
+        direction: payload.side,
+        entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+        positionNotional: order.notionalUsdc,
+        bookSnapshot: book,
+        order,
+        actualFillPrice: order.avgFillPrice,
+        slippageBps: order.slippageBps,
+        partialFilled: order.partialFilled,
+        unfilledQty: order.unfilledQty,
+        executionLatencyMs: order.matchLatencyMs,
+        estimatedFee: order.estimatedFee,
+        actualFee: order.actualFee,
+        feeBreakdown: order.feeBreakdown,
+        feeCurrency: order.feeCurrency,
+        failureReason: order.failureReason,
+        contextJson: {
+          roundStatus: currentRound.status,
+          acceptingOrders: currentRound.acceptingOrders,
+          requestAction: action,
+          requestSide: payload.side,
+          requestAmount: payload.amount,
+          requestQty: payload.qty,
+          clientOrderId,
+          orderType: orderKind,
+          isAccepted: status !== "failed",
+          bookSnapshotId: book.snapshotId,
+          bookKey,
+          bookAcquireLatencyMs: order.bookAcquireLatencyMs,
+          localMatchLatencyMs: order.localMatchLatencyMs,
+          persistLatencyMs: order.persistLatencyMs,
+          totalOrderLatencyMs: order.totalOrderLatencyMs,
+          tradePersistSegments,
+          executionBookSource: executionBook.source,
+          executionBookAgeMs: executionBook.ageMs,
+          executionBookFallbackReason: executionBook.fallbackReason,
+          marketInfo
+        }
+      });
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog(successAuditEvent, { emitUserPayload: false });
+        await this.writeBehaviorLog(successBehaviorLog);
+      });
+      this.store.emitUserPayload(user.id, "trade");
+      return { order, changedPositionIds };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Order failed.";
       const serverNow = Date.now();
-      await this.writeAuditLog({
+      const failureAuditEvent: AuditEvent = {
         eventId: this.store.newId("evt"),
         traceId,
         category: "matching",
@@ -1034,31 +843,33 @@ export class SimulationEngine {
           requestedQty: payload.qty,
           failureReason: message
         }
+      };
+      const failureBehaviorLog = this.createBehaviorLog({
+        user,
+        actionType: "place_order",
+        actionStatus: "failed",
+        traceId,
+        round: currentRound,
+        snapshot,
+        direction: payload.side,
+        entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
+        positionNotional: payload.amount,
+        failureReason: message,
+        contextJson: {
+          requestAction: action,
+          requestSide: payload.side,
+          requestAmount: payload.amount,
+          requestQty: payload.qty,
+          clientOrderId,
+          orderType: payload.orderKind ?? "market",
+          limitPrice: payload.limitPrice,
+          failureReason: message
+        }
       });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
-          user,
-          actionType: "place_order",
-          actionStatus: "failed",
-          traceId,
-          round: currentRound,
-          snapshot,
-          direction: payload.side,
-          entryOdds: snapshot[payload.side === "UP" ? "upPrice" : "downPrice"],
-          positionNotional: payload.amount,
-          failureReason: message,
-          contextJson: {
-            requestAction: action,
-            requestSide: payload.side,
-            requestAmount: payload.amount,
-            requestQty: payload.qty,
-            clientOrderId,
-            orderType: payload.orderKind ?? "market",
-            limitPrice: payload.limitPrice,
-            failureReason: message
-          }
-        })
-      );
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog(failureAuditEvent, { emitUserPayload: false });
+        await this.writeBehaviorLog(failureBehaviorLog);
+      });
       throw error;
     }
   }
@@ -1077,6 +888,7 @@ export class SimulationEngine {
 
       const releasedFrozenUsdc = order.frozenUsdc ?? 0;
       const releasedFrozenQty = order.frozenQty ?? 0;
+      let changedPositionIds: string[] = [];
       await this.runTradeWriteTransaction(async () => {
         order.status = "cancelled";
         order.lifecycleStatus = "cancelled";
@@ -1087,12 +899,12 @@ export class SimulationEngine {
           await this.store.persistUser(user);
         }
         if (order.frozenQty && order.frozenQty > 0) {
-          await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
+          changedPositionIds = await this.unlockSellQty(user.id, order.roundId, order.side, order.frozenQty);
           order.frozenQty = 0;
         }
         order.serverPublishTs = Date.now();
         await this.store.persistOrder(order);
-        await Promise.all([
+        await Promise.allSettled([
           this.writeAuditLog({
             eventId: this.store.newId("evt"),
             traceId: order.traceId,
@@ -1153,8 +965,8 @@ export class SimulationEngine {
           )
         ]);
       });
-      this.store.emitUserPayload(user.id);
-      return order;
+      this.store.emitUserPayload(user.id, "trade");
+      return { order, changedPositionIds };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Cancel order failed.";
       const serverNow = Date.now();
@@ -1229,7 +1041,7 @@ export class SimulationEngine {
       if (availableQty <= QTY_EPSILON) {
         throw new Error("Position has no unlocked quantity available to sell.");
       }
-      const { order } = await this.placeOrder(user, {
+      const result = await this.placeOrder(user, {
         action: "sell",
         side: position.side,
         qty: availableQty,
@@ -1238,42 +1050,44 @@ export class SimulationEngine {
         positionIds: [positionId],
         exitType
       });
+      const { order } = result;
       if (order.status !== "filled") {
         throw new Error(order.failureReason ?? "Sell order was not fully filled.");
       }
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId: order.traceId,
-        category: "matching",
-        actionType: "sell_position",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "profile.main",
-        moduleName: "position.table",
-        symbol: order.symbol,
-        roundId: order.roundId,
-        serverRecvTs: order.serverRecvTs,
-        serverPublishTs: Date.now(),
-        backendLatencyMs: order.matchLatencyMs,
-        resultCode: "SELL_POSITION_FILLED",
-        resultMessage: "Position was sold against the current Polymarket CLOB snapshot.",
-        details: {
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
           traceId: order.traceId,
+          category: "matching",
+          actionType: "sell_position",
+          actionStatus: "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "profile.main",
+          moduleName: "position.table",
+          symbol: order.symbol,
           roundId: order.roundId,
-          marketId: order.marketId,
-          marketSlug: order.marketSlug,
-          orderId: order.id,
-          positionId,
-          bookKey: order.bookKey,
-          bookSnapshotId: order.bookHash,
-          avgFillPrice: order.avgFillPrice,
-          filledQty: order.filledQty,
-          slippageBps: order.slippageBps
-        }
-      });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+          serverRecvTs: order.serverRecvTs,
+          serverPublishTs: Date.now(),
+          backendLatencyMs: order.matchLatencyMs,
+          resultCode: "SELL_POSITION_FILLED",
+          resultMessage: "Position was sold against the current Polymarket CLOB snapshot.",
+          details: {
+            traceId: order.traceId,
+            roundId: order.roundId,
+            marketId: order.marketId,
+            marketSlug: order.marketSlug,
+            orderId: order.id,
+            positionId,
+            bookKey: order.bookKey,
+            bookSnapshotId: order.bookHash,
+            avgFillPrice: order.avgFillPrice,
+            filledQty: order.filledQty,
+            slippageBps: order.slippageBps
+          }
+        }, { emitUserPayload: false });
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "sell_position",
           actionStatus: "success",
@@ -1297,8 +1111,9 @@ export class SimulationEngine {
             positionId
           }
         })
-      );
-      return order;
+        );
+      });
+      return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sell position failed.";
       const currentRound = position ? this.store.getRoundById(position.roundId) : this.getActiveRound(Date.now());
@@ -1391,9 +1206,6 @@ export class SimulationEngine {
   }) {
     const bookKey = this.resolveReplayBookKey(input);
     const response = await this.matchingClient.getCurrentBook(bookKey);
-    if (response.book) {
-      this.cacheMatchingBook(response.book);
-    }
     return {
       bookKey,
       book: response.book
@@ -1423,7 +1235,7 @@ export class SimulationEngine {
     const now = Date.now();
     const currentRound = this.getActiveRound(now);
     try {
-      this.assertCanCreateNewOrder(currentRound, now);
+      this.assertCanSellOrder(currentRound, now);
       const positions = this.store.positions
         .filter(
           (position) =>
@@ -1439,7 +1251,7 @@ export class SimulationEngine {
       const requestedQty = roundNumber(positions.reduce((sum, position) => sum + position.qty, 0), 4);
 
       const failures: Array<{ positionId: string; message: string }> = [];
-      const { order } = await this.placeOrder(user, {
+      const result = await this.placeOrder(user, {
         action: "sell",
         side: payload.side,
         qty: requestedQty,
@@ -1448,6 +1260,7 @@ export class SimulationEngine {
         positionIds: positions.map((position) => position.id),
         exitType: "close_side"
       });
+      const { order } = result;
       if (order.status !== "filled") {
         const message = order.failureReason ?? "Close side sell order was not fully filled.";
         failures.push(...positions.map((position) => ({ positionId: position.id, message })));
@@ -1460,39 +1273,40 @@ export class SimulationEngine {
       const closedPositionsCount = positions.filter((position) => position.status === "closed").length;
       const serverNow = Date.now();
 
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId,
-        category: "operation",
-        actionType: "close_side",
-        actionStatus: failures.length > 0 ? "timeout" : "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "quick.actions",
-        symbol: this.config.symbol,
-        roundId: currentRound.id,
-        clientSendTs: payload.clientSendTs,
-        serverRecvTs: serverNow,
-        serverPublishTs: serverNow,
-        backendLatencyMs: 1,
-        resultCode: failures.length > 0 ? "CLOSE_SIDE_PARTIAL" : "CLOSE_SIDE_COMPLETED",
-        resultMessage:
-          failures.length > 0
-            ? "Close side completed with partial failures."
-            : "All positions on the selected side were closed.",
-        details: {
-          side: payload.side,
-          closedPositionsCount,
-          totalQty,
-          totalProceeds,
-          avgFillPrice,
-          failures
-        }
-      });
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId,
+          category: "operation",
+          actionType: "close_side",
+          actionStatus: failures.length > 0 ? "timeout" : "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "trade.main",
+          moduleName: "quick.actions",
+          symbol: this.config.symbol,
+          roundId: currentRound.id,
+          clientSendTs: payload.clientSendTs,
+          serverRecvTs: serverNow,
+          serverPublishTs: serverNow,
+          backendLatencyMs: 1,
+          resultCode: failures.length > 0 ? "CLOSE_SIDE_PARTIAL" : "CLOSE_SIDE_COMPLETED",
+          resultMessage:
+            failures.length > 0
+              ? "Close side completed with partial failures."
+              : "All positions on the selected side were closed.",
+          details: {
+            side: payload.side,
+            closedPositionsCount,
+            totalQty,
+            totalProceeds,
+            avgFillPrice,
+            failures
+          }
+        }, { emitUserPayload: false });
 
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "close_side",
           actionStatus: failures.length > 0 ? "timeout" : "success",
@@ -1513,7 +1327,8 @@ export class SimulationEngine {
             closedPositionsCount
           }
         })
-      );
+        );
+      });
 
       return {
         closedPositionsCount,
@@ -1521,7 +1336,8 @@ export class SimulationEngine {
         totalProceeds,
         avgFillPrice,
         matchLatencyMs: order.matchLatencyMs,
-        failures
+        failures,
+        changedPositionIds: result.changedPositionIds
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Close side failed.";
@@ -1573,7 +1389,8 @@ export class SimulationEngine {
     const now = Date.now();
     const currentRound = this.getActiveRound(now);
     try {
-      this.assertCanCreateNewOrder(currentRound, now);
+      this.assertCanSellOrder(currentRound, now);
+      this.assertCanBuyOrder(currentRound, now);
       const closeResult = await this.closeSide(user, payload);
       if (closeResult.totalProceeds <= 0) {
         throw new Error("Reverse side requires positive proceeds from the close action.");
@@ -1585,33 +1402,34 @@ export class SimulationEngine {
         clientSendTs: payload.clientSendTs
       });
       const serverNow = Date.now();
-      await this.writeAuditLog({
-        eventId: this.store.newId("evt"),
-        traceId,
-        category: "operation",
-        actionType: "reverse_side",
-        actionStatus: "success",
-        userId: user.id,
-        role: user.role,
-        pageName: "trade.main",
-        moduleName: "quick.actions",
-        symbol: this.config.symbol,
-        roundId: currentRound?.id,
-        clientSendTs: payload.clientSendTs,
-        serverRecvTs: serverNow,
-        serverPublishTs: serverNow,
-        backendLatencyMs: result.order.matchLatencyMs,
-        resultCode: "REVERSE_SIDE_COMPLETED",
-        resultMessage: "Side was closed and the opposite side was bought.",
-        details: {
-          requestedSide: payload.side,
-          reverseSide,
-          closeResult,
-          reverseOrderId: result.order.id
-        }
-      });
-      await this.writeBehaviorLog(
-        this.createBehaviorLog({
+      this.enqueueTradeLog(async () => {
+        await this.writeAuditLog({
+          eventId: this.store.newId("evt"),
+          traceId,
+          category: "operation",
+          actionType: "reverse_side",
+          actionStatus: "success",
+          userId: user.id,
+          role: user.role,
+          pageName: "trade.main",
+          moduleName: "quick.actions",
+          symbol: this.config.symbol,
+          roundId: currentRound?.id,
+          clientSendTs: payload.clientSendTs,
+          serverRecvTs: serverNow,
+          serverPublishTs: serverNow,
+          backendLatencyMs: result.order.matchLatencyMs,
+          resultCode: "REVERSE_SIDE_COMPLETED",
+          resultMessage: "Side was closed and the opposite side was bought.",
+          details: {
+            requestedSide: payload.side,
+            reverseSide,
+            closeResult,
+            reverseOrderId: result.order.id
+          }
+        }, { emitUserPayload: false });
+        await this.writeBehaviorLog(
+          this.createBehaviorLog({
           user,
           actionType: "reverse_side",
           actionStatus: "success",
@@ -1633,12 +1451,14 @@ export class SimulationEngine {
             reverseOrderId: result.order.id
           }
         })
-      );
+        );
+      });
 
       return {
         closeResult,
         reverseSide,
-        reverseOrder: result.order
+        reverseOrder: result.order,
+        changedPositionIds: [...closeResult.changedPositionIds, ...result.changedPositionIds]
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Reverse side failed.";
@@ -1692,149 +1512,137 @@ export class SimulationEngine {
     return this.buildSnapshot();
   }
 
-  private createBehaviorLog(input: {
-    user: UserRecord;
-    actionType: string;
-    actionStatus: BehaviorActionLog["actionStatus"];
-    traceId?: string;
-    orderId?: string;
-    round?: RoundRecord;
-    snapshot: MarketSnapshot;
-    direction?: TradeSide;
-    entryOdds?: number;
-    positionNotional?: number;
-    exitType?: string;
-    exitOdds?: number;
-    settlementResult?: PositionRecord["settlementResult"];
-    bookSnapshot?: OrderBookSnapshot;
-    actualFillPrice?: number;
-    slippageBps?: number;
-    partialFilled?: boolean;
-    unfilledQty?: number;
-    executionLatencyMs?: number;
-    estimatedFee?: number;
-    actualFee?: number;
-    feeBreakdown?: FeeBreakdown;
-    feeCurrency?: "USD";
-    settlementDirection?: TradeSide;
-    settlementTimeMs?: number;
-    gammaPollCount?: number;
-    redeemFinishTimeMs?: number;
-    order?: OrderRecord;
-    failureReason?: string;
-    frozenAssetRelease?: Record<string, unknown>;
-    contextJson?: Record<string, unknown>;
-  }): BehaviorActionLog {
-    const direction = input.direction;
-    const round = input.round;
-    const snapshot = input.snapshot;
-    const bookSnapshot =
-      input.bookSnapshot ??
-      (direction ? snapshot.orderBooks[direction] : snapshot.orderBooks.UP);
-    const candles = snapshot.binance.candlesByInterval;
-    const contextJson = {
-      ...(input.order
-        ? {
-            requestAction: input.order.action,
-            requestedAmountUsdc: input.order.requestedAmountUsdc,
-            requestedQty: input.order.requestedQty,
-            orderKind: input.order.orderKind,
-            timeInForce: input.order.timeInForce,
-            limitPrice: input.order.limitPrice,
-            lifecycleStatus: input.order.lifecycleStatus,
-            resultType: input.order.resultType,
-            bookKey: input.order.bookKey,
-            bookSnapshotId: input.order.bookHash,
-            marketId: input.order.marketId,
-            marketSlug: input.order.marketSlug,
-            fills: input.order.fills,
-            estimatedFee: input.order.estimatedFee,
-            actualFee: input.order.actualFee,
-            feeBreakdown: input.order.feeBreakdown,
-            feeCurrency: input.order.feeCurrency,
-            failureReason: input.order.failureReason
-          }
-        : {}),
-      ...(input.frozenAssetRelease ? { frozenAssetRelease: input.frozenAssetRelease } : {}),
-      ...(input.failureReason ? { failureReason: input.failureReason } : {}),
-      ...(input.contextJson ?? {})
-    };
-    return {
+  private createBehaviorLog(input: BehaviorLogBuildInput): BehaviorActionLog {
+    return buildBehaviorLog({
+      ...input,
       logId: this.store.newId("blog"),
       timestampMs: Date.now(),
-      assetClass: "BTC_5M_UPDOWN",
-      actionType: input.actionType,
-      actionStatus: input.actionStatus,
-      roundId: round?.id,
-      direction,
-      entryOdds: input.entryOdds,
-      deltaClob: snapshot.clob.delta,
-      volumeClob: snapshot.clob.volume,
-      positionNotional: input.positionNotional,
-      exitType: input.exitType,
-      exitOdds: input.exitOdds,
-      settlementResult: input.settlementResult,
-      testerIdAnon: this.store.anonymizeUserId(input.user.id),
-      traceId: input.traceId,
-      orderId: input.orderId,
-      marketId: snapshot.marketId,
-      marketSlug: snapshot.marketSlug,
-      roundStatus: round?.status,
-      countdownMs: snapshot.uiMeta.countdownMs,
-      binanceSpotPrice: snapshot.binance.spotPrice,
-      binance1mLastClose: candles["1m"].at(-1)?.close ?? 0,
-      binance5mLastClose: candles["5m"].at(-1)?.close ?? 0,
-      binance1dLastClose: candles["1d"].at(-1)?.close ?? 0,
-      chainlinkPrice: snapshot.chainlink.referencePrice,
-      priceToBeat: snapshot.priceToBeat,
-      upPrice: snapshot.upPrice,
-      downPrice: snapshot.downPrice,
-      upBookTop5: snapshot.orderBooks.UP.bids.slice(0, 5),
-      downBookTop5: snapshot.orderBooks.DOWN.bids.slice(0, 5),
-      recentTradesTop20: snapshot.recentTrades.slice(0, 20),
-      bookSnapshotEntry: {
-        snapshotId: bookSnapshot.snapshotId,
-        snapshotTs: bookSnapshot.snapshotTs,
-        topBids: bookSnapshot.bids.slice(0, 5),
-        topAsks: bookSnapshot.asks.slice(0, 5)
-      },
-      actualFillPrice: input.actualFillPrice,
-      slippageBps: input.slippageBps,
-      partialFilled: input.partialFilled,
-      unfilledQty: input.unfilledQty,
-      executionLatencyMs: input.executionLatencyMs,
-      estimatedFee: input.estimatedFee,
-      actualFee: input.actualFee,
-      feeBreakdown: input.feeBreakdown,
-      feeCurrency: input.feeCurrency,
-      settlementDirection: input.settlementDirection,
-      settlementTimeMs: input.settlementTimeMs,
-      gammaPollCount: input.gammaPollCount,
-      redeemFinishTimeMs: input.redeemFinishTimeMs,
-      sourceStates: {
-        binance: this.pickSourceState(snapshot.sources.binance),
-        chainlink: this.pickSourceState(snapshot.sources.chainlink),
-        clob: this.pickSourceState(snapshot.sources.clob)
-      },
-      contextJson
-    };
-  }
-
-  private pickSourceState(source: SourceHealth) {
-    return {
-      source: source.source,
-      state: source.state,
-      sourceEventTs: source.sourceEventTs,
-      serverRecvTs: source.serverRecvTs,
-      serverPublishTs: source.serverPublishTs
-    };
+      testerIdAnon: this.store.anonymizeUserId(input.user.id)
+    });
   }
 
   private async writeBehaviorLog(log: BehaviorActionLog) {
     await this.store.recordBehaviorLog(log);
+    if (log.actionType !== "place_order" || !log.traceId) {
+      return;
+    }
+    this.emitBridgeEvent("paper:filled", {
+      traceId: log.traceId,
+      fillPrice: log.actualFillPrice ?? null,
+      slippageBps: log.slippageBps ?? null,
+      status: log.actionStatus === "success" ? "filled" : "failed",
+      feeUsdc: log.actualFee ?? log.estimatedFee ?? 0,
+      filledQty:
+        typeof log.actualFillPrice === "number" && log.actualFillPrice > 0 && typeof log.positionNotional === "number"
+          ? roundNumber(log.positionNotional / log.actualFillPrice, 4)
+          : null,
+      partial: log.partialFilled ?? false,
+      filledAt: log.timestampMs ?? Date.now()
+    });
+  }
+
+  private enqueueTradeLog(task: TradeLogTask) {
+    this.tradeLogQueue ??= [];
+    this.tradeLogQueue.push(task);
+    if (this.tradeLogFlushScheduled || this.tradeLogFlushRunning) {
+      return;
+    }
+    this.tradeLogFlushScheduled = true;
+    setImmediate(() => {
+      this.tradeLogFlushScheduled = false;
+      void this.flushTradeLogQueue();
+    });
+  }
+
+  private async flushTradeLogQueue() {
+    if (this.tradeLogFlushRunning) {
+      return;
+    }
+    this.tradeLogFlushRunning = true;
+    try {
+      while (this.tradeLogQueue.length > 0) {
+        const task = this.tradeLogQueue.shift();
+        if (!task) {
+          continue;
+        }
+        try {
+          await task();
+        } catch (error) {
+          console.warn("[simulation] Background trade log write failed:", error);
+        }
+      }
+    } finally {
+      this.tradeLogFlushRunning = false;
+      if (this.tradeLogQueue.length > 0) {
+        this.enqueueTradeLog(async () => undefined);
+      }
+    }
+  }
+
+  private scheduleSnapshotOnlyRefresh(source: "binance" | "coinbase" | "clob") {
+    this.snapshotRefreshSources.add(source);
+    this.snapshotRefreshQueued = true;
+    this.snapshotRefreshQueuedAt ??= Date.now();
+    if (this.snapshotRefreshRunning) {
+      return;
+    }
+
+    this.snapshotRefreshRunning = true;
+    setImmediate(() => {
+      void this.snapshotOnlyRefreshLoop();
+    });
+  }
+
+  private async snapshotOnlyRefreshLoop() {
+    try {
+      while (this.snapshotRefreshQueued) {
+        const queuedAt = this.snapshotRefreshQueuedAt;
+        this.snapshotRefreshQueued = false;
+        this.snapshotRefreshQueuedAt = undefined;
+        this.snapshotRefreshSources.clear();
+        try {
+          await this.refreshMarketSnapshotOnly(queuedAt);
+        } catch (error) {
+          if (this.store.isPersistenceUnavailableError(error)) {
+            console.warn("[simulation] Snapshot-only refresh deferred while persistence is unavailable:", error);
+            await sleep(250);
+            this.snapshotRefreshQueued = true;
+            continue;
+          }
+          throw error;
+        }
+      }
+    } finally {
+      this.snapshotRefreshRunning = false;
+      if (this.snapshotRefreshQueued) {
+        this.snapshotRefreshRunning = true;
+        setImmediate(() => {
+          void this.snapshotOnlyRefreshLoop();
+        });
+      }
+    }
+  }
+
+  private async refreshMarketSnapshotOnly(queuedAt?: number) {
+    const startedAt = Date.now();
+    try {
+      const snapshot = this.buildSnapshot();
+      await this.store.setMarketSnapshot(snapshot);
+      this.scheduleLatencyLogs(snapshot);
+    } finally {
+      appMetrics.recordMarketSnapshotRefresh({
+        mode: "snapshot_only",
+        durationMs: Date.now() - startedAt,
+        queueAgeMs: queuedAt ? Math.max(startedAt - queuedAt, 0) : undefined
+      });
+    }
   }
 
   private scheduleReconcile() {
+    this.scheduleFullReconcile();
+  }
+
+  private scheduleFullReconcile() {
     if (this.reconcileRunning) {
       this.reconcileQueued = true;
       return;
@@ -1853,9 +1661,9 @@ export class SimulationEngine {
         } catch (error) {
           if (this.store.isPersistenceUnavailableError(error)) {
             console.warn("[simulation] Reconcile deferred while PostgreSQL is unavailable:", error);
-            await sleep(250);
-            continue;
-          }
+          await sleep(250);
+          continue;
+        }
           throw error;
         }
       } while (this.reconcileQueued);
@@ -1868,6 +1676,102 @@ export class SimulationEngine {
     return this.store.rounds
       .filter((round) => round.startAt <= now && round.endAt > now)
       .sort((left, right) => right.startAt - left.startAt)[0];
+  }
+
+  private resolveCurrentRoundBinanceOpenReference(round: RoundRecord | undefined, now: number) {
+    if (!round || round.startAt > now) {
+      return undefined;
+    }
+    if (isBtcReferencePrice(round.binanceOpenPrice)) {
+      const persistedReference = roundNumber(round.binanceOpenPrice, 2);
+      this.currentRoundBinanceOpenReferences ??= new Map<string, number>();
+      this.currentRoundBinanceOpenReferences.set(round.id, persistedReference);
+      return persistedReference;
+    }
+    this.currentRoundBinanceOpenReferences ??= new Map<string, number>();
+    const cachedReference = this.currentRoundBinanceOpenReferences.get(round.id);
+    if (isBtcReferencePrice(cachedReference)) {
+      return cachedReference;
+    }
+    if (!this.binanceState.candlesByInterval) {
+      return undefined;
+    }
+    for (const interval of ["5m", "1m", "30s"] as const) {
+      const bar = this.binanceState.candlesByInterval[interval].find(
+        (candidate) => candidate.startTs === round.startAt && isBtcReferencePrice(candidate.open)
+      );
+      if (bar && bar.startTs === round.startAt && isBtcReferencePrice(bar.open)) {
+        const reference = roundNumber(bar.open, 2);
+        this.currentRoundBinanceOpenReferences.set(round.id, reference);
+        this.pruneCurrentRoundBinanceOpenReferences(round.id, now);
+        return reference;
+      }
+    }
+    return undefined;
+  }
+
+  withCurrentRoundBinanceOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
+    if (!round) {
+      return round;
+    }
+    const reference = this.resolveCurrentRoundBinanceOpenReference(round, now);
+    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.binanceOpenPrice)) {
+      return round;
+    }
+    return { ...round, binanceOpenPrice: reference };
+  }
+
+  private resolveCurrentRoundCoinbaseOpenReference(round: RoundRecord | undefined, now: number) {
+    if (!round || round.startAt > now) {
+      return undefined;
+    }
+    if (isBtcReferencePrice(round.coinbaseOpenPrice)) {
+      return roundNumber(round.coinbaseOpenPrice, 2);
+    }
+    const bar = this.coinbaseCandlesByInterval?.["30s"]?.find(
+      (candidate) => candidate.startTs === round.startAt && isBtcReferencePrice(candidate.open)
+    );
+    return bar ? roundNumber(bar.open, 2) : undefined;
+  }
+
+  private resolveRoundCoinbaseCloseReference(round: RoundRecord | undefined, now = Date.now()) {
+    if (!round || now < round.endAt) {
+      return undefined;
+    }
+    if (isBtcReferencePrice(round.coinbaseClosePrice)) {
+      return roundNumber(round.coinbaseClosePrice, 2);
+    }
+    const bar = this.coinbaseCandlesByInterval?.["30s"]?.find(
+      (candidate) => candidate.endTs === round.endAt && isBtcReferencePrice(candidate.close)
+    );
+    return bar ? roundNumber(bar.close, 2) : undefined;
+  }
+
+  withCurrentRoundCoinbaseOpenReference<T extends RoundRecord | undefined>(round: T, now = Date.now()): T {
+    if (!round) {
+      return round;
+    }
+    const reference = this.resolveCurrentRoundCoinbaseOpenReference(round, now);
+    if (!isBtcReferencePrice(reference) || isBtcReferencePrice(round.coinbaseOpenPrice)) {
+      return round;
+    }
+    return { ...round, coinbaseOpenPrice: reference };
+  }
+
+  private pruneCurrentRoundBinanceOpenReferences(activeRoundId: string, now: number) {
+    if (this.currentRoundBinanceOpenReferences.size <= 24) {
+      return;
+    }
+    const recentRoundIds = new Set(
+      this.store.rounds
+        .filter((round) => round.id === activeRoundId || round.endAt >= now - 2 * 60 * 60 * 1000)
+        .map((round) => round.id)
+    );
+    for (const roundId of this.currentRoundBinanceOpenReferences.keys()) {
+      if (!recentRoundIds.has(roundId)) {
+        this.currentRoundBinanceOpenReferences.delete(roundId);
+      }
+    }
   }
 
   private canCreateNewOrders(round: RoundRecord | undefined, now = Date.now()) {
@@ -1883,19 +1787,30 @@ export class SimulationEngine {
     return round.endAt - now > this.config.freezeWindowMs;
   }
 
-  private assertCanCreateNewOrder(round: RoundRecord | undefined, now = Date.now()) {
+  private assertActiveTradableRound(round: RoundRecord | undefined, now = Date.now(), freezeMessage: string) {
     if (!round || now < round.startAt || now >= round.endAt) {
       throw new Error("No active round is available.");
     }
     if (round.endAt - now <= this.config.freezeWindowMs) {
-      throw new Error("Round entered final 10-second order freeze window.");
-    }
-    if (round.acceptingOrders === false) {
-      throw new Error("Round is not accepting new orders.");
+      throw new Error(freezeMessage);
     }
     if (round.status !== "Trading") {
       throw new Error(`Round is ${round.status}.`);
     }
+  }
+
+  private assertCanBuyOrder(round: RoundRecord | undefined, now = Date.now()) {
+    this.assertActiveTradableRound(round, now, "Round entered final 10-second order freeze window.");
+    if (!round) {
+      throw new Error("No active round is available.");
+    }
+    if (round.acceptingOrders === false) {
+      throw new Error("Round is not accepting new orders.");
+    }
+  }
+
+  private assertCanSellOrder(round: RoundRecord | undefined, now = Date.now()) {
+    this.assertActiveTradableRound(round, now, "Current round entered the final 10-second sell freeze window.");
   }
 
   private assertCanSellPosition(position: PositionRecord, round: RoundRecord | undefined, now = Date.now()) {
@@ -1909,15 +1824,7 @@ export class SimulationEngine {
     if (!activeRound || activeRound.id !== round.id || now < round.startAt || now >= round.endAt) {
       throw new Error("This position does not belong to the current tradable round.");
     }
-    if (round.endAt - now <= this.config.freezeWindowMs) {
-      throw new Error("Current round entered the final 10-second sell freeze window.");
-    }
-    if (round.acceptingOrders === false) {
-      throw new Error("Current round is not accepting sell orders.");
-    }
-    if (round.status !== "Trading") {
-      throw new Error("Current round is frozen and can no longer sell positions.");
-    }
+    this.assertCanSellOrder(round, now);
   }
 
   private resolveBookContext(side: TradeSide, round?: RoundRecord, marketId?: string) {
@@ -1941,66 +1848,6 @@ export class SimulationEngine {
     }
     const round = input.roundId ? this.store.getRoundById(input.roundId) : undefined;
     return this.resolveBookContext(input.side ?? "UP", round, input.marketId).bookKey;
-  }
-
-  private async syncMatchingBooks() {
-    const activeRound = this.getActiveRound();
-    await Promise.all([this.syncMatchingBook("UP", activeRound), this.syncMatchingBook("DOWN", activeRound)]);
-  }
-
-  private async ensureCurrentMatchingBook(side: TradeSide, round?: RoundRecord, forceSync = false) {
-    const state = await this.syncMatchingBook(side, round, forceSync);
-    return state?.snapshot ?? this.polymarketState.orderBooks[side];
-  }
-
-  private async syncMatchingBook(side: TradeSide, round?: RoundRecord, forceSync = false) {
-    const sourceBook = this.polymarketState.orderBooks[side];
-    const context = this.resolveBookContext(side, round);
-    const cached = this.matchingBooks.get(context.bookKey);
-    this.currentBookKeys.set(side, context.bookKey);
-
-    if (!forceSync && cached && this.lastSyncedSnapshotIds.get(context.bookKey) === sourceBook.snapshotId) {
-      return cached;
-    }
-
-    try {
-      const response = await this.matchingClient.syncBook({
-        bookKey: context.bookKey,
-        roundId: context.roundId,
-        marketId: context.marketId,
-        bookSide: side,
-        source: "Polymarket",
-        sourceSnapshot: sourceBook,
-        syncedAt: Date.now()
-      });
-      this.cacheMatchingBook(response.book);
-      this.lastSyncedSnapshotIds.set(context.bookKey, sourceBook.snapshotId);
-      return response.book;
-    } catch {
-      if (cached) {
-        return cached;
-      }
-
-      const current = await this.matchingClient.getCurrentBook(context.bookKey).catch(() => ({ book: undefined }));
-      if (current.book) {
-        this.cacheMatchingBook(current.book);
-        return current.book;
-      }
-      return undefined;
-    }
-  }
-
-  private async refreshMatchingBook(bookKey: string) {
-    const response = await this.matchingClient.getCurrentBook(bookKey);
-    if (response.book) {
-      this.cacheMatchingBook(response.book);
-    }
-    return response.book;
-  }
-
-  private cacheMatchingBook(book: MatchingBookState) {
-    this.matchingBooks.set(book.bookKey, book);
-    this.currentBookKeys.set(book.bookSide, book.bookKey);
   }
 
   private getDisplayedBook(side: TradeSide): OrderBookSnapshot {
@@ -2098,6 +1945,7 @@ export class SimulationEngine {
     positionIds?: string[]
   ) {
     let remaining = qty;
+    const changedPositionIds: string[] = [];
     for (const position of this.scopedPositions(userId, roundId, side, positionIds)) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2110,14 +1958,17 @@ export class SimulationEngine {
       position.lockedQty = roundNumber((position.lockedQty ?? 0) + take, 4);
       remaining = roundNumber(Math.max(remaining - take, 0), 4);
       await this.store.persistPosition(position);
+      changedPositionIds.push(position.id);
     }
     if (remaining > QTY_EPSILON) {
       throw new Error("Insufficient unlocked position quantity.");
     }
+    return changedPositionIds;
   }
 
   private async unlockSellQty(userId: string, roundId: string, side: TradeSide, qty: number) {
     let remaining = qty;
+    const changedPositionIds: string[] = [];
     for (const position of this.scopedPositions(userId, roundId, side)) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2130,7 +1981,9 @@ export class SimulationEngine {
       position.lockedQty = roundNumber(Math.max(locked - release, 0), 4);
       remaining = roundNumber(Math.max(remaining - release, 0), 4);
       await this.store.persistPosition(position);
+      changedPositionIds.push(position.id);
     }
+    return changedPositionIds;
   }
 
   private async applyFilledOrder(
@@ -2140,7 +1993,8 @@ export class SimulationEngine {
     estimate: ClobExecutionEstimate,
     positionIds?: string[],
     exitType: Exclude<OrderLifecycleExitType, "settlement" | "mixed"> = "manual_sell",
-    emitUserPayload = true
+    emitUserPayload = true,
+    tradePersistSegments?: TradePersistSegments
   ) {
     order.status = "filled";
     order.lifecycleStatus = "filled";
@@ -2168,6 +2022,7 @@ export class SimulationEngine {
         user.availableUsdc = roundCurrency(user.availableUsdc - totalSpend);
       }
       const position = this.upsertBuyPosition(
+        order.id,
         user.id,
         round.id,
         order.side,
@@ -2176,15 +2031,17 @@ export class SimulationEngine {
         order.midPrice || order.avgFillPrice || 0,
         order.actualFee ?? 0
       );
-      await Promise.all([
-        this.store.persistPosition(position),
-        this.store.persistUser(user),
-        this.store.persistOrder(order)
-      ]);
+      await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+        this.store.persistTradeRecords({
+          orders: [order],
+          positions: [position],
+          users: [user]
+        })
+      );
       if (emitUserPayload) {
-        this.store.emitUserPayload(user.id);
+        this.store.emitUserPayload(user.id, "trade");
       }
-      return;
+      return [position.id];
     }
 
     let remainingQty = order.filledQty;
@@ -2243,12 +2100,17 @@ export class SimulationEngine {
     if (remainingQty > QTY_EPSILON) {
       throw new Error("Filled sell order could not be applied to local positions.");
     }
+    const buyOrderIds = [...new Set(changedPositions.map((position) => position.buyOrderId).filter(Boolean) as string[])];
     user.availableUsdc = roundCurrency(user.availableUsdc + estimate.matchedNotional - (order.actualFee ?? 0));
     order.frozenQty = 0;
-    await Promise.all([
-      ...changedPositions.map((position) => this.store.persistPosition(position)),
-      this.store.persistUser(user),
-      this.store.persistOrder(order),
+    await this.measureTradePersistSegment(tradePersistSegments, "persistTradeWriteBatch", () =>
+      this.store.persistTradeRecords({
+        orders: [order],
+        positions: changedPositions,
+        users: [user]
+      })
+    );
+    await this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () =>
       this.store.applyLifecycleExit({
         userId: user.id,
         roundId: round.id,
@@ -2256,19 +2118,22 @@ export class SimulationEngine {
         qty: order.filledQty,
         exitType,
         exitTokenPrice: order.avgFillPrice,
-        exitFee: order.actualFee ?? 0
+        exitFee: order.actualFee ?? 0,
+        buyOrderIds: buyOrderIds.length > 0 ? buyOrderIds : undefined
       })
-    ]);
+    );
     if (emitUserPayload) {
-      this.store.emitUserPayload(user.id);
+      this.store.emitUserPayload(user.id, "trade");
     }
+    return changedPositions.map((position) => position.id);
   }
 
   private async recordBuyLifecycle(
     user: UserRecord,
     round: RoundRecord,
     order: OrderRecord,
-    snapshot: MarketSnapshot
+    snapshot: MarketSnapshot,
+    tradePersistSegments?: TradePersistSegments
   ) {
     if (order.action !== "buy" || order.resultType !== "all_filled" || order.filledQty <= QTY_EPSILON) {
       return;
@@ -2281,7 +2146,7 @@ export class SimulationEngine {
           ? snapshot.currentPrice
           : undefined;
     const btcOpenPriceToBeat = round.priceToBeat > 0 ? round.priceToBeat : snapshot.priceToBeat || undefined;
-    await this.store.persistOrderLifecycle({
+    await this.measureTradePersistSegment(tradePersistSegments, "persistOrderLifecycle", () => this.store.persistOrderLifecycle({
       id: `ol_${order.id}`,
       buyOrderId: order.id,
       traceId: order.traceId,
@@ -2314,7 +2179,7 @@ export class SimulationEngine {
       feeCurrency: order.feeCurrency,
       createdAt: now,
       updatedAt: now
-    });
+    }));
   }
 
   private async processPendingOrders() {
@@ -2377,7 +2242,7 @@ export class SimulationEngine {
         if (order.action === "buy") {
           await this.recordBuyLifecycle(user, round, order, actionSnapshot);
         }
-        await Promise.all([
+        await Promise.allSettled([
           this.writeAuditLog({
             eventId: this.store.newId("evt"),
             traceId: order.traceId,
@@ -2432,7 +2297,7 @@ export class SimulationEngine {
           )
         ]);
       });
-      this.store.emitUserPayload(user.id);
+      this.store.emitUserPayload(user.id, "trade");
     }
   }
 
@@ -2502,7 +2367,7 @@ export class SimulationEngine {
       const now = Date.now();
       const snapshot = this.captureActionSnapshot();
       const round = this.store.getRoundById(order.roundId);
-      await Promise.all([
+      await Promise.allSettled([
         this.writeAuditLog({
           eventId: this.store.newId("evt"),
           traceId: order.traceId,
@@ -2557,7 +2422,7 @@ export class SimulationEngine {
         )
       ]);
     });
-    this.store.emitUserPayload(user.id);
+    this.store.emitUserPayload(user.id, "trade");
   }
 
   private schedulePendingOrderProcessing() {
@@ -2575,17 +2440,29 @@ export class SimulationEngine {
   }
 
   private async reconcileOnce() {
-    await this.syncDiscoveredRounds();
-    await this.syncCurrentRoundMarket();
-    const roundChangedUsers = await this.processRounds();
-    const snapshot = this.buildSnapshot();
-    const changedUsers = this.refreshOpenPositions(snapshot);
-    await this.store.setMarketSnapshot(snapshot);
-    this.scheduleLatencyLogs(snapshot);
-    for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
-      this.store.emitUserPayload(userId);
+    await this.fullReconcileOnce();
+  }
+
+  private async fullReconcileOnce() {
+    const startedAt = Date.now();
+    try {
+      await this.syncDiscoveredRounds();
+      await this.syncCurrentRoundMarket();
+      const roundChangedUsers = await this.processRounds();
+      const snapshot = this.buildSnapshot();
+      const changedUsers = this.refreshOpenPositions(snapshot);
+      await this.store.setMarketSnapshot(snapshot);
+      this.scheduleLatencyLogs(snapshot);
+      for (const userId of new Set([...roundChangedUsers, ...changedUsers])) {
+        this.store.emitUserPayload(userId, "trade");
+      }
+      this.schedulePendingOrderProcessing();
+    } finally {
+      appMetrics.recordMarketSnapshotRefresh({
+        mode: "full_reconcile",
+        durationMs: Date.now() - startedAt
+      });
     }
-    this.schedulePendingOrderProcessing();
   }
 
   private scheduleLatencyLogs(snapshot: MarketSnapshot) {
@@ -2617,7 +2494,6 @@ export class SimulationEngine {
   }
 
   private async syncDiscoveredRounds() {
-    const now = Date.now();
     for (const discovered of this.polymarketState.discoveredRounds) {
       const currentMarket = this.polymarketState.currentMarket;
       const isCurrentMarket = currentMarket?.slug === discovered.marketSlug;
@@ -2657,6 +2533,8 @@ export class SimulationEngine {
         redeemScheduledAt: existing?.redeemScheduledAt,
         binanceOpenPrice: existing?.binanceOpenPrice,
         binanceClosePrice: existing?.binanceClosePrice,
+        coinbaseOpenPrice: existing?.coinbaseOpenPrice,
+        coinbaseClosePrice: existing?.coinbaseClosePrice,
         redeemStartTs: existing?.redeemStartTs,
         redeemFinishTs: existing?.redeemFinishTs,
         manualReason: existing?.manualReason,
@@ -2688,19 +2566,29 @@ export class SimulationEngine {
         this.applyMarketMetadata(round, liveDetail);
       }
 
-      if (!round.binanceOpenPrice && round.startAt <= now && this.binanceState.price > 0) {
-        round.binanceOpenPrice = roundNumber(this.binanceState.price, 2);
+      const binanceOpenReference = this.resolveCurrentRoundBinanceOpenReference(round, now);
+      if (!round.binanceOpenPrice && isBtcReferencePrice(binanceOpenReference)) {
+        round.binanceOpenPrice = binanceOpenReference;
       }
 
       if (!round.binanceClosePrice && now >= round.endAt && this.binanceState.price > 0) {
         round.binanceClosePrice = roundNumber(this.binanceState.price, 2);
       }
 
+      const coinbaseOpenReference = this.resolveCurrentRoundCoinbaseOpenReference(round, now);
+      if (!round.coinbaseOpenPrice && isBtcReferencePrice(coinbaseOpenReference)) {
+        round.coinbaseOpenPrice = coinbaseOpenReference;
+      }
+
+      const coinbaseCloseReference = this.resolveRoundCoinbaseCloseReference(round);
+      if (!round.coinbaseClosePrice && isBtcReferencePrice(coinbaseCloseReference)) {
+        round.coinbaseClosePrice = coinbaseCloseReference;
+      }
+
       if (!round.closingSpotPrice && now >= round.endAt && this.binanceState.price > 0) {
         round.closingSpotPrice = roundNumber(this.binanceState.price, 2);
         round.closingPriceSource = "Gamma";
       }
-      await this.hydrateRoundPolymarketReferencePrices(round, now);
       this.syncPriceToBeatFromPolymarketOpenPrice(round, now);
       this.refreshPreliminarySettlement(round, now);
 
@@ -2718,9 +2606,20 @@ export class SimulationEngine {
         }
       }
 
-      const nextStatus = this.computeRoundStatus(round, now);
-      if (nextStatus !== round.status) {
-        round.status = nextStatus;
+      if (
+        shouldRequireManualSettlement(
+          round,
+          now,
+          this.config.manualSettlementTimeoutMs,
+          this.config.pollDelayMs
+        )
+      ) {
+        await this.markRoundForManualSettlement(round, now);
+      } else {
+        const nextStatus = this.computeRoundStatus(round, now);
+        if (nextStatus !== round.status) {
+          round.status = nextStatus;
+        }
       }
 
       if (round.status === "Polling" || this.shouldPrefetchGamma(round, now)) {
@@ -2753,6 +2652,49 @@ export class SimulationEngine {
     return changedUsers;
   }
 
+  private async markRoundForManualSettlement(round: RoundRecord, now: number) {
+    round.status = "Manual";
+    round.acceptingOrders = false;
+    round.manualReason =
+      round.manualReason ??
+      `Gamma polling timed out after ${Math.round(this.config.manualSettlementTimeoutMs / 1000)} seconds.`;
+    this.getPreliminarySettlements().delete(round.id);
+
+    const pendingOrders = this.store.orders.filter((order) => order.roundId === round.id && order.status === "pending");
+    for (const order of pendingOrders) {
+      const user = this.store.getUserById(order.userId);
+      if (user) {
+        await this.failPendingOrder(user, order, "Round entered manual settlement");
+      }
+    }
+
+    await this.writeAuditLog({
+      eventId: this.store.newId("evt"),
+      traceId: this.store.newTraceId(),
+      category: "settlement",
+      actionType: "poll_settlement",
+      actionStatus: "timeout",
+      pageName: "trade.main",
+      moduleName: "settlement.engine",
+      symbol: round.symbol,
+      roundId: round.id,
+      serverRecvTs: now,
+      serverPublishTs: now,
+      backendLatencyMs: 0,
+      resultCode: "MANUAL_REVIEW_REQUIRED",
+      resultMessage: "Settlement polling timed out; Admin manual settlement is required.",
+      details: {
+        roundId: round.id,
+        marketId: round.marketId,
+        marketSlug: round.marketSlug,
+        pollCount: round.pollCount,
+        lastPollAt: round.lastPollAt,
+        manualReason: round.manualReason,
+        pendingOrdersFailed: pendingOrders.length
+      }
+    });
+  }
+
   private scheduleSettlementPoll(round: RoundRecord, now: number) {
     if (this.pollLocks.has(round.id)) {
       return;
@@ -2770,7 +2712,7 @@ export class SimulationEngine {
             }
           }
           for (const userId of this.collectRoundPositionUsers(round.id)) {
-            this.store.emitUserPayload(userId);
+            this.store.emitUserPayload(userId, "trade");
           }
           this.scheduleReconcile();
         }
@@ -2793,52 +2735,201 @@ export class SimulationEngine {
     return this.config.gammaPollIntervalMs;
   }
 
-  private recordChainlinkSample(price: number, ts = Date.now()) {
-    if (!this.config.chainlinkEnabled || !Number.isFinite(price) || price <= 0) {
+  private async restoreCoinbaseMarketCandles(now = Date.now()) {
+    const candles = this.store.getMarketCandles({
+      source: "coinbase",
+      symbol: this.config.symbol,
+      interval: "30s",
+      fromOpenTs: now - COINBASE_MARKET_CANDLE_RESTORE_MS
+    });
+    if (candles.length === 0) {
       return;
     }
-    for (const interval of TRADE_CHART_INTERVALS) {
-      this.chainlinkCandlesByInterval[interval] = upsertSampleBar(
-        this.chainlinkCandlesByInterval[interval],
-        interval,
-        price,
-        ts
+    this.mergeCoinbaseThirtySecondBars(candles.map((candle) => marketCandleToBar(candle)));
+  }
+
+  private mergeCoinbaseThirtySecondBars(bars: CandleBar[]) {
+    this.coinbaseCandlesByInterval["30s"] = mergeCoinbaseHistoryBars(
+      this.coinbaseCandlesByInterval["30s"],
+      bars,
+      "30s"
+    );
+    this.refreshCoinbaseAggregatesFromThirtySecondBars();
+  }
+
+  private refreshCoinbaseAggregatesFromThirtySecondBars() {
+    const thirtySecondBars = this.coinbaseCandlesByInterval["30s"];
+    this.coinbaseCandlesByInterval["1m"] = aggregateCoinbaseBars("1m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["5m"] = aggregateCoinbaseBars("5m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["15m"] = aggregateCoinbaseBars("15m", thirtySecondBars);
+    this.coinbaseCandlesByInterval["1h"] = aggregateCoinbaseBars("1h", thirtySecondBars);
+  }
+
+  private refreshCoinbaseAggregateBucketFromThirtySecondBar(bar: CandleBar) {
+    for (const interval of ["1m", "5m", "15m", "1h"] as const) {
+      const bucketSize = COINBASE_INTERVAL_MS[interval];
+      const startTs = Math.floor(bar.startTs / bucketSize) * bucketSize;
+      const endTs = startTs + bucketSize;
+      const sourceBars = this.coinbaseCandlesByInterval["30s"].filter(
+        (candidate) => candidate.startTs >= startTs && candidate.startTs < endTs
+      );
+      const [aggregate] = aggregateCoinbaseBars(interval, sourceBars);
+      if (!aggregate) {
+        continue;
+      }
+      const existing = this.coinbaseCandlesByInterval[interval].filter((candidate) => candidate.startTs !== startTs);
+      this.coinbaseCandlesByInterval[interval] = [...existing, aggregate]
+        .sort((left, right) => left.startTs - right.startTs)
+        .slice(-COINBASE_BAR_LIMITS[interval]);
+    }
+  }
+
+  private coinbaseMarketCandleFromBar(bar: CandleBar, origin: MarketCandleRecord["origin"]): MarketCandleRecord {
+    const openTs = Math.floor(bar.startTs / COINBASE_INTERVAL_MS["30s"]) * COINBASE_INTERVAL_MS["30s"];
+    return {
+      source: "coinbase",
+      symbol: this.config.symbol,
+      interval: "30s",
+      openTs,
+      closeTs: openTs + COINBASE_INTERVAL_MS["30s"],
+      open: roundNumber(bar.open, 2),
+      high: roundNumber(bar.high, 2),
+      low: roundNumber(bar.low, 2),
+      close: roundNumber(bar.close, 2),
+      volume: roundNumber(bar.volume ?? 0, 6),
+      origin,
+      updatedAt: Date.now()
+    };
+  }
+
+  private queueCoinbaseMarketCandle(candle: MarketCandleRecord) {
+    const existing = this.pendingCoinbaseMarketCandles.get(candle.openTs);
+    if (shouldReplaceCoinbaseMarketCandle(existing, candle)) {
+      this.pendingCoinbaseMarketCandles.set(candle.openTs, candle);
+    }
+    if (this.pendingCoinbaseMarketCandles.size >= COINBASE_MARKET_CANDLE_FLUSH_SIZE) {
+      void this.flushPendingCoinbaseMarketCandles();
+      return;
+    }
+    if (!this.coinbaseMarketCandleFlushTimer) {
+      this.coinbaseMarketCandleFlushTimer = setTimeout(() => {
+        this.coinbaseMarketCandleFlushTimer = undefined;
+        void this.flushPendingCoinbaseMarketCandles();
+      }, COINBASE_MARKET_CANDLE_FLUSH_MS);
+    }
+  }
+
+  private async flushPendingCoinbaseMarketCandles() {
+    if (this.coinbaseMarketCandleFlushRunning || this.pendingCoinbaseMarketCandles.size === 0) {
+      return;
+    }
+    this.coinbaseMarketCandleFlushRunning = true;
+    const batch = [...this.pendingCoinbaseMarketCandles.values()];
+    try {
+      await this.store.upsertMarketCandles(batch);
+      for (const candle of batch) {
+        const current = this.pendingCoinbaseMarketCandles.get(candle.openTs);
+        if (current && current.updatedAt <= candle.updatedAt) {
+          this.pendingCoinbaseMarketCandles.delete(candle.openTs);
+        }
+      }
+    } catch (error) {
+      console.warn("[simulation] Coinbase market candle flush failed:", error);
+    } finally {
+      this.coinbaseMarketCandleFlushRunning = false;
+      if (this.pendingCoinbaseMarketCandles.size > 0 && !this.coinbaseMarketCandleFlushTimer) {
+        this.coinbaseMarketCandleFlushTimer = setTimeout(() => {
+          this.coinbaseMarketCandleFlushTimer = undefined;
+          void this.flushPendingCoinbaseMarketCandles();
+        }, COINBASE_MARKET_CANDLE_FLUSH_MS);
+      }
+    }
+  }
+
+  private recordCoinbaseSample(price: number, ts = Date.now()) {
+    if (!this.config.coinbaseEnabled || !Number.isFinite(price) || price <= 0) {
+      return;
+    }
+    const sampleKey = `${ts}:${roundNumber(price, 2)}`;
+    if (this.lastCoinbaseSampleKey === sampleKey) {
+      return;
+    }
+    this.lastCoinbaseSampleKey = sampleKey;
+    const bucketStart = Math.floor(ts / COINBASE_INTERVAL_MS["30s"]) * COINBASE_INTERVAL_MS["30s"];
+    const bucketEnd = bucketStart + COINBASE_INTERVAL_MS["30s"];
+    const current30s = this.coinbaseCandlesByInterval["30s"].at(-1);
+    let next30s: CandleBar;
+    if (current30s && current30s.startTs === bucketStart) {
+      current30s.high = roundNumber(Math.max(current30s.high, price), 2);
+      current30s.low = roundNumber(Math.min(current30s.low, price), 2);
+      current30s.close = roundNumber(price, 2);
+      current30s.volume = roundNumber(current30s.volume + 1, 6);
+      next30s = current30s;
+    } else {
+      next30s = {
+        interval: "30s",
+        startTs: bucketStart,
+        endTs: bucketEnd,
+        open: roundNumber(price, 2),
+        high: roundNumber(price, 2),
+        low: roundNumber(price, 2),
+        close: roundNumber(price, 2),
+        volume: 1
+      };
+      this.coinbaseCandlesByInterval["30s"] = [...this.coinbaseCandlesByInterval["30s"], next30s].slice(
+        -COINBASE_BAR_LIMITS["30s"]
       );
     }
-    const bucketStart = Math.floor(ts / 5000) * 5000;
-    const bucketEnd = bucketStart + 5000;
-    const current = this.chainlinkCandles5s.at(-1);
-    if (current && current.startTs === bucketStart) {
+    this.refreshCoinbaseAggregateBucketFromThirtySecondBar(next30s);
+    this.queueCoinbaseMarketCandle(this.coinbaseMarketCandleFromBar(next30s, "rtds_30s"));
+    const sampleBucketStart = Math.floor(ts / 5000) * 5000;
+    const sampleBucketEnd = sampleBucketStart + 5000;
+    const current = this.coinbaseCandles5s.at(-1);
+    if (current && current.startTs === sampleBucketStart) {
       current.high = roundNumber(Math.max(current.high, price), 2);
       current.low = roundNumber(Math.min(current.low, price), 2);
       current.close = roundNumber(price, 2);
       current.volume += 1;
       return;
     }
-    this.chainlinkCandles5s.push({
+    this.coinbaseCandles5s.push({
       interval: "5s",
-      startTs: bucketStart,
-      endTs: bucketEnd,
+      startTs: sampleBucketStart,
+      endTs: sampleBucketEnd,
       open: roundNumber(price, 2),
       high: roundNumber(price, 2),
       low: roundNumber(price, 2),
       close: roundNumber(price, 2),
       volume: 1
     });
-    if (this.chainlinkCandles5s.length > 50) {
-      this.chainlinkCandles5s = this.chainlinkCandles5s.slice(-50);
+    if (this.coinbaseCandles5s.length > 50) {
+      this.coinbaseCandles5s = this.coinbaseCandles5s.slice(-50);
     }
   }
 
-  private syncChainlinkHistoryCandles(candlesByInterval?: ChainlinkConnectorState["candlesByInterval"]) {
+  private syncCoinbaseHistoryCandles(candlesByInterval?: CoinbaseConnectorState["candlesByInterval"]) {
     if (!candlesByInterval) {
       return;
     }
-    for (const interval of TRADE_CHART_INTERVALS) {
-      const bars = candlesByInterval[interval];
-      if (bars?.length) {
-        this.chainlinkCandlesByInterval[interval] = [...bars];
-      }
+    const bars = candlesByInterval["30s"];
+    if (!bars?.length) {
+      return;
+    }
+    const latestBar = bars.at(-1);
+    const now = Date.now();
+    if (now - this.lastCoinbaseHistorySyncAt < COINBASE_HISTORY_CANDLE_SYNC_MIN_MS) {
+      return;
+    }
+    const historyKey = `${bars.length}:${latestBar?.startTs ?? 0}:${latestBar?.close ?? 0}`;
+    if (this.lastCoinbaseHistorySyncKey === historyKey) {
+      return;
+    }
+    this.lastCoinbaseHistorySyncKey = historyKey;
+    this.lastCoinbaseHistorySyncAt = now;
+    const historyCandles = bars.map((bar) => this.coinbaseMarketCandleFromBar(bar, "history_1m_split"));
+    this.mergeCoinbaseThirtySecondBars(historyCandles.map((candle) => marketCandleToBar(candle)));
+    for (const candle of historyCandles) {
+      this.queueCoinbaseMarketCandle(candle);
     }
   }
 
@@ -2912,11 +3003,11 @@ export class SimulationEngine {
     });
     const upDisplayPrice = displayPrices.UP;
     const downDisplayPrice = displayPrices.DOWN;
-    const chainlinkPrice =
-      this.config.chainlinkEnabled && this.chainlinkState.price > 0 ? roundNumber(this.chainlinkState.price, 2) : 0;
-    this.syncChainlinkHistoryCandles(this.chainlinkState.candlesByInterval);
-    this.recordChainlinkSample(chainlinkPrice, this.chainlinkState.updatedAt || now);
+    const coinbasePrice =
+      this.config.coinbaseEnabled && this.coinbaseState.price > 0 ? roundNumber(this.coinbaseState.price, 2) : 0;
     const binancePrice = this.binanceState.price > 0 ? roundNumber(this.binanceState.price, 2) : 0;
+    const currentRoundBinanceOpenReference = this.resolveCurrentRoundBinanceOpenReference(currentRound, now);
+    const currentRoundCoinbaseOpenReference = this.resolveCurrentRoundCoinbaseOpenReference(currentRound, now);
     const countdownTargetTs = currentRound
       ? currentRound.startAt > now
         ? currentRound.startAt
@@ -2937,18 +3028,18 @@ export class SimulationEngine {
       const marketInfo = clobMarketInfoFor(matchedMarket);
       const sources = {
         binance: this.normalizeSourceHealth(this.binanceState.status, now),
-        chainlink: this.normalizeSourceHealth(this.chainlinkState.status, now),
+        coinbase: this.normalizeSourceHealth(this.coinbaseState.status, now),
         clob: this.normalizeSourceHealth(this.polymarketState.status, now)
       };
       const latencyBreakdown = {
         sourceEventAge: {
           binance: Math.max(now - sources.binance.sourceEventTs, 0),
-          chainlink: Math.max(now - sources.chainlink.sourceEventTs, 0),
+          coinbase: Math.max(now - sources.coinbase.sourceEventTs, 0),
           clob: Math.max(now - sources.clob.sourceEventTs, 0)
         },
         serverIngressLatency: {
           binance: Math.max(sources.binance.serverRecvTs - sources.binance.sourceEventTs, 0),
-          chainlink: Math.max(sources.chainlink.serverRecvTs - sources.chainlink.sourceEventTs, 0),
+          coinbase: Math.max(sources.coinbase.serverRecvTs - sources.coinbase.sourceEventTs, 0),
           clob: Math.max(sources.clob.serverRecvTs - sources.clob.sourceEventTs, 0)
         },
         serverComputeLatency: Math.max(Date.now() - now, 0)
@@ -2959,8 +3050,8 @@ export class SimulationEngine {
         ? roundNumber(currentRound.priceToBeat, 2)
         : undefined;
     const fallbackDisplayPriceToBeat =
-      !officialPriceToBeat && currentRound && isBtcReferencePrice(currentRound.binanceOpenPrice)
-        ? roundNumber(currentRound.binanceOpenPrice, 2)
+      !officialPriceToBeat && currentRound && isBtcReferencePrice(currentRoundBinanceOpenReference)
+        ? roundNumber(currentRoundBinanceOpenReference, 2)
         : undefined;
 
     return {
@@ -2973,8 +3064,8 @@ export class SimulationEngine {
       seriesSlug: currentRound?.seriesSlug ?? matchedMarket?.seriesSlug,
       serverNow: now,
       binancePrice,
-      chainlinkPrice,
-      currentPrice: binancePrice || chainlinkPrice,
+      coinbasePrice,
+      currentPrice: binancePrice || coinbasePrice,
       priceToBeat: officialPriceToBeat ?? 0,
       displayPriceToBeat: officialPriceToBeat ?? fallbackDisplayPriceToBeat,
       displayPriceToBeatSource: officialPriceToBeat
@@ -3009,16 +3100,17 @@ export class SimulationEngine {
         latestTick: this.binanceState.latestTick,
         candlesByInterval
       },
-      chainlink: {
-        referencePrice: chainlinkPrice,
-        settlementReference: currentRound?.settlementPrice ?? chainlinkPrice,
-        candles5s: [...this.chainlinkCandles5s],
+      coinbase: {
+        referencePrice: coinbasePrice,
+        settlementReference: currentRound?.settlementPrice ?? coinbasePrice,
+        currentRoundOpenReference: currentRoundCoinbaseOpenReference,
+        candles5s: [...this.coinbaseCandles5s],
         candlesByInterval: {
-          "30s": [...this.chainlinkCandlesByInterval["30s"]],
-          "1m": [...this.chainlinkCandlesByInterval["1m"]],
-          "5m": [...this.chainlinkCandlesByInterval["5m"]],
-          "15m": [...this.chainlinkCandlesByInterval["15m"]],
-          "1h": [...this.chainlinkCandlesByInterval["1h"]],
+          "30s": [...this.coinbaseCandlesByInterval["30s"]],
+          "1m": [...this.coinbaseCandlesByInterval["1m"]],
+          "5m": [...this.coinbaseCandlesByInterval["5m"]],
+          "15m": [...this.coinbaseCandlesByInterval["15m"]],
+          "1h": [...this.coinbaseCandlesByInterval["1h"]],
           "1d": []
         }
       },
@@ -3045,13 +3137,14 @@ export class SimulationEngine {
         marketTitle,
         marketSubtitle: currentRound ? utcRangeText(currentRound.startAt, currentRound.endAt) : matchedMarket?.slug,
         countdownMs,
+        countdownTargetTs,
         acceptingOrders:
           this.canCreateNewOrders(currentRound, now) &&
           (matchedMarket?.acceptingOrders ?? currentRound?.acceptingOrders ?? false),
         marketSwitchState: this.getMarketSwitchState(currentRound, matchedMarket, now),
         sourceStatusSummary: [
           { source: "Binance", state: this.binanceState.status.state },
-          { source: "Chainlink", state: this.chainlinkState.status.state },
+          { source: "Coinbase", state: this.coinbaseState.status.state },
           { source: "CLOB", state: this.polymarketState.status.state }
         ]
       }
@@ -3081,6 +3174,7 @@ export class SimulationEngine {
 
   private refreshOpenPositions(snapshot: MarketSnapshot) {
     const changedUsers = new Set<string>();
+    const changedPositionIdsByUser = new Map<string, Set<string>>();
     const activeRound = this.getActiveRound(snapshot.serverNow);
     for (const position of this.store.positions) {
       if (position.status !== "open") {
@@ -3117,7 +3211,13 @@ export class SimulationEngine {
         position.markPnlUsdc = unrealizedPnl;
         position.executablePnlUsdc = executablePnl;
         changedUsers.add(position.userId);
+        const changedPositionIds = changedPositionIdsByUser.get(position.userId) ?? new Set<string>();
+        changedPositionIds.add(position.id);
+        changedPositionIdsByUser.set(position.userId, changedPositionIds);
       }
+    }
+    for (const [userId, positionIds] of changedPositionIdsByUser.entries()) {
+      this.store.markTradePositionChanges(userId, positionIds);
     }
     return changedUsers;
   }
@@ -3543,7 +3643,7 @@ export class SimulationEngine {
       });
 
       for (const userId of userIds) {
-        this.store.emitUserPayload(userId);
+        this.store.emitUserPayload(userId, "trade");
       }
       await this.publishSettlementMarketSnapshot(round, "redeem_completed");
     } catch (error) {
@@ -3567,6 +3667,7 @@ export class SimulationEngine {
   }
 
   private upsertBuyPosition(
+    buyOrderId: string,
     userId: string,
     roundId: string,
     side: TradeSide,
@@ -3575,35 +3676,31 @@ export class SimulationEngine {
     mark: number,
     entryFee = 0
   ) {
-    let position = this.store.positions.find(
-      (item) => item.userId === userId && item.roundId === roundId && item.side === side && item.status === "open"
-    );
-    if (!position) {
-      position = {
-        id: this.store.newId("pos"),
-        userId,
-        roundId,
-        side,
-        qty: 0,
-        lockedQty: 0,
-        averageEntry: 0,
-        notionalSpent: 0,
-        currentMark: mark,
-        unrealizedPnl: 0,
-        realizedPnl: 0,
-        entryFeeUsdc: 0,
-        exitFeeUsdc: 0,
-        totalFeeUsdc: 0,
-        costBasisUsdc: 0,
-        markPnlUsdc: 0,
-        executablePnlUsdc: 0,
-        status: "open",
-        openedAt: Date.now()
-      };
-    }
+    const position: PositionRecord = {
+      id: this.store.newId("pos"),
+      buyOrderId,
+      userId,
+      roundId,
+      side,
+      qty: 0,
+      lockedQty: 0,
+      averageEntry: 0,
+      notionalSpent: 0,
+      currentMark: mark,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      entryFeeUsdc: 0,
+      exitFeeUsdc: 0,
+      totalFeeUsdc: 0,
+      costBasisUsdc: 0,
+      markPnlUsdc: 0,
+      executablePnlUsdc: 0,
+      status: "open",
+      openedAt: Date.now()
+    };
 
-    const totalCost = position.notionalSpent + spent;
-    const totalQty = position.qty + filledQty;
+    const totalCost = spent;
+    const totalQty = filledQty;
     position.averageEntry = roundNumber(totalCost / Math.max(totalQty, QTY_EPSILON), 4);
     position.qty = roundNumber(totalQty, 4);
     position.notionalSpent = roundNumber(totalCost, 4);
@@ -3632,10 +3729,7 @@ export class SimulationEngine {
   }
 
   private resolveExactOutcomeSettledSide(detail: PolymarketMarketDetail): TradeSide | undefined {
-    const [upPrice, downPrice] = detail.outcomePrices;
-    if (upPrice === 1 && downPrice === 0) return "UP";
-    if (downPrice === 1 && upPrice === 0) return "DOWN";
-    return undefined;
+    return resolveExactSettledSideFromOutcomePrices(detail.outcomePrices);
   }
 
   private settlementPriceForSide(detail: PolymarketMarketDetail, side: TradeSide) {
@@ -3644,18 +3738,6 @@ export class SimulationEngine {
       : side === "UP"
         ? 1
         : 0;
-  }
-
-  private confirmExactGammaOutcome(roundId: string, side: TradeSide, now: number) {
-    this.gammaOutcomeConfirmations ??= new Map<string, { side: TradeSide; count: number; observedAt: number }>();
-    const previous = this.gammaOutcomeConfirmations.get(roundId);
-    if (!previous || previous.side !== side || now - previous.observedAt > 10_000) {
-      this.gammaOutcomeConfirmations.set(roundId, { side, count: 1, observedAt: now });
-      return false;
-    }
-    const next = { side, count: previous.count + 1, observedAt: now };
-    this.gammaOutcomeConfirmations.set(roundId, next);
-    return next.count >= 2;
   }
 
   private resolveTrustedGammaSettlement(
@@ -3683,22 +3765,11 @@ export class SimulationEngine {
       return undefined;
     }
 
-    if (detail.closed || detail.settlementStatus === "resolved" || detail.automaticallyResolved) {
-      this.gammaOutcomeConfirmations.delete(round.id);
-      return {
-        side: exactOutcomeSide,
-        price: this.settlementPriceForSide(detail, exactOutcomeSide),
-        message: "Gamma resolved market detail confirmed settlement."
-      };
-    }
-
-    if (!this.confirmExactGammaOutcome(round.id, exactOutcomeSide, now)) {
-      return undefined;
-    }
+    this.gammaOutcomeConfirmations.delete(round.id);
     return {
       side: exactOutcomeSide,
       price: this.settlementPriceForSide(detail, exactOutcomeSide),
-      message: "Gamma exact outcome prices confirmed settlement on consecutive polls."
+      message: "Gamma exact outcome price threshold confirmed settlement."
     };
   }
 
@@ -3917,50 +3988,6 @@ export class SimulationEngine {
     round.priceToBeatCapturedAt = now;
   }
 
-  private async hydrateRoundPolymarketReferencePrices(round: RoundRecord, now: number) {
-    if (!isBtcReferencePrice(round.polymarketOpenPrice) || !isOfficialPtbSource(round.polymarketOpenPriceSource)) {
-      round.polymarketOpenPrice = undefined;
-      round.polymarketOpenPriceSource = undefined;
-    }
-    if (!isBtcReferencePrice(round.polymarketClosePrice) || !isOfficialPtbSource(round.polymarketClosePriceSource)) {
-      round.polymarketClosePrice = undefined;
-      round.polymarketClosePriceSource = undefined;
-    }
-    const liveDetail =
-      this.polymarketState.currentMarket?.slug === round.marketSlug ? this.polymarketState.currentMarket : undefined;
-    const resolutionSource = liveDetail?.resolutionSource ?? round.resolutionSource;
-    const isActiveRound = round.startAt <= now && round.endAt > now;
-    if (!round.polymarketOpenPrice && round.startAt <= now) {
-      let openReference;
-      try {
-        openReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.startAt, {
-          resolutionSource,
-          historyCacheMs: isActiveRound ? 2_000 : undefined
-        });
-      } catch (error) {
-        console.warn(`[simulation] Failed to resolve Chainlink opening reference for ${round.id}:`, error);
-      }
-      if (isBtcReferencePrice(openReference?.price)) {
-        round.polymarketOpenPrice = roundNumber(openReference.price, 2);
-        round.polymarketOpenPriceSource = openReference.source;
-      }
-    }
-    if (!round.polymarketClosePrice && now >= round.endAt) {
-      let closeReference;
-      try {
-        closeReference = await this.polymarketReferenceResolver.resolveBoundaryPrice(round.endAt, {
-          resolutionSource
-        });
-      } catch (error) {
-        console.warn(`[simulation] Failed to resolve Chainlink closing reference for ${round.id}:`, error);
-      }
-      if (isBtcReferencePrice(closeReference?.price)) {
-        round.polymarketClosePrice = roundNumber(closeReference.price, 2);
-        round.polymarketClosePriceSource = closeReference.source;
-      }
-    }
-  }
-
   private collectRoundPositionUsers(roundId: string) {
     return new Set(
       this.store.positions
@@ -4007,6 +4034,8 @@ export class SimulationEngine {
       round.redeemScheduledAt,
       round.binanceOpenPrice,
       round.binanceClosePrice,
+      round.coinbaseOpenPrice,
+      round.coinbaseClosePrice,
       round.redeemStartTs,
       round.redeemFinishTs,
       round.manualReason,
@@ -4055,8 +4084,8 @@ export class SimulationEngine {
     }
   }
 
-  private async writeAuditLog(event: AuditEvent) {
-    await this.store.recordLog(event);
+  private async writeAuditLog(event: AuditEvent, options?: { emitUserPayload?: boolean }) {
+    await this.store.recordLog(event, options);
   }
 
   private async publishSettlementMarketSnapshot(round: RoundRecord, reason: string) {

@@ -1,0 +1,434 @@
+Remote Server and IP/Port Information Summary
+Generated on: 2026-06-19
+
+1. Servers and Entry Addresses
+
+- The old production/live entry point is repeatedly written as http://103.147.13.98:10001
+  Purpose: External business entry point, reverse-proxied by Caddy to app-server
+  Sources:
+  - docs/deployment-production.md: ALLOW_INSECURE_PROD_HTTP=true VITE_API_BASE_URL=http://103.147.13.98:10001
+  - docs/测试与生产服务切换手册.md: Production service http://103.147.13.98:10001, test service http://103.147.13.98:10002
+  - docs/服务端替换前准备-runbook-2026-06-01.md: Current production entry point http://103.147.13.98:10001
+  - docs/superpowers/plans/2026-05-19-realtime-display-latency-fix.md: LOAD_TEST_BASE_URL=http://103.147.13.98:10001
+
+- The new production server is explicitly written as 103.179.242.161:10001
+  Purpose: Entry point of the new production server
+  Sources:
+  - docs/Coinbase数据源卡死根因与修复记录.md: Environment is the new production server 103.179.242.161:10001
+  - docs/Coinbase数据源卡死根因与修复记录.md: Verified after the fix was deployed to 103.179.242.161
+
+- The generic production placeholders are http://<PRODUCTION_HOST>:10001 and ws://<PRODUCTION_HOST>:10001
+  Purpose: Standard production API/WS addresses used in documentation templates
+  Sources:
+  - docs/deployment-production.md
+  - docs/生产环境配置说明.md
+  - docs/production-deployment-notes.md
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+
+- The Green test stack entry point is written as http://103.147.13.98:10002
+  Purpose: External entry point for the isolated same-host test stack / green environment
+  Sources:
+  - docs/deployment-production.md
+  - docs/dual-slot-green-prod-runbook.md
+  - docs/测试与生产服务切换手册.md
+
+- The Hyper bridge gateway address is ws://16.162.106.88:8770
+  Purpose: Bridge entry point for Hyper Terminal to send order signals to Hyper Link Gateway
+  Sources:
+  - yyx-jx-对接说明.md: Gateway address ws://16.162.106.88:8770
+
+- The SD-WAN/HTTPS solution documents also mention https://papertrade.sdw and wss://papertrade.sdw
+  Purpose: Recommended private-network domain / HTTPS-WSS production solution
+  Sources:
+  - docs/打包与部署流程.md
+
+
+2. Internal Service Ports and Exposure Rules
+
+- Ports that should be exposed publicly
+  - 22/tcp: SSH management port
+  - 10001/tcp: Caddy HTTP API and WebSocket reverse-proxy business entry point
+  Sources:
+  - docs/deployment-production.md
+  - docs/production-deployment-notes.md
+  - docs/生产环境配置说明.md
+
+- Green test entry port
+  - 10002/tcp: External entry point for the green test stack
+  Sources:
+  - docs/deployment-production.md
+  - docs/dual-slot-green-prod-runbook.md
+  - docs/测试与生产服务切换手册.md
+
+- Internal Docker business ports
+  - 8787: app-server
+  - 8788: matching-service
+  - 5432: PostgreSQL
+  - 6379: Redis
+  Sources:
+  - docs/deployment-production.md
+  - docs/production-deployment-notes.md
+  - docs/生产环境配置说明.md
+  - docs/打包与部署流程.md
+
+- Monitoring-related ports
+  - 9090: Prometheus
+  - 3000: Grafana
+  - 9100: node-exporter
+  - 8080: cAdvisor
+  Sources:
+  - docs/deployment-production.md
+  - docs/monitoring-production.md
+  - docs/生产环境配置说明.md
+
+- Ports used for external market data / upstream connections
+  - 9443: Binance WebSocket upstream stream.binance.com port
+  Sources:
+  - docs/data-sources.md
+
+- Summary of port exposure rules
+  - Allowed externally: 22, 10001, and optionally 10002 depending on the test plan
+  - Should not be exposed to the public Internet: 8787, 8788, 5432, 6379, 9090, 3000
+  - Internal ops/monitoring collection: 9100, 8080
+
+
+3. Deployment Directories and Key Configuration Files
+
+- Production deployment directory: /srv/p-t/app
+  Purpose: Current online service directory
+  Sources:
+  - docs/生产环境配置说明.md
+  - docs/production-deployment-notes.md
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+
+- Release directory: /srv/p-t/releases
+  Purpose: Upload and switch release packages
+  Sources:
+  - docs/生产环境配置说明.md
+  - docs/release-and-deploy-workflow.md
+  - docs/服务更新以及数据回滚/服务更新以及数据回滚.md
+
+- Rollback directory: /srv/p-t/rollback
+  Purpose: Store code snapshots and rollback copies
+  Sources:
+  - docs/生产环境配置说明.md
+  - docs/release-and-deploy-workflow.md
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+
+- Production environment file: /srv/p-t/app/.env.production
+  Purpose: Actual remote production configuration
+  Sources:
+  - docs/生产环境配置说明.md
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+  - docs/服务更新以及数据回滚/服务更新以及数据回滚.md
+
+- Initial production admin password file: /srv/p-t/deployment-secrets-current.txt
+  Purpose: Root-only storage for the initial Admin password
+  Sources:
+  - docs/生产环境配置说明.md
+
+- Docker volumes / persistence
+  - app_pgdata: PostgreSQL data
+  - app_redisdata: Redis data
+  - app_logs: JSONL logs
+  - app_backups: Database backups
+  - app_caddy_data: Caddy data
+  - app_caddy_config: Caddy configuration
+  Sources:
+  - docs/生产环境配置说明.md
+
+
+4. Key Environment Variables and Connection Addresses
+
+- PUBLIC_BASE_URL
+  - In production HTTP documentation it is commonly written as http://<PRODUCTION_HOST>:10001
+  - In the SD-WAN/HTTPS solution it is written as https://papertrade.sdw or https://<your-domain>
+  Sources:
+  - docs/deployment-production.md
+  - docs/生产环境配置说明.md
+  - docs/https-production-rollout.md
+  - docs/打包与部署流程.md
+
+- CORS_ORIGINS / CORS_ORIGIN
+  - In production HTTP documentation it is commonly written as http://<PRODUCTION_HOST>:10001
+  - In the HTTPS solution it is written as https://papertrade.sdw or https://<your-domain>
+  Sources:
+  - docs/deployment-production.md
+  - docs/生产环境配置说明.md
+  - docs/https-production-rollout.md
+  - docs/打包与部署流程.md
+
+- MATCHING_SERVICE_URL=http://matching-service:8788
+  Purpose: Docker internal network address used by app-server to access matching-service
+  Sources:
+  - docs/生产环境配置说明.md
+  - docs/打包与部署流程.md
+  - docs/架构与优化计划.md
+
+- DATABASE_URL
+  - Local default example: postgresql://postgres:postgres@127.0.0.1:5432/paper_trading
+  - Production template example: postgresql://paper_app:CHANGE_ME@postgres:5432/paper_trading
+  - Migration smoke example: postgresql://postgres:postgres@127.0.0.1:5432/btc_paper_smoke
+  Sources:
+  - docs/data-sources.md
+  - docs/deployment-production.md
+  - docs/打包与部署流程.md
+
+- REDIS_URL
+  - Local default example: redis://127.0.0.1:6379
+  - Production template example: redis://redis:6379
+  Sources:
+  - docs/data-sources.md
+  - docs/打包与部署流程.md
+  - docs/架构与优化计划.md
+
+- HYPER_GATEWAY_URL
+  - Configuration format: ws://16.162.106.88:8770?token=<BRIDGE_TOKEN>
+  - The real plaintext token is shown in Section 6
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Other upstream-related addresses
+  - COINBASE_WS_URL=wss://advanced-trade-ws.coinbase.com
+  - COINBASE_REST_URL=https://api.exchange.coinbase.com
+  - CHAINLINK_HISTORY_URL=https://data.chain.link/api/historical-data-engine-stream-data
+  - BINANCE_FALLBACK_REST_URL=https://www.okx.com
+  Sources:
+  - docs/Coinbase数据源卡死根因与修复记录.md
+  - docs/生产环境配置说明.md
+  - docs/打包与部署流程.md
+
+
+5. Local Proxy / Forwarding / Client-Related Addresses
+
+- Local system proxy address: 127.0.0.1:7897
+  Purpose: The Windows client once showed "backend offline" because the system proxy pointed to this address
+  Notes: It was later handled through proxy bypass, packaging metadata, and Electron proxy-bypass-list
+  Sources:
+  - docs/生产环境配置说明.md
+
+- Local renderer access address: http://127.0.0.1:18787
+  Purpose: When the frontend production package runs, it first accesses the local machine, then Electron main process forwards it to remote http://<PRODUCTION_HOST>:10001
+  Sources:
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+
+- Remote forwarding target: http://<PRODUCTION_HOST>:10001
+  Purpose: Final remote Caddy entry point used by the Electron local proxy
+  Sources:
+  - docs/服务更新以及数据回滚/前后端打包与后端数据回滚流程.md
+
+- Legacy client packaging example
+  - ALLOW_INSECURE_PROD_HTTP=true
+  - VITE_API_BASE_URL=http://103.147.13.98:10001
+  Sources:
+  - docs/deployment-production.md
+
+- Recommended production/private-network client addresses
+  - VITE_API_BASE_URL=https://papertrade.sdw
+  - VITE_WS_BASE_URL=wss://papertrade.sdw
+  Sources:
+  - docs/打包与部署流程.md
+
+
+6. Bridge Integration Information
+
+- Bridge purpose
+  Purpose: Send order signals from Hyper Terminal (paper-trading) to Hyper Link Gateway via WebSocket for live-trading mirroring comparison
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Bridge gateway address
+  - ws://16.162.106.88:8770
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Bridge operating mode
+  - dryrun
+  Notes: Zero real funds, comparison only
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Bridge-related environment variables
+  - HYPER_BRIDGE_ENABLED=true
+  - HYPER_GATEWAY_URL=ws://16.162.106.88:8770?token=<BRIDGE_TOKEN>
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Plaintext Bridge token
+  - 7fbd313e4c6c35b413d58dcdc2d27a8fc2e8e24db9caef9bbf27e933726c5cce
+  Sources:
+  - bridge token2026.6.md
+
+- Integration code locations
+  - Copy bridge-template/hyper-bridge.ts to apps/server/src/services/hyper-bridge.ts
+  - Add one emit line each in simulation.ts placeOrder() and writeBehaviorLog()
+  Sources:
+  - yyx-jx-对接说明.md
+
+- user ID integration requirement
+  - Change hyper_user_id from p.user.id to p.user.username
+  Reason: Dashboard should display a readable username directly instead of an internal UUID
+  Sources:
+  - yyx-jx-对接说明.md
+
+- Connection verification information
+  - Example gateway log: [gateway] peer connection: <your IP>
+  - Example gateway log: [gateway] signal tr_xxx BUY UP ... status=dryrun_ok e2e=XXms
+  - If it does not work, check whether the token matches, whether the server egress IP is allowlisted, and whether the ?token= part in HYPER_GATEWAY_URL is concatenated correctly
+  - How to obtain the egress IP: curl -s https://api.ipify.org
+  Sources:
+  - yyx-jx-对接说明.md
+
+
+7. Server and Connection Issues Mentioned in Reports
+
+- Production version mentioned in the order-lag fix report
+  - p-t-app-server:v072fix2
+  - Git branch release/1.0.1
+  Sources:
+  - 下单卡顿修复报告.md
+
+- Production crash / gateway errors mentioned in the report
+  - app-server crashed and restarted 3 times when real testers came online after deployment
+  - Intermittent 502 errors for testers
+  Sources:
+  - 下单卡顿修复报告.md
+
+- Connector issues confirmed in the report
+  - Existing bug in 0.7.2: CoinbaseConnector.scheduleReconnect calls close() on a socket that is still in CONNECTING state after removeAllListeners()
+  - The ws layer emitted an error with no listener, causing an uncaught exception and process crash
+  - Similar fixes were also added to binance.ts; no similar issue was found after checking Polymarket
+  Sources:
+  - 下单卡顿修复报告.md
+
+- Mitigation measures mentioned in the report
+  - First set COINBASE_ENABLED=false and restart
+  - Restore COINBASE_ENABLED=true after the fix is completed
+  Sources:
+  - 下单卡顿修复报告.md
+
+- PostgreSQL connection risks mentioned in the report
+  - Periodic transient disconnects occurred between app-server and PostgreSQL
+  - Short-lived 503 responses may occur in strict mode
+  - Log keywords: PostgreSQL reconnecting / Position sell blocked
+  - Recommended checks: PG idle timeout, keepalive, minimum keepalive connections
+  - Data in the report: idle timeout is currently 60s, about 17,000 sessions accumulated over 23h, about 12 connection rebuilds per minute
+  Sources:
+  - 下单卡顿修复报告.md
+
+- Verification status of the new production server
+  - docs/Coinbase数据源卡死根因与修复记录.md states that after the fix was deployed to 103.179.242.161, app-server, matching-service, caddy, postgres, and redis were all healthy
+  Sources:
+  - docs/Coinbase数据源卡死根因与修复记录.md
+
+
+8. Verbatim List of IPs / Hosts / Ports
+
+- 103.147.13.98
+  Context:
+  - Production/live entry host
+  - SSH host and 10001/10002 health-check target in the test/production switching guide
+  - SSH and curl target in the pre-replacement server runbook
+  - LOAD_TEST_BASE_URL in the latency stress-test plan
+
+- 103.147.13.98:10001
+  Context:
+  - Old production/live business entry point
+  - API address in the Windows production client packaging example
+
+- 103.147.13.98:10002
+  Context:
+  - Green test entry point
+  - Verification address used when test takes over the official entry point
+
+- 103.179.242.161
+  Context:
+  - New production server host in the Coinbase fix record
+
+- 103.179.242.161:10001
+  Context:
+  - New production server entry point in the Coinbase fix record
+
+- 16.162.106.88
+  Context:
+  - Hyper bridge gateway host
+
+- 16.162.106.88:8770
+  Context:
+  - Hyper bridge gateway WebSocket address
+
+- 127.0.0.1:7897
+  Context:
+  - Windows system proxy address
+
+- 127.0.0.1:18787
+  Context:
+  - Electron local proxy entry point
+
+- <PRODUCTION_HOST>
+  Context:
+  - Host placeholder used in multiple production deployment documents
+
+- papertrade.sdw
+  Context:
+  - Recommended SD-WAN private DNS / HTTPS-WSS domain
+
+- 22
+  Context:
+  - SSH management port
+
+- 10001
+  Context:
+  - Official business entry point / Caddy public-facing port
+
+- 10002
+  Context:
+  - Green test entry port
+
+- 8770
+  Context:
+  - Hyper bridge gateway port
+
+- 8787
+  Context:
+  - app-server Docker internal port
+
+- 8788
+  Context:
+  - matching-service Docker internal port
+
+- 5432
+  Context:
+  - PostgreSQL
+
+- 6379
+  Context:
+  - Redis
+
+- 8080
+  Context:
+  - cAdvisor metrics
+
+- 9090
+  Context:
+  - Prometheus
+
+- 9100
+  Context:
+  - node-exporter
+
+- 3000
+  Context:
+  - Grafana
+
+- 9443
+  Context:
+  - Binance upstream WebSocket port
+
+Additional Notes
+
+- The documents contain both the old production IP 103.147.13.98 and the new production server IP 103.179.242.161. This summary keeps all of them as requested and does not merge them into a single current address on its own.
+- The documents contain both a temporary HTTP solution and an SD-WAN/HTTPS solution:
+  - The temporary HTTP solution mainly uses http://<PRODUCTION_HOST>:10001 or http://103.147.13.98:10001
+  - The private-network/HTTPS solution mainly uses https://papertrade.sdw
+- The bridge token is intentionally kept in plaintext in this file as requested.

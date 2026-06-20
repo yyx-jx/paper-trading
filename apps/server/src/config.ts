@@ -2,15 +2,8 @@ import "dotenv/config";
 
 export type PersistenceMode = "external" | "memory";
 
-export const DEFAULT_CHAINLINK_RPC_URL = "https://eth.llamarpc.com";
-export const DEFAULT_CHAINLINK_FALLBACK_RPC_URLS = [
-  "https://ethereum-rpc.publicnode.com",
-  "https://mainnet.infura.io/v3/b6bf7d3508c941499b10025c0776eaf8"
-];
-export const DEFAULT_CHAINLINK_RTDS_WS_URL = "wss://ws-live-data.polymarket.com";
-export const DEFAULT_CHAINLINK_HISTORY_URL = "https://data.chain.link/api/historical-data-engine-stream-data";
-export const DEFAULT_CHAINLINK_BTC_USD_STREAM_FEED_ID =
-  "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8";
+export const DEFAULT_COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com";
+export const DEFAULT_COINBASE_REST_URL = "https://api.exchange.coinbase.com";
 
 function textEnv(value: string | undefined, fallback: string) {
   const trimmed = value?.trim();
@@ -55,7 +48,7 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     matchingServiceUrl: textEnv(env.MATCHING_SERVICE_URL, "http://127.0.0.1:8788"),
     matchingServiceTimeoutMs: Number(env.MATCHING_SERVICE_TIMEOUT_MS ?? 4000),
     embeddedMatchingService: env.EMBEDDED_MATCHING_SERVICE !== "false",
-    chainlinkEnabled: env.CHAINLINK_ENABLED !== "false",
+    coinbaseEnabled: env.COINBASE_ENABLED !== "false",
     upstreamProxyUrl: optionalTextEnv(env.UPSTREAM_PROXY_URL),
     publicDomain: optionalTextEnv(env.PUBLIC_DOMAIN),
     corsOrigins,
@@ -71,13 +64,15 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     initialBalance: Number(env.INITIAL_BALANCE ?? 10000),
     freezeWindowMs: Number(env.FREEZE_WINDOW_MS ?? 10000),
     pollDelayMs: Number(env.POLL_DELAY_MS ?? 0),
+    manualSettlementTimeoutMs: Number(env.MANUAL_SETTLEMENT_TIMEOUT_MS ?? 450_000),
     marketWsMinIntervalMs: Number(env.MARKET_WS_MIN_INTERVAL_MS ?? 50),
     marketSnapshotIntervalMs: Number(env.MARKET_SNAPSHOT_INTERVAL_MS ?? 500),
+    marketFullReconcileIntervalMs: Number(env.MARKET_FULL_RECONCILE_INTERVAL_MS ?? 1000),
     marketHistoryCacheMaxUsers: Number(env.MARKET_HISTORY_CACHE_MAX_USERS ?? 200),
     strictPersistence: env.SERVER_STRICT_PERSISTENCE !== "false",
     requireSchemaMigrations: isProduction ? env.SERVER_REQUIRE_MIGRATIONS !== "false" : env.SERVER_REQUIRE_MIGRATIONS === "true",
     allowDevSchemaBootstrap: !isProduction && env.SERVER_ALLOW_DEV_SCHEMA_BOOTSTRAP !== "false",
-    expectedSchemaMigrationId: textEnv(env.EXPECTED_SCHEMA_MIGRATION_ID, "000004"),
+    expectedSchemaMigrationId: textEnv(env.EXPECTED_SCHEMA_MIGRATION_ID, "000008"),
     loginRateLimitWindowMs: Number(env.LOGIN_RATE_LIMIT_WINDOW_MS ?? 60_000),
     loginRateLimitMax: Number(env.LOGIN_RATE_LIMIT_MAX ?? 30),
     writeRateLimitWindowMs: Number(env.WRITE_RATE_LIMIT_WINDOW_MS ?? 60_000),
@@ -120,17 +115,11 @@ export function buildServerConfig(env: NodeJS.ProcessEnv = process.env) {
     ),
     binanceRestPollMs: Number(env.BINANCE_REST_POLL_MS ?? 3000),
     binanceWsStaleMs: Number(env.BINANCE_WS_STALE_MS ?? 15000),
-    chainlinkRpcUrl: textEnv(env.CHAINLINK_RPC_URL, DEFAULT_CHAINLINK_RPC_URL),
-    chainlinkFallbackRpcUrls: csvEnv(env.CHAINLINK_FALLBACK_RPC_URLS, DEFAULT_CHAINLINK_FALLBACK_RPC_URLS),
-    chainlinkRequestTimeoutMs: Number(env.CHAINLINK_REQUEST_TIMEOUT_MS ?? 8000),
-    chainlinkBtcUsdProxyAddress: textEnv(env.CHAINLINK_BTC_USD_PROXY_ADDRESS, "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c"),
-    chainlinkPollMs: Number(env.CHAINLINK_POLL_MS ?? 1500),
-    chainlinkRtdsWsUrl: textEnv(env.CHAINLINK_RTDS_WS_URL, DEFAULT_CHAINLINK_RTDS_WS_URL),
-    chainlinkRtdsSymbol: textEnv(env.CHAINLINK_RTDS_SYMBOL, "btc/usd"),
-    chainlinkRtdsPingMs: Number(env.CHAINLINK_RTDS_PING_MS ?? 5000),
-    chainlinkHistoryUrl: textEnv(env.CHAINLINK_HISTORY_URL, DEFAULT_CHAINLINK_HISTORY_URL),
-    chainlinkHistoryFeedId: textEnv(env.CHAINLINK_HISTORY_FEED_ID, DEFAULT_CHAINLINK_BTC_USD_STREAM_FEED_ID),
-    chainlinkHistoryPollMs: Number(env.CHAINLINK_HISTORY_POLL_MS ?? 10000),
+    coinbaseWsUrl: textEnv(env.COINBASE_WS_URL, DEFAULT_COINBASE_WS_URL),
+    coinbaseRestUrl: textEnv(env.COINBASE_REST_URL, DEFAULT_COINBASE_REST_URL),
+    coinbaseRestPollMs: Number(env.COINBASE_REST_POLL_MS ?? 5000),
+    coinbaseRequestTimeoutMs: Number(env.COINBASE_REQUEST_TIMEOUT_MS ?? 6000),
+    coinbaseWsStaleMs: Number(env.COINBASE_WS_STALE_MS ?? 15000),
     gammaBaseUrl: textEnv(env.POLYMARKET_GAMMA_BASE_URL, "https://gamma-api.polymarket.com"),
     clobBaseUrl: textEnv(env.POLYMARKET_CLOB_BASE_URL, "https://clob.polymarket.com"),
     dataApiBaseUrl: textEnv(env.POLYMARKET_DATA_BASE_URL, "https://data-api.polymarket.com"),

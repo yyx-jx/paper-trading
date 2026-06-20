@@ -9,7 +9,7 @@ const store = new AppStore({
   symbol: "BTC",
   databaseUrl: "",
   redisUrl: "",
-  chainlinkEnabled: false
+  coinbaseEnabled: false
 });
 
 async function main() {

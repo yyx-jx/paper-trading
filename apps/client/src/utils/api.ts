@@ -13,7 +13,7 @@ export type LogSystem = "all" | "audit" | "training" | "matching";
 export type LogCategory = "operation" | "matching" | "settlement" | "latency";
 export type MatchingEventType = "external_book_synced" | "order_executed" | "order_cancelled";
 export type LogGroup = "operation" | "settlement" | "market_latency" | "system_latency" | "matching_action";
-export type LatencySource = "binance" | "chainlink" | "clob" | "system";
+export type LatencySource = "binance" | "coinbase" | "clob" | "system";
 export type ConnectionState = "healthy" | "reconnecting" | "stale" | "degraded" | "disabled";
 export type LatencyPhase = "backend" | "acquire" | "publish" | "frontend";
 export type MatchingLogKind = "action" | "engine";
@@ -47,7 +47,7 @@ export interface PublicUser {
 }
 
 export interface SourceHealth {
-  source: "Binance" | "Chainlink" | "CLOB";
+  source: "Binance" | "Coinbase" | "CLOB";
   symbol: string;
   state: "healthy" | "reconnecting" | "stale" | "degraded" | "disabled";
   reconnectCount: number;
@@ -60,6 +60,16 @@ export interface SourceHealth {
   frontendLatencyMs: number;
   clientRecvTs?: number;
   message?: string;
+  components?: Record<string, SourceComponentHealth>;
+}
+
+export interface SourceComponentHealth {
+  name: string;
+  label?: string;
+  state: SourceHealth["state"];
+  sourceEventTs: number;
+  serverRecvTs: number;
+  message?: string;
 }
 
 export interface MarketTransportMeta {
@@ -69,6 +79,9 @@ export interface MarketTransportMeta {
   serverQueueMs?: number;
   snapshotBuildTs?: number;
   wsSendStartTs?: number;
+  broadcastBuildMs?: number;
+  broadcastFanoutSize?: number;
+  droppedForBackpressure?: boolean;
 }
 
 export interface ClobMarketInfo {
@@ -105,8 +118,8 @@ export interface FeeBreakdown {
 }
 
 export interface LatencyBreakdown {
-  sourceEventAge: Record<"binance" | "chainlink" | "clob", number>;
-  serverIngressLatency: Record<"binance" | "chainlink" | "clob", number>;
+  sourceEventAge: Record<"binance" | "coinbase" | "clob", number>;
+  serverIngressLatency: Record<"binance" | "coinbase" | "clob", number>;
   serverComputeLatency: number;
   clientTransportLatency?: number;
 }
@@ -116,7 +129,7 @@ export interface SettlementPreview {
   state: "preliminary" | "confirmed" | "manual";
   side?: TradeSide;
   price?: number;
-  source: "CLOB" | "Gamma" | "Polymarket" | "Chainlink";
+  source: "CLOB" | "Gamma" | "Polymarket" | "Coinbase";
   detectedAt?: number;
   upPrice?: number;
   downPrice?: number;
@@ -178,7 +191,7 @@ export interface MarketSnapshot {
   seriesSlug?: string;
   serverNow: number;
   binancePrice: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   currentPrice: number;
   priceToBeat: number;
   displayPriceToBeat?: number;
@@ -189,7 +202,7 @@ export interface MarketSnapshot {
   displayPriceSource: Record<TradeSide, DisplayPriceSource>;
   displayPriceSpread: Record<TradeSide, number>;
   latencyBreakdown: LatencyBreakdown;
-  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
+  sources: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   orderBooks: Record<TradeSide, OrderBookSnapshot>;
   recentTrades: MarketTrade[];
   candles: Array<{ ts: number; price: number }>;
@@ -198,9 +211,10 @@ export interface MarketSnapshot {
     latestTick?: { ts: number; price: number };
     candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
-  chainlink: {
+  coinbase: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     candles5s: CandleBar[];
     candlesByInterval: Record<CandleInterval, CandleBar[]>;
   };
@@ -218,6 +232,7 @@ export interface MarketSnapshot {
     marketTitle: string;
     marketSubtitle?: string;
     countdownMs: number;
+    countdownTargetTs?: number;
     acceptingOrders: boolean;
     marketSwitchState: MarketSwitchState;
     sourceStatusSummary: Array<{ source: SourceHealth["source"]; state: SourceHealth["state"] }>;
@@ -225,8 +240,10 @@ export interface MarketSnapshot {
 }
 
 export interface MarketPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   history: HistoryRound[];
+  historyRevision?: number;
   snapshot: MarketSnapshot;
   settlementPreview?: SettlementPreview;
   transportMeta?: MarketTransportMeta;
@@ -239,7 +256,7 @@ export interface MarketRealtimeTick {
   serverNow: number;
   currentPrice: number;
   binancePrice: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   priceToBeat: number;
   displayPriceToBeat?: number;
   displayPriceToBeatSource?: "official" | "binance_open_fallback";
@@ -249,22 +266,25 @@ export interface MarketRealtimeTick {
   displayPriceSource: Record<TradeSide, DisplayPriceSource>;
   displayPriceSpread: Record<TradeSide, number>;
   latencyBreakdown: LatencyBreakdown;
-  sources: Record<"binance" | "chainlink" | "clob", SourceHealth>;
-  orderBooks: Record<TradeSide, OrderBookSnapshot>;
+  sources: Record<"binance" | "coinbase" | "clob", SourceHealth>;
   binance: {
     spotPrice: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
-  chainlink: {
+  coinbase: {
     referencePrice: number;
     settlementReference: number;
+    currentRoundOpenReference?: number;
     latestTick?: CandlePoint;
+    candleUpdates?: Partial<Record<CandleInterval, CandleBar>>;
   };
   clob: {
     delta: number;
     volume: number;
     currentRoundUpPricePoint?: CandlePoint;
     bestBidAskSummary: Record<TradeSide, { bestBid: number; bestAsk: number }>;
+    topLevels?: Record<TradeSide, { bids: BookLevel[]; asks: BookLevel[] }>;
   };
   uiMeta: {
     countdownMs: number;
@@ -276,22 +296,51 @@ export interface MarketRealtimeTick {
 }
 
 export interface MarketTickPayload {
+  viewedUserId: string;
   currentRound?: RoundRecord;
   tick: MarketRealtimeTick;
-  settlementPreview?: SettlementPreview;
   transportMeta?: MarketTransportMeta;
 }
 
+export interface MarketHistoryPatchPayload {
+  viewedUserId: string;
+  history: HistoryRound[];
+  historyRevision: number;
+  serverPublishTs: number;
+}
+
 export interface UserPayload {
+  viewedUserId: string;
+  viewedUser: PublicUser;
   profile: ProfileOverview;
   operatedHistory?: HistoryRound[];
   positions: PositionRecord[];
   orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
   logs: AuditEvent[];
 }
 
+export interface UserTradePayload {
+  viewedUserId: string;
+  profile: ProfileOverview;
+  positionsMode?: "replace" | "delta";
+  positions: PositionRecord[];
+  orders: OrderRecord[];
+  orderLifecycles: OrderLifecycleRecord[];
+}
+
+export interface UserHeartbeatPayload {
+  serverNow: number;
+}
+
+export type UserWsMessage =
+  | { type: "user"; data: UserPayload }
+  | { type: "user:trade"; data: UserTradePayload }
+  | { type: "user:heartbeat"; data: UserHeartbeatPayload };
+
 export interface BootstrapPayload extends MarketPayload, UserPayload {
   me: PublicUser;
+  viewedUser: PublicUser;
   sourceStatus: SourceHealth[];
 }
 
@@ -325,7 +374,7 @@ export interface RoundRecord {
   settledSide?: TradeSide;
   settlementPrice?: number;
   settlementTs?: number;
-  settlementSource?: "Polymarket" | "Gamma" | "Chainlink" | "CLOB";
+  settlementSource?: "Polymarket" | "Gamma" | "Coinbase" | "CLOB";
   polymarketSettlementPrice?: number;
   polymarketSettlementStatus?: "pending" | "resolved" | "fallback" | "manual";
   polymarketOpenPrice?: number;
@@ -336,16 +385,38 @@ export interface RoundRecord {
   redeemScheduledAt?: number;
   binanceOpenPrice?: number;
   binanceClosePrice?: number;
+  coinbaseOpenPrice?: number;
+  coinbaseClosePrice?: number;
   redeemStartTs?: number;
   redeemFinishTs?: number;
   manualReason?: string;
   acceptingOrders?: boolean;
-  closingPriceSource?: "Chainlink" | "Gamma";
+  closingPriceSource?: "Coinbase" | "Gamma";
   settlementPreview?: SettlementPreview;
 }
 
 export interface HistoryRound extends RoundRecord {
   userPnl: number;
+}
+
+export interface ManualSettlementCandidate {
+  roundId: string;
+  symbol: string;
+  marketId: string;
+  marketSlug?: string;
+  title?: string;
+  startAt: number;
+  endAt: number;
+  status: RoundStatus;
+  pollCount: number;
+  pollStartAt?: number;
+  lastPollAt?: number;
+  manualReason?: string;
+  participantCount: number;
+  openPositionCount: number;
+  pendingOrderCount: number;
+  upOpenQty: number;
+  downOpenQty: number;
 }
 
 export interface ProfileOverview {
@@ -361,6 +432,7 @@ export interface ProfileOverview {
 
 export interface PositionRecord {
   id: string;
+  buyOrderId?: string;
   userId: string;
   roundId: string;
   side: TradeSide;
@@ -444,6 +516,45 @@ export interface OrderRecord {
   createdAt: number;
 }
 
+export type OrderLifecycleExitType = "manual_sell" | "close_side" | "settlement" | "mixed";
+
+export interface OrderLifecycleRecord {
+  id: string;
+  buyOrderId: string;
+  traceId: string;
+  userId: string;
+  testerId: string;
+  roundId: string;
+  symbol: string;
+  assetClass: "BTC";
+  marketId: string;
+  marketSlug?: string;
+  direction: TradeSide;
+  orderTimestampMs: number;
+  entryTokenPrice?: number;
+  btcTradePrice?: number;
+  btcOpenPriceToBeat?: number;
+  deltaBtc?: number;
+  volumeTokenQty: number;
+  remainingTokenQty: number;
+  closedTokenQty: number;
+  positionNotional: number;
+  exitType?: OrderLifecycleExitType;
+  exitTokenPrice?: number;
+  exitNotional: number;
+  settlementResult?: "win" | "loss";
+  settlementTimeMs?: number;
+  settlementDirection?: TradeSide;
+  actualFillPrice?: number;
+  slippageBps?: number;
+  matchLatencyMs: number;
+  entryFee?: number;
+  exitFee?: number;
+  feeCurrency?: FeeCurrency;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface AuditEvent {
   eventId: string;
   traceId: string;
@@ -494,7 +605,7 @@ export interface BehaviorActionLog {
   binance1mLastClose: number;
   binance5mLastClose: number;
   binance1dLastClose: number;
-  chainlinkPrice: number;
+  coinbasePrice: number;
   priceToBeat: number;
   upPrice: number;
   downPrice: number;
@@ -525,6 +636,7 @@ export interface BehaviorActionLog {
 export interface AuditLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   roundId?: string;
   category?: "operation" | "matching" | "settlement" | "latency";
@@ -539,6 +651,7 @@ export interface AuditLogQuery {
 export interface BehaviorLogQuery {
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   roundId?: string;
   actionType?: string;
@@ -554,6 +667,7 @@ export interface LogSearchQuery {
   systems?: Array<Exclude<LogSystem, "all">>;
   from?: number;
   to?: number;
+  viewUserId?: string;
   userId?: string;
   userIds?: string[];
   role?: Role;
@@ -631,6 +745,21 @@ export interface LogSearchResult {
   nextCursor?: string;
   limit: number;
   system: LogSystem;
+}
+
+export const USER_HISTORY_PAGE_SIZE = 25;
+
+export interface HistoryPageRequest {
+  limit?: number;
+  offset?: number;
+}
+
+export interface PagedResult<T> {
+  rows: T[];
+  limit: number;
+  offset: number;
+  nextOffset?: number;
+  hasMore: boolean;
 }
 
 export interface LogFacets {
@@ -733,7 +862,16 @@ export interface BulkCreateUsersPreviewResult {
   failed: BulkCreateUsersResult["failed"];
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8787";
+const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
+const API_BASE_URL = RAW_API_BASE_URL || (import.meta.env.DEV ? "" : "http://127.0.0.1:8787");
+
+function wsBaseUrl() {
+  if (API_BASE_URL) {
+    return API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+  }
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}`;
+}
 
 async function request<T>(path: string, token?: string, init?: RequestInit): Promise<T> {
   const hasBody = typeof init?.body !== "undefined";
@@ -890,18 +1028,25 @@ export const api = {
     }
     return Math.round((startedAt + receivedAt) / 2 - data.serverNow);
   },
-  createWsUrl(path: string, token: string) {
-    const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
-    return `${base}${path}?token=${token}`;
+  createWsUrl(path: string, token: string, viewUserId?: string, clientInstanceId?: string) {
+    const base = wsBaseUrl();
+    const params = new URLSearchParams({ token });
+    if (viewUserId) {
+      params.set("viewUserId", viewUserId);
+    }
+    if (clientInstanceId) {
+      params.set("clientInstanceId", clientInstanceId);
+    }
+    return `${base}${path}?${params.toString()}`;
   },
   createWsTicketUrl(path: string, ticket: string) {
-    const base = API_BASE_URL.replace("http://", "ws://").replace("https://", "wss://");
+    const base = wsBaseUrl();
     return `${base}${path}?ticket=${ticket}`;
   },
-  createWsTicket(token: string, channel: "market" | "user") {
+  createWsTicket(token: string, channel: "market" | "user", viewUserId?: string, clientInstanceId?: string) {
     return request<{ ticket: string; expiresAt: number }>("/api/ws/tickets", token, {
       method: "POST",
-      body: JSON.stringify({ channel })
+      body: JSON.stringify({ channel, viewUserId, clientInstanceId })
     });
   },
   async login(username: string, password: string) {
@@ -911,8 +1056,8 @@ export const api = {
     });
     return mapLoginResponse(data);
   },
-  getBootstrap(token: string) {
-    return request<BootstrapPayload>("/api/bootstrap/full", token);
+  getBootstrap(token: string, viewUserId?: string) {
+    return request<BootstrapPayload>(`/api/bootstrap/full${buildQuery({ viewUserId })}`, token);
   },
   getMe(token: string) {
     return request<PublicUser>("/api/me", token);
@@ -935,16 +1080,20 @@ export const api = {
       body: JSON.stringify(input)
     });
   },
-  getCurrentRound(token: string) {
+  getCurrentRound(token: string, viewUserId?: string) {
     return request<{
+      viewedUserId?: string;
       currentRound?: RoundRecord;
       snapshot: MarketSnapshot;
       settlementPreview?: SettlementPreview;
       transportMeta?: MarketTransportMeta;
-    }>("/api/rounds/current", token);
+    }>(`/api/rounds/current${buildQuery({ viewUserId })}`, token);
   },
-  getHistory(token: string, limit = 60) {
-    return request<HistoryRound[]>(`/api/rounds/history?limit=${limit}`, token);
+  getHistory(token: string, limit = 60, viewUserId?: string) {
+    return request<HistoryRound[]>(`/api/rounds/history${buildQuery({ limit, viewUserId })}`, token);
+  },
+  getManualSettlementQueue(token: string, limit = 100) {
+    return request<ManualSettlementCandidate[]>(`/api/rounds/manual-settlement${buildQuery({ limit })}`, token);
   },
   manualSettleRound(token: string, roundId: string, input: { side: TradeSide; price?: number; reason?: string }) {
     return request<RoundRecord>(`/api/rounds/${roundId}/manual-settlement`, token, {
@@ -952,20 +1101,32 @@ export const api = {
       body: JSON.stringify(input)
     });
   },
-  getOperatedHistory(token: string, limit = 500) {
-    return request<HistoryRound[]>(`/api/profile/rounds/operated?limit=${limit}`, token);
+  getOperatedHistory(token: string, limit = 500, viewUserId?: string) {
+    return request<HistoryRound[]>(`/api/profile/rounds/operated${buildQuery({ limit, viewUserId })}`, token);
   },
-  getProfile(token: string) {
-    return request<ProfileOverview>("/api/profile/me", token);
+  getProfile(token: string, viewUserId?: string) {
+    return request<ProfileOverview>(`/api/profile/me${buildQuery({ viewUserId })}`, token);
   },
-  getPositions(token: string) {
-    return request<PositionRecord[]>("/api/positions/me", token);
+  getPositions(token: string, viewUserId?: string) {
+    return request<PositionRecord[]>(`/api/positions/me${buildQuery({ viewUserId })}`, token);
   },
-  getOrders(token: string) {
-    return request<OrderRecord[]>("/api/orders/me", token);
+  getOrders(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<OrderRecord[]>(`/api/orders/me${buildQuery({ viewUserId, ...page })}`, token);
   },
-  getLogs(token: string) {
-    return request<AuditEvent[]>("/api/logs/me", token);
+  getOrdersPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<OrderRecord>>(`/api/orders/me/page${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getOrderLifecycles(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<OrderLifecycleRecord[]>(`/api/order-lifecycles/me${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getOrderLifecyclesPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<OrderLifecycleRecord>>(`/api/order-lifecycles/me/page${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getLogs(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<AuditEvent[]>(`/api/logs/me${buildQuery({ viewUserId, ...page })}`, token);
+  },
+  getLogsPage(token: string, viewUserId?: string, page?: HistoryPageRequest) {
+    return request<PagedResult<AuditEvent>>(`/api/logs/me/page${buildQuery({ viewUserId, ...page })}`, token);
   },
   getSourceStatus(token: string) {
     return request<SourceHealth[]>("/api/system/sources/status", token);
@@ -989,9 +1150,9 @@ export const api = {
   getLogFacets(token: string) {
     return request<LogFacets>("/api/logs/facets", token);
   },
-  getRoundActivity(token: string, roundId: string) {
+  getRoundActivity(token: string, roundId: string, viewUserId?: string) {
     return request<{ auditLogs: AuditEvent[]; behaviorLogs: BehaviorActionLog[] }>(
-      `/api/logs/round-activity${buildQuery({ roundId })}`,
+      `/api/logs/round-activity${buildQuery({ roundId, viewUserId })}`,
       token
     );
   },
@@ -1022,6 +1183,12 @@ export const api = {
     return request<PublicUser>(`/api/users/${userId}`, token, {
       method: "PATCH",
       body: JSON.stringify(input)
+    });
+  },
+  changeUserGroup(token: string, userId: string, managerUserId: string) {
+    return request<PublicUser>(`/api/users/${userId}/group`, token, {
+      method: "PATCH",
+      body: JSON.stringify({ managerUserId })
     });
   },
   bulkCreateUsers(token: string, users: BulkCreateUserInput[]) {
@@ -1084,7 +1251,7 @@ export const api = {
       (globalThis.crypto?.randomUUID
         ? globalThis.crypto.randomUUID()
         : `client_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-    return request<{ order: OrderRecord }>("/api/orders", token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>("/api/orders", token, {
       method: "POST",
       body: JSON.stringify({
         ...input,
@@ -1094,12 +1261,12 @@ export const api = {
     });
   },
   cancelOrder(token: string, orderId: string) {
-    return request<OrderRecord>(`/api/orders/${orderId}/cancel`, token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>(`/api/orders/${orderId}/cancel`, token, {
       method: "POST"
     });
   },
   sellPosition(token: string, positionId: string) {
-    return request<OrderRecord>(`/api/positions/${positionId}/sell`, token, {
+    return request<{ order: OrderRecord; tradePatch?: UserTradePayload }>(`/api/positions/${positionId}/sell`, token, {
       method: "POST"
     });
   },
@@ -1111,6 +1278,7 @@ export const api = {
       avgFillPrice?: number;
       matchLatencyMs: number;
       failures: Array<{ positionId: string; message: string }>;
+      tradePatch?: UserTradePayload;
     }>("/api/positions/close-side", token, {
       method: "POST",
       body: JSON.stringify({
@@ -1131,6 +1299,7 @@ export const api = {
       };
       reverseSide: TradeSide;
       reverseOrder: OrderRecord;
+      tradePatch?: UserTradePayload;
     }>("/api/positions/reverse-side", token, {
       method: "POST",
       body: JSON.stringify({

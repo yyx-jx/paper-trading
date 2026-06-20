@@ -73,7 +73,7 @@ export const LOG_FACETS = {
       "details"
     ],
     logGroups: ["operation", "settlement", "market_latency", "system_latency", "matching_action"],
-    latencySources: ["binance", "chainlink", "clob", "system"],
+    latencySources: ["binance", "coinbase", "clob", "system"],
     connectionStates: ["healthy", "reconnecting", "stale", "degraded", "disabled"],
     latencyPhases: ["backend", "acquire", "publish", "frontend"]
   },

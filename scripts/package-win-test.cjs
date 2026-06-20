@@ -67,7 +67,7 @@ fs.writeFileSync(
 - 不需要安装 Node.js、npm、Docker、PostgreSQL 或 Redis。
 - 安装包不会包含开发机上的 \`.env\`、数据库目录或日志目录。
 - 测试版默认使用内存模式，重启后交易数据不保证保留。
-- Chainlink 在测试版中默认关闭；行情功能依赖当前网络访问 Binance 和 Polymarket。
+- Coinbase 在测试版中默认关闭；行情功能依赖当前网络访问 Binance 和 Polymarket。
 `,
   "utf8"
 );

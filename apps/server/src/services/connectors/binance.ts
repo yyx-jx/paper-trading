@@ -1,7 +1,7 @@
 import WebSocket from "ws";
 import type { Agent } from "node:http";
 import { createProxyDispatcher, createProxyWsAgent, fetchJsonWithTimeout } from "./network";
-import type { BinanceConnectorState, CandleBar, CandleInterval, CandlePoint, SourceHealth } from "../../domain/types";
+import type { BinanceConnectorState, CandleBar, CandleInterval, SourceHealth } from "../../domain/types";
 
 const BAR_LIMITS: Record<CandleInterval, number> = {
   "30s": 240,
@@ -274,8 +274,7 @@ export class BinanceConnector {
       this.staleTimer = undefined;
     }
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
   }
@@ -381,7 +380,9 @@ export class BinanceConnector {
           this.upsertBar(interval, bar);
         }
       }
-      if (price > 0) {
+      const shouldApplyRestTicker =
+        this.lastWsMessageAt === 0 || now - this.lastWsMessageAt > this.config.wsStaleMs || this.state.price <= 0;
+      if (price > 0 && shouldApplyRestTicker) {
         this.applyTradeTick(price, 0, now);
       }
       if (this.lastWsMessageAt === 0 || now - this.lastWsMessageAt > this.config.wsStaleMs) {
@@ -557,14 +558,6 @@ export class BinanceConnector {
               volume: Number(kline.v ?? 0)
             });
           }
-          const close = Number(kline.c ?? this.state.price);
-          if (close > 0) {
-            this.state.price = roundNumber(close, 2);
-            this.state.latestTick = {
-              ts: sourceEventTs || now,
-              price: roundNumber(close, 2)
-            };
-          }
         }
 
         this.state = {
@@ -729,12 +722,17 @@ export class BinanceConnector {
     }
   }
 
+  private closeSocketQuietly(socket: WebSocket) {
+    socket.removeAllListeners();
+    socket.once("error", () => undefined);
+    socket.close();
+  }
+
   private scheduleReconnect(message: string) {
     this.reconnectCount += 1;
     this.lastWsMessageAt = 0;
     if (this.ws) {
-      this.ws.removeAllListeners();
-      this.ws.close();
+      this.closeSocketQuietly(this.ws);
       this.ws = undefined;
     }
     this.state = {

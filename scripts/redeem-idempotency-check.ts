@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { readSimulationServiceSource, readStoreServiceSource } from "./source-contracts";
 
 type UserStub = {
   id: string;
   username: string;
-  role: "Tester";
+  role: "Admin" | "Tester";
   availableUsdc: number;
 };
 
@@ -35,7 +36,7 @@ type RoundStub = {
   startAt: number;
   endAt: number;
   priceToBeat: number;
-  status: "Redeeming" | "Closed";
+  status: "Manual" | "Settled" | "Redeeming" | "Closed";
   pollCount: number;
   settledSide: "UP" | "DOWN";
   settlementTs: number;
@@ -55,10 +56,12 @@ function createStoreStub(input: { user: UserStub; position: PositionStub }) {
   const ledger = new Set<string>();
   const events: string[] = [];
   const users = new Map<string, UserStub>([[input.user.id, input.user]]);
+  const rounds = new Map<string, RoundStub>();
   return {
     users,
     positions: [input.position],
     events,
+    rounds,
     async withTransaction<T>(handler: () => Promise<T>) {
       events.push("tx:begin");
       try {
@@ -82,6 +85,9 @@ function createStoreStub(input: { user: UserStub; position: PositionStub }) {
     },
     getUserById(userId: string) {
       return users.get(userId);
+    },
+    getRoundById(roundId: string) {
+      return rounds.get(roundId);
     },
     async persistUser() {
       events.push("persist:user");
@@ -170,29 +176,95 @@ async function testRedeemLedgerPreventsDuplicateCredit() {
   assert.ok(store.events.includes("claim:duplicate:position-1"));
 }
 
+async function testManualSettlementImmediatelyRedeemsOldRound() {
+  const user: UserStub = { id: "user-manual", username: "tester", role: "Tester", availableUsdc: 50 };
+  const position: PositionStub = {
+    id: "position-manual",
+    userId: user.id,
+    roundId: "round-manual-old",
+    side: "UP",
+    qty: 4,
+    averageEntry: 0.25,
+    notionalSpent: 1,
+    currentMark: 0.6,
+    currentValue: 2.4,
+    unrealizedPnl: 1.4,
+    realizedPnl: 0,
+    status: "open",
+    openedAt: Date.now() - 3 * 60 * 60_000
+  };
+  const store = createStoreStub({ user, position });
+  const engine = createEngineStub();
+  engine.store = store;
+  engine.redeemLocks = new Set<string>();
+  engine.captureActionSnapshot = () => ({});
+  engine.createBehaviorLog = (input: unknown) => input;
+  engine.writeAuditLog = async () => store.events.push("audit");
+  engine.writeBehaviorLog = async () => store.events.push("behavior");
+  engine.publishSettlementMarketSnapshot = async () => store.events.push("market:publish");
+  engine.scheduleReconcile = () => store.events.push("reconcile:scheduled");
+
+  const round: RoundStub = {
+    id: "round-manual-old",
+    marketId: "market-manual-old",
+    marketSlug: "btc-updown-5m-manual-old",
+    symbol: "BTC",
+    startAt: Date.now() - 3 * 60 * 60_000,
+    endAt: Date.now() - 3 * 60 * 60_000 + 5 * 60_000,
+    priceToBeat: 100000,
+    status: "Manual",
+    pollCount: 12,
+    settledSide: "DOWN",
+    settlementTs: 0,
+    settlementPrice: 0
+  };
+  store.rounds.set(round.id, round);
+
+  await (engine as {
+    manualSettleRound: (
+      actor: UserStub,
+      input: { roundId: string; side: "UP" | "DOWN"; reason?: string }
+    ) => Promise<RoundStub>;
+  }).manualSettleRound(
+    { id: "admin-1", username: "admin", role: "Admin", availableUsdc: 0 },
+    { roundId: round.id, side: "UP", reason: "Admin manual settlement queue selected UP." }
+  );
+
+  assert.equal(position.status, "closed");
+  assert.equal(position.settlementResult, "win");
+  assert.equal(user.availableUsdc, 54);
+  assert.equal(round.status, "Closed");
+  assert.ok(round.redeemFinishTs);
+  assert.ok(store.events.includes("claim:new:position-manual"));
+  assert.ok(store.events.includes("settle:lifecycle"));
+  assert.ok(store.events.includes("reconcile:scheduled"));
+}
+
 function testStaticTransactionAndMigrationWiring() {
   const migration = readFileSync("db/migrations/000003_redeem_ledger.sql", "utf8");
   assert.match(migration, /CREATE TABLE IF NOT EXISTS redeem_ledger/);
   assert.match(migration, /UNIQUE \(round_id, user_id, position_id\)/);
 
-  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
+  const storeSource = readStoreServiceSource();
   assert.match(storeSource, /async withTransaction<T>/);
   assert.match(storeSource, /txStorage\.run\(client, handler\)/);
   assert.match(storeSource, /async claimRedeemLedger/);
   assert.match(storeSource, /ON CONFLICT \(round_id, user_id, position_id\) DO NOTHING/);
 
-  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const simulationSource = readSimulationServiceSource();
   assert.match(simulationSource, /await this\.store\.withTransaction/);
   assert.match(simulationSource, /claimRedeemLedger/);
   assert.match(simulationSource, /redeemedPositionCount/);
+  assert.match(simulationSource, /await this\.applyRedeem\(round\)/);
 
   const configSource = readFileSync("apps/server/src/config.ts", "utf8");
-  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000004"/);
+  assert.match(configSource, /EXPECTED_SCHEMA_MIGRATION_ID, "000008"/);
 }
 
 async function main() {
   testStaticTransactionAndMigrationWiring();
   await testRedeemLedgerPreventsDuplicateCredit();
+  await testManualSettlementImmediatelyRedeemsOldRound();
   console.log("redeem-idempotency-check ok");
 }
 

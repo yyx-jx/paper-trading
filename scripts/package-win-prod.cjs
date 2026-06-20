@@ -7,6 +7,23 @@ const outputDir = path.join(root, "deploy", "windows-production");
 const readmePath = path.join(outputDir, "production-client-readme.md");
 const redactedApiBaseUrl = "http://<PRODUCTION_HOST>:10001";
 const rendererApiBaseUrl = "http://127.0.0.1:18787";
+const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const versionOverride = String(process.env.PACKAGE_VERSION_OVERRIDE || "").trim();
+const packageVersion = versionOverride || String(packageJson.version || "0.0.0");
+const packageVersionForMetadata = packageVersion.replace(/_/g, "-");
+const connectionMode = String(process.env.PROD_CLIENT_CONNECTION_MODE || "proxy").trim().toLowerCase();
+const productionArtifactName = `BTC Paper Trading Setup ${packageVersion}${connectionMode === "direct" ? " Direct" : ""}.\${ext}`;
+const productionInstallerName = productionArtifactName.replace("${ext}", "exe");
+
+function assertPackageVersion(value) {
+  if (!/^\d+\.\d+\.\d+(?:[-_][0-9A-Za-z.-]+)?$/.test(value)) {
+    throw new Error(`Invalid package version override: ${value}`);
+  }
+}
+
+function rendererApiBaseUrlForMode() {
+  return connectionMode === "direct" ? process.env.VITE_API_BASE_URL : rendererApiBaseUrl;
+}
 
 function assertInsideRoot(targetPath) {
   const relative = path.relative(root, targetPath);
@@ -51,10 +68,19 @@ function runNodeScript(scriptPath, args, extraEnv = {}) {
   });
 }
 
+function runLocalBuilds() {
+  runNodeScript(require.resolve("tsup/dist/cli-default.js"), ["--config", "tsup.server.config.ts"]);
+  runNodeScript(require.resolve("tsup/dist/cli-default.js"), ["--config", "tsup.matching.config.ts"]);
+  const viteBinPath = path.join(path.dirname(require.resolve("vite/package.json")), "bin", "vite.js");
+  runNodeScript(viteBinPath, ["build", "--config", "apps/client/vite.config.ts"], {
+    VITE_API_BASE_URL: rendererApiBaseUrlForMode()
+  });
+}
+
 function createPortableZip() {
   const unpackedDir = path.join(outputDir, "win-unpacked");
   const exePath = path.join(unpackedDir, "BTC Paper Trading.exe");
-  const zipPath = path.join(outputDir, "BTC Paper Trading Portable.zip");
+  const zipPath = path.join(outputDir, `BTC Paper Trading Portable ${packageVersion}.zip`);
   if (!fs.existsSync(exePath)) {
     throw new Error("electron-builder did not produce win-unpacked/BTC Paper Trading.exe.");
   }
@@ -85,18 +111,14 @@ function createPortableZip() {
 }
 
 assertProductionApiBaseUrl(process.env.VITE_API_BASE_URL);
+assertPackageVersion(packageVersion);
+if (!["proxy", "direct"].includes(connectionMode)) {
+  throw new Error("PROD_CLIENT_CONNECTION_MODE must be proxy or direct.");
+}
 assertInsideRoot(outputDir);
 fs.rmSync(outputDir, { recursive: true, force: true });
 fs.mkdirSync(outputDir, { recursive: true });
-
-const npmCli = process.env.npm_execpath;
-if (!npmCli) {
-  throw new Error("npm_execpath is not available; run this script through npm.");
-}
-
-runNodeScript(npmCli, ["run", "build"], {
-  VITE_API_BASE_URL: rendererApiBaseUrl
-});
+runLocalBuilds();
 let nsisSucceeded = true;
 try {
   runNodeScript(require.resolve("electron-builder/cli.js"), [
@@ -107,10 +129,13 @@ try {
     "never",
     "-c.appId=com.local.btcpapertrading",
     "-c.productName=BTC Paper Trading",
+    "-c.win.signAndEditExecutable=false",
+    `-c.extraMetadata.version=${packageVersionForMetadata}`,
     `-c.extraMetadata.productionApiBaseUrl=${process.env.VITE_API_BASE_URL}`,
     "-c.directories.output=deploy/windows-production",
-    "-c.win.artifactName=BTC Paper Trading Setup.${ext}",
-    "-c.nsis.shortcutName=BTC Paper Trading"
+    `-c.win.artifactName=${productionArtifactName}`,
+    "-c.nsis.shortcutName=BTC Paper Trading",
+    `-c.extraMetadata.productionClientConnectionMode=${connectionMode}`
   ]);
 } catch (error) {
   nsisSucceeded = false;
@@ -134,10 +159,13 @@ fs.writeFileSync(
 This installer is the production C/S client. It does not start a local memory backend by default.
 
 - API base URL shown in this README: ${redactedApiBaseUrl}
-- Client runtime URL: ${rendererApiBaseUrl}
+- Client version: ${packageVersion}
+- Installer filename: ${productionInstallerName}
+- Client runtime URL: ${connectionMode === "direct" ? redactedApiBaseUrl : rendererApiBaseUrl}
+- Connection mode: ${connectionMode}
 - WebSocket URLs are derived from the API base URL and use WSS for HTTPS origins or WS for temporary HTTP origins.
 - Temporary HTTP mode: ${process.env.ALLOW_INSECURE_PROD_HTTP === "true" ? "enabled" : "disabled"}
-- Connection mode: Electron starts a local proxy on 127.0.0.1 and forwards traffic to the production server.
+- Proxy mode: ${connectionMode === "proxy" ? "Electron starts a local proxy on 127.0.0.1 and forwards traffic to the production server." : "disabled; renderer connects to the production API directly."}
 - Use this installer only after the Docker + Caddy server is ready.
 `,
   "utf8"

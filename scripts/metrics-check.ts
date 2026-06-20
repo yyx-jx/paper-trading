@@ -13,6 +13,8 @@ metrics.recordWsSend("market", 512, 3, true);
 metrics.recordWsDisconnect("user", "close");
 metrics.recordOrder("filled", 35);
 metrics.recordOrder("failed", 50);
+metrics.recordTradePersistSegment("persistOrder", 12);
+metrics.recordTradePersistSegment("persistPosition", 25);
 metrics.setPendingOrders(4);
 metrics.recordPositionClose("success");
 metrics.recordExport("customer_dataset", "success", 25);
@@ -87,6 +89,7 @@ async function main() {
     "ws_disconnects_total",
     "order_status_total",
     "order_place_duration_seconds",
+    "trade_persist_segment_duration_seconds",
     "pending_orders_total",
     "position_close_requests_total",
     "export_requests_total",
@@ -107,6 +110,8 @@ async function main() {
 
   assert.match(text, /http_requests_total\{method="GET",route="\/api\/health\/ready",status="200"\} 1/);
   assert.match(text, /ws_connections\{channel="market"\} 2/);
+  assert.match(text, /trade_persist_segment_duration_seconds_count\{segment="persistOrder"\} 1/);
+  assert.match(text, /trade_persist_segment_duration_seconds_count\{segment="persistPosition"\} 1/);
   assert.match(text, /jsonl_queue_depth\{writer="audit"\} 0/);
   assert.match(text, /jsonl_rotation_total\{writer="audit"\} 2/);
   assert.match(text, /jsonl_dropped_records_total\{writer="audit"\} 3/);
@@ -119,6 +124,7 @@ async function main() {
   });
 
   const indexSource = await readFile("apps/server/src/index.ts", "utf8");
+  const heartbeatSource = await readFile("apps/server/src/ws/heartbeat.ts", "utf8");
   for (const field of [
     "eventLoopLagMs",
     "http",
@@ -136,8 +142,10 @@ async function main() {
   assert.match(indexSource, /exports: appMetrics\.getExportOverview\(\)/);
   assert.doesNotMatch(indexSource, /metricsExposePublic/);
   assert.doesNotMatch(indexSource, /see \/metrics counters/);
-  assert.match(indexSource, /heartbeatTimeoutSockets\.add\(socket\)/);
   assert.match(indexSource, /consumeHeartbeatTimeout\(socket\)/);
+  assert.match(indexSource, /createHeartbeatController/);
+  assert.match(heartbeatSource, /heartbeatTimeoutSockets\.add\(socket\)/);
+  assert.match(heartbeatSource, /recordDisconnect\?\.\(channel, "heartbeat_timeout"\)/);
 
   console.log("metrics-check ok");
 }

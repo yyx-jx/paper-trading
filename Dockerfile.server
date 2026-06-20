@@ -1,7 +1,13 @@
 FROM node:24-alpine AS deps
 WORKDIR /app
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 COPY package.json package-lock.json ./
 RUN npm ci
+
+FROM node:24-alpine AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 FROM node:24-alpine AS builder
 WORKDIR /app
@@ -12,9 +18,9 @@ RUN npm run build
 FROM node:24-alpine AS base-runner
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apk add --no-cache bash postgresql-client
 COPY package.json package-lock.json ./
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
+COPY --from=prod-deps /app/node_modules ./node_modules
 COPY scripts ./scripts
 COPY db ./db
 COPY apps/server/src ./apps/server/src
@@ -23,9 +29,11 @@ RUN chown -R node:node /app/data
 USER node
 
 FROM base-runner AS app-server
+COPY --from=builder /app/dist/server ./dist/server
 EXPOSE 8787
 CMD ["node", "dist/server/index.js"]
 
 FROM base-runner AS matching-service
+COPY --from=builder /app/dist/matching ./dist/matching
 EXPOSE 8788
 CMD ["node", "dist/matching/matching-index.js"]

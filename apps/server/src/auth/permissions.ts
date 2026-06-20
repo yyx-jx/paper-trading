@@ -20,6 +20,7 @@ export const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
     "profile:update",
     "profile:password:change",
     "users:list",
+    "users:create",
     "users:disable",
     "users:enable",
     "users:reset-password",
@@ -40,7 +41,12 @@ export const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
     "profile:password:change",
     "system:status:view",
     "users:list",
-    "users:manager:update",
+    "users:create",
+    "users:disable",
+    "users:enable",
+    "users:reset-password",
+    "users:update",
+    "users:balance:set",
     "users:permission-level:update",
     "logs:view:team",
     "logs:view:managed",
@@ -77,7 +83,8 @@ export const ROLE_PERMISSIONS: Record<Role, PermissionCode[]> = {
     "data:export:include-d",
     "quality:review",
     "strategy:config",
-    "market:config"
+    "market:config",
+    "settlement:manual"
   ]
 };
 

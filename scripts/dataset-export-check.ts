@@ -20,7 +20,7 @@ const baseLog: BehaviorActionLog = {
   binance1mLastClose: 1,
   binance5mLastClose: 1,
   binance1dLastClose: 1,
-  chainlinkPrice: 1,
+  coinbasePrice: 1,
   priceToBeat: 1,
   upPrice: 0.5,
   downPrice: 0.5,
@@ -35,7 +35,7 @@ const baseLog: BehaviorActionLog = {
   },
   sourceStates: {
     binance: "healthy",
-    chainlink: "disabled",
+    coinbase: "disabled",
     clob: "healthy"
   },
   qualityGrade: "A"

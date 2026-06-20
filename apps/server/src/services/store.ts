@@ -17,6 +17,44 @@ import { createClient } from "redis";
 import { ROLE_PERMISSIONS, normalizeRolePermissions } from "../auth/permissions";
 import { hashPassword, isBcryptHash, verifyPassword } from "../auth/password";
 import { AsyncJsonlWriter } from "./log-writer";
+import { trimArrayByCreatedAt } from "./store/cache-pruning";
+import {
+  detailString,
+  hasUnsupportedBehaviorSearchFilter,
+  matchesAuditSearch,
+  matchesBehaviorSearch,
+  normalizeSearchLimit,
+  resolveBehaviorSearchUserIds
+} from "./store/log-search";
+import {
+  dedupeMarketCandles,
+  isValidMarketCandle,
+  marketCandleKey,
+  mergeMarketCandlesIntoMemory
+} from "./store/market-candles";
+import { cloneOrderBookSnapshot, orderBookSnapshotRef } from "./store/order-book-snapshots";
+import {
+  buildBulkUpsertQuery,
+  buildCombinedBulkUpsertQuery,
+  flattenBulkUpsertParams,
+  orderLifecyclePersistenceSpec,
+  orderPersistenceSpec,
+  positionPersistenceSpec,
+  userPersistenceSpec
+} from "./store/persistence-batches";
+import { buildProfileOverview } from "./store/profile";
+import {
+  rowToAuditEvent,
+  rowToBehaviorLog,
+  rowToMarketCandle,
+  rowToOrder,
+  rowToOrderBookSnapshotRecord,
+  rowToOrderLifecycle,
+  rowToPosition,
+  rowToRound
+} from "./store/row-mappers";
+import { createUserPayloadRequest, mergeUserPayloadRequest, type UserPayloadRequest, type UserPayloadScope } from "../ws/user-payload-scope";
+import { SCHEMA_SQL } from "./store/schema";
 import type {
   AuditEvent,
   AuditLogQuery,
@@ -26,6 +64,8 @@ import type {
   CandleInterval,
   Language,
   LogSearchQuery,
+  MarketCandleQuery,
+  MarketCandleRecord,
   MarketSnapshot,
   OrderBookSnapshotRecord,
   OrderLifecycleExitType,
@@ -39,11 +79,9 @@ import type {
   PublicUser,
   Role,
   RoundRecord,
-  RoundStatus,
   SourceHealth,
   TradeSide,
   TradeTimeline,
-  UserPayload,
   UserRecord
 } from "../domain/types";
 
@@ -54,7 +92,12 @@ const QTY_EPSILON = 0.0000001;
 const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
 const LOG_FILE_TAIL_BYTES = 512 * 1024;
 const MEMORY_GUARD_INTERVAL_MS = 15_000;
+const PRUNE_MEMORY_CACHES_THROTTLE_MS = 1_000;
 const PERSISTENCE_FAILURE_THRESHOLD = 3;
+const MARKET_CANDLE_MEMORY_RETENTION_MS = 24 * 60 * 60_000;
+const MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS = 1_000;
+const ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS = 1_000;
+const PERSIST_UPSERT_BATCH_SIZE = 50;
 const txStorage = new AsyncLocalStorage<PoolClient>();
 
 type MemoryProtectionState = "normal" | "warning" | "protect";
@@ -82,23 +125,6 @@ function isFiveMinuteRound(round: RoundRecord) {
   return round.endAt > round.startAt && round.endAt - round.startAt === FIVE_MINUTE_ROUND_MS;
 }
 
-function cloneOrderBookSnapshot(snapshot: OrderBookSnapshot): OrderBookSnapshot {
-  return {
-    snapshotId: snapshot.snapshotId,
-    snapshotTs: snapshot.snapshotTs,
-    bestBid: snapshot.bestBid,
-    bestAsk: snapshot.bestAsk,
-    midPrice: snapshot.midPrice,
-    bids: snapshot.bids.map((level) => ({ ...level })),
-    asks: snapshot.asks.map((level) => ({ ...level }))
-  };
-}
-
-function orderBookSnapshotRef(snapshot: OrderBookSnapshot) {
-  const normalized = cloneOrderBookSnapshot(snapshot);
-  return `obs_${createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 32)}`;
-}
-
 function parseBtcFiveMinuteSlugStart(value?: string) {
   const match = value?.toLowerCase().match(/^btc-updown-5m-(\d+)$/);
   if (!match) {
@@ -115,10 +141,6 @@ function inferFiveMinuteWindow(input: { roundId: string; marketSlug?: string; fa
     startAt,
     endAt: startAt + FIVE_MINUTE_ROUND_MS
   };
-}
-
-function sanitizePolymarketBtcReference(price?: number) {
-  return typeof price === "number" && Number.isFinite(price) && price > 1000 ? price : undefined;
 }
 
 function readUtf8Tail(filePath: string, maxBytes: number) {
@@ -160,419 +182,6 @@ function readJsonlTail<T>(filePath: string, maxBytes: number, guard: (value: unk
     .filter(guard);
 }
 
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  username TEXT UNIQUE NOT NULL,
-  password TEXT NOT NULL,
-  display_name TEXT NOT NULL,
-  role TEXT NOT NULL,
-  language TEXT NOT NULL,
-  permission_codes JSONB NOT NULL,
-  available_usdc DOUBLE PRECISION NOT NULL,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  senior_tester_id TEXT,
-  disabled_at BIGINT,
-  disabled_by TEXT,
-  manager_user_id TEXT,
-  permission_level TEXT NOT NULL DEFAULT 'Standard',
-  failed_login_count INTEGER NOT NULL DEFAULT 0,
-  locked_until BIGINT,
-  password_changed_at BIGINT,
-  last_login_at BIGINT,
-  must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
-  data_version INTEGER NOT NULL DEFAULT 1,
-  created_at BIGINT NOT NULL,
-  updated_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS rounds (
-  id TEXT PRIMARY KEY,
-  market_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  event_id TEXT,
-  market_slug TEXT,
-  event_slug TEXT,
-  condition_id TEXT,
-  series_slug TEXT,
-  up_token_id TEXT,
-  down_token_id TEXT,
-  title TEXT,
-  resolution_source TEXT,
-  start_at BIGINT NOT NULL,
-  end_at BIGINT NOT NULL,
-  price_to_beat DOUBLE PRECISION NOT NULL,
-  price_to_beat_source TEXT,
-  price_to_beat_captured_at BIGINT,
-  status TEXT NOT NULL,
-  poll_count INTEGER NOT NULL,
-  poll_start_at BIGINT,
-  last_poll_at BIGINT,
-  closing_spot_price DOUBLE PRECISION,
-  settled_side TEXT,
-  settlement_price DOUBLE PRECISION,
-  settlement_ts BIGINT,
-  redeem_start_ts BIGINT,
-  redeem_finish_ts BIGINT,
-  manual_reason TEXT,
-  accepting_orders BOOLEAN,
-  closing_price_source TEXT,
-  settlement_source TEXT,
-  polymarket_settlement_price DOUBLE PRECISION,
-  polymarket_settlement_status TEXT,
-  polymarket_open_price DOUBLE PRECISION,
-  polymarket_close_price DOUBLE PRECISION,
-  polymarket_open_price_source TEXT,
-  polymarket_close_price_source TEXT,
-  settlement_received_at BIGINT,
-  redeem_scheduled_at BIGINT,
-  binance_open_price DOUBLE PRECISION,
-  binance_close_price DOUBLE PRECISION
-);
-
-CREATE TABLE IF NOT EXISTS order_book_snapshots (
-  ref TEXT PRIMARY KEY,
-  snapshot_id TEXT NOT NULL,
-  snapshot_ts BIGINT NOT NULL,
-  best_bid DOUBLE PRECISION NOT NULL,
-  best_ask DOUBLE PRECISION NOT NULL,
-  mid_price DOUBLE PRECISION NOT NULL,
-  snapshot JSONB NOT NULL,
-  created_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-  id TEXT PRIMARY KEY,
-  trace_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  market_id TEXT NOT NULL,
-  order_kind TEXT,
-  time_in_force TEXT,
-  limit_price DOUBLE PRECISION,
-  lifecycle_status TEXT,
-  result_type TEXT,
-  token_id TEXT,
-  book_key TEXT,
-  book_hash TEXT,
-  requested_amount_usdc DOUBLE PRECISION,
-  requested_qty DOUBLE PRECISION,
-  frozen_usdc DOUBLE PRECISION,
-  frozen_qty DOUBLE PRECISION,
-  fills JSONB,
-  estimated_fee DOUBLE PRECISION,
-  actual_fee DOUBLE PRECISION,
-  fee_breakdown JSONB,
-  fee_currency TEXT,
-  source_latency_ms DOUBLE PRECISION,
-  market_slug TEXT,
-  order_book_snapshot_ref TEXT,
-  order_book_snapshot JSONB,
-  action TEXT NOT NULL,
-  side TEXT NOT NULL,
-  status TEXT NOT NULL,
-  notional_usdc DOUBLE PRECISION NOT NULL,
-  expected_qty DOUBLE PRECISION NOT NULL,
-  filled_qty DOUBLE PRECISION NOT NULL,
-  unfilled_qty DOUBLE PRECISION NOT NULL,
-  avg_fill_price DOUBLE PRECISION,
-  best_bid DOUBLE PRECISION NOT NULL,
-  best_ask DOUBLE PRECISION NOT NULL,
-  mid_price DOUBLE PRECISION NOT NULL,
-  book_snapshot_ts BIGINT NOT NULL,
-  partial_filled BOOLEAN NOT NULL,
-  slippage_bps DOUBLE PRECISION,
-  match_latency_ms DOUBLE PRECISION NOT NULL,
-  book_acquire_latency_ms DOUBLE PRECISION,
-  local_match_latency_ms DOUBLE PRECISION,
-  persist_latency_ms DOUBLE PRECISION,
-  total_order_latency_ms DOUBLE PRECISION,
-  failure_reason TEXT,
-  client_order_id TEXT,
-  client_send_ts BIGINT,
-  server_recv_ts BIGINT NOT NULL,
-  server_publish_ts BIGINT NOT NULL,
-  created_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS order_lifecycle_logs (
-  id TEXT PRIMARY KEY,
-  buy_order_id TEXT UNIQUE NOT NULL,
-  trace_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  tester_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  asset_class TEXT NOT NULL,
-  market_id TEXT NOT NULL,
-  market_slug TEXT,
-  direction TEXT NOT NULL,
-  order_timestamp_ms BIGINT NOT NULL,
-  entry_token_price DOUBLE PRECISION,
-  btc_trade_price DOUBLE PRECISION,
-  btc_open_price_to_beat DOUBLE PRECISION,
-  delta_btc DOUBLE PRECISION,
-  volume_token_qty DOUBLE PRECISION NOT NULL,
-  remaining_token_qty DOUBLE PRECISION NOT NULL,
-  closed_token_qty DOUBLE PRECISION NOT NULL,
-  position_notional DOUBLE PRECISION NOT NULL,
-  exit_type TEXT,
-  exit_token_price DOUBLE PRECISION,
-  exit_notional DOUBLE PRECISION NOT NULL,
-  settlement_result TEXT,
-  order_book_snapshot_ref TEXT,
-  actual_fill_price DOUBLE PRECISION,
-  slippage_bps DOUBLE PRECISION,
-  match_latency_ms DOUBLE PRECISION NOT NULL,
-  settlement_time_ms BIGINT,
-  settlement_direction TEXT,
-  entry_fee DOUBLE PRECISION,
-  exit_fee DOUBLE PRECISION,
-  fee_currency TEXT,
-  created_at BIGINT NOT NULL,
-  updated_at BIGINT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS positions (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  round_id TEXT NOT NULL,
-  side TEXT NOT NULL,
-  qty DOUBLE PRECISION NOT NULL,
-  locked_qty DOUBLE PRECISION,
-  average_entry DOUBLE PRECISION NOT NULL,
-  notional_spent DOUBLE PRECISION NOT NULL,
-  current_mark DOUBLE PRECISION NOT NULL,
-  current_bid DOUBLE PRECISION,
-  current_ask DOUBLE PRECISION,
-  current_mid DOUBLE PRECISION,
-  current_value DOUBLE PRECISION,
-  source_latency_ms DOUBLE PRECISION,
-  unrealized_pnl DOUBLE PRECISION NOT NULL,
-  realized_pnl DOUBLE PRECISION NOT NULL,
-  entry_fee_usdc DOUBLE PRECISION,
-  exit_fee_usdc DOUBLE PRECISION,
-  total_fee_usdc DOUBLE PRECISION,
-  cost_basis_usdc DOUBLE PRECISION,
-  mark_pnl_usdc DOUBLE PRECISION,
-  executable_pnl_usdc DOUBLE PRECISION,
-  data_version INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL,
-  opened_at BIGINT NOT NULL,
-  closed_at BIGINT,
-  settlement_result TEXT
-);
-
-CREATE TABLE IF NOT EXISTS audit_events (
-  event_id TEXT PRIMARY KEY,
-  trace_id TEXT NOT NULL,
-  category TEXT NOT NULL,
-  action_type TEXT NOT NULL,
-  action_status TEXT NOT NULL,
-  user_id TEXT,
-  role TEXT,
-  page_name TEXT NOT NULL,
-  module_name TEXT NOT NULL,
-  symbol TEXT,
-  round_id TEXT,
-  result_code TEXT NOT NULL,
-  result_message TEXT NOT NULL,
-  client_send_ts BIGINT,
-  server_recv_ts BIGINT NOT NULL,
-  engine_start_ts BIGINT,
-  engine_finish_ts BIGINT,
-  server_publish_ts BIGINT NOT NULL,
-  backend_latency_ms DOUBLE PRECISION NOT NULL,
-  frontend_latency_ms DOUBLE PRECISION,
-  details JSONB
-);
-
-CREATE TABLE IF NOT EXISTS behavior_action_logs (
-  log_id TEXT PRIMARY KEY,
-  timestamp_ms BIGINT NOT NULL,
-  asset_class TEXT NOT NULL,
-  action_type TEXT NOT NULL,
-  action_status TEXT NOT NULL,
-  round_id TEXT,
-  direction TEXT,
-  entry_odds DOUBLE PRECISION,
-  delta_clob DOUBLE PRECISION NOT NULL,
-  volume_clob DOUBLE PRECISION NOT NULL,
-  position_notional DOUBLE PRECISION,
-  exit_type TEXT,
-  exit_odds DOUBLE PRECISION,
-  settlement_result TEXT,
-  tester_id_anon TEXT NOT NULL,
-  trace_id TEXT,
-  order_id TEXT,
-  market_id TEXT,
-  market_slug TEXT,
-  round_status TEXT,
-  countdown_ms BIGINT,
-  binance_spot_price DOUBLE PRECISION NOT NULL,
-  binance_1m_last_close DOUBLE PRECISION NOT NULL,
-  binance_5m_last_close DOUBLE PRECISION NOT NULL,
-  binance_1d_last_close DOUBLE PRECISION NOT NULL,
-  chainlink_price DOUBLE PRECISION NOT NULL,
-  price_to_beat DOUBLE PRECISION NOT NULL,
-  up_price DOUBLE PRECISION NOT NULL,
-  down_price DOUBLE PRECISION NOT NULL,
-  up_book_top5 JSONB NOT NULL,
-  down_book_top5 JSONB NOT NULL,
-  recent_trades_top20 JSONB NOT NULL,
-  book_snapshot_entry JSONB NOT NULL,
-  actual_fill_price DOUBLE PRECISION,
-  slippage_bps DOUBLE PRECISION,
-  partial_filled BOOLEAN,
-  unfilled_qty DOUBLE PRECISION,
-  execution_latency_ms DOUBLE PRECISION,
-  settlement_direction TEXT,
-  settlement_time_ms BIGINT,
-  gamma_poll_count INTEGER,
-  redeem_finish_time_ms BIGINT,
-  source_states JSONB NOT NULL,
-  strategy_cluster_label TEXT,
-  market_regime_label TEXT,
-  quality_grade TEXT,
-  context_json JSONB
-);
-
-CREATE TABLE IF NOT EXISTS export_audit_logs (
-  export_id TEXT PRIMARY KEY,
-  actor_user_id TEXT NOT NULL,
-  actor_role TEXT NOT NULL,
-  export_type TEXT NOT NULL,
-  format TEXT NOT NULL,
-  scope JSONB NOT NULL,
-  record_count INTEGER NOT NULL,
-  filtered_d_grade_count INTEGER NOT NULL,
-  missing_quality_count INTEGER NOT NULL,
-  file_sha256 TEXT NOT NULL,
-  created_at_ms BIGINT NOT NULL,
-  details JSONB
-);
-
-CREATE TABLE IF NOT EXISTS redeem_ledger (
-  id TEXT PRIMARY KEY,
-  round_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  position_id TEXT NOT NULL,
-  redeem_amount_usdc DOUBLE PRECISION NOT NULL,
-  realized_pnl_usdc DOUBLE PRECISION NOT NULL,
-  settlement_result TEXT NOT NULL,
-  created_at_ms BIGINT NOT NULL,
-  details JSONB,
-  UNIQUE (round_id, user_id, position_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_rounds_start_at ON rounds(start_at DESC);
-CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_ts ON order_book_snapshots(snapshot_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_user_client_order_id ON orders(user_id, client_order_id) WHERE client_order_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_order_lifecycle_user_time ON order_lifecycle_logs(user_id, order_timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_order_lifecycle_round ON order_lifecycle_logs(round_id, direction, order_timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_positions_user_opened ON positions(user_id, opened_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_user_recv ON audit_events(user_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_round_recv ON audit_events(round_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_category_action_recv ON audit_events(category, action_type, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_trace_recv ON audit_events(trace_id, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_module_recv ON audit_events(module_name, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_latency_recv ON audit_events(category, module_name, backend_latency_ms, server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_order_id ON audit_events((details->>'orderId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_position_id ON audit_events((details->>'positionId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_market_id ON audit_events((details->>'marketId'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_market_slug ON audit_events((details->>'marketSlug'));
-CREATE INDEX IF NOT EXISTS idx_audit_events_details_connection_state ON audit_events((details->>'connectionState'), server_recv_ts DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_timestamp ON behavior_action_logs(timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_user_round ON behavior_action_logs(tester_id_anon, round_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_market_time ON behavior_action_logs(market_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_trace_time ON behavior_action_logs(trace_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_order_time ON behavior_action_logs(order_id, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_action_time ON behavior_action_logs(action_type, action_status, timestamp_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_behavior_logs_round_status_time ON behavior_action_logs(round_status, timestamp_ms DESC);
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS senior_tester_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_by TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS manager_user_id TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_level TEXT NOT NULL DEFAULT 'Standard';
-ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT;
-UPDATE users SET updated_at = created_at WHERE updated_at IS NULL;
-UPDATE users SET manager_user_id = senior_tester_id WHERE manager_user_id IS NULL AND senior_tester_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_users_senior_tester ON users(senior_tester_id);
-CREATE INDEX IF NOT EXISTS idx_users_manager_user ON users(manager_user_id);
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_settlement_status TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_open_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_close_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_open_price_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS polymarket_close_price_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS settlement_received_at BIGINT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS redeem_scheduled_at BIGINT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_open_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS binance_close_price DOUBLE PRECISION;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_source TEXT;
-ALTER TABLE rounds ADD COLUMN IF NOT EXISTS price_to_beat_captured_at BIGINT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_kind TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS time_in_force TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS limit_price DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS lifecycle_status TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS result_type TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS token_id TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_key TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_hash TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS requested_amount_usdc DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS requested_qty DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_usdc DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_qty DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fills JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS estimated_fee DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS actual_fee DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_breakdown JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS fee_currency TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS market_slug TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_book_snapshot_ref TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_book_snapshot JSONB;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS book_acquire_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS local_match_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS persist_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_order_latency_ms DOUBLE PRECISION;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS locked_qty DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_bid DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_ask DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_mid DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS current_value DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS source_latency_ms DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS exit_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS total_fee_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS cost_basis_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS mark_pnl_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS executable_pnl_usdc DOUBLE PRECISION;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS entry_fee DOUBLE PRECISION;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS exit_fee DOUBLE PRECISION;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS fee_currency TEXT;
-ALTER TABLE order_lifecycle_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE behavior_action_logs ADD COLUMN IF NOT EXISTS data_version INTEGER NOT NULL DEFAULT 1;
-CREATE INDEX IF NOT EXISTS idx_export_audit_logs_actor_created ON export_audit_logs(actor_user_id, created_at_ms DESC);
-CREATE INDEX IF NOT EXISTS idx_redeem_ledger_round_user ON redeem_ledger(round_id, user_id);
-`;
-
 const LOG_DIR = path.resolve(process.cwd(), "data/logs");
 const LOG_FILE = path.join(LOG_DIR, "audit-events.jsonl");
 const BEHAVIOR_LOG_FILE = path.join(LOG_DIR, "behavior-action-logs.jsonl");
@@ -596,12 +205,12 @@ function createEmptyCandleBar(interval: CandleInterval, now: number): CandleBar 
   };
 }
 
-function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): MarketSnapshot {
+function createEmptyMarketSnapshot(symbol: string, coinbaseEnabled: boolean): MarketSnapshot {
   const now = Date.now();
-  const emptySource = (source: "Binance" | "Chainlink" | "CLOB"): SourceHealth => ({
+  const emptySource = (source: "Binance" | "Coinbase" | "CLOB"): SourceHealth => ({
     source,
     symbol,
-    state: source === "Chainlink" && !chainlinkEnabled ? "disabled" : "reconnecting",
+    state: source === "Coinbase" && !coinbaseEnabled ? "disabled" : "reconnecting",
     reconnectCount: 0,
     sourceEventTs: now,
     serverRecvTs: now,
@@ -611,8 +220,8 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     publishLatencyMs: 0,
     frontendLatencyMs: 0,
     message:
-      source === "Chainlink" && !chainlinkEnabled
-        ? "Chainlink is disabled in local testing mode."
+      source === "Coinbase" && !coinbaseEnabled
+        ? "Coinbase is disabled in local testing mode."
         : `Waiting for ${source}.`
   });
   return {
@@ -620,7 +229,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
     marketId: "",
     serverNow: now,
     binancePrice: 0,
-    chainlinkPrice: 0,
+    coinbasePrice: 0,
     currentPrice: 0,
     priceToBeat: 0,
     displayPriceToBeat: undefined,
@@ -640,13 +249,13 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       DOWN: 0
     },
     latencyBreakdown: {
-      sourceEventAge: { binance: 0, chainlink: 0, clob: 0 },
-      serverIngressLatency: { binance: 0, chainlink: 0, clob: 0 },
+      sourceEventAge: { binance: 0, coinbase: 0, clob: 0 },
+      serverIngressLatency: { binance: 0, coinbase: 0, clob: 0 },
       serverComputeLatency: 0
     },
     sources: {
       binance: emptySource("Binance"),
-      chainlink: emptySource("Chainlink"),
+      coinbase: emptySource("Coinbase"),
       clob: emptySource("CLOB")
     },
     orderBooks: {
@@ -686,7 +295,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
         "1d": [createEmptyCandleBar("1d", now)]
       }
     },
-    chainlink: {
+    coinbase: {
       referencePrice: 0,
       settlementReference: 0,
       candles5s: [],
@@ -750,7 +359,7 @@ function createEmptyMarketSnapshot(symbol: string, chainlinkEnabled: boolean): M
       marketSwitchState: "market_not_ready",
       sourceStatusSummary: [
         { source: "Binance", state: "reconnecting" },
-        { source: "Chainlink", state: chainlinkEnabled ? "reconnecting" : "disabled" },
+        { source: "Coinbase", state: coinbaseEnabled ? "reconnecting" : "disabled" },
         { source: "CLOB", state: "reconnecting" }
       ]
     }
@@ -777,9 +386,6 @@ export type TradeMutationMemorySnapshot = {
   orders: OrderRecord[];
   positions: PositionRecord[];
   orderLifecycleLogs: OrderLifecycleRecord[];
-  orderBookSnapshots: Array<[string, OrderBookSnapshotRecord]>;
-  logs: AuditEvent[];
-  behaviorLogs: BehaviorActionLog[];
 };
 
 export class AppStore {
@@ -789,7 +395,9 @@ export class AppStore {
   public readonly orders: OrderRecord[] = [];
   public readonly orderLifecycleLogs: OrderLifecycleRecord[] = [];
   public readonly orderBookSnapshots = new Map<string, OrderBookSnapshotRecord>();
+  private readonly pendingOrderBookSnapshotRecords = new Map<string, OrderBookSnapshotRecord>();
   public readonly positions: PositionRecord[] = [];
+  private readonly marketCandles = new Map<string, MarketCandleRecord[]>();
   public readonly logs: AuditEvent[] = [];
   public readonly behaviorLogs: BehaviorActionLog[] = [];
   public marketSnapshot: MarketSnapshot;
@@ -803,14 +411,27 @@ export class AppStore {
   private redisEnabled = false;
   private queuedMarketSnapshot?: MarketSnapshot;
   private marketSnapshotPersistRunning = false;
+  private marketSnapshotPersistTimer?: ReturnType<typeof setTimeout>;
+  private lastMarketSnapshotPersistAt = 0;
   private lastRetentionCleanupAt = 0;
+  private retentionCleanupRunning = false;
   private lastMemoryGuardAt = 0;
+  private lastPruneMemoryCachesAt = 0;
   private readonly orderIndexById = new Map<string, number>();
   private readonly positionIndexById = new Map<string, number>();
   private readonly orderLifecycleIndexById = new Map<string, number>();
-  private readonly pendingUserPayloadIds = new Set<string>();
+  private ordersByUserId = new Map<string, OrderRecord[]>();
+  private positionsByUserId = new Map<string, PositionRecord[]>();
+  private orderLifecyclesByUserId = new Map<string, OrderLifecycleRecord[]>();
+  private operatedRoundIdsByUserId = new Map<string, Set<string>>();
+  private readonly pendingUserPayloadIds = new Map<string, UserPayloadRequest>();
+  private readonly pendingTradePositionIds = new Map<string, Set<string>>();
   private readonly memoryRedeemLedgerKeys = new Set<string>();
   private userPayloadFlushScheduled = false;
+  private orderBookSnapshotFlushRunning = false;
+  private orderBookSnapshotFlushTimer?: ReturnType<typeof setTimeout>;
+  private orderBookSnapshotFlushFailures = 0;
+  private orderBookSnapshotLastFlushMs = 0;
   private memoryProtectionState: MemoryProtectionState = "normal";
   private postgresReconnectTask?: Promise<void>;
   private closed = false;
@@ -828,7 +449,7 @@ export class AppStore {
     databaseUrl: string;
     redisUrl: string;
     persistenceMode: "external" | "memory";
-    chainlinkEnabled: boolean;
+    coinbaseEnabled: boolean;
     strictPersistence: boolean;
     seedDefaultUsers?: boolean;
     requireSchemaMigrations?: boolean;
@@ -860,7 +481,7 @@ export class AppStore {
     databaseUrl: string;
     redisUrl: string;
     persistenceMode: "external" | "memory";
-    chainlinkEnabled: boolean;
+    coinbaseEnabled: boolean;
     strictPersistence: boolean;
     seedDefaultUsers: boolean;
     requireSchemaMigrations: boolean;
@@ -888,11 +509,11 @@ export class AppStore {
       seedDefaultUsers: config.seedDefaultUsers ?? true,
       requireSchemaMigrations: config.requireSchemaMigrations ?? false,
       allowDevSchemaBootstrap: config.allowDevSchemaBootstrap ?? true,
-      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000004"
+      expectedSchemaMigrationId: config.expectedSchemaMigrationId ?? "000007"
     };
     this.snapshotCacheKey = `market:snapshot:${config.symbol}`;
     this.sourcesCacheKey = `market:sources:${config.symbol}`;
-    this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.chainlinkEnabled);
+    this.marketSnapshot = createEmptyMarketSnapshot(config.symbol, config.coinbaseEnabled);
     this.persistenceHealth = {
       postgres: {
         enabled: config.persistenceMode !== "memory",
@@ -1054,25 +675,21 @@ export class AppStore {
     };
   }
 
+  getOrderBookSnapshotQueueStats() {
+    return {
+      pending: this.pendingOrderBookSnapshotRecords.size,
+      flushing: this.orderBookSnapshotFlushRunning,
+      failures: this.orderBookSnapshotFlushFailures,
+      lastFlushMs: this.orderBookSnapshotLastFlushMs
+    };
+  }
+
   captureTradeMutationSnapshot(): TradeMutationMemorySnapshot {
     return {
       users: [...this.users.entries()].map(([id, user]) => [id, { ...user }]),
       orders: this.orders.map((order) => ({ ...order })),
       positions: this.positions.map((position) => ({ ...position })),
-      orderLifecycleLogs: this.orderLifecycleLogs.map((log) => ({ ...log })),
-      orderBookSnapshots: [...this.orderBookSnapshots.entries()].map(([ref, record]) => [
-        ref,
-        {
-          ...record,
-          snapshot: {
-            ...record.snapshot,
-            bids: record.snapshot.bids.map((level) => ({ ...level })),
-            asks: record.snapshot.asks.map((level) => ({ ...level }))
-          }
-        }
-      ]),
-      logs: this.logs.map((log) => ({ ...log })),
-      behaviorLogs: this.behaviorLogs.map((log) => ({ ...log }))
+      orderLifecycleLogs: this.orderLifecycleLogs.map((log) => ({ ...log }))
     };
   }
 
@@ -1088,21 +705,18 @@ export class AppStore {
       this.orderLifecycleLogs.length,
       ...snapshot.orderLifecycleLogs.map((log) => ({ ...log }))
     );
-    this.orderBookSnapshots.clear();
-    for (const [ref, record] of snapshot.orderBookSnapshots) {
-      this.orderBookSnapshots.set(ref, {
-        ...record,
-        snapshot: {
-          ...record.snapshot,
-          bids: record.snapshot.bids.map((level) => ({ ...level })),
-          asks: record.snapshot.asks.map((level) => ({ ...level }))
-        }
-      });
-    }
-    this.logs.splice(0, this.logs.length, ...snapshot.logs.map((log) => ({ ...log })));
-    this.behaviorLogs.splice(0, this.behaviorLogs.length, ...snapshot.behaviorLogs.map((log) => ({ ...log })));
     this.rebuildHotIndexes();
     this.bumpHistoryRevision();
+  }
+
+  prepareOrderBookSnapshotForOrder(order: OrderRecord) {
+    if (!order.orderBookSnapshot) {
+      return order.orderBookSnapshotRef;
+    }
+    const ref = this.enqueueOrderBookSnapshot(order.orderBookSnapshot);
+    order.orderBookSnapshotRef = ref;
+    order.orderBookSnapshot = undefined;
+    return ref;
   }
 
   assertWritablePersistence(context: string) {
@@ -1208,62 +822,102 @@ export class AppStore {
     records.push(record);
   }
 
+  private removeUserIndexedRecord<T extends { id: string }>(recordsByUserId: Map<string, T[]>, record: T & { userId: string }) {
+    const records = recordsByUserId.get(record.userId);
+    if (!records) {
+      return;
+    }
+    const next = records.filter((item) => item.id !== record.id);
+    if (next.length > 0) {
+      recordsByUserId.set(record.userId, next);
+    } else {
+      recordsByUserId.delete(record.userId);
+    }
+  }
+
+  private upsertUserIndexedRecord<T extends { id: string; userId: string }>(recordsByUserId: Map<string, T[]>, record: T) {
+    const records = recordsByUserId.get(record.userId) ?? [];
+    const index = records.findIndex((item) => item.id === record.id);
+    if (index >= 0) {
+      records[index] = record;
+    } else {
+      records.push(record);
+    }
+    recordsByUserId.set(record.userId, records);
+  }
+
+  private rememberOperatedRound(userId: string, roundId?: string) {
+    if (!roundId) {
+      return;
+    }
+    const roundIds = this.operatedRoundIdsByUserId.get(userId) ?? new Set<string>();
+    roundIds.add(roundId);
+    this.operatedRoundIdsByUserId.set(userId, roundIds);
+  }
+
+  private upsertOrderInMemory(order: OrderRecord) {
+    const previousIndex = this.orderIndexById.get(order.id);
+    const previous = typeof previousIndex === "number" ? this.orders[previousIndex] : undefined;
+    if (previous && previous.userId !== order.userId) {
+      this.removeUserIndexedRecord(this.ordersByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    this.upsertUserIndexedRecord(this.ordersByUserId, order);
+    this.rememberOperatedRound(order.userId, order.roundId);
+  }
+
+  private upsertPositionInMemory(position: PositionRecord) {
+    const previousIndex = this.positionIndexById.get(position.id);
+    const previous = typeof previousIndex === "number" ? this.positions[previousIndex] : undefined;
+    if (previous && previous.userId !== position.userId) {
+      this.removeUserIndexedRecord(this.positionsByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.positions, this.positionIndexById, position);
+    this.upsertUserIndexedRecord(this.positionsByUserId, position);
+    this.rememberOperatedRound(position.userId, position.roundId);
+  }
+
+  private upsertOrderLifecycleInMemory(log: OrderLifecycleRecord) {
+    const previousIndex = this.orderLifecycleIndexById.get(log.id);
+    const previous = typeof previousIndex === "number" ? this.orderLifecycleLogs[previousIndex] : undefined;
+    if (previous && previous.userId !== log.userId) {
+      this.removeUserIndexedRecord(this.orderLifecyclesByUserId, previous);
+    }
+    this.upsertIndexedRecord(this.orderLifecycleLogs, this.orderLifecycleIndexById, log);
+    this.upsertUserIndexedRecord(this.orderLifecyclesByUserId, log);
+    this.rememberOperatedRound(log.userId, log.roundId);
+  }
+
   private rebuildHotIndexes() {
+    this.ordersByUserId ??= new Map<string, OrderRecord[]>();
+    this.positionsByUserId ??= new Map<string, PositionRecord[]>();
+    this.orderLifecyclesByUserId ??= new Map<string, OrderLifecycleRecord[]>();
+    this.operatedRoundIdsByUserId ??= new Map<string, Set<string>>();
     this.orderIndexById.clear();
     this.positionIndexById.clear();
     this.orderLifecycleIndexById.clear();
-    this.orders.forEach((order, index) => this.orderIndexById.set(order.id, index));
-    this.positions.forEach((position, index) => this.positionIndexById.set(position.id, index));
-    this.orderLifecycleLogs.forEach((log, index) => this.orderLifecycleIndexById.set(log.id, index));
+    this.ordersByUserId.clear();
+    this.positionsByUserId.clear();
+    this.orderLifecyclesByUserId.clear();
+    this.operatedRoundIdsByUserId.clear();
+    this.orders.forEach((order, index) => {
+      this.orderIndexById.set(order.id, index);
+      this.upsertUserIndexedRecord(this.ordersByUserId, order);
+      this.rememberOperatedRound(order.userId, order.roundId);
+    });
+    this.positions.forEach((position, index) => {
+      this.positionIndexById.set(position.id, index);
+      this.upsertUserIndexedRecord(this.positionsByUserId, position);
+      this.rememberOperatedRound(position.userId, position.roundId);
+    });
+    this.orderLifecycleLogs.forEach((log, index) => {
+      this.orderLifecycleIndexById.set(log.id, index);
+      this.upsertUserIndexedRecord(this.orderLifecyclesByUserId, log);
+      this.rememberOperatedRound(log.userId, log.roundId);
+    });
   }
 
-  private trimArrayByCreatedAt<T>(
-    records: T[],
-    maxItems: number,
-    getCreatedAt: (record: T) => number,
-    onTrim?: (trimmed: T[]) => void
-  ) {
-    if (records.length <= maxItems) {
-      return;
-    }
-    const retained = [...records]
-      .sort((left, right) => getCreatedAt(right) - getCreatedAt(left))
-      .slice(0, maxItems);
-    const retainedSet = new Set(retained);
-    const trimmed = records.filter((record) => !retainedSet.has(record));
-    records.splice(0, records.length, ...retained);
-    onTrim?.(trimmed);
-  }
-
-  private pruneMemoryCaches(now = Date.now()) {
-    this.trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
-    this.trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
-    this.trimArrayByCreatedAt(
-      this.orderLifecycleLogs,
-      this.config.orderLifecycleMemoryMax,
-      (log) => log.updatedAt ?? log.createdAt,
-      () => this.rebuildHotIndexes()
-    );
-    this.trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt, () =>
-      this.rebuildHotIndexes()
-    );
-    this.trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
-    this.trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
-    this.pruneOrderBookSnapshots(now);
-    this.rebuildHotIndexes();
-  }
-
-  private pruneOrderBookSnapshots(now = Date.now()) {
-    if (this.orderBookSnapshots.size <= this.config.orderBookSnapshotsMemoryMax) {
-      const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
-      for (const [ref, snapshot] of this.orderBookSnapshots.entries()) {
-        if (snapshot.createdAt < cutoff && !this.isSnapshotRefReferenced(ref)) {
-          this.orderBookSnapshots.delete(ref);
-        }
-      }
-      return;
-    }
-
+  private collectReferencedSnapshotRefs() {
     const referenced = new Set<string>();
     for (const order of this.orders) {
       if (order.orderBookSnapshotRef) {
@@ -1274,6 +928,41 @@ export class AppStore {
       if (log.orderBookSnapshotRef) {
         referenced.add(log.orderBookSnapshotRef);
       }
+    }
+    return referenced;
+  }
+
+  private pruneMemoryCaches(now = Date.now(), options?: { force?: boolean }) {
+    const force = options?.force === true;
+    if (!force && this.lastPruneMemoryCachesAt > 0 && now - this.lastPruneMemoryCachesAt < PRUNE_MEMORY_CACHES_THROTTLE_MS) {
+      return;
+    }
+    this.lastPruneMemoryCachesAt = now;
+    trimArrayByCreatedAt(this.rounds, this.config.roundsMemoryMax, (round) => round.startAt);
+    const ordersPrune = trimArrayByCreatedAt(this.orders, this.config.ordersMemoryMax, (order) => order.createdAt);
+    const lifecyclesPrune = trimArrayByCreatedAt(
+      this.orderLifecycleLogs,
+      this.config.orderLifecycleMemoryMax,
+      (log) => log.updatedAt ?? log.createdAt
+    );
+    const positionsPrune = trimArrayByCreatedAt(this.positions, this.config.positionsMemoryMax, (position) => position.openedAt);
+    trimArrayByCreatedAt(this.logs, this.config.auditLogsMemoryMax, (log) => log.serverRecvTs);
+    trimArrayByCreatedAt(this.behaviorLogs, this.config.behaviorLogsMemoryMax, (log) => log.timestampMs);
+    this.pruneOrderBookSnapshots(now, this.collectReferencedSnapshotRefs());
+    if (ordersPrune.trimmedCount > 0 || lifecyclesPrune.trimmedCount > 0 || positionsPrune.trimmedCount > 0) {
+      this.rebuildHotIndexes();
+    }
+  }
+
+  private pruneOrderBookSnapshots(now = Date.now(), referenced = this.collectReferencedSnapshotRefs()) {
+    if (this.orderBookSnapshots.size <= this.config.orderBookSnapshotsMemoryMax) {
+      const cutoff = now - this.config.orderBookSnapshotsMemoryMaxAgeMs;
+      for (const [ref, snapshot] of this.orderBookSnapshots.entries()) {
+        if (snapshot.createdAt < cutoff && !referenced.has(ref)) {
+          this.orderBookSnapshots.delete(ref);
+        }
+      }
+      return;
     }
 
     const snapshots = [...this.orderBookSnapshots.values()].sort((left, right) => right.createdAt - left.createdAt);
@@ -1289,11 +978,6 @@ export class AppStore {
       }
       this.orderBookSnapshots.delete(snapshot.ref);
     }
-  }
-
-  private isSnapshotRefReferenced(ref: string) {
-    return this.orders.some((order) => order.orderBookSnapshotRef === ref) ||
-      this.orderLifecycleLogs.some((log) => log.orderBookSnapshotRef === ref);
   }
 
   private heapUsedMb() {
@@ -1325,66 +1009,119 @@ export class AppStore {
     return user;
   }
 
+  private prepareUsersForPersistence(users: readonly UserRecord[]) {
+    for (const user of users) {
+      user.permissionCodes = ROLE_PERMISSIONS[user.role];
+      user.managerUserId = user.managerUserId ?? user.seniorTesterId;
+      user.permissionLevel = user.permissionLevel ?? "Standard";
+      user.updatedAt = user.updatedAt || Date.now();
+    }
+  }
+
+  private applyUsersToMemory(users: readonly UserRecord[]) {
+    for (const user of users) {
+      this.users.set(user.id, user);
+    }
+  }
+
+  private applyOrdersToMemory(orders: readonly OrderRecord[]) {
+    for (const order of orders) {
+      if (order.orderBookSnapshot) {
+        this.prepareOrderBookSnapshotForOrder(order);
+      }
+      this.upsertOrderInMemory(order);
+    }
+  }
+
+  private applyPositionsToMemory(positions: readonly PositionRecord[]) {
+    const positionIdsByUser = new Map<string, string[]>();
+    for (const position of positions) {
+      this.upsertPositionInMemory(position);
+      const ids = positionIdsByUser.get(position.userId) ?? [];
+      ids.push(position.id);
+      positionIdsByUser.set(position.userId, ids);
+    }
+    return positionIdsByUser;
+  }
+
+  private applyOrderLifecyclesToMemory(logs: readonly OrderLifecycleRecord[]) {
+    for (const log of logs) {
+      this.upsertOrderLifecycleInMemory(log);
+    }
+  }
+
+  private refreshHistoryViews(positionIdsByUser?: ReadonlyMap<string, string[]>) {
+    this.pruneMemoryCaches();
+    this.bumpHistoryRevision();
+    if (!positionIdsByUser) {
+      return;
+    }
+    for (const [userId, positionIds] of positionIdsByUser.entries()) {
+      this.markTradePositionChanges(userId, positionIds);
+    }
+  }
+
+  private async runBulkUpsert<T>(
+    spec: {
+      columns: readonly string[];
+      conflictTarget: string;
+      mapRecord: (record: T) => readonly unknown[];
+      table: string;
+      updateAssignments: readonly string[];
+    },
+    records: readonly T[]
+  ) {
+    for (let index = 0; index < records.length; index += PERSIST_UPSERT_BATCH_SIZE) {
+      const batch = records.slice(index, index + PERSIST_UPSERT_BATCH_SIZE);
+      await this.runDb(buildBulkUpsertQuery(spec, batch), flattenBulkUpsertParams(spec, batch));
+    }
+  }
+
+  async persistTradeRecords(input: {
+    orderLifecycles?: readonly OrderLifecycleRecord[];
+    orders?: readonly OrderRecord[];
+    positions?: readonly PositionRecord[];
+    users?: readonly UserRecord[];
+  }) {
+    const users = input.users ?? [];
+    const orders = input.orders ?? [];
+    const positions = input.positions ?? [];
+    const orderLifecycles = input.orderLifecycles ?? [];
+    if (!users.length && !orders.length && !positions.length && !orderLifecycles.length) {
+      return;
+    }
+
+    this.prepareUsersForPersistence(users);
+    this.applyUsersToMemory(users);
+    this.applyOrdersToMemory(orders);
+    const positionIdsByUser = this.applyPositionsToMemory(positions);
+    this.applyOrderLifecyclesToMemory(orderLifecycles);
+    if (orders.length || positions.length || orderLifecycles.length) {
+      this.refreshHistoryViews(positionIdsByUser);
+    }
+
+    const statement = buildCombinedBulkUpsertQuery([
+      { alias: "users_upsert", spec: userPersistenceSpec, records: users },
+      { alias: "orders_upsert", spec: orderPersistenceSpec, records: orders },
+      { alias: "positions_upsert", spec: positionPersistenceSpec, records: positions },
+      { alias: "order_lifecycles_upsert", spec: orderLifecyclePersistenceSpec, records: orderLifecycles }
+    ]);
+    if (statement.query) {
+      await this.runDb(statement.query, statement.params);
+    }
+  }
+
+  async persistUsers(users: readonly UserRecord[]) {
+    if (!users.length) {
+      return;
+    }
+    this.prepareUsersForPersistence(users);
+    this.applyUsersToMemory(users);
+    await this.runBulkUpsert(userPersistenceSpec, users);
+  }
+
   async persistUser(user: UserRecord) {
-    user.permissionCodes = ROLE_PERMISSIONS[user.role];
-    user.managerUserId = user.managerUserId ?? user.seniorTesterId;
-    user.permissionLevel = user.permissionLevel ?? "Standard";
-    user.updatedAt = user.updatedAt || Date.now();
-    this.users.set(user.id, user);
-    await this.runDb(
-      `
-      INSERT INTO users (
-        id, username, password, display_name, role, language, permission_codes, available_usdc,
-        is_active, senior_tester_id, disabled_at, disabled_by, manager_user_id, permission_level,
-        failed_login_count, locked_until, password_changed_at, last_login_at, must_change_password,
-        created_at, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-      ON CONFLICT (id) DO UPDATE SET
-        username = EXCLUDED.username,
-        password = EXCLUDED.password,
-        display_name = EXCLUDED.display_name,
-        role = EXCLUDED.role,
-        language = EXCLUDED.language,
-        permission_codes = EXCLUDED.permission_codes,
-        available_usdc = EXCLUDED.available_usdc,
-        is_active = EXCLUDED.is_active,
-        senior_tester_id = EXCLUDED.senior_tester_id,
-        disabled_at = EXCLUDED.disabled_at,
-        disabled_by = EXCLUDED.disabled_by,
-        manager_user_id = EXCLUDED.manager_user_id,
-        permission_level = EXCLUDED.permission_level,
-        failed_login_count = EXCLUDED.failed_login_count,
-        locked_until = EXCLUDED.locked_until,
-        password_changed_at = EXCLUDED.password_changed_at,
-        last_login_at = EXCLUDED.last_login_at,
-        must_change_password = EXCLUDED.must_change_password,
-        updated_at = EXCLUDED.updated_at
-      `,
-      [
-        user.id,
-        user.username,
-        user.password,
-        user.displayName,
-        user.role,
-        user.language,
-        JSON.stringify(user.permissionCodes),
-        user.availableUsdc,
-        user.isActive,
-        user.seniorTesterId ?? null,
-        user.disabledAt ?? null,
-        user.disabledBy ?? null,
-        user.managerUserId ?? null,
-        user.permissionLevel ?? "Standard",
-        user.failedLoginCount ?? 0,
-        user.lockedUntil ?? null,
-        user.passwordChangedAt ?? null,
-        user.lastLoginAt ?? null,
-        user.mustChangePassword ?? false,
-        user.createdAt,
-        user.updatedAt
-      ]
-    );
+    await this.persistUsers([user]);
   }
 
   async createUser(input: {
@@ -1538,29 +1275,45 @@ export class AppStore {
       return;
     }
     this.queuedMarketSnapshot = snapshot;
+    if (this.marketSnapshotPersistRunning || this.marketSnapshotPersistTimer) {
+      return;
+    }
+    this.scheduleMarketSnapshotCacheFlush();
+  }
+
+  private scheduleMarketSnapshotCacheFlush(delayMs = 0) {
+    if (this.marketSnapshotPersistTimer) {
+      return;
+    }
+    this.marketSnapshotPersistTimer = setTimeout(() => {
+      this.marketSnapshotPersistTimer = undefined;
+      void this.flushMarketSnapshotCache();
+    }, Math.max(delayMs, 0));
+  }
+
+  private async flushMarketSnapshotCache() {
     if (this.marketSnapshotPersistRunning) {
       return;
     }
     this.marketSnapshotPersistRunning = true;
-    setImmediate(() => {
-      void this.flushMarketSnapshotCache();
-    });
-  }
-
-  private async flushMarketSnapshotCache() {
     try {
-      while (this.queuedMarketSnapshot) {
-        const snapshot = this.queuedMarketSnapshot;
-        this.queuedMarketSnapshot = undefined;
-        await this.persistMarketSnapshotCache(snapshot);
+      const snapshot = this.queuedMarketSnapshot;
+      if (!snapshot) {
+        return;
       }
+      const nextAllowedAt = this.lastMarketSnapshotPersistAt + MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS;
+      const delayMs = nextAllowedAt - Date.now();
+      if (delayMs > 0) {
+        return;
+      }
+      this.queuedMarketSnapshot = undefined;
+      await this.persistMarketSnapshotCache(snapshot);
+      this.lastMarketSnapshotPersistAt = Date.now();
     } finally {
       this.marketSnapshotPersistRunning = false;
       if (this.queuedMarketSnapshot) {
-        this.marketSnapshotPersistRunning = true;
-        setImmediate(() => {
-          void this.flushMarketSnapshotCache();
-        });
+        const nextAllowedAt = this.lastMarketSnapshotPersistAt + MARKET_SNAPSHOT_CACHE_FLUSH_INTERVAL_MS;
+        this.scheduleMarketSnapshotCacheFlush(Math.max(nextAllowedAt - Date.now(), 0));
       }
     }
   }
@@ -1570,20 +1323,22 @@ export class AppStore {
       return;
     }
     try {
+      const snapshotJson = JSON.stringify(snapshot);
+      const sourcesJson = JSON.stringify(Object.values(snapshot.sources));
       await Promise.all([
-        this.redis.set(this.snapshotCacheKey, JSON.stringify(snapshot), {
+        this.redis.set(this.snapshotCacheKey, snapshotJson, {
           expiration: {
             type: "EX",
             value: this.config.snapshotRetentionSeconds
           }
         }),
-        this.redis.set(this.sourcesCacheKey, JSON.stringify(Object.values(snapshot.sources)), {
+        this.redis.set(this.sourcesCacheKey, sourcesJson, {
           expiration: {
             type: "EX",
             value: this.config.snapshotRetentionSeconds
           }
         }),
-        this.redis.publish(`market:update:${this.config.symbol}`, JSON.stringify(snapshot))
+        this.redis.publish(`market:update:${this.config.symbol}`, snapshotJson)
       ]);
     } catch (error) {
       this.redisEnabled = false;
@@ -1615,7 +1370,9 @@ export class AppStore {
       settlementPrice: round.settlementPrice,
       settlementTs: round.settlementTs,
       settlementSource: round.settlementSource,
-      manualReason: round.manualReason
+      manualReason: round.manualReason,
+      coinbaseOpenPrice: round.coinbaseOpenPrice,
+      coinbaseClosePrice: round.coinbaseClosePrice
     });
   }
 
@@ -1653,28 +1410,21 @@ export class AppStore {
   }
 
   getOperatedHistory(limit = 500, userId: string) {
-    const operatedRoundIds = new Set<string>();
     const orderByRoundId = new Map<string, OrderRecord>();
     const positionByRoundId = new Map<string, PositionRecord>();
-    for (const order of this.orders) {
-      if (order.userId === userId) {
-        operatedRoundIds.add(order.roundId);
-        if (!orderByRoundId.has(order.roundId)) {
-          orderByRoundId.set(order.roundId, order);
-        }
+    for (const order of this.ordersByUserId.get(userId) ?? []) {
+      if (!orderByRoundId.has(order.roundId)) {
+        orderByRoundId.set(order.roundId, order);
       }
     }
-    for (const position of this.positions) {
-      if (position.userId === userId) {
-        operatedRoundIds.add(position.roundId);
-        if (!positionByRoundId.has(position.roundId)) {
-          positionByRoundId.set(position.roundId, position);
-        }
+    for (const position of this.positionsByUserId.get(userId) ?? []) {
+      if (!positionByRoundId.has(position.roundId)) {
+        positionByRoundId.set(position.roundId, position);
       }
     }
 
     const roundById = new Map(this.rounds.map((round) => [round.id, round]));
-    return [...operatedRoundIds]
+    return [...(this.operatedRoundIdsByUserId.get(userId) ?? new Set<string>())]
       .map((roundId) => roundById.get(roundId) ?? this.createOperatedFallbackRound(roundId, orderByRoundId.get(roundId), positionByRoundId.get(roundId)))
       .filter(
         (round): round is RoundRecord =>
@@ -1689,8 +1439,18 @@ export class AppStore {
   }
 
   getPositions(userId: string) {
-    return this.positions
-      .filter((position) => position.userId === userId)
+    return [...(this.positionsByUserId.get(userId) ?? [])]
+      .sort((left, right) => right.openedAt - left.openedAt)
+      .map((position) => this.decoratePosition(position));
+  }
+
+  getTradePositions(userId: string, positionIds?: string[]) {
+    if (!positionIds) {
+      return this.getPositions(userId);
+    }
+    const requestedIds = new Set(positionIds);
+    return [...(this.positionsByUserId.get(userId) ?? [])]
+      .filter((position) => requestedIds.has(position.id))
       .sort((left, right) => right.openedAt - left.openedAt)
       .map((position) => this.decoratePosition(position));
   }
@@ -1700,10 +1460,19 @@ export class AppStore {
     return typeof index === "number" ? this.positions[index] : this.positions.find((position) => position.id === positionId);
   }
 
-  getOrders(userId: string) {
-    return this.orders
-      .filter((order) => order.userId === userId)
+  getOrders(userId: string, options?: { limit?: number; offset?: number }) {
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
+    return [...(this.ordersByUserId.get(userId) ?? [])]
       .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined)
+      .map((order) => this.sanitizeOrder(order));
+  }
+
+  getRecentTradeOrders(userId: string, limit = 50) {
+    return [...(this.ordersByUserId.get(userId) ?? [])]
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(0, Math.max(1, Math.floor(limit)))
       .map((order) => this.sanitizeOrder(order));
   }
 
@@ -1732,8 +1501,8 @@ export class AppStore {
     if (!row) {
       return undefined;
     }
-    const order = this.rowToOrder(row);
-    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
+    const order = rowToOrder(row);
+    this.upsertOrderInMemory(order);
     this.pruneMemoryCaches();
     return order;
   }
@@ -1745,10 +1514,13 @@ export class AppStore {
     };
   }
 
-  getOrderLifecycleLogs(userId: string, options?: { includeSnapshots?: boolean }) {
+  getOrderLifecycleLogs(userId: string, options?: { includeSnapshots?: boolean; limit?: number; offset?: number }) {
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
     return this.orderLifecycleLogs
       .filter((log) => log.userId === userId)
       .sort((left, right) => right.orderTimestampMs - left.orderTimestampMs)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined)
       .map((log) => {
         const snapshot = options?.includeSnapshots && log.orderBookSnapshotRef
           ? this.getOrderBookSnapshot(log.orderBookSnapshotRef)
@@ -1764,15 +1536,18 @@ export class AppStore {
     return this.orderBookSnapshots.get(ref)?.snapshot;
   }
 
-  getRecentLogs(userId: string) {
+  getRecentLogs(userId: string, options?: { limit?: number; offset?: number }) {
     const threshold = Date.now() - this.config.logRetentionMs;
+    const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+    const limit = typeof options?.limit === "number" ? Math.max(1, Math.floor(options.limit)) : undefined;
     return this.logs
       .filter((log) => log.serverRecvTs >= threshold && (!userId || log.userId === userId))
-      .sort((left, right) => right.serverRecvTs - left.serverRecvTs);
+      .sort((left, right) => right.serverRecvTs - left.serverRecvTs)
+      .slice(offset, typeof limit === "number" ? offset + limit : undefined);
   }
 
   async searchAuditLogs(filters?: LogSearchQuery, options?: { limit?: number; offset?: number }) {
-    const limit = this.normalizeSearchLimit(options?.limit);
+    const limit = normalizeSearchLimit(options?.limit);
     const offset = Math.max(0, Math.floor(options?.offset ?? 0));
     if (filters?.userIds && filters.userIds.length === 0) {
       return [] as AuditEvent[];
@@ -1814,9 +1589,9 @@ export class AppStore {
         if (filters.logGroup === "matching_action") {
           add("category =", "matching");
         } else if (filters.logGroup === "market_latency") {
-          where.push(`category = 'latency' AND module_name = ANY(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name = ANY(ARRAY['binance','coinbase','clob']::text[])`);
         } else if (filters.logGroup === "system_latency") {
-          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','coinbase','clob']::text[])`);
         } else {
           add("category =", filters.logGroup);
         }
@@ -1869,7 +1644,7 @@ export class AppStore {
       }
       if (filters?.latencySource) {
         if (filters.latencySource === "system") {
-          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','chainlink','clob']::text[])`);
+          where.push(`category = 'latency' AND module_name <> ALL(ARRAY['binance','coinbase','clob']::text[])`);
         } else {
           add("module_name =", filters.latencySource);
           where.push(`category = 'latency'`);
@@ -1905,26 +1680,26 @@ export class AppStore {
           `,
           values as never[]
         );
-        return rows.rows.map((row) => this.rowToAuditEvent(row));
+        return rows.rows.map((row) => rowToAuditEvent(row));
       } catch (error) {
         console.warn("[store] PostgreSQL audit search failed, falling back to memory:", error);
       }
     }
 
     return this.logs
-      .filter((log) => this.matchesAuditSearch(log, filters))
+      .filter((log) => matchesAuditSearch(log, filters))
       .sort((left, right) => right.serverRecvTs - left.serverRecvTs || right.eventId.localeCompare(left.eventId))
       .slice(offset, offset + limit);
   }
 
   async searchBehaviorLogs(filters?: LogSearchQuery, options?: { limit?: number; offset?: number }) {
-    const limit = this.normalizeSearchLimit(options?.limit);
+    const limit = normalizeSearchLimit(options?.limit);
     const offset = Math.max(0, Math.floor(options?.offset ?? 0));
-    const effectiveUserIds = this.resolveBehaviorSearchUserIds(filters);
+    const effectiveUserIds = resolveBehaviorSearchUserIds(filters, this.users.values());
     if (effectiveUserIds && effectiveUserIds.length === 0) {
       return [] as BehaviorActionLog[];
     }
-    if (this.hasUnsupportedBehaviorSearchFilter(filters)) {
+    if (hasUnsupportedBehaviorSearchFilter(filters)) {
       return [] as BehaviorActionLog[];
     }
 
@@ -1989,14 +1764,14 @@ export class AppStore {
           `,
           values as never[]
         );
-        return rows.rows.map((row) => this.rowToBehaviorLog(row));
+        return rows.rows.map((row) => rowToBehaviorLog(row));
       } catch (error) {
         console.warn("[store] PostgreSQL training log search failed, falling back to memory:", error);
       }
     }
 
     return this.behaviorLogs
-      .filter((log) => this.matchesBehaviorSearch(log, filters, effectiveUserIds))
+      .filter((log) => matchesBehaviorSearch(log, filters, effectiveUserIds, (userId) => this.anonymizeUserId(userId)))
       .sort((left, right) => right.timestampMs - left.timestampMs || right.logId.localeCompare(left.logId))
       .slice(offset, offset + limit);
   }
@@ -2034,10 +1809,10 @@ export class AppStore {
         if (filters?.resultCode && log.resultCode !== filters.resultCode) {
           return false;
         }
-        if (filters?.orderId && this.detailString(log.details, "orderId") !== filters.orderId) {
+        if (filters?.orderId && detailString(log.details, "orderId") !== filters.orderId) {
           return false;
         }
-        if (filters?.positionId && this.detailString(log.details, "positionId") !== filters.positionId) {
+        if (filters?.positionId && detailString(log.details, "positionId") !== filters.positionId) {
           return false;
         }
         return true;
@@ -2099,12 +1874,12 @@ export class AppStore {
     const allBehaviorLogs = this.getBehaviorLogs();
     const positionId =
       allAuditEvents
-        .filter((event) => event.traceId === order.traceId || this.detailString(event.details, "orderId") === order.id)
-        .map((event) => this.detailString(event.details, "positionId"))
+        .filter((event) => event.traceId === order.traceId || detailString(event.details, "orderId") === order.id)
+        .map((event) => detailString(event.details, "positionId"))
         .find(Boolean) ??
       allBehaviorLogs
         .filter((log) => log.traceId === order.traceId || log.orderId === order.id)
-        .map((log) => this.detailString(log.contextJson, "positionId"))
+        .map((log) => detailString(log.contextJson, "positionId"))
         .find(Boolean);
     const rawPosition = positionId
       ? this.positions.find((item) => item.id === positionId)
@@ -2115,15 +1890,15 @@ export class AppStore {
     const auditEvents = allAuditEvents.filter((event) => {
       return (
         event.traceId === order.traceId ||
-        this.detailString(event.details, "orderId") === order.id ||
-        Boolean(positionId && this.detailString(event.details, "positionId") === positionId)
+        detailString(event.details, "orderId") === order.id ||
+        Boolean(positionId && detailString(event.details, "positionId") === positionId)
       );
     });
     const behaviorLogs = allBehaviorLogs.filter((log) => {
       return (
         log.traceId === order.traceId ||
         log.orderId === order.id ||
-        Boolean(positionId && this.detailString(log.contextJson, "positionId") === positionId)
+        Boolean(positionId && detailString(log.contextJson, "positionId") === positionId)
       );
     });
 
@@ -2136,64 +1911,25 @@ export class AppStore {
   }
 
   getProfile(userId: string): ProfileOverview {
-    const user = this.users.get(userId);
-    if (!user) {
-      return {
-        totalEquity: 0,
-        availableUsdc: 0,
-        positionValue: 0,
-        realizedPnlToday: 0,
-        unrealizedPnl: 0,
-        winRate: 0,
-        roundsParticipatedTotal: 0,
-        roundsParticipatedToday: 0
-      };
-    }
-
-    const positions = this.getPositions(userId);
-    const livePositions = positions.filter((position) => position.displayStatus === "open");
-    const positionValue = livePositions.reduce((sum, position) => sum + (position.currentValue ?? position.qty * position.currentMark), 0);
-
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const todayTs = todayStart.getTime();
-
-    const realizedPnlToday = positions
-      .filter((position) => (position.closedAt ?? position.openedAt) >= todayTs)
-      .reduce((sum, position) => sum + position.realizedPnl, 0);
-    const unrealizedPnl = livePositions.reduce((sum, position) => sum + position.unrealizedPnl, 0);
-    const settledPositions = positions.filter(
-      (position) =>
-        position.status === "closed" &&
-        (position.settlementResult === "win" || position.settlementResult === "loss")
-    );
-    const wins = settledPositions.filter((position) => position.settlementResult === "win").length;
-    const userOrders = this.getOrders(userId);
-    const roundsParticipatedTotal = new Set([
-      ...positions.map((position) => position.roundId),
-      ...userOrders.map((order) => order.roundId)
-    ]).size;
-    const roundsParticipatedToday = new Set([
-      ...positions
-        .filter((position) => position.openedAt >= todayTs || (position.closedAt ?? 0) >= todayTs)
-        .map((position) => position.roundId),
-      ...userOrders.filter((order) => order.createdAt >= todayTs).map((order) => order.roundId)
-    ]).size;
-
-    return {
-      totalEquity: Number((user.availableUsdc + positionValue).toFixed(2)),
-      availableUsdc: Number(user.availableUsdc.toFixed(2)),
-      positionValue: Number(positionValue.toFixed(2)),
-      realizedPnlToday: Number(realizedPnlToday.toFixed(2)),
-      unrealizedPnl: Number(unrealizedPnl.toFixed(2)),
-      winRate: settledPositions.length > 0 ? wins / settledPositions.length : 0,
-      roundsParticipatedTotal,
-      roundsParticipatedToday
-    };
+    return buildProfileOverview(this.users.get(userId), this.getPositions(userId), this.getOrders(userId));
   }
 
-  emitUserPayload(userId: string) {
-    this.pendingUserPayloadIds.add(userId);
+  markTradePositionChanges(userId: string, positionIds: Iterable<string>) {
+    const nextIds = [...new Set([...positionIds].filter((id) => typeof id === "string" && id.trim().length > 0))];
+    if (nextIds.length === 0) {
+      return;
+    }
+    const existing = this.pendingTradePositionIds.get(userId) ?? new Set<string>();
+    for (const positionId of nextIds) {
+      existing.add(positionId);
+    }
+    this.pendingTradePositionIds.set(userId, existing);
+  }
+
+  emitUserPayload(userId: string, scope: UserPayloadScope = "full") {
+    const existingRequest = this.pendingUserPayloadIds.get(userId);
+    const nextRequest = createUserPayloadRequest(scope);
+    this.pendingUserPayloadIds.set(userId, mergeUserPayloadRequest(existingRequest, nextRequest));
     if (this.userPayloadFlushScheduled) {
       return;
     }
@@ -2202,18 +1938,17 @@ export class AppStore {
   }
 
   private flushUserPayloads() {
-    const userIds = [...this.pendingUserPayloadIds];
+    const payloadRequests = [...this.pendingUserPayloadIds.entries()];
     this.pendingUserPayloadIds.clear();
     this.userPayloadFlushScheduled = false;
-    for (const userId of userIds) {
-      const payload: UserPayload = {
-        profile: this.getProfile(userId),
-        operatedHistory: this.getOperatedHistory(500, userId),
-        positions: this.getPositions(userId),
-        orders: this.getOrders(userId),
-        logs: this.getRecentLogs(userId)
-      };
-      this.emitter.emit(`user:${userId}`, payload);
+    for (const [userId, request] of payloadRequests) {
+      const trackedPositionIds = this.pendingTradePositionIds.get(userId);
+      this.pendingTradePositionIds.delete(userId);
+      const nextRequest =
+        request.scope === "trade"
+          ? createUserPayloadRequest("trade", [...(request.positionIds ?? []), ...(trackedPositionIds ?? [])])
+          : request;
+      this.emitter.emit(`user:${userId}`, nextRequest);
     }
   }
 
@@ -2249,247 +1984,6 @@ export class AppStore {
       ...sanitized,
       displayStatus
     };
-  }
-
-  private detailString(details: Record<string, unknown> | undefined, key: string) {
-    const value = details?.[key];
-    return typeof value === "string" || typeof value === "number" ? String(value) : undefined;
-  }
-
-  private normalizeSearchLimit(limit?: number) {
-    return Math.max(1, Math.min(Math.floor(limit ?? 100), 501));
-  }
-
-  private matchesAuditSearch(log: AuditEvent, filters?: LogSearchQuery) {
-    if (typeof filters?.from === "number" && log.serverRecvTs < filters.from) {
-      return false;
-    }
-    if (typeof filters?.to === "number" && log.serverRecvTs > filters.to) {
-      return false;
-    }
-    if (filters?.userId && log.userId !== filters.userId) {
-      return false;
-    }
-    if (filters?.userIds && !filters.userIds.includes(log.userId ?? "")) {
-      return false;
-    }
-    if (filters?.role && log.role !== filters.role) {
-      return false;
-    }
-    if (filters?.category && log.category !== filters.category) {
-      return false;
-    }
-    if (filters?.actionType && log.actionType !== filters.actionType) {
-      return false;
-    }
-    if (filters?.actionStatus && log.actionStatus !== filters.actionStatus) {
-      return false;
-    }
-    if (filters?.moduleName && log.moduleName !== filters.moduleName) {
-      return false;
-    }
-    if (filters?.pageName && log.pageName !== filters.pageName) {
-      return false;
-    }
-    if (filters?.symbol && log.symbol !== filters.symbol) {
-      return false;
-    }
-    if (filters?.roundId && log.roundId !== filters.roundId) {
-      return false;
-    }
-    if (filters?.traceId && log.traceId !== filters.traceId) {
-      return false;
-    }
-    if (filters?.resultCode && log.resultCode !== filters.resultCode) {
-      return false;
-    }
-    if (filters?.orderId && this.detailString(log.details, "orderId") !== filters.orderId) {
-      return false;
-    }
-    if (filters?.positionId && this.detailString(log.details, "positionId") !== filters.positionId) {
-      return false;
-    }
-    if (filters?.marketId && this.detailString(log.details, "marketId") !== filters.marketId) {
-      return false;
-    }
-    if (filters?.marketSlug && this.detailString(log.details, "marketSlug") !== filters.marketSlug) {
-      return false;
-    }
-    const direction = this.detailString(log.details, "direction") ?? this.detailString(log.details, "side");
-    if (filters?.direction && direction !== filters.direction) {
-      return false;
-    }
-    if (filters?.roundStatus && this.detailString(log.details, "roundStatus") !== filters.roundStatus) {
-      return false;
-    }
-    if (
-      filters?.settlementResult &&
-      this.detailString(log.details, "settlementResult") !== filters.settlementResult
-    ) {
-      return false;
-    }
-    if (filters?.matchingLogKind === "engine") {
-      return false;
-    }
-    if (filters?.bookKey || filters?.bookSide || filters?.eventType || filters?.sequenceFrom || filters?.sequenceTo) {
-      return false;
-    }
-    if (filters?.logGroup && this.auditLogGroup(log) !== filters.logGroup) {
-      return false;
-    }
-    if (filters?.matchingLogKind === "action" && log.category !== "matching") {
-      return false;
-    }
-    if (filters?.latencySource && this.auditLatencySource(log) !== filters.latencySource) {
-      return false;
-    }
-    if (filters?.connectionState && this.detailString(log.details, "connectionState") !== filters.connectionState) {
-      return false;
-    }
-    if (typeof filters?.latencyMinMs === "number" || typeof filters?.latencyMaxMs === "number") {
-      const latency = this.auditLatencyValue(log, filters.latencyPhase);
-      if (typeof latency !== "number") {
-        return false;
-      }
-      if (typeof filters.latencyMinMs === "number" && latency < filters.latencyMinMs) {
-        return false;
-      }
-      if (typeof filters.latencyMaxMs === "number" && latency > filters.latencyMaxMs) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private auditLogGroup(log: AuditEvent) {
-    if (log.category === "matching") {
-      return "matching_action";
-    }
-    if (log.category === "settlement") {
-      return "settlement";
-    }
-    if (log.category === "latency") {
-      return ["binance", "chainlink", "clob"].includes(log.moduleName) ? "market_latency" : "system_latency";
-    }
-    return "operation";
-  }
-
-  private auditLatencySource(log: AuditEvent) {
-    if (log.category !== "latency") {
-      return undefined;
-    }
-    return ["binance", "chainlink", "clob"].includes(log.moduleName) ? log.moduleName : "system";
-  }
-
-  private detailNumber(details: Record<string, unknown> | undefined, key: string) {
-    const value = details?.[key];
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-    if (typeof value === "string" && Number.isFinite(Number(value))) {
-      return Number(value);
-    }
-    return undefined;
-  }
-
-  private auditLatencyValue(log: AuditEvent, phase?: LogSearchQuery["latencyPhase"]) {
-    if (phase === "acquire") {
-      return this.detailNumber(log.details, "acquireLatencyMs");
-    }
-    if (phase === "publish") {
-      return this.detailNumber(log.details, "publishLatencyMs");
-    }
-    if (phase === "frontend") {
-      return log.frontendLatencyMs ?? this.detailNumber(log.details, "frontendLatencyMs");
-    }
-    return log.backendLatencyMs;
-  }
-
-  private resolveBehaviorSearchUserIds(filters?: LogSearchQuery) {
-    if (filters?.userId) {
-      const user = this.getUserById(filters.userId);
-      if (filters.role && user?.role !== filters.role) {
-        return [] as string[];
-      }
-      return [filters.userId];
-    }
-    const baseIds = filters?.userIds;
-    if (!filters?.role) {
-      return baseIds;
-    }
-    const roleIds = new Set(
-      [...this.users.values()].filter((user) => user.role === filters.role).map((user) => user.id)
-    );
-    return baseIds ? baseIds.filter((userId) => roleIds.has(userId)) : [...roleIds];
-  }
-
-  private hasUnsupportedBehaviorSearchFilter(filters?: LogSearchQuery) {
-    return Boolean(
-      filters?.category ||
-        filters?.moduleName ||
-        filters?.pageName ||
-        filters?.symbol ||
-        filters?.positionId ||
-        filters?.resultCode ||
-        filters?.bookKey ||
-        filters?.bookSide ||
-        filters?.eventType ||
-        filters?.logGroup ||
-        filters?.latencySource ||
-        filters?.connectionState ||
-        filters?.latencyPhase ||
-        typeof filters?.latencyMinMs === "number" ||
-        typeof filters?.latencyMaxMs === "number" ||
-        filters?.matchingLogKind ||
-        typeof filters?.sequenceFrom === "number" ||
-        typeof filters?.sequenceTo === "number"
-    );
-  }
-
-  private matchesBehaviorSearch(log: BehaviorActionLog, filters?: LogSearchQuery, userIds?: string[]) {
-    if (typeof filters?.from === "number" && log.timestampMs < filters.from) {
-      return false;
-    }
-    if (typeof filters?.to === "number" && log.timestampMs > filters.to) {
-      return false;
-    }
-    if (userIds?.length) {
-      const allowedAnonIds = new Set(userIds.map((userId) => this.anonymizeUserId(userId)));
-      if (!allowedAnonIds.has(log.testerIdAnon)) {
-        return false;
-      }
-    }
-    if (filters?.roundId && log.roundId !== filters.roundId) {
-      return false;
-    }
-    if (filters?.actionType && log.actionType !== filters.actionType) {
-      return false;
-    }
-    if (filters?.actionStatus && log.actionStatus !== filters.actionStatus) {
-      return false;
-    }
-    if (filters?.traceId && log.traceId !== filters.traceId) {
-      return false;
-    }
-    if (filters?.orderId && log.orderId !== filters.orderId) {
-      return false;
-    }
-    if (filters?.marketId && log.marketId !== filters.marketId) {
-      return false;
-    }
-    if (filters?.marketSlug && log.marketSlug !== filters.marketSlug) {
-      return false;
-    }
-    if (filters?.direction && log.direction !== filters.direction) {
-      return false;
-    }
-    if (filters?.roundStatus && log.roundStatus !== filters.roundStatus) {
-      return false;
-    }
-    if (filters?.settlementResult && log.settlementResult !== filters.settlementResult) {
-      return false;
-    }
-    return true;
   }
 
   private createOperatedFallbackRound(roundId: string, order?: OrderRecord, position?: PositionRecord): RoundRecord | undefined {
@@ -2544,6 +2038,70 @@ export class AppStore {
     return Object.values(this.marketSnapshot.sources).map((source: SourceHealth) => source);
   }
 
+  async upsertMarketCandles(candles: MarketCandleRecord[]) {
+    const validCandles = dedupeMarketCandles(candles.filter((candle) => isValidMarketCandle(candle)));
+    if (validCandles.length === 0) {
+      return;
+    }
+    mergeMarketCandlesIntoMemory(this.marketCandles, validCandles, MARKET_CANDLE_MEMORY_RETENTION_MS);
+    if (!this.postgresEnabled || !this.pool) {
+      return;
+    }
+
+    const values: string[] = [];
+    const params: unknown[] = [];
+    validCandles.forEach((candle, index) => {
+      const offset = index * 12;
+      values.push(
+        `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8},$${offset + 9},$${offset + 10},$${offset + 11},$${offset + 12})`
+      );
+      params.push(
+        candle.source,
+        candle.symbol,
+        candle.interval,
+        candle.openTs,
+        candle.closeTs,
+        candle.open,
+        candle.high,
+        candle.low,
+        candle.close,
+        candle.volume,
+        candle.origin,
+        candle.updatedAt
+      );
+    });
+    await this.runDb(
+      `
+      INSERT INTO market_candles (
+        source, symbol, interval, open_ts, close_ts, open, high, low, close, volume, origin, updated_at
+      ) VALUES ${values.join(",")}
+      ON CONFLICT (source, symbol, interval, open_ts) DO UPDATE SET
+        close_ts = EXCLUDED.close_ts,
+        open = EXCLUDED.open,
+        high = EXCLUDED.high,
+        low = EXCLUDED.low,
+        close = EXCLUDED.close,
+        volume = EXCLUDED.volume,
+        origin = EXCLUDED.origin,
+        updated_at = EXCLUDED.updated_at
+      WHERE market_candles.origin <> 'rtds_30s' OR EXCLUDED.origin = 'rtds_30s'
+      `,
+      params
+    );
+  }
+
+  getMarketCandles(query: MarketCandleQuery) {
+    const key = marketCandleKey(query.source, query.symbol, query.interval);
+    const rows = this.marketCandles.get(key) ?? [];
+    const filtered = rows.filter(
+      (candle) =>
+        (typeof query.fromOpenTs !== "number" || candle.openTs >= query.fromOpenTs) &&
+        (typeof query.toOpenTs !== "number" || candle.openTs <= query.toOpenTs)
+    );
+    const limit = query.limit && query.limit > 0 ? query.limit : filtered.length;
+    return filtered.slice(-limit).map((candle) => ({ ...candle }));
+  }
+
   async upsertRound(round: RoundRecord) {
     const index = this.rounds.findIndex((item) => item.id === round.id);
     const previous = index >= 0 ? this.rounds[index] : undefined;
@@ -2571,10 +2129,10 @@ export class AppStore {
         polymarket_settlement_status, polymarket_open_price, polymarket_close_price,
         polymarket_open_price_source, polymarket_close_price_source,
         settlement_received_at, redeem_scheduled_at,
-        binance_open_price, binance_close_price
+        binance_open_price, binance_close_price, chainlink_open_price, chainlink_close_price
       ) VALUES (
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-        $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41
+        $29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43
       )
       ON CONFLICT (id) DO UPDATE SET
         market_id = EXCLUDED.market_id,
@@ -2616,7 +2174,9 @@ export class AppStore {
         settlement_received_at = EXCLUDED.settlement_received_at,
         redeem_scheduled_at = EXCLUDED.redeem_scheduled_at,
         binance_open_price = EXCLUDED.binance_open_price,
-        binance_close_price = EXCLUDED.binance_close_price
+        binance_close_price = EXCLUDED.binance_close_price,
+        chainlink_open_price = EXCLUDED.chainlink_open_price,
+        chainlink_close_price = EXCLUDED.chainlink_close_price
       `,
       [
         round.id,
@@ -2659,12 +2219,14 @@ export class AppStore {
         round.settlementReceivedAt ?? null,
         round.redeemScheduledAt ?? null,
         round.binanceOpenPrice ?? null,
-        round.binanceClosePrice ?? null
+        round.binanceClosePrice ?? null,
+        round.coinbaseOpenPrice ?? null,
+        round.coinbaseClosePrice ?? null
       ]
     );
   }
 
-  async persistOrderBookSnapshot(snapshot: OrderBookSnapshot) {
+  private enqueueOrderBookSnapshot(snapshot: OrderBookSnapshot) {
     const snapshotCopy = cloneOrderBookSnapshot(snapshot);
     const ref = orderBookSnapshotRef(snapshotCopy);
     const existing = this.orderBookSnapshots.get(ref);
@@ -2680,14 +2242,50 @@ export class AppStore {
         createdAt: Date.now()
       };
       this.orderBookSnapshots.set(ref, record);
-      await this.runDb(
-        `
-        INSERT INTO order_book_snapshots (
-          ref, snapshot_id, snapshot_ts, best_bid, best_ask, mid_price, snapshot, created_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT (ref) DO NOTHING
-        `,
-        [
+      this.pendingOrderBookSnapshotRecords.set(ref, record);
+      this.scheduleOrderBookSnapshotFlush();
+    }
+    return ref;
+  }
+
+  async persistOrderBookSnapshot(snapshot: OrderBookSnapshot) {
+    const ref = this.enqueueOrderBookSnapshot(snapshot);
+    await this.flushOrderBookSnapshotQueue();
+    return ref;
+  }
+
+  private scheduleOrderBookSnapshotFlush() {
+    if (this.orderBookSnapshotFlushTimer || this.orderBookSnapshotFlushRunning) {
+      return;
+    }
+    txStorage.exit(() => {
+      this.orderBookSnapshotFlushTimer = setTimeout(() => {
+        this.orderBookSnapshotFlushTimer = undefined;
+        void this.flushOrderBookSnapshotQueue();
+      }, ORDER_BOOK_SNAPSHOT_FLUSH_DELAY_MS);
+    });
+  }
+
+  private async flushOrderBookSnapshotQueue() {
+    if (this.orderBookSnapshotFlushRunning || this.pendingOrderBookSnapshotRecords.size === 0) {
+      return;
+    }
+    if (!this.postgresEnabled || !this.pool) {
+      return;
+    }
+    this.orderBookSnapshotFlushRunning = true;
+    const startedAt = Date.now();
+    const records = [...this.pendingOrderBookSnapshotRecords.values()];
+    this.pendingOrderBookSnapshotRecords.clear();
+    try {
+      const values: string[] = [];
+      const params: unknown[] = [];
+      records.forEach((record, index) => {
+        const offset = index * 8;
+        values.push(
+          `($${offset + 1},$${offset + 2},$${offset + 3},$${offset + 4},$${offset + 5},$${offset + 6},$${offset + 7},$${offset + 8})`
+        );
+        params.push(
           record.ref,
           record.snapshotId,
           record.snapshotTs,
@@ -2696,83 +2294,43 @@ export class AppStore {
           record.midPrice,
           JSON.stringify(record.snapshot),
           record.createdAt
-        ]
+        );
+      });
+      await this.runDb(
+        `
+        INSERT INTO order_book_snapshots (
+          ref, snapshot_id, snapshot_ts, best_bid, best_ask, mid_price, snapshot, created_at
+        ) VALUES ${values.join(",")}
+        ON CONFLICT (ref) DO NOTHING
+        `,
+        params
       );
+      this.orderBookSnapshotLastFlushMs = Date.now() - startedAt;
+    } catch (error) {
+      this.orderBookSnapshotFlushFailures += 1;
+      for (const record of records) {
+        this.pendingOrderBookSnapshotRecords.set(record.ref, record);
+      }
+      console.warn("[store] Background order book snapshot flush failed:", error);
+    } finally {
+      this.orderBookSnapshotFlushRunning = false;
+      if (this.pendingOrderBookSnapshotRecords.size > 0) {
+        this.scheduleOrderBookSnapshotFlush();
+      }
     }
-    return ref;
   }
 
   async persistOrderLifecycle(log: OrderLifecycleRecord) {
-    this.upsertIndexedRecord(this.orderLifecycleLogs, this.orderLifecycleIndexById, log);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
+    await this.persistOrderLifecycles([log]);
+  }
 
-    await this.runDb(
-      `
-      INSERT INTO order_lifecycle_logs (
-        id, buy_order_id, trace_id, user_id, tester_id, round_id, symbol, asset_class, market_id,
-        market_slug, direction, order_timestamp_ms, entry_token_price, btc_trade_price,
-        btc_open_price_to_beat, delta_btc, volume_token_qty, remaining_token_qty,
-        closed_token_qty, position_notional, exit_type, exit_token_price, exit_notional,
-        settlement_result, order_book_snapshot_ref, actual_fill_price, slippage_bps,
-        match_latency_ms, settlement_time_ms, settlement_direction, entry_fee, exit_fee, fee_currency, created_at, updated_at
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,
-        $33,$34,$35
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        remaining_token_qty = EXCLUDED.remaining_token_qty,
-        closed_token_qty = EXCLUDED.closed_token_qty,
-        exit_type = EXCLUDED.exit_type,
-        exit_token_price = EXCLUDED.exit_token_price,
-        exit_notional = EXCLUDED.exit_notional,
-        settlement_result = EXCLUDED.settlement_result,
-        settlement_time_ms = EXCLUDED.settlement_time_ms,
-        settlement_direction = EXCLUDED.settlement_direction,
-        exit_fee = EXCLUDED.exit_fee,
-        fee_currency = EXCLUDED.fee_currency,
-        updated_at = EXCLUDED.updated_at
-      `,
-      [
-        log.id,
-        log.buyOrderId,
-        log.traceId,
-        log.userId,
-        log.testerId,
-        log.roundId,
-        log.symbol,
-        log.assetClass,
-        log.marketId,
-        log.marketSlug ?? null,
-        log.direction,
-        log.orderTimestampMs,
-        log.entryTokenPrice ?? null,
-        log.btcTradePrice ?? null,
-        log.btcOpenPriceToBeat ?? null,
-        log.deltaBtc ?? null,
-        log.volumeTokenQty,
-        log.remainingTokenQty,
-        log.closedTokenQty,
-        log.positionNotional,
-        log.exitType ?? null,
-        log.exitTokenPrice ?? null,
-        log.exitNotional,
-        log.settlementResult ?? null,
-        log.orderBookSnapshotRef ?? null,
-        log.actualFillPrice ?? null,
-        log.slippageBps ?? null,
-        log.matchLatencyMs,
-        log.settlementTimeMs ?? null,
-        log.settlementDirection ?? null,
-        log.entryFee ?? null,
-        log.exitFee ?? null,
-        log.feeCurrency ?? null,
-        log.createdAt,
-        log.updatedAt
-      ]
-    );
+  async persistOrderLifecycles(logs: readonly OrderLifecycleRecord[]) {
+    if (!logs.length) {
+      return;
+    }
+    this.applyOrderLifecyclesToMemory(logs);
+    this.refreshHistoryViews();
+    await this.runBulkUpsert(orderLifecyclePersistenceSpec, logs);
   }
 
   async applyLifecycleExit(input: {
@@ -2783,10 +2341,12 @@ export class AppStore {
     exitType: Exclude<OrderLifecycleExitType, "settlement">;
     exitTokenPrice?: number;
     exitFee?: number;
+    buyOrderIds?: string[];
   }) {
     if (input.qty <= QTY_EPSILON || typeof input.exitTokenPrice !== "number") {
       return;
     }
+    const buyOrderIds = input.buyOrderIds ? new Set(input.buyOrderIds) : undefined;
     let remaining = roundNumber(input.qty, 4);
     const logs = this.orderLifecycleLogs
       .filter(
@@ -2794,11 +2354,13 @@ export class AppStore {
           log.userId === input.userId &&
           log.roundId === input.roundId &&
           log.direction === input.side &&
+          (!buyOrderIds || buyOrderIds.has(log.buyOrderId)) &&
           log.remainingTokenQty > QTY_EPSILON
       )
       .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
 
     const feePerQty = (input.exitFee ?? 0) / Math.max(input.qty, QTY_EPSILON);
+    const updatedLogs: OrderLifecycleRecord[] = [];
     for (const log of logs) {
       if (remaining <= QTY_EPSILON) {
         break;
@@ -2816,8 +2378,11 @@ export class AppStore {
       log.exitTokenPrice = roundNumber(log.exitNotional / Math.max(log.closedTokenQty, QTY_EPSILON), 4);
       log.exitType = log.exitType && log.exitType !== input.exitType ? "mixed" : input.exitType;
       log.updatedAt = Date.now();
-      await this.persistOrderLifecycle(log);
+      updatedLogs.push(log);
       remaining = roundNumber(Math.max(remaining - take, 0), 4);
+    }
+    if (updatedLogs.length > 0) {
+      await this.persistOrderLifecycles(updatedLogs);
     }
   }
 
@@ -2837,6 +2402,7 @@ export class AppStore {
         log.direction === input.side &&
         log.remainingTokenQty > QTY_EPSILON
     );
+    const updatedLogs: OrderLifecycleRecord[] = [];
     for (const log of logs) {
       const remaining = log.remainingTokenQty;
       log.closedTokenQty = roundNumber(log.closedTokenQty + remaining, 4);
@@ -2849,195 +2415,59 @@ export class AppStore {
       log.settlementTimeMs = input.settlementTimeMs;
       log.feeCurrency = log.feeCurrency ?? "USD";
       log.updatedAt = Date.now();
-      await this.persistOrderLifecycle(log);
+      updatedLogs.push(log);
+    }
+    if (updatedLogs.length > 0) {
+      await this.persistOrderLifecycles(updatedLogs);
     }
   }
 
   async persistOrder(order: OrderRecord) {
-    if (order.orderBookSnapshot) {
-      order.orderBookSnapshotRef = await this.persistOrderBookSnapshot(order.orderBookSnapshot);
-      order.orderBookSnapshot = undefined;
-    }
-    this.upsertIndexedRecord(this.orders, this.orderIndexById, order);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
+    await this.persistOrders([order]);
+  }
 
+  async persistOrders(orders: readonly OrderRecord[]) {
+    if (!orders.length) {
+      return;
+    }
+    this.applyOrdersToMemory(orders);
+    this.refreshHistoryViews();
+    await this.runBulkUpsert(orderPersistenceSpec, orders);
+  }
+
+  async persistOrderLatency(order: OrderRecord) {
     await this.runDb(
       `
-      INSERT INTO orders (
-        id, trace_id, user_id, round_id, symbol, market_id, order_kind, time_in_force, limit_price,
-        lifecycle_status, result_type, token_id, book_key, book_hash, requested_amount_usdc,
-        requested_qty, frozen_usdc, frozen_qty, fills, estimated_fee, actual_fee, fee_breakdown, fee_currency,
-        source_latency_ms, market_slug, order_book_snapshot_ref, order_book_snapshot,
-        action, side, status, notional_usdc,
-        expected_qty, filled_qty, unfilled_qty, avg_fill_price, best_bid, best_ask, mid_price,
-        book_snapshot_ts, partial_filled, slippage_bps, match_latency_ms,
-        book_acquire_latency_ms, local_match_latency_ms, persist_latency_ms, total_order_latency_ms, failure_reason,
-        client_order_id, client_send_ts, server_recv_ts, server_publish_ts, created_at
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
-        $31,$32,$33,$34,$35,$36,$37,$38,$39,$40,
-        $41,$42,$43,$44,$45,$46,$47,$48,$49,$50,
-        $51,$52
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        lifecycle_status = EXCLUDED.lifecycle_status,
-        result_type = EXCLUDED.result_type,
-        status = EXCLUDED.status,
-        filled_qty = EXCLUDED.filled_qty,
-        unfilled_qty = EXCLUDED.unfilled_qty,
-        avg_fill_price = EXCLUDED.avg_fill_price,
-        notional_usdc = EXCLUDED.notional_usdc,
-        partial_filled = EXCLUDED.partial_filled,
-        slippage_bps = EXCLUDED.slippage_bps,
-        match_latency_ms = EXCLUDED.match_latency_ms,
-        book_acquire_latency_ms = EXCLUDED.book_acquire_latency_ms,
-        local_match_latency_ms = EXCLUDED.local_match_latency_ms,
-        persist_latency_ms = EXCLUDED.persist_latency_ms,
-        total_order_latency_ms = EXCLUDED.total_order_latency_ms,
-        frozen_usdc = EXCLUDED.frozen_usdc,
-        frozen_qty = EXCLUDED.frozen_qty,
-        fills = EXCLUDED.fills,
-        estimated_fee = EXCLUDED.estimated_fee,
-        actual_fee = EXCLUDED.actual_fee,
-        fee_breakdown = EXCLUDED.fee_breakdown,
-        fee_currency = EXCLUDED.fee_currency,
-        order_book_snapshot_ref = EXCLUDED.order_book_snapshot_ref,
-        failure_reason = EXCLUDED.failure_reason,
-        client_order_id = EXCLUDED.client_order_id,
-        server_publish_ts = EXCLUDED.server_publish_ts
+      UPDATE orders
+      SET
+        persist_latency_ms = $2,
+        total_order_latency_ms = $3,
+        server_publish_ts = $4
+      WHERE id = $1
       `,
       [
         order.id,
-        order.traceId,
-        order.userId,
-        order.roundId,
-        order.symbol,
-        order.marketId,
-        order.orderKind ?? null,
-        order.timeInForce ?? null,
-        order.limitPrice ?? null,
-        order.lifecycleStatus ?? order.status,
-        order.resultType ?? null,
-        order.tokenId ?? null,
-        order.bookKey ?? null,
-        order.bookHash ?? null,
-        order.requestedAmountUsdc ?? null,
-        order.requestedQty ?? null,
-        order.frozenUsdc ?? null,
-        order.frozenQty ?? null,
-        JSON.stringify(order.fills ?? []),
-        order.estimatedFee ?? null,
-        order.actualFee ?? null,
-        JSON.stringify(order.feeBreakdown ?? null),
-        order.feeCurrency ?? null,
-        order.sourceLatencyMs ?? null,
-        order.marketSlug ?? null,
-        order.orderBookSnapshotRef ?? null,
-        null,
-        order.action,
-        order.side,
-        order.status,
-        order.notionalUsdc,
-        order.expectedQty,
-        order.filledQty,
-        order.unfilledQty,
-        order.avgFillPrice ?? null,
-        order.bestBid,
-        order.bestAsk,
-        order.midPrice,
-        order.bookSnapshotTs,
-        order.partialFilled,
-        order.slippageBps ?? null,
-        order.matchLatencyMs,
-        order.bookAcquireLatencyMs ?? null,
-        order.localMatchLatencyMs ?? null,
         order.persistLatencyMs ?? null,
         order.totalOrderLatencyMs ?? null,
-        order.failureReason ?? null,
-        order.clientOrderId ?? null,
-        order.clientSendTs ?? null,
-        order.serverRecvTs,
-        order.serverPublishTs,
-        order.createdAt
+        order.serverPublishTs
       ]
     );
   }
 
   async persistPosition(position: PositionRecord) {
-    this.upsertIndexedRecord(this.positions, this.positionIndexById, position);
-    this.pruneMemoryCaches();
-    this.bumpHistoryRevision();
-
-    await this.runDb(
-      `
-      INSERT INTO positions (
-        id, user_id, round_id, side, qty, locked_qty, average_entry, notional_spent, current_mark,
-        current_bid, current_ask, current_mid, current_value, source_latency_ms,
-        unrealized_pnl, realized_pnl, entry_fee_usdc, exit_fee_usdc, total_fee_usdc,
-        cost_basis_usdc, mark_pnl_usdc, executable_pnl_usdc, status, opened_at, closed_at, settlement_result
-      ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-        $21,$22,$23,$24,$25,$26
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        qty = EXCLUDED.qty,
-        locked_qty = EXCLUDED.locked_qty,
-        average_entry = EXCLUDED.average_entry,
-        notional_spent = EXCLUDED.notional_spent,
-        current_mark = EXCLUDED.current_mark,
-        current_bid = EXCLUDED.current_bid,
-        current_ask = EXCLUDED.current_ask,
-        current_mid = EXCLUDED.current_mid,
-        current_value = EXCLUDED.current_value,
-        source_latency_ms = EXCLUDED.source_latency_ms,
-        unrealized_pnl = EXCLUDED.unrealized_pnl,
-        realized_pnl = EXCLUDED.realized_pnl,
-        entry_fee_usdc = EXCLUDED.entry_fee_usdc,
-        exit_fee_usdc = EXCLUDED.exit_fee_usdc,
-        total_fee_usdc = EXCLUDED.total_fee_usdc,
-        cost_basis_usdc = EXCLUDED.cost_basis_usdc,
-        mark_pnl_usdc = EXCLUDED.mark_pnl_usdc,
-        executable_pnl_usdc = EXCLUDED.executable_pnl_usdc,
-        status = EXCLUDED.status,
-        closed_at = EXCLUDED.closed_at,
-        settlement_result = EXCLUDED.settlement_result
-      `,
-      [
-        position.id,
-        position.userId,
-        position.roundId,
-        position.side,
-        position.qty,
-        position.lockedQty ?? 0,
-        position.averageEntry,
-        position.notionalSpent,
-        position.currentMark,
-        position.currentBid ?? null,
-        position.currentAsk ?? null,
-        position.currentMid ?? null,
-        position.currentValue ?? null,
-        position.sourceLatencyMs ?? null,
-        position.unrealizedPnl,
-        position.realizedPnl,
-        position.entryFeeUsdc ?? 0,
-        position.exitFeeUsdc ?? 0,
-        position.totalFeeUsdc ?? roundNumber((position.entryFeeUsdc ?? 0) + (position.exitFeeUsdc ?? 0), 8),
-        position.costBasisUsdc ?? position.notionalSpent,
-        position.markPnlUsdc ?? roundNumber((position.currentValue ?? position.qty * position.currentMark) - (position.costBasisUsdc ?? position.notionalSpent), 2),
-        position.executablePnlUsdc ?? roundNumber(((position.currentBid ?? position.currentMark) * position.qty) - (position.costBasisUsdc ?? position.notionalSpent), 2),
-        position.status,
-        position.openedAt,
-        position.closedAt ?? null,
-        position.settlementResult ?? null
-      ]
-    );
+    await this.persistPositions([position]);
   }
 
-  async recordLog(event: AuditEvent) {
+  async persistPositions(positions: readonly PositionRecord[]) {
+    if (!positions.length) {
+      return;
+    }
+    const positionIdsByUser = this.applyPositionsToMemory(positions);
+    this.refreshHistoryViews(positionIdsByUser);
+    await this.runBulkUpsert(positionPersistenceSpec, positions);
+  }
+
+  async recordLog(event: AuditEvent, options?: { emitUserPayload?: boolean; payloadScope?: UserPayloadScope }) {
     this.logs.unshift(event);
     this.pruneMemoryCaches(event.serverRecvTs);
     this.auditLogWriter.write(event);
@@ -3080,9 +2510,9 @@ export class AppStore {
         JSON.stringify(event.details ?? {})
       ]
     );
-    await this.cleanupRetentionIfDue(event.serverRecvTs);
-    if (event.userId) {
-      this.emitUserPayload(event.userId);
+    this.cleanupRetentionIfDue(event.serverRecvTs);
+    if (event.userId && options?.emitUserPayload !== false) {
+      this.emitUserPayload(event.userId, options?.payloadScope ?? "full");
     }
   }
 
@@ -3143,7 +2573,7 @@ export class AppStore {
         log.binance1mLastClose,
         log.binance5mLastClose,
         log.binance1dLastClose,
-        log.chainlinkPrice,
+        log.coinbasePrice,
         log.priceToBeat,
         log.upPrice,
         log.downPrice,
@@ -3542,9 +2972,23 @@ export class AppStore {
 
   private async loadStateFromPersistence() {
     if (this.postgresEnabled && this.pool) {
-      const [userRows, roundRows, snapshotRows, orderRows, lifecycleRows, positionRows, logRows, behaviorRows] = await Promise.all([
+      const [
+        userRows,
+        roundRows,
+        marketCandleRows,
+        snapshotRows,
+        orderRows,
+        lifecycleRows,
+        positionRows,
+        logRows,
+        behaviorRows
+      ] = await Promise.all([
         this.pool.query("SELECT * FROM users ORDER BY created_at ASC"),
         this.pool.query("SELECT * FROM rounds ORDER BY start_at DESC LIMIT 80"),
+        this.pool.query(
+          "SELECT * FROM market_candles WHERE source = $1 AND symbol = $2 AND interval = $3 AND open_ts >= $4 ORDER BY open_ts ASC",
+          ["coinbase", this.config.symbol, "30s", Date.now() - MARKET_CANDLE_MEMORY_RETENTION_MS]
+        ),
         this.pool.query("SELECT * FROM order_book_snapshots ORDER BY snapshot_ts DESC LIMIT 5000"),
         this.pool.query("SELECT * FROM orders ORDER BY created_at DESC LIMIT 2000"),
         this.pool.query("SELECT * FROM order_lifecycle_logs ORDER BY order_timestamp_ms DESC LIMIT 5000"),
@@ -3589,27 +3033,34 @@ export class AppStore {
         });
       }
 
-      this.rounds.splice(0, this.rounds.length, ...roundRows.rows.map((row) => this.rowToRound(row)));
+      this.rounds.splice(0, this.rounds.length, ...roundRows.rows.map((row) => rowToRound(row)));
+      this.marketCandles.clear();
+      mergeMarketCandlesIntoMemory(
+        this.marketCandles,
+        marketCandleRows.rows.map((row) => rowToMarketCandle(row)),
+        MARKET_CANDLE_MEMORY_RETENTION_MS
+      );
       this.orderBookSnapshots.clear();
       for (const row of snapshotRows.rows) {
-        const snapshotRecord = this.rowToOrderBookSnapshotRecord(row);
+        const snapshotRecord = rowToOrderBookSnapshotRecord(row);
         this.orderBookSnapshots.set(snapshotRecord.ref, snapshotRecord);
       }
-      this.orders.splice(0, this.orders.length, ...orderRows.rows.map((row) => this.rowToOrder(row)));
+      this.orders.splice(0, this.orders.length, ...orderRows.rows.map((row) => rowToOrder(row)));
       this.orderLifecycleLogs.splice(
         0,
         this.orderLifecycleLogs.length,
-        ...lifecycleRows.rows.map((row) => this.rowToOrderLifecycle(row))
+        ...lifecycleRows.rows.map((row) => rowToOrderLifecycle(row))
       );
-      this.positions.splice(0, this.positions.length, ...positionRows.rows.map((row) => this.rowToPosition(row)));
-      this.logs.splice(0, this.logs.length, ...logRows.rows.map((row) => this.rowToAuditEvent(row)));
+      this.positions.splice(0, this.positions.length, ...positionRows.rows.map((row) => rowToPosition(row)));
+      this.logs.splice(0, this.logs.length, ...logRows.rows.map((row) => rowToAuditEvent(row)));
       this.behaviorLogs.splice(
         0,
         this.behaviorLogs.length,
-        ...behaviorRows.rows.map((row) => this.rowToBehaviorLog(row))
+        ...behaviorRows.rows.map((row) => rowToBehaviorLog(row))
       );
       this.rebuildHotIndexes();
-      this.pruneMemoryCaches();
+      await this.rebuildLegacyOpenPositionLotsFromLifecycle();
+      this.pruneMemoryCaches(undefined, { force: true });
     }
 
     if (this.redisEnabled && this.redis?.isOpen) {
@@ -3620,17 +3071,163 @@ export class AppStore {
     }
   }
 
-  private async cleanupRetentionIfDue(now = Date.now()) {
+  private legacyPositionLotId(buyOrderId: string) {
+    return `pos_lot_${createHash("sha256").update(`position-lot:${buyOrderId}`).digest("hex").slice(0, 24)}`;
+  }
+
+  private async rebuildLegacyOpenPositionLotsFromLifecycle(now = Date.now()) {
+    const groupKey = (input: { userId: string; roundId: string; side: TradeSide }) =>
+      `${input.userId}\u0000${input.roundId}\u0000${input.side}`;
+    const legacyGroups = new Map<
+      string,
+      { userId: string; roundId: string; side: TradeSide; positions: PositionRecord[] }
+    >();
+    const groupsWithOpenLots = new Set<string>();
+
+    for (const position of this.positions) {
+      if (position.status !== "open") {
+        continue;
+      }
+      const key = groupKey(position);
+      if (position.buyOrderId) {
+        groupsWithOpenLots.add(key);
+        continue;
+      }
+      const group = legacyGroups.get(key) ?? {
+        userId: position.userId,
+        roundId: position.roundId,
+        side: position.side,
+        positions: []
+      };
+      group.positions.push(position);
+      legacyGroups.set(key, group);
+    }
+
+    let migratedGroups = 0;
+    if (legacyGroups.size > 0) {
+      this.rebuildHotIndexes();
+    }
+    for (const [key, group] of legacyGroups) {
+      if (groupsWithOpenLots.has(key) || group.positions.some((position) => (position.lockedQty ?? 0) > QTY_EPSILON)) {
+        continue;
+      }
+      const lots = this.orderLifecycleLogs
+        .filter(
+          (log) =>
+            log.userId === group.userId &&
+            log.roundId === group.roundId &&
+            log.direction === group.side &&
+            log.remainingTokenQty > QTY_EPSILON
+        )
+        .sort((left, right) => left.orderTimestampMs - right.orderTimestampMs);
+      if (lots.length === 0) {
+        continue;
+      }
+
+      const legacyQty = roundNumber(
+        group.positions.reduce((sum, position) => sum + Math.max(position.qty, 0), 0),
+        4
+      );
+      const lifecycleQty = roundNumber(
+        lots.reduce((sum, log) => sum + Math.max(log.remainingTokenQty, 0), 0),
+        4
+      );
+      if (Math.abs(legacyQty - lifecycleQty) > 0.0001) {
+        console.warn(
+          `[store] skipped legacy position lot rebuild for ${group.userId}/${group.roundId}/${group.side}: position qty ${legacyQty} != lifecycle qty ${lifecycleQty}`
+        );
+        continue;
+      }
+
+      const aggregate = group.positions[0];
+      if (!aggregate) {
+        continue;
+      }
+
+      for (const log of lots) {
+        const qty = roundNumber(log.remainingTokenQty, 4);
+        const volumeQty = Math.max(log.volumeTokenQty, QTY_EPSILON);
+        const entryFeeUsdc = roundNumber(((log.entryFee ?? 0) * qty) / volumeQty, 8);
+        const fullNotionalWithoutFee = Math.max(log.positionNotional - (log.entryFee ?? 0), 0);
+        const fallbackNotional = typeof log.entryTokenPrice === "number" ? log.entryTokenPrice * qty : 0;
+        const notionalSpent = roundNumber(
+          fullNotionalWithoutFee > QTY_EPSILON ? (fullNotionalWithoutFee * qty) / volumeQty : fallbackNotional,
+          4
+        );
+        const currentMark = roundNumber(aggregate.currentMark, 4);
+        const currentBid = typeof aggregate.currentBid === "number" ? roundNumber(aggregate.currentBid, 4) : undefined;
+        const currentValue = roundNumber(qty * currentMark, 2);
+        const markPnlUsdc = roundNumber(currentValue - notionalSpent, 2);
+        const executablePnlUsdc =
+          typeof currentBid === "number" ? roundNumber(currentBid * qty - notionalSpent, 2) : markPnlUsdc;
+        const position: PositionRecord = {
+          id: this.legacyPositionLotId(log.buyOrderId),
+          buyOrderId: log.buyOrderId,
+          userId: group.userId,
+          roundId: group.roundId,
+          side: group.side,
+          qty,
+          lockedQty: 0,
+          averageEntry: roundNumber(notionalSpent / Math.max(qty, QTY_EPSILON), 4),
+          notionalSpent,
+          currentMark,
+          currentBid,
+          currentAsk: typeof aggregate.currentAsk === "number" ? roundNumber(aggregate.currentAsk, 4) : undefined,
+          currentMid: typeof aggregate.currentMid === "number" ? roundNumber(aggregate.currentMid, 4) : undefined,
+          currentValue,
+          sourceLatencyMs: aggregate.sourceLatencyMs,
+          unrealizedPnl: markPnlUsdc,
+          realizedPnl: 0,
+          entryFeeUsdc,
+          exitFeeUsdc: 0,
+          totalFeeUsdc: entryFeeUsdc,
+          costBasisUsdc: notionalSpent,
+          markPnlUsdc,
+          executablePnlUsdc,
+          status: "open",
+          openedAt: log.orderTimestampMs
+        };
+        await this.persistPosition(position);
+      }
+
+      for (const position of group.positions) {
+        await this.persistPosition({
+          ...position,
+          qty: 0,
+          lockedQty: 0,
+          currentValue: 0,
+          unrealizedPnl: 0,
+          markPnlUsdc: 0,
+          executablePnlUsdc: 0,
+          status: "closed",
+          closedAt: position.closedAt ?? now,
+          settlementResult: "sold"
+        });
+      }
+      migratedGroups += 1;
+    }
+
+    if (migratedGroups > 0) {
+      console.log(`[store] rebuilt ${migratedGroups} legacy open position group(s) into order-level lots`);
+    }
+  }
+
+  private cleanupRetentionIfDue(now = Date.now()) {
     if (now - this.lastMemoryGuardAt >= MEMORY_GUARD_INTERVAL_MS) {
       this.lastMemoryGuardAt = now;
       this.updateMemoryProtectionState();
       if (this.memoryProtectionState !== "normal") {
-        this.pruneMemoryCaches(now);
+        this.pruneMemoryCaches(now, { force: true });
       }
     }
-    if (now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
+    if (!this.retentionCleanupRunning && now - this.lastRetentionCleanupAt >= RETENTION_CLEANUP_INTERVAL_MS) {
       this.lastRetentionCleanupAt = now;
-      await this.cleanupRetention(now);
+      this.retentionCleanupRunning = true;
+      void this.cleanupRetention(now)
+        .catch((error) => console.warn("[store] Log retention cleanup failed:", error))
+        .finally(() => {
+          this.retentionCleanupRunning = false;
+        });
     }
   }
 
@@ -3660,340 +3257,6 @@ export class AppStore {
         )
     ).filter((event) => event.serverRecvTs >= threshold);
     await this.auditLogWriter.rewrite(filtered);
-  }
-
-  private rowToRound(row: Record<string, unknown>): RoundRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    const polymarketOpenPrice = sanitizePolymarketBtcReference(numberOrUndefined(row.polymarket_open_price));
-    const polymarketClosePrice = sanitizePolymarketBtcReference(numberOrUndefined(row.polymarket_close_price));
-    return {
-      id: String(row.id),
-      marketId: String(row.market_id),
-      symbol: String(row.symbol),
-      eventId: row.event_id ? String(row.event_id) : undefined,
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      eventSlug: row.event_slug ? String(row.event_slug) : undefined,
-      conditionId: row.condition_id ? String(row.condition_id) : undefined,
-      seriesSlug: row.series_slug ? String(row.series_slug) : undefined,
-      upTokenId: row.up_token_id ? String(row.up_token_id) : undefined,
-      downTokenId: row.down_token_id ? String(row.down_token_id) : undefined,
-      title: row.title ? String(row.title) : undefined,
-      resolutionSource: row.resolution_source ? String(row.resolution_source) : undefined,
-      startAt: Number(row.start_at),
-      endAt: Number(row.end_at),
-      priceToBeat: Number(row.price_to_beat),
-      priceToBeatSource: row.price_to_beat_source ? String(row.price_to_beat_source) : undefined,
-      priceToBeatCapturedAt: row.price_to_beat_captured_at ? Number(row.price_to_beat_captured_at) : undefined,
-      status: String(row.status) as RoundStatus,
-      pollCount: Number(row.poll_count),
-      pollStartAt: row.poll_start_at ? Number(row.poll_start_at) : undefined,
-      lastPollAt: row.last_poll_at ? Number(row.last_poll_at) : undefined,
-      closingSpotPrice: row.closing_spot_price !== null ? Number(row.closing_spot_price) : undefined,
-      settledSide: row.settled_side ? (String(row.settled_side) as RoundRecord["settledSide"]) : undefined,
-      settlementPrice: row.settlement_price !== null ? Number(row.settlement_price) : undefined,
-      settlementTs: row.settlement_ts ? Number(row.settlement_ts) : undefined,
-      settlementSource: row.settlement_source ? (String(row.settlement_source) as RoundRecord["settlementSource"]) : undefined,
-      polymarketSettlementPrice: numberOrUndefined(row.polymarket_settlement_price),
-      polymarketSettlementStatus: row.polymarket_settlement_status
-        ? (String(row.polymarket_settlement_status) as RoundRecord["polymarketSettlementStatus"])
-        : undefined,
-      polymarketOpenPrice,
-      polymarketClosePrice,
-      polymarketOpenPriceSource:
-        polymarketOpenPrice && row.polymarket_open_price_source ? String(row.polymarket_open_price_source) : undefined,
-      polymarketClosePriceSource:
-        polymarketClosePrice && row.polymarket_close_price_source ? String(row.polymarket_close_price_source) : undefined,
-      settlementReceivedAt: numberOrUndefined(row.settlement_received_at),
-      redeemScheduledAt: numberOrUndefined(row.redeem_scheduled_at),
-      binanceOpenPrice: numberOrUndefined(row.binance_open_price),
-      binanceClosePrice: numberOrUndefined(row.binance_close_price),
-      redeemStartTs: row.redeem_start_ts ? Number(row.redeem_start_ts) : undefined,
-      redeemFinishTs: row.redeem_finish_ts ? Number(row.redeem_finish_ts) : undefined,
-      manualReason: row.manual_reason ? String(row.manual_reason) : undefined,
-      acceptingOrders: row.accepting_orders !== null ? Boolean(row.accepting_orders) : undefined,
-      closingPriceSource: row.closing_price_source
-        ? (String(row.closing_price_source) as RoundRecord["closingPriceSource"])
-        : undefined
-    };
-  }
-
-  private rowToOrderBookSnapshotRecord(row: Record<string, unknown>): OrderBookSnapshotRecord {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-    const snapshot = parseJson<OrderBookSnapshot>(row.snapshot, {
-      snapshotId: String(row.snapshot_id),
-      snapshotTs: Number(row.snapshot_ts),
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      bids: [],
-      asks: []
-    });
-    return {
-      ref: String(row.ref),
-      snapshotId: String(row.snapshot_id),
-      snapshotTs: Number(row.snapshot_ts),
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      snapshot: cloneOrderBookSnapshot(snapshot),
-      createdAt: Number(row.created_at)
-    };
-  }
-
-  private rowToOrderLifecycle(row: Record<string, unknown>): OrderLifecycleRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      buyOrderId: String(row.buy_order_id),
-      traceId: String(row.trace_id),
-      userId: String(row.user_id),
-      testerId: String(row.tester_id),
-      roundId: String(row.round_id),
-      symbol: String(row.symbol),
-      assetClass: "BTC",
-      marketId: String(row.market_id),
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      direction: row.direction as TradeSide,
-      orderTimestampMs: Number(row.order_timestamp_ms),
-      entryTokenPrice: numberOrUndefined(row.entry_token_price),
-      btcTradePrice: numberOrUndefined(row.btc_trade_price),
-      btcOpenPriceToBeat: numberOrUndefined(row.btc_open_price_to_beat),
-      deltaBtc: numberOrUndefined(row.delta_btc),
-      volumeTokenQty: Number(row.volume_token_qty),
-      remainingTokenQty: Number(row.remaining_token_qty),
-      closedTokenQty: Number(row.closed_token_qty),
-      positionNotional: Number(row.position_notional),
-      exitType: row.exit_type ? (String(row.exit_type) as OrderLifecycleExitType) : undefined,
-      exitTokenPrice: numberOrUndefined(row.exit_token_price),
-      exitNotional: Number(row.exit_notional),
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as OrderLifecycleRecord["settlementResult"])
-        : undefined,
-      orderBookSnapshotRef: row.order_book_snapshot_ref ? String(row.order_book_snapshot_ref) : undefined,
-      actualFillPrice: numberOrUndefined(row.actual_fill_price),
-      slippageBps: numberOrUndefined(row.slippage_bps),
-      matchLatencyMs: Number(row.match_latency_ms),
-      settlementTimeMs: numberOrUndefined(row.settlement_time_ms),
-      settlementDirection: row.settlement_direction ? (String(row.settlement_direction) as TradeSide) : undefined,
-      entryFee: numberOrUndefined(row.entry_fee),
-      exitFee: numberOrUndefined(row.exit_fee),
-      feeCurrency: row.fee_currency ? "USD" : undefined,
-      createdAt: Number(row.created_at),
-      updatedAt: Number(row.updated_at)
-    };
-  }
-
-  private rowToOrder(row: Record<string, unknown>): OrderRecord {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      traceId: String(row.trace_id),
-      userId: String(row.user_id),
-      roundId: String(row.round_id),
-      symbol: String(row.symbol),
-      marketId: String(row.market_id),
-      action: row.action as OrderRecord["action"],
-      side: row.side as OrderRecord["side"],
-      status: row.status as OrderRecord["status"],
-      orderKind: row.order_kind ? (String(row.order_kind) as OrderRecord["orderKind"]) : undefined,
-      timeInForce: row.time_in_force ? (String(row.time_in_force) as OrderRecord["timeInForce"]) : undefined,
-      limitPrice: numberOrUndefined(row.limit_price),
-      lifecycleStatus: row.lifecycle_status ? (String(row.lifecycle_status) as OrderRecord["lifecycleStatus"]) : undefined,
-      resultType: row.result_type ? (String(row.result_type) as OrderRecord["resultType"]) : undefined,
-      tokenId: row.token_id ? String(row.token_id) : undefined,
-      bookKey: row.book_key ? String(row.book_key) : undefined,
-      bookHash: row.book_hash ? String(row.book_hash) : undefined,
-      requestedAmountUsdc: numberOrUndefined(row.requested_amount_usdc),
-      requestedQty: numberOrUndefined(row.requested_qty),
-      frozenUsdc: numberOrUndefined(row.frozen_usdc),
-      frozenQty: numberOrUndefined(row.frozen_qty),
-      fills: parseJson(row.fills, []),
-      estimatedFee: numberOrUndefined(row.estimated_fee),
-      actualFee: numberOrUndefined(row.actual_fee),
-      feeBreakdown: parseJson(row.fee_breakdown, undefined),
-      feeCurrency: row.fee_currency ? "USD" : undefined,
-      sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      orderBookSnapshotRef: row.order_book_snapshot_ref ? String(row.order_book_snapshot_ref) : undefined,
-      orderBookSnapshot: parseJson<OrderBookSnapshot | undefined>(row.order_book_snapshot, undefined),
-      notionalUsdc: Number(row.notional_usdc),
-      expectedQty: Number(row.expected_qty),
-      filledQty: Number(row.filled_qty),
-      unfilledQty: Number(row.unfilled_qty),
-      avgFillPrice: row.avg_fill_price !== null ? Number(row.avg_fill_price) : undefined,
-      bestBid: Number(row.best_bid),
-      bestAsk: Number(row.best_ask),
-      midPrice: Number(row.mid_price),
-      bookSnapshotTs: Number(row.book_snapshot_ts),
-      partialFilled: Boolean(row.partial_filled),
-      slippageBps: row.slippage_bps !== null ? Number(row.slippage_bps) : undefined,
-      matchLatencyMs: Number(row.match_latency_ms),
-      bookAcquireLatencyMs: numberOrUndefined(row.book_acquire_latency_ms),
-      localMatchLatencyMs: numberOrUndefined(row.local_match_latency_ms),
-      persistLatencyMs: numberOrUndefined(row.persist_latency_ms),
-      totalOrderLatencyMs: numberOrUndefined(row.total_order_latency_ms),
-      failureReason: row.failure_reason ? String(row.failure_reason) : undefined,
-      clientOrderId: row.client_order_id ? String(row.client_order_id) : undefined,
-      clientSendTs: row.client_send_ts ? Number(row.client_send_ts) : undefined,
-      serverRecvTs: Number(row.server_recv_ts),
-      serverPublishTs: Number(row.server_publish_ts),
-      createdAt: Number(row.created_at)
-    };
-  }
-
-  private rowToPosition(row: Record<string, unknown>): PositionRecord {
-    const numberOrUndefined = (value: unknown) => value === null || typeof value === "undefined" ? undefined : Number(value);
-    return {
-      id: String(row.id),
-      userId: String(row.user_id),
-      roundId: String(row.round_id),
-      side: row.side as PositionRecord["side"],
-      qty: Number(row.qty),
-      lockedQty: numberOrUndefined(row.locked_qty),
-      averageEntry: Number(row.average_entry),
-      notionalSpent: Number(row.notional_spent),
-      currentMark: Number(row.current_mark),
-      currentBid: numberOrUndefined(row.current_bid),
-      currentAsk: numberOrUndefined(row.current_ask),
-      currentMid: numberOrUndefined(row.current_mid),
-      currentValue: numberOrUndefined(row.current_value),
-      sourceLatencyMs: numberOrUndefined(row.source_latency_ms),
-      unrealizedPnl: Number(row.unrealized_pnl),
-      realizedPnl: Number(row.realized_pnl),
-      entryFeeUsdc: numberOrUndefined(row.entry_fee_usdc),
-      exitFeeUsdc: numberOrUndefined(row.exit_fee_usdc),
-      totalFeeUsdc: numberOrUndefined(row.total_fee_usdc),
-      costBasisUsdc: numberOrUndefined(row.cost_basis_usdc) ?? Number(row.notional_spent),
-      markPnlUsdc: numberOrUndefined(row.mark_pnl_usdc),
-      executablePnlUsdc: numberOrUndefined(row.executable_pnl_usdc),
-      status: row.status as PositionRecord["status"],
-      openedAt: Number(row.opened_at),
-      closedAt: row.closed_at ? Number(row.closed_at) : undefined,
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as PositionRecord["settlementResult"])
-        : undefined
-    };
-  }
-
-  private rowToAuditEvent(row: Record<string, unknown>): AuditEvent {
-    return {
-      eventId: String(row.event_id),
-      traceId: String(row.trace_id),
-      category: row.category as AuditEvent["category"],
-      actionType: String(row.action_type),
-      actionStatus: row.action_status as AuditEvent["actionStatus"],
-      userId: row.user_id ? String(row.user_id) : undefined,
-      role: row.role ? (String(row.role) as Role) : undefined,
-      pageName: String(row.page_name),
-      moduleName: String(row.module_name),
-      symbol: row.symbol ? String(row.symbol) : undefined,
-      roundId: row.round_id ? String(row.round_id) : undefined,
-      resultCode: String(row.result_code),
-      resultMessage: String(row.result_message),
-      clientSendTs: row.client_send_ts ? Number(row.client_send_ts) : undefined,
-      serverRecvTs: Number(row.server_recv_ts),
-      engineStartTs: row.engine_start_ts ? Number(row.engine_start_ts) : undefined,
-      engineFinishTs: row.engine_finish_ts ? Number(row.engine_finish_ts) : undefined,
-      serverPublishTs: Number(row.server_publish_ts),
-      backendLatencyMs: Number(row.backend_latency_ms),
-      frontendLatencyMs: row.frontend_latency_ms !== null ? Number(row.frontend_latency_ms) : undefined,
-      details: (row.details as Record<string, unknown> | null) ?? undefined
-    };
-  }
-
-  private rowToBehaviorLog(row: Record<string, unknown>): BehaviorActionLog {
-    const parseJson = <T>(value: unknown, fallback: T): T => {
-      if (typeof value === "string") {
-        try {
-          return JSON.parse(value) as T;
-        } catch {
-          return fallback;
-        }
-      }
-      return (value as T) ?? fallback;
-    };
-
-    return {
-      logId: String(row.log_id),
-      timestampMs: Number(row.timestamp_ms),
-      assetClass: "BTC_5M_UPDOWN",
-      actionType: String(row.action_type),
-      actionStatus: row.action_status as BehaviorActionLog["actionStatus"],
-      roundId: row.round_id ? String(row.round_id) : undefined,
-      direction: row.direction ? (String(row.direction) as BehaviorActionLog["direction"]) : undefined,
-      entryOdds: row.entry_odds !== null ? Number(row.entry_odds) : undefined,
-      deltaClob: Number(row.delta_clob),
-      volumeClob: Number(row.volume_clob),
-      positionNotional: row.position_notional !== null ? Number(row.position_notional) : undefined,
-      exitType: row.exit_type ? String(row.exit_type) : undefined,
-      exitOdds: row.exit_odds !== null ? Number(row.exit_odds) : undefined,
-      settlementResult: row.settlement_result
-        ? (String(row.settlement_result) as BehaviorActionLog["settlementResult"])
-        : undefined,
-      testerIdAnon: String(row.tester_id_anon),
-      traceId: row.trace_id ? String(row.trace_id) : undefined,
-      orderId: row.order_id ? String(row.order_id) : undefined,
-      marketId: row.market_id ? String(row.market_id) : undefined,
-      marketSlug: row.market_slug ? String(row.market_slug) : undefined,
-      roundStatus: row.round_status ? (String(row.round_status) as RoundStatus) : undefined,
-      countdownMs: row.countdown_ms !== null ? Number(row.countdown_ms) : undefined,
-      binanceSpotPrice: Number(row.binance_spot_price),
-      binance1mLastClose: Number(row.binance_1m_last_close),
-      binance5mLastClose: Number(row.binance_5m_last_close),
-      binance1dLastClose: Number(row.binance_1d_last_close),
-      chainlinkPrice: Number(row.chainlink_price),
-      priceToBeat: Number(row.price_to_beat),
-      upPrice: Number(row.up_price),
-      downPrice: Number(row.down_price),
-      upBookTop5: parseJson(row.up_book_top5, []),
-      downBookTop5: parseJson(row.down_book_top5, []),
-      recentTradesTop20: parseJson(row.recent_trades_top20, []),
-      bookSnapshotEntry: parseJson(row.book_snapshot_entry, {
-        snapshotId: "",
-        snapshotTs: 0,
-        topBids: [],
-        topAsks: []
-      }),
-      actualFillPrice: row.actual_fill_price !== null ? Number(row.actual_fill_price) : undefined,
-      slippageBps: row.slippage_bps !== null ? Number(row.slippage_bps) : undefined,
-      partialFilled: row.partial_filled !== null ? Boolean(row.partial_filled) : undefined,
-      unfilledQty: row.unfilled_qty !== null ? Number(row.unfilled_qty) : undefined,
-      executionLatencyMs: row.execution_latency_ms !== null ? Number(row.execution_latency_ms) : undefined,
-      settlementDirection: row.settlement_direction
-        ? (String(row.settlement_direction) as TradeSide)
-        : undefined,
-      settlementTimeMs: row.settlement_time_ms !== null ? Number(row.settlement_time_ms) : undefined,
-      gammaPollCount: row.gamma_poll_count !== null ? Number(row.gamma_poll_count) : undefined,
-      redeemFinishTimeMs: row.redeem_finish_time_ms !== null ? Number(row.redeem_finish_time_ms) : undefined,
-      sourceStates: parseJson(row.source_states, {
-        binance: { source: "Binance", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-        chainlink: { source: "Chainlink", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-        clob: { source: "CLOB", state: "reconnecting", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 }
-      }),
-      strategyClusterLabel: row.strategy_cluster_label ? String(row.strategy_cluster_label) : undefined,
-      marketRegimeLabel: row.market_regime_label ? String(row.market_regime_label) : undefined,
-      qualityGrade: row.quality_grade ? String(row.quality_grade) : undefined,
-      contextJson: parseJson(row.context_json, {})
-    };
   }
 
   private async queryDb(query: string, params: unknown[]): Promise<QueryResult> {

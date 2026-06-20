@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { readSimulationServiceSource, readStoreServiceSource } from "./source-contracts";
 
 function assertIncludes(source: string, needle: string, label: string) {
   assert.ok(source.includes(needle), `${label} missing: ${needle}`);
@@ -38,8 +39,8 @@ async function testMemoryLookup() {
 
 function testStaticContracts() {
   const migration = readFileSync("db/migrations/000004_order_client_idempotency.sql", "utf8");
-  const storeSource = readFileSync("apps/server/src/services/store.ts", "utf8");
-  const simulationSource = readFileSync("apps/server/src/services/simulation.ts", "utf8");
+  const storeSource = readStoreServiceSource();
+  const simulationSource = readSimulationServiceSource();
   const indexSource = readFileSync("apps/server/src/index.ts", "utf8");
   const apiSource = readFileSync("apps/client/src/utils/api.ts", "utf8");
 
@@ -55,7 +56,7 @@ function testStaticContracts() {
   assertInOrder(
     simulationSource,
     "await this.store.findOrderByClientOrderId(user.id, clientOrderId)",
-    "this.assertCanCreateNewOrder(currentRound, now);",
+    "this.assertCanBuyOrder(currentRound, now);",
     "duplicate clientOrderId check before trading mutation"
   );
   assertIncludes(simulationSource, "isClientOrderConflict(writeError)", "unique conflict recovery");

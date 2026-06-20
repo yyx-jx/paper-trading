@@ -11,7 +11,7 @@ const store = new AppStore({
   symbol: "BTC",
   databaseUrl: "",
   redisUrl: "",
-  chainlinkEnabled: false
+  coinbaseEnabled: false
 });
 
 async function create(username: string, role: Role, seniorTesterId?: string) {
@@ -86,7 +86,7 @@ function behavior(input: {
     binance1mLastClose: 0,
     binance5mLastClose: 0,
     binance1dLastClose: 0,
-    chainlinkPrice: 0,
+    coinbasePrice: 0,
     priceToBeat: 0,
     upPrice: 0,
     downPrice: 0,
@@ -101,7 +101,7 @@ function behavior(input: {
     },
     sourceStates: {
       binance: { source: "Binance", state: "disabled", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
-      chainlink: { source: "Chainlink", state: "disabled", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
+      coinbase: { source: "Coinbase", state: "disabled", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 },
       clob: { source: "CLOB", state: "disabled", sourceEventTs: 0, serverRecvTs: 0, serverPublishTs: 0 }
     },
     settlementResult: "win",

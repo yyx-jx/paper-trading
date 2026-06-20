@@ -1,6 +1,5 @@
 import type {
   MatchingBookState,
-  MatchingCancelResult,
   MatchingExecutionRequest,
   MatchingExecutionResult,
   MatchingEventRecord,
